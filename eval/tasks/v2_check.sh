@@ -261,7 +261,9 @@ else
     bash "$WORKDIR/build_and_test.sh" --no-cmake >/dev/null
 
     # 4. Apply hidden tests over agent's tree, build with -std=c++17 -Wall -Wextra -Werror, and run
-    compile_and_run_hidden
+    if [[ "$CATEGORY" != "review" ]]; then
+        compile_and_run_hidden
+    fi
 
     # 5. Category-specific checks
     if [[ "$CATEGORY" == "review" ]]; then

@@ -8,13 +8,15 @@
 #   2. Applies setup.patch and asserts that check.sh FAILS (exits non-zero).
 #   3. For v2 non-trap tasks, asserts that STOP-only and marker-only submissions FAIL.
 #   4. Applies solution.patch and asserts that check.sh PASSES (exits 0).
-#   5. For v2 non-trap tasks, runs structural meta-checks:
+#   5. For v2 vague-bugfix, multi-file-feature, and spec-driven tasks:
 #      - hidden/ contains >= 1 test source compiled and run by check.sh (verified
 #        with a compile-probe against check.sh)
 #      - solution.patch changes >= 1 file under src/ or include/
 #      - vague-bugfix tasks have a non-empty setup.patch changing src/
 #      - check.sh FAILS on solution.patch minus its src/ hunks
-#   6. For category 'trap', requires cheat.patch and asserts check.sh FAILS on it.
+#   6. For v2 review tasks, requires review.patch to apply and build, and every
+#      negative_*.patch submission to apply and FAIL check.sh. Unknown v2 categories FAIL.
+#   7. For category 'trap', requires cheat.patch and asserts check.sh FAILS on it.
 #
 # Prints a summary table and exits 0 only if every active task passes.
 #
@@ -25,7 +27,7 @@
 set -euo pipefail
 
 usage() {
-    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,/^set -euo pipefail/{ /^set -euo pipefail/d; p; }' "$0" | sed 's/^# \{0,1\}//'
 }
 
 FILTER_TASK=""
@@ -88,6 +90,20 @@ for task_dir in "$TASKS_ROOT"/*/; do
         category="$(awk -F': ' '/^Category:/ {print $2; exit}' "$task_dir/task.md")"
         tier="$(awk -F': ' '/^Tier:/ {print $2; exit}' "$task_dir/task.md")"
         task_status="$(awk -F': ' '/^Status:/ {print $2; exit}' "$task_dir/task.md")"
+    fi
+
+    code_change_task=0
+    if [[ "$tier" == "v2" ]]; then
+        case "$category" in
+            vague-bugfix|multi-file-feature|spec-driven) code_change_task=1 ;;
+            review|trap) ;;
+            *)
+                echo "META-CHECK FAIL ($task_id): unknown v2 category '$category'" >&2
+                FAILED_TASKS=$((FAILED_TASKS + 1))
+                printf "%-34s %-18s %-14s %-14s %-8s\n" "$task_id" "$category" "-" "-" "FAIL"
+                continue
+                ;;
+        esac
     fi
 
     if [[ "$task_status" == "rebuilding" ]]; then
@@ -156,9 +172,9 @@ for task_dir in "$TASKS_ROOT"/*/; do
         after_solve="FAIL(BAD)"
     fi
 
-    # Structural meta-checks for v2 non-trap tasks
+    # Structural meta-checks for v2 code-change tasks
     v2_meta_ok=1
-    if [[ "$tier" == "v2" && "$category" != "trap" ]]; then
+    if [[ "$code_change_task" -eq 1 ]]; then
         # 1) hidden/ contains >= 1 test source compiled and run by check.sh
         mapfile -t hidden_srcs < <(find "$task_dir/hidden" -maxdepth 1 -type f \( -name '*.cpp' -o -name '*.c' -o -name '*.cc' \) 2>/dev/null | sort || true)
         if [[ "${#hidden_srcs[@]}" -eq 0 ]]; then
@@ -233,6 +249,40 @@ PY
         fi
         if (cd "$no_src_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$no_src_dir" >/dev/null 2>&1); then
             echo "META-CHECK FAIL ($task_id): check.sh passed on solution.patch minus src/ hunks" >&2
+            v2_meta_ok=0
+        fi
+    fi
+
+    # Review tasks grade a document about a buildable seeded patch.
+    if [[ "$tier" == "v2" && "$category" == "review" ]]; then
+        review_dir="$TMP_ROOT/review_${task_id}"
+        mkdir -p "$review_dir"
+        cp -r "$work_dir/." "$review_dir/"
+        git -C "$review_dir" reset -q --hard HEAD
+        git -C "$review_dir" clean -q -fd
+        if [[ ! -f "$task_dir/review.patch" ]] ||
+            ! git -C "$review_dir" apply "$task_dir/review.patch" ||
+            ! bash "$review_dir/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
+            echo "META-CHECK FAIL ($task_id): review.patch must apply and pass fixture build" >&2
+            v2_meta_ok=0
+        fi
+
+        negative_count=0
+        for negative_patch in "$task_dir"/negative_*.patch; do
+            [[ -f "$negative_patch" ]] || continue
+            negative_count=$((negative_count + 1))
+            git -C "$review_dir" reset -q --hard HEAD
+            git -C "$review_dir" clean -q -fd
+            if ! git -C "$review_dir" apply "$negative_patch"; then
+                echo "META-CHECK FAIL ($task_id): $(basename "$negative_patch") does not apply" >&2
+                v2_meta_ok=0
+            elif (cd "$review_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$review_dir" >/dev/null 2>&1); then
+                echo "META-CHECK FAIL ($task_id): check.sh accepted $(basename "$negative_patch")" >&2
+                v2_meta_ok=0
+            fi
+        done
+        if [[ "$negative_count" -eq 0 ]]; then
+            echo "META-CHECK FAIL ($task_id): review task has no negative_*.patch submissions" >&2
             v2_meta_ok=0
         fi
     fi
