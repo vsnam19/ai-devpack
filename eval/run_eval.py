@@ -203,6 +203,7 @@ class TrialResult:
     memory_over_recall_rate: float | None = None
     memory_injected_tokens: int | None = None
     memory_injected_ids: list[str] = field(default_factory=list)
+    violation_reason: str = ""
 
 
 @dataclass
@@ -440,6 +441,8 @@ def load_and_validate_memory_sequences(
             p_path = sdir / p_rel
             if not p_path.is_file():
                 raise ValueError(f"Memory sequence '{sdir.name}' missing step prompt: {p_path}")
+            if not sdata.get("allowed_files"):
+                raise ValueError(f"Memory sequence '{sdir.name}' {skey} missing allowed_files")
             steps.append(
                 MemoryStepSpec(
                     step_id=skey,
@@ -1642,6 +1645,111 @@ def run_orchestrator_trial(
         cleanup_cfg_dir(trial_root / "cfg")
 
 
+MEMORY_PROTECTED_GLOBS: tuple[str, ...] = ("tests/**",)
+MEMORY_STEP_BASELINE_MSG = "chore: memory eval step baseline"
+SCOPE_CHECK_SCRIPT = REPO_ROOT / "enforcement" / "checks" / "scope_check.py"
+TEST_LOCK_SCRIPT = REPO_ROOT / "enforcement" / "checks" / "test_lock.py"
+
+
+def _commit_step_baseline(work_dir: Path, git_env: Mapping[str, str]) -> str:
+    """Commit the worktree as it stands before a step and return that commit SHA.
+
+    The SHA is the base for the step's enforcement checks, so each step is judged only on
+    the edits it made (earlier accepted steps are part of its baseline).
+    """
+    env = dict(git_env)
+    subprocess.run(["git", "add", "-A"], cwd=str(work_dir), env=env, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", MEMORY_STEP_BASELINE_MSG],
+        cwd=str(work_dir),
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(work_dir),
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return head.stdout.strip()
+
+
+def _classify_enforcement_proc(
+    proc: subprocess.CompletedProcess[str],
+    violation_tag: str,
+    violation_kind: str,
+    label: str,
+) -> tuple[str, str]:
+    """Map a check result to ``("", "")`` (clean), ``(violation_kind, detail)`` or ``("harness_error", detail)``."""
+    if proc.returncode == 0:
+        return "", ""
+    violation_lines = [line for line in (proc.stdout or "").splitlines() if violation_tag in line]
+    if proc.returncode == 1 and violation_lines:
+        return violation_kind, "; ".join(violation_lines)
+    tail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-500:]
+    return "harness_error", f"{label} failed (exit {proc.returncode}): {tail}"
+
+
+def _run_step_enforcement(
+    work_dir: Path,
+    base_ref: str,
+    allowed_files: Sequence[str],
+    git_env: Mapping[str, str],
+    timeout_s: int,
+) -> tuple[str, str]:
+    """Run the test lock then the scope check for one step, using the pack-root scripts.
+
+    Returns ``("", "")`` when the step is clean, ``("test_lock_violation" | "scope_violation", detail)``
+    on a violation, or ``("harness_error", detail)`` when a check could not run.
+    """
+    if not allowed_files:
+        return "harness_error", "memory step has no allowed_files; cannot run scope check"
+    env = dict(git_env)
+    lock = subprocess.run(
+        [
+            sys.executable,
+            "-B",  # never write __pycache__ into the pack root
+            str(TEST_LOCK_SCRIPT),
+            "--repo",
+            str(work_dir),
+            "--base",
+            base_ref,
+            "--protected",
+            *MEMORY_PROTECTED_GLOBS,
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout_s,
+        check=False,
+    )
+    kind, detail = _classify_enforcement_proc(lock, "TEST_LOCK_VIOLATION", "test_lock_violation", "test_lock")
+    if kind:
+        return kind, detail
+    scope = subprocess.run(
+        [
+            sys.executable,
+            "-B",  # never write __pycache__ into the pack root
+            str(SCOPE_CHECK_SCRIPT),
+            "--repo",
+            str(work_dir),
+            "--base",
+            base_ref,
+            "--allow",
+            *allowed_files,
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout_s,
+        check=False,
+    )
+    return _classify_enforcement_proc(scope, "SCOPE_VIOLATION", "scope_violation", "scope_check")
+
+
 def run_memory_trial(
     seq: MemorySequenceSpec,
     model: str,
@@ -1768,6 +1876,8 @@ def run_memory_trial(
         last_stderr = ""
         last_init_model = ""
         last_init_digest = ""
+        violation_reason = ""
+        violation_detail = ""
 
         for step_idx, step in enumerate(seq.steps, start=1):
             step_prompt = step.prompt_file.read_text(encoding="utf-8")
@@ -1798,6 +1908,7 @@ def run_memory_trial(
                 memory_root=mem_root,
                 memory_config=memory_config,
             )
+            step_base_ref = _commit_step_baseline(work_dir, git_env)
             agent_res = run_agent(req)
             last_rc = agent_res.exit_code
             last_excerpt = _redact(agent_res.final_text)[:EXCERPT_MAX_CHARS]
@@ -1825,6 +1936,20 @@ def run_memory_trial(
                     harness_reason = agent_res.error
             if agent_res.status != "ok" and not last_error:
                 last_error = agent_res.error
+
+            # Enforce scope and the test lock before grading or accepting this step's proposals.
+            enforce_kind, enforce_detail = _run_step_enforcement(
+                work_dir, step_base_ref, step.allowed_files, git_env, timeout_s
+            )
+            if enforce_kind == "harness_error":
+                any_harness_err = True
+                if not harness_reason:
+                    harness_reason = _redact(f"step {step_idx}: {enforce_detail}")
+                break
+            if enforce_kind:
+                violation_reason = enforce_kind
+                violation_detail = _redact(f"step {step_idx}: {enforce_detail}")
+                break
 
             if mem_enabled:
                 expected_set = set(step.expected_ids)
@@ -1898,16 +2023,21 @@ def run_memory_trial(
                 else 0.0
             )
 
-        passed = check_rc == 0 and not any_harness_err and not any_timeout
+        passed = check_rc == 0 and not any_harness_err and not any_timeout and not violation_reason
         outcome = (
             "pass"
             if passed
-            else ("harness_error" if any_harness_err else ("timeout" if any_timeout else "fail"))
+            else (
+                "harness_error"
+                if any_harness_err
+                else ("timeout" if any_timeout else (violation_reason or "fail"))
+            )
         )
         update_run_json(
             trial_run_dir,
             outcome=outcome,
             timed_out=any_timeout,
+            violation_reason=violation_reason,
             memory_arm=arm,
             memory_recall_rate=recall_rate,
             memory_over_recall_rate=over_recall_rate,
@@ -1926,7 +2056,7 @@ def run_memory_trial(
             cost_usd=None if (any_harness_err or engine.is_local) else round(total_cost, 6),
             turns=total_turns if not any_harness_err else None,
             duration_s=round(total_duration, 4),
-            error=_redact(last_error),
+            error=_redact(last_error) or violation_detail,
             check_output=redacted_check_out,
             harness_error=any_harness_err,
             harness_error_reason=_redact(harness_reason),
@@ -1946,6 +2076,7 @@ def run_memory_trial(
             memory_over_recall_rate=over_recall_rate,
             memory_injected_tokens=total_injected_tokens,
             memory_injected_ids=all_injected_ids,
+            violation_reason=violation_reason,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")

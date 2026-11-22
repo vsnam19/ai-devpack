@@ -55,6 +55,7 @@ Agents never write `.devpack/memory/` directly:
    - `decision` and `fact` entries are stored as `pending` and are **never
      injected** into prompts until a human reviews and runs:
      `python3 runner/devpack_memory.py approve <id>`.
+   - A proposal whose `supersedes` names a `decision` or `fact` entry is stored as `pending` whatever its type, so the supersede takes effect only when a human approves it, and a `supersedes` id that does not exist rejects the proposal.
 3. **Human management:** humans inspect and maintain memory using
    `runner/devpack_memory.py` (`list`, `show`, `add`, `approve`, `supersede`,
    `expire`, `query --explain`).

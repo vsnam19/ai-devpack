@@ -33,6 +33,7 @@ from enforcement.checks import secret_pii_check  # noqa: E402
 VALID_TYPES: tuple[str, ...] = ("decision", "fact", "handoff", "known-gap")
 VALID_STATUSES: tuple[str, ...] = ("active", "pending", "superseded", "expired")
 AUTO_ACCEPT_TYPES: tuple[str, ...] = ("handoff", "known-gap")
+HUMAN_APPROVAL_TYPES: tuple[str, ...] = ("decision", "fact")
 APPROVAL_REQUIRED_TYPES: tuple[str, ...] = ("decision", "fact")
 
 DEFAULT_TOP_K = 5
@@ -1327,8 +1328,10 @@ def process_memory_proposals(
 ) -> ProposalProcessResult:
     """Parse proposals from ``final_text`` and ``stop_report_text`` and store them safely.
 
-    - ``handoff`` and ``known-gap`` proposals are auto-accepted with ``status='active'``.
+    - ``handoff`` and ``known-gap`` proposals are auto-accepted with ``status='active'``, unless
+      their ``supersedes`` names a ``decision`` or ``fact`` entry (then stored ``pending``).
     - ``decision`` and ``fact`` proposals are stored with ``status='pending'`` for human approval.
+    - A ``supersedes`` id that does not exist rejects the proposal (listed in ``result.rejected``).
     - Any proposal failing schema or secret/PII checks is rejected without writing to disk.
     """
     proposals = parse_memory_proposals(final_text)
@@ -1341,7 +1344,18 @@ def process_memory_proposals(
         try:
             norm_type = validate_entry_type(prop.entry_type)
             norm_scope = validate_scope(prop.scope)
-            status = "active" if norm_type in AUTO_ACCEPT_TYPES else "pending"
+            supersede_ids = [validate_entry_id(s) for s in prop.supersedes if str(s).strip()]
+            existing = {e.id: e for e in load_memory_entries(root)}
+            unknown_ids = [sid for sid in supersede_ids if sid not in existing]
+            if unknown_ids:
+                raise MemoryValidationError(
+                    f"Proposal supersedes unknown memory id(s): {', '.join(unknown_ids)}"
+                )
+            # Superseding a human-approved entry (decision/fact) must wait for human approval,
+            # so the supersede is applied only when `approve` writes the entry as active.
+            touches_approved = any(existing[sid].entry_type in HUMAN_APPROVAL_TYPES for sid in supersede_ids)
+            auto_accept = norm_type in AUTO_ACCEPT_TYPES and not touches_approved
+            status = "active" if auto_accept else "pending"
             entry = add_memory_entry(
                 root,
                 entry_type=norm_type,

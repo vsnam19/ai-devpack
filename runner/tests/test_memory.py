@@ -355,6 +355,91 @@ class MemoryStoreAndRetrievalTests(unittest.TestCase):
             self.assertEqual([], memory.parse_memory_proposals("## Memory proposals\nNone.\n"))
 
 
+class MemorySupersedeGuardTests(unittest.TestCase):
+    """Tests that agent proposals never retire human-approved decision/fact entries before approval."""
+
+    def _seed(self, mem_root: Path, entry_id: str, entry_type: str, body: str) -> None:
+        """Persist an active entry as if a human had approved it."""
+        memory.add_memory_entry(
+            mem_root,
+            entry_type=entry_type,
+            body=body,
+            entry_id=entry_id,
+            status="active",
+            source="human",
+        )
+
+    def test_handoff_superseding_decision_or_fact_waits_for_approval(self) -> None:
+        """A handoff superseding an active decision/fact is stored pending; the target changes only on approve."""
+        for target_type in ("decision", "fact"):
+            with self.subTest(target_type=target_type), tempfile.TemporaryDirectory() as tmp:
+                mem_root = memory.memory_root_for(Path(tmp))
+                target_id = f"{target_type}-clamp"
+                self._seed(mem_root, target_id, target_type, "Clamp inputs to 0..255.")
+                text = (
+                    "## Memory proposals\n"
+                    "- type: handoff\n"
+                    "  id: mem-handoff-clamp\n"
+                    "  scope: project\n"
+                    "  tags: REQ-1\n"
+                    f"  supersedes: {target_id}\n"
+                    "  summary: Clamp is now 0..100.\n"
+                )
+                res = memory.process_memory_proposals(mem_root, text, source="run:test-run-2")
+                self.assertEqual([], res.rejected)
+                self.assertEqual([], res.accepted)
+                self.assertEqual(["mem-handoff-clamp"], [e.id for e in res.pending])
+                self.assertEqual("pending", memory.find_memory_entry(mem_root, "mem-handoff-clamp").status)
+                self.assertEqual("active", memory.find_memory_entry(mem_root, target_id).status)
+
+                memory.approve_memory_entry(mem_root, "mem-handoff-clamp")
+                self.assertEqual("active", memory.find_memory_entry(mem_root, "mem-handoff-clamp").status)
+                self.assertEqual("superseded", memory.find_memory_entry(mem_root, target_id).status)
+
+    def test_handoff_superseding_handoff_is_auto_accepted(self) -> None:
+        """A handoff superseding only a handoff keeps the auto-accept behaviour and retires the old handoff."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mem_root = memory.memory_root_for(Path(tmp))
+            self._seed(mem_root, "mem-handoff-old", "handoff", "Old progress note.")
+            text = (
+                "## Memory proposals\n"
+                "- type: handoff\n"
+                "  id: mem-handoff-new\n"
+                "  scope: project\n"
+                "  tags: REQ-1\n"
+                "  supersedes: mem-handoff-old\n"
+                "  summary: Newer progress note.\n"
+            )
+            res = memory.process_memory_proposals(mem_root, text, source="run:test-run-3")
+            self.assertEqual([], res.rejected)
+            self.assertEqual(["mem-handoff-new"], [e.id for e in res.accepted])
+            self.assertEqual([], res.pending)
+            self.assertEqual("active", memory.find_memory_entry(mem_root, "mem-handoff-new").status)
+            self.assertEqual("superseded", memory.find_memory_entry(mem_root, "mem-handoff-old").status)
+
+    def test_supersedes_unknown_id_rejects_proposal(self) -> None:
+        """A supersedes id that is not in the store rejects the proposal with a clear reason and writes nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mem_root = memory.memory_root_for(Path(tmp))
+            text = (
+                "## Memory proposals\n"
+                "- type: handoff\n"
+                "  id: mem-handoff-orphan\n"
+                "  scope: project\n"
+                "  tags: REQ-1\n"
+                "  supersedes: mem-does-not-exist\n"
+                "  summary: Refers to a missing entry.\n"
+            )
+            res = memory.process_memory_proposals(mem_root, text, source="run:test-run-4")
+            self.assertEqual([], res.accepted)
+            self.assertEqual([], res.pending)
+            self.assertEqual(1, len(res.rejected))
+            reason = res.rejected[0]["reason"]
+            self.assertIn("unknown memory id", reason)
+            self.assertIn("mem-does-not-exist", reason)
+            self.assertEqual([], memory.load_memory_entries(mem_root))
+
+
 class MemoryRunnerIntegrationTests(unittest.TestCase):
     """Tests for agent_exec memory injection meta, dispatch, devpack_run, and broker."""
 

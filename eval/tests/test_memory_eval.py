@@ -183,6 +183,139 @@ class MemoryEvalTests(unittest.TestCase):
             self.assertIn("## Memory Metrics", summary_md)
             self.assertIn("01-recall-seq", summary_md)
 
+    def _run_enforcement_trial(self, base: Path, edit_snippet: str) -> tuple[list[dict], Path]:
+        """Run a 2-step memory sequence whose step 1 agent runs ``edit_snippet``; return run.json records and log.
+
+        The stub agent records each call in a log outside the workdir, so tests can tell whether step 2 ran.
+        """
+        fixture_dir = base / "fixture"
+        (fixture_dir / "src").mkdir(parents=True)
+        (fixture_dir / "include").mkdir(parents=True)
+        (fixture_dir / "tests").mkdir(parents=True)
+        (fixture_dir / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.16)\n", encoding="utf-8")
+        (fixture_dir / "build_and_test.sh").write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
+            encoding="utf-8",
+        )
+        os.chmod(fixture_dir / "build_and_test.sh", stat.S_IRWXU)
+        (fixture_dir / "src" / "val.txt").write_text("0\n", encoding="utf-8")
+        (fixture_dir / "tests" / "test_framework.hpp").write_text(
+            "// Test framework header.\nint check_one() { return 1; }\nint check_two() { return 2; }\n",
+            encoding="utf-8",
+        )
+
+        mem_tasks = base / "memory_tasks"
+        seq_dir = mem_tasks / "01-enforce-seq"
+        seq_dir.mkdir(parents=True)
+        (seq_dir / "sequence.toml").write_text(
+            'id = "01-enforce-seq"\n'
+            'category = "recall"\n'
+            'tier = "v2"\n'
+            'title = "Enforcement stub"\n'
+            "ab_compare = true\n\n"
+            "[step_1]\n"
+            'role = "implementer"\n'
+            'prompt_file = "step1.md"\n'
+            'allowed_files = ["src/val.txt"]\n\n'
+            "[step_2]\n"
+            'role = "implementer"\n'
+            'prompt_file = "step2.md"\n'
+            'allowed_files = ["src/val.txt"]\n',
+            encoding="utf-8",
+        )
+        (seq_dir / "step1.md").write_text("Step 1 on src/val.txt.\n", encoding="utf-8")
+        (seq_dir / "step2.md").write_text("Step 2 on src/val.txt.\n", encoding="utf-8")
+        _write_exec(seq_dir / "check.sh", "#!/usr/bin/env bash\nexit 1\n")
+
+        log = base / "agent_calls.log"
+        fake_agent = _write_exec(
+            base / "fake_claude.py",
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            f"LOG = {str(log)!r}\n"
+            "with open(LOG, 'a', encoding='utf-8') as fh:\n"
+            "    fh.write('call\\n')\n"
+            "prompt = sys.argv[-1]\n"
+            "if 'Step 1' in prompt:\n"
+            f"    {edit_snippet}\n"
+            "    result = ('Step 1 done.\\n\\n## Memory proposals\\n'\n"
+            "              '- type: handoff\\n  id: mem-violation-handoff\\n  scope: project\\n'\n"
+            "              '  tags: REQ-MEM-1\\n  summary: Must not be stored after a violation.\\n')\n"
+            "else:\n"
+            "    pathlib.Path('src/val.txt').write_text('MAGIC_99\\n', encoding='utf-8')\n"
+            "    result = 'Step 2 done.'\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,"
+            " 'total_cost_usd': 0.01, 'num_turns': 1, 'duration_ms': 10,"
+            " 'usage': {'input_tokens': 20, 'output_tokens': 10}, 'result': result}))\n",
+        )
+
+        cred = base / "creds.json"
+        cred.write_text('{"accessToken":"fake-eval-tok"}', encoding="utf-8")
+        work_root = base / "work_root"
+        with contextlib.redirect_stdout(io.StringIO()):
+            run_eval.main(
+                [
+                    "--mode",
+                    "memory",
+                    "--engines",
+                    "haiku",
+                    "--k",
+                    "1",
+                    "--isolation",
+                    "local",
+                    "--allow-unsandboxed-local",
+                    "--credentials",
+                    str(cred),
+                    "--fixture-dir",
+                    str(fixture_dir),
+                    "--memory-tasks-dir",
+                    str(mem_tasks),
+                    "--work-root",
+                    str(work_root),
+                    "--out",
+                    str(base / "out"),
+                    "--agent-bin",
+                    str(fake_agent),
+                ]
+            )
+        records = []
+        for run_json in sorted((base / "out").rglob("run.json")):
+            data = json.loads(run_json.read_text(encoding="utf-8"))
+            if "memory_arm" in data:
+                records.append(data)
+        return records, log
+
+    def test_step_editing_test_lock_file_fails_trial_with_test_lock_violation(self) -> None:
+        """A step removing a line from tests/test_framework.hpp fails the trial; its proposals and later steps drop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            edit = (
+                "pathlib.Path('tests/test_framework.hpp').write_text("
+                "'// Test framework header.\\nint check_one() { return 1; }\\n', encoding='utf-8')"
+            )
+            records, log = self._run_enforcement_trial(base, edit)
+            self.assertEqual(2, len(records), "expected one trial per arm")
+            for data in records:
+                self.assertEqual("test_lock_violation", data["violation_reason"])
+                self.assertEqual("test_lock_violation", data["outcome"])
+            # Step 2 never ran: one agent call per trial.
+            self.assertEqual(len(records), log.read_text(encoding="utf-8").count("call"))
+            # The step's handoff proposal was not accepted.
+            self.assertEqual([], list(base.rglob("mem-violation-handoff.md")))
+
+    def test_step_editing_outside_allowed_files_fails_trial_with_scope_violation(self) -> None:
+        """A step that writes a file outside allowed_files fails the trial with scope_violation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            edit = "pathlib.Path('notes.txt').write_text('scratch\\n', encoding='utf-8')"
+            records, log = self._run_enforcement_trial(base, edit)
+            self.assertEqual(2, len(records), "expected one trial per arm")
+            for data in records:
+                self.assertEqual("scope_violation", data["violation_reason"])
+                self.assertEqual("scope_violation", data["outcome"])
+            self.assertEqual(len(records), log.read_text(encoding="utf-8").count("call"))
+            self.assertEqual([], list(base.rglob("mem-violation-handoff.md")))
+
 
 if __name__ == "__main__":
     unittest.main()
