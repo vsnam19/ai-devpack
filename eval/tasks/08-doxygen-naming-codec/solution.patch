@@ -1,0 +1,143 @@
+diff --git a/include/can_codec.hpp b/include/can_codec.hpp
+index dde1f06..ca3e8de 100644
+--- a/include/can_codec.hpp
++++ b/include/can_codec.hpp
+@@ -70,30 +70,40 @@ struct SignalDef {
+ bool isValidSignal(const SignalDef& signal) noexcept;
+ 
+ /**
+- * @param signal Validated signal layout descriptor.
+- * @param val Raw bit pattern to insert.
+- * @param buf Target frame byte array.
+- * @param frameLength Length of buf in bytes.
++ * @brief Pack the lowest bitLength bits of rawValue into an 8-byte CAN frame buffer.
++ * @param[in] signal Validated signal layout descriptor.
++ * @param[in] rawValue Raw bit pattern to insert (lowest signal.bitLength bits used).
++ * @param[in,out] frameBytes Target frame byte array of at least kMaxFrameBytes bytes.
++ * @param[in] frameLength Length of frameBytes in bytes (must be >= kMaxFrameBytes).
++ * @return True on success, false if signal is invalid, frameBytes is null, or frameLength < 8.
+  */
+ bool packRaw(
+     const SignalDef& signal,
+-    std::uint64_t val,
+-    std::uint8_t* buf,
++    std::uint64_t rawValue,
++    std::uint8_t* frameBytes,
+     std::size_t frameLength) noexcept;
+ 
+ /**
+- * @param signal Validated signal layout descriptor.
+- * @param buf Source frame byte array.
+- * @param frameLength Length of buf in bytes.
+- * @param ptr Destination pointer receiving the extracted unsigned raw bits.
++ * @brief Unpack a raw unsigned bit pattern from an 8-byte CAN frame buffer.
++ * @param[in] signal Validated signal layout descriptor.
++ * @param[in] frameBytes Source frame byte array of at least kMaxFrameBytes bytes.
++ * @param[in] frameLength Length of frameBytes in bytes (must be >= kMaxFrameBytes).
++ * @param[out] rawOut Destination pointer receiving the extracted unsigned raw bits.
++ * @return True on success, false if signal is invalid, pointers are null, or frameLength < 8.
+  */
+ bool unpackRaw(
+     const SignalDef& signal,
+-    const std::uint8_t* buf,
++    const std::uint8_t* frameBytes,
+     std::size_t frameLength,
+-    std::uint64_t* ptr) noexcept;
++    std::uint64_t* rawOut) noexcept;
+ 
+-std::int64_t signExtend(std::uint64_t val, std::uint8_t bitLength) noexcept;
++/**
++ * @brief Sign-extend an unsigned bitLength-bit raw value using two's-complement rules.
++ * @param[in] rawValue Extracted unsigned bit pattern.
++ * @param[in] bitLength Number of significant bits in rawValue (1..64).
++ * @return Signed 64-bit integer value after sign extension.
++ */
++std::int64_t signExtend(std::uint64_t rawValue, std::uint8_t bitLength) noexcept;
+ 
+ /**
+  * @brief Encode a physical floating-point value into a CAN frame buffer using signal scaling.
+diff --git a/src/can_codec.cpp b/src/can_codec.cpp
+index c1094e4..c96dd47 100644
+--- a/src/can_codec.cpp
++++ b/src/can_codec.cpp
+@@ -80,24 +80,24 @@ bool isValidSignal(const SignalDef& signal) noexcept {
+ 
+ bool packRaw(
+     const SignalDef& signal,
+-    std::uint64_t val,
+-    std::uint8_t* buf,
++    std::uint64_t rawValue,
++    std::uint8_t* frameBytes,
+     std::size_t frameLength) noexcept {
+-    if (!isValidSignal(signal) || buf == nullptr || frameLength < kMaxFrameBytes) {
++    if (!isValidSignal(signal) || frameBytes == nullptr || frameLength < kMaxFrameBytes) {
+         return false;
+     }
+-    const std::uint64_t tmp = val & computeBitMask(signal.bitLength);
++    const std::uint64_t maskedValue = rawValue & computeBitMask(signal.bitLength);
+     for (std::uint8_t i = 0U; i < signal.bitLength; ++i) {
+         std::size_t byteIndex = 0U;
+         std::uint8_t bitInByte = 0U;
+         resolveFrameBitPosition(signal, i, &byteIndex, &bitInByte);
+         const auto bitMask = static_cast<std::uint8_t>(1U << bitInByte);
+-        const bool bitIsSet = ((tmp >> i) & 1ULL) != 0ULL;
++        const bool bitIsSet = ((maskedValue >> i) & 1ULL) != 0ULL;
+         if (bitIsSet) {
+-            buf[byteIndex] = static_cast<std::uint8_t>(buf[byteIndex] | bitMask);
++            frameBytes[byteIndex] = static_cast<std::uint8_t>(frameBytes[byteIndex] | bitMask);
+         } else {
+-            buf[byteIndex] =
+-                static_cast<std::uint8_t>(buf[byteIndex] & static_cast<std::uint8_t>(~bitMask));
++            frameBytes[byteIndex] =
++                static_cast<std::uint8_t>(frameBytes[byteIndex] & static_cast<std::uint8_t>(~bitMask));
+         }
+     }
+     return true;
+@@ -105,37 +105,37 @@ bool packRaw(
+ 
+ bool unpackRaw(
+     const SignalDef& signal,
+-    const std::uint8_t* buf,
++    const std::uint8_t* frameBytes,
+     std::size_t frameLength,
+-    std::uint64_t* ptr) noexcept {
+-    if (!isValidSignal(signal) || buf == nullptr || ptr == nullptr ||
++    std::uint64_t* rawOut) noexcept {
++    if (!isValidSignal(signal) || frameBytes == nullptr || rawOut == nullptr ||
+         frameLength < kMaxFrameBytes) {
+         return false;
+     }
+-    std::uint64_t tmp = 0ULL;
++    std::uint64_t extractedBits = 0ULL;
+     for (std::uint8_t i = 0U; i < signal.bitLength; ++i) {
+         std::size_t byteIndex = 0U;
+         std::uint8_t bitInByte = 0U;
+         resolveFrameBitPosition(signal, i, &byteIndex, &bitInByte);
+-        const std::uint8_t byteValue = buf[byteIndex];
++        const std::uint8_t byteValue = frameBytes[byteIndex];
+         if (((byteValue >> bitInByte) & 1U) != 0U) {
+-            tmp |= (1ULL << i);
++            extractedBits |= (1ULL << i);
+         }
+     }
+-    *ptr = tmp;
++    *rawOut = extractedBits;
+     return true;
+ }
+ 
+ // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+-std::int64_t signExtend(std::uint64_t val, std::uint8_t bitLength) noexcept {
++std::int64_t signExtend(std::uint64_t rawValue, std::uint8_t bitLength) noexcept {
+     if (bitLength == 0U) {
+         return 0;
+     }
+     if (bitLength >= static_cast<std::uint8_t>(kMaxFrameBits)) {
+-        return static_cast<std::int64_t>(val);
++        return static_cast<std::int64_t>(rawValue);
+     }
+     const std::uint64_t mask = computeBitMask(bitLength);
+-    std::uint64_t cleanedBits = val & mask;
++    std::uint64_t cleanedBits = rawValue & mask;
+     const std::uint64_t signBitMask = 1ULL << (bitLength - 1U);
+     if ((cleanedBits & signBitMask) != 0ULL) {
+         cleanedBits |= ~mask;

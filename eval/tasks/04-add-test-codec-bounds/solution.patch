@@ -1,0 +1,48 @@
+diff --git a/tests/test_can_codec.cpp b/tests/test_can_codec.cpp
+index bc4e33c..ba8c098 100644
+--- a/tests/test_can_codec.cpp
++++ b/tests/test_can_codec.cpp
+@@ -130,6 +130,35 @@ void testPhysicalScalingAndClamping() {
+     CHECK_NEAR(decodedTemp, -40.0, 1e-6);
+ }
+ 
++/**
++ * @brief Verify packRaw and unpackRaw reject null pointers, short frames, and out-of-bounds signals.
++ * @req REQ-CODEC-006
++ */
++void testCodecBoundsAndNullChecks() {
++    std::array<std::uint8_t, kMaxFrameBytes> frameBytes{};
++    std::uint64_t rawValue = 0ULL;
++
++    const SignalDef validBoundary{56U, 8U, Endianness::Little, false, 1.0, 0.0, 0.0, 255.0};
++    const SignalDef pastBoundary{57U, 8U, Endianness::Little, false, 1.0, 0.0, 0.0, 255.0};
++    const SignalDef startOutOfBounds{64U, 1U, Endianness::Big, false, 1.0, 0.0, 0.0, 1.0};
++
++    CHECK(can_fixture::isValidSignal(validBoundary));
++    CHECK(!can_fixture::isValidSignal(pastBoundary));
++    CHECK(!can_fixture::isValidSignal(startOutOfBounds));
++
++    CHECK(!can_fixture::packRaw(pastBoundary, 1ULL, frameBytes.data(), frameBytes.size()));
++    CHECK(!can_fixture::unpackRaw(pastBoundary, frameBytes.data(), frameBytes.size(), &rawValue));
++
++    CHECK(!can_fixture::packRaw(validBoundary, 1ULL, nullptr, kMaxFrameBytes));
++    CHECK(!can_fixture::packRaw(validBoundary, 1ULL, frameBytes.data(), 7U));
++    CHECK(!can_fixture::packRaw(validBoundary, 1ULL, frameBytes.data(), 0U));
++
++    CHECK(!can_fixture::unpackRaw(validBoundary, nullptr, kMaxFrameBytes, &rawValue));
++    CHECK(!can_fixture::unpackRaw(validBoundary, frameBytes.data(), kMaxFrameBytes, nullptr));
++    CHECK(!can_fixture::unpackRaw(validBoundary, frameBytes.data(), 7U, &rawValue));
++    CHECK(!can_fixture::unpackRaw(validBoundary, frameBytes.data(), 0U, &rawValue));
++}
++
+ }  // namespace
+ 
+ void runCanCodecTests() {
+@@ -138,6 +167,7 @@ void runCanCodecTests() {
+     testBigEndianPackUnpack();
+     testSignedSignalEncodeDecode();
+     testPhysicalScalingAndClamping();
++    testCodecBoundsAndNullChecks();
+ }
+ 
+ }  // namespace can_fixture_test

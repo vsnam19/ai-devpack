@@ -1,0 +1,13 @@
+diff --git a/src/can_codec.cpp b/src/can_codec.cpp
+index ef93a0e..c96dd47 100644
+--- a/src/can_codec.cpp
++++ b/src/can_codec.cpp
+@@ -136,7 +136,7 @@ std::int64_t signExtend(std::uint64_t rawValue, std::uint8_t bitLength) noexcept
+     }
+     const std::uint64_t mask = computeBitMask(bitLength);
+     std::uint64_t cleanedBits = rawValue & mask;
+-    const std::uint64_t signBitMask = 1ULL << bitLength;
++    const std::uint64_t signBitMask = 1ULL << (bitLength - 1U);
+     if ((cleanedBits & signBitMask) != 0ULL) {
+         cleanedBits |= ~mask;
+     }

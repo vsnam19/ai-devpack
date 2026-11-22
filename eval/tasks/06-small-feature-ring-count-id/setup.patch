@@ -1,0 +1,9 @@
+diff --git a/requirements.txt b/requirements.txt
+index 3d21882..3860f9d 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -10,3 +10,4 @@ REQ-LINK-001: LinkStateMachine shall transition from Idle to Connecting on start
+ REQ-LINK-002: LinkStateMachine in Connecting shall retry up to maxRetries on handshakeTimeoutMs before entering Fault.
+ REQ-LINK-003: LinkStateMachine in Active shall enter Degraded on heartbeatTimeoutMs, recover to Active on onHeartbeat, or enter Fault after maxRetries missed heartbeats.
+ REQ-LINK-004: LinkStateMachine reset shall return the state machine from any state to Idle with zero retryCount.
++REQ-RING-004: FrameRingBuffer countByCanId shall return the number of currently buffered frames matching a given canId without modifying buffer state.

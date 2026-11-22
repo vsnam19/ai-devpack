@@ -1,0 +1,225 @@
+diff --git a/include/link_state_machine.hpp b/include/link_state_machine.hpp
+index 33c93cb..a4da18a 100644
+--- a/include/link_state_machine.hpp
++++ b/include/link_state_machine.hpp
+@@ -56,21 +56,32 @@ public:
+     bool isConfigValid() const noexcept;
+ 
+     /**
+-     * @param val Current monotonic timestamp in milliseconds.
++     * @brief Initiate connection handshake from the Idle state.
++     * @param[in] nowMs Current monotonic timestamp in milliseconds.
++     * @return True if transitioned from Idle to Connecting, false if config is invalid or not Idle.
+      */
+-    bool startConnect(std::uint64_t val) noexcept;
++    bool startConnect(std::uint64_t nowMs) noexcept;
+ 
+     /**
+-     * @param val Current monotonic timestamp in milliseconds.
++     * @brief Process a handshake acknowledgment while in the Connecting state.
++     * @param[in] nowMs Current monotonic timestamp in milliseconds (must be >= lastTimestampMs()).
++     * @return True if transitioned from Connecting to Active, false otherwise.
+      */
+-    bool onHandshakeAck(std::uint64_t val) noexcept;
++    bool onHandshakeAck(std::uint64_t nowMs) noexcept;
+ 
+     /**
+-     * @param val Current monotonic timestamp in milliseconds.
++     * @brief Process a peer heartbeat while in Active or Degraded state.
++     * @param[in] nowMs Current monotonic timestamp in milliseconds (must be >= lastTimestampMs()).
++     * @return True if processed and state is Active with retryCount reset to 0, false otherwise.
+      */
+-    bool onHeartbeat(std::uint64_t val) noexcept;
++    bool onHeartbeat(std::uint64_t nowMs) noexcept;
+ 
+-    LinkState onTick(std::uint64_t val) noexcept;
++    /**
++     * @brief Advance time supervision and evaluate handshake or heartbeat timeouts.
++     * @param[in] nowMs Current monotonic timestamp in milliseconds.
++     * @return Resulting LinkState after evaluating elapsed time.
++     */
++    LinkState onTick(std::uint64_t nowMs) noexcept;
+ 
+     /**
+      * @brief Reset the state machine back to Idle and clear retry and timestamp state.
+@@ -96,10 +107,10 @@ public:
+     std::uint64_t lastTimestampMs() const noexcept;
+ 
+ private:
+-    LinkConfig cfg_;
+-    LinkState st_;
+-    std::uint64_t ts_;
+-    std::uint8_t retries_;
++    LinkConfig m_config;
++    LinkState m_state;
++    std::uint64_t m_lastTimestampMs;
++    std::uint8_t m_retryCount;
+ };
+ 
+ }  // namespace can_fixture
+diff --git a/src/link_state_machine.cpp b/src/link_state_machine.cpp
+index 9036c08..000ff0f 100644
+--- a/src/link_state_machine.cpp
++++ b/src/link_state_machine.cpp
+@@ -8,84 +8,84 @@
+ namespace can_fixture {
+ 
+ LinkStateMachine::LinkStateMachine(const LinkConfig& config) noexcept
+-    : cfg_(config),
+-      st_(LinkState::Idle),
+-      ts_(0ULL),
+-      retries_(0U) {
++    : m_config(config),
++      m_state(LinkState::Idle),
++      m_lastTimestampMs(0ULL),
++      m_retryCount(0U) {
+ }
+ 
+ bool LinkStateMachine::isConfigValid() const noexcept {
+-    return (cfg_.handshakeTimeoutMs > 0U) &&
+-           (cfg_.heartbeatTimeoutMs > 0U) &&
+-           (cfg_.maxRetries > 0U);
++    return (m_config.handshakeTimeoutMs > 0U) &&
++           (m_config.heartbeatTimeoutMs > 0U) &&
++           (m_config.maxRetries > 0U);
+ }
+ 
+-bool LinkStateMachine::startConnect(std::uint64_t val) noexcept {
+-    if (!isConfigValid() || st_ != LinkState::Idle) {
++bool LinkStateMachine::startConnect(std::uint64_t nowMs) noexcept {
++    if (!isConfigValid() || m_state != LinkState::Idle) {
+         return false;
+     }
+-    st_ = LinkState::Connecting;
+-    ts_ = val;
+-    retries_ = 0U;
++    m_state = LinkState::Connecting;
++    m_lastTimestampMs = nowMs;
++    m_retryCount = 0U;
+     return true;
+ }
+ 
+-bool LinkStateMachine::onHandshakeAck(std::uint64_t val) noexcept {
+-    if (st_ != LinkState::Connecting || val < ts_) {
++bool LinkStateMachine::onHandshakeAck(std::uint64_t nowMs) noexcept {
++    if (m_state != LinkState::Connecting || nowMs < m_lastTimestampMs) {
+         return false;
+     }
+-    st_ = LinkState::Active;
+-    ts_ = val;
+-    retries_ = 0U;
++    m_state = LinkState::Active;
++    m_lastTimestampMs = nowMs;
++    m_retryCount = 0U;
+     return true;
+ }
+ 
+-bool LinkStateMachine::onHeartbeat(std::uint64_t val) noexcept {
+-    if ((st_ != LinkState::Active && st_ != LinkState::Degraded) ||
+-        val < ts_) {
++bool LinkStateMachine::onHeartbeat(std::uint64_t nowMs) noexcept {
++    if ((m_state != LinkState::Active && m_state != LinkState::Degraded) ||
++        nowMs < m_lastTimestampMs) {
+         return false;
+     }
+-    st_ = LinkState::Active;
+-    ts_ = val;
+-    retries_ = 0U;
++    m_state = LinkState::Active;
++    m_lastTimestampMs = nowMs;
++    m_retryCount = 0U;
+     return true;
+ }
+ 
+-LinkState LinkStateMachine::onTick(std::uint64_t val) noexcept {
+-    if (val <= ts_) {
+-        return st_;
++LinkState LinkStateMachine::onTick(std::uint64_t nowMs) noexcept {
++    if (nowMs <= m_lastTimestampMs) {
++        return m_state;
+     }
+-    const std::uint64_t tmp = val - ts_;
++    const std::uint64_t elapsedMs = nowMs - m_lastTimestampMs;
+ 
+-    switch (st_) {
++    switch (m_state) {
+         case LinkState::Connecting: {
+-            if (tmp >= static_cast<std::uint64_t>(cfg_.handshakeTimeoutMs)) {
+-                if (retries_ < cfg_.maxRetries) {
+-                    ++retries_;
+-                    ts_ = val;
++            if (elapsedMs >= static_cast<std::uint64_t>(m_config.handshakeTimeoutMs)) {
++                if (m_retryCount < m_config.maxRetries) {
++                    ++m_retryCount;
++                    m_lastTimestampMs = nowMs;
+                 } else {
+-                    st_ = LinkState::Fault;
+-                    ts_ = val;
++                    m_state = LinkState::Fault;
++                    m_lastTimestampMs = nowMs;
+                 }
+             }
+             break;
+         }
+         case LinkState::Active: {
+-            if (tmp >= static_cast<std::uint64_t>(cfg_.heartbeatTimeoutMs)) {
+-                st_ = LinkState::Degraded;
+-                retries_ = 1U;
+-                ts_ = val;
++            if (elapsedMs >= static_cast<std::uint64_t>(m_config.heartbeatTimeoutMs)) {
++                m_state = LinkState::Degraded;
++                m_retryCount = 1U;
++                m_lastTimestampMs = nowMs;
+             }
+             break;
+         }
+         case LinkState::Degraded: {
+-            if (tmp >= static_cast<std::uint64_t>(cfg_.heartbeatTimeoutMs)) {
+-                if (retries_ < cfg_.maxRetries) {
+-                    ++retries_;
+-                    ts_ = val;
++            if (elapsedMs >= static_cast<std::uint64_t>(m_config.heartbeatTimeoutMs)) {
++                if (m_retryCount < m_config.maxRetries) {
++                    ++m_retryCount;
++                    m_lastTimestampMs = nowMs;
+                 } else {
+-                    st_ = LinkState::Fault;
+-                    ts_ = val;
++                    m_state = LinkState::Fault;
++                    m_lastTimestampMs = nowMs;
+                 }
+             }
+             break;
+@@ -96,25 +96,25 @@ LinkState LinkStateMachine::onTick(std::uint64_t val) noexcept {
+             break;
+         }
+     }
+-    return st_;
++    return m_state;
+ }
+ 
+ void LinkStateMachine::reset() noexcept {
+-    st_ = LinkState::Idle;
+-    ts_ = 0ULL;
+-    retries_ = 0U;
++    m_state = LinkState::Idle;
++    m_lastTimestampMs = 0ULL;
++    m_retryCount = 0U;
+ }
+ 
+ LinkState LinkStateMachine::state() const noexcept {
+-    return st_;
++    return m_state;
+ }
+ 
+ std::uint8_t LinkStateMachine::retryCount() const noexcept {
+-    return retries_;
++    return m_retryCount;
+ }
+ 
+ std::uint64_t LinkStateMachine::lastTimestampMs() const noexcept {
+-    return ts_;
++    return m_lastTimestampMs;
+ }
+ 
+ }  // namespace can_fixture

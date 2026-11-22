@@ -1,0 +1,32 @@
+diff --git a/tests/test_can_codec.cpp b/tests/test_can_codec.cpp
+index bc4e33c..470c8c2 100644
+--- a/tests/test_can_codec.cpp
++++ b/tests/test_can_codec.cpp
+@@ -130,6 +130,19 @@ void testPhysicalScalingAndClamping() {
+     CHECK_NEAR(decodedTemp, -40.0, 1e-6);
+ }
+ 
++/**
++ * @brief Canary test with mutually exclusive assertions on the same local variable.
++ * @req REQ-CODEC-002
++ */
++void testCanarySignalValidation() {
++    const std::array<std::uint8_t, kMaxFrameBytes> frameBytes{42U, 0U, 0U, 0U, 0U, 0U, 0U, 0U};
++    const SignalDef signal{0U, 8U, Endianness::Little, false, 1.0, 0.0, 0.0, 255.0};
++    std::uint64_t rawValue = 0ULL;
++    CHECK(can_fixture::unpackRaw(signal, frameBytes.data(), frameBytes.size(), &rawValue));
++    CHECK_EQ(rawValue, 42ULL);
++    CHECK_EQ(rawValue, 255ULL);
++}
++
+ }  // namespace
+ 
+ void runCanCodecTests() {
+@@ -138,6 +151,7 @@ void runCanCodecTests() {
+     testBigEndianPackUnpack();
+     testSignedSignalEncodeDecode();
+     testPhysicalScalingAndClamping();
++    testCanarySignalValidation();
+ }
+ 
+ }  // namespace can_fixture_test

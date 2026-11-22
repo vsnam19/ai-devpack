@@ -1,0 +1,12 @@
+diff --git a/src/ring_buffer.cpp b/src/ring_buffer.cpp
+index 0b7dc0b..745ba88 100644
+--- a/src/ring_buffer.cpp
++++ b/src/ring_buffer.cpp
+@@ -50,7 +50,6 @@ bool FrameRingBuffer::pushOverwrite(const CanFrame& frame) noexcept {
+     m_storage[m_head] = frame;
+     m_head = (m_head + 1U) % m_capacity;
+     if (wasFull) {
+-        m_tail = (m_tail + 1U) % m_capacity;
+         ++m_droppedCount;
+     } else {
+         ++m_count;

@@ -1,0 +1,87 @@
+diff --git a/include/can_codec.hpp b/include/can_codec.hpp
+index ca3e8de..489fb88 100644
+--- a/include/can_codec.hpp
++++ b/include/can_codec.hpp
+@@ -133,6 +133,14 @@ bool decodePhysical(
+     std::size_t frameLength,
+     double* physicalOut) noexcept;
+ 
++/**
++ * @brief Check whether a candidate integer value fits within signal.bitLength and signal.isSigned.
++ * @param[in] signal Signal definition describing bitLength and signedness.
++ * @param[in] candidateValue Candidate raw integer value to test.
++ * @return True if signal is valid and candidateValue is representable in signal's raw bit range.
++ */
++bool isRawInRange(const SignalDef& signal, std::int64_t candidateValue) noexcept;
++
+ }  // namespace can_fixture
+ 
+ #endif  // CAN_FIXTURE_CAN_CODEC_HPP
+diff --git a/src/can_codec.cpp b/src/can_codec.cpp
+index c96dd47..ae82667 100644
+--- a/src/can_codec.cpp
++++ b/src/can_codec.cpp
+@@ -220,4 +220,26 @@ bool decodePhysical(
+     return true;
+ }
+ 
++bool isRawInRange(const SignalDef& signal, std::int64_t candidateValue) noexcept {
++    if (!isValidSignal(signal)) {
++        return false;
++    }
++    if (!signal.isSigned) {
++        if (candidateValue < 0) {
++            return false;
++        }
++        if (signal.bitLength >= 63U) {
++            return true;
++        }
++        const std::uint64_t maxUnsigned = (1ULL << signal.bitLength) - 1ULL;
++        return static_cast<std::uint64_t>(candidateValue) <= maxUnsigned;
++    }
++    if (signal.bitLength >= static_cast<std::uint8_t>(kMaxFrameBits)) {
++        return true;
++    }
++    const std::int64_t minSigned = -(1LL << (signal.bitLength - 1U));
++    const std::int64_t maxSigned = (1LL << (signal.bitLength - 1U)) - 1LL;
++    return (candidateValue >= minSigned) && (candidateValue <= maxSigned);
++}
++
+ }  // namespace can_fixture
+diff --git a/tests/test_can_codec.cpp b/tests/test_can_codec.cpp
+index bc4e33c..37f71f1 100644
+--- a/tests/test_can_codec.cpp
++++ b/tests/test_can_codec.cpp
+@@ -130,6 +130,24 @@ void testPhysicalScalingAndClamping() {
+     CHECK_NEAR(decodedTemp, -40.0, 1e-6);
+ }
+ 
++/**
++ * @brief Verify isRawInRange boundary checks for signed and unsigned signal definitions.
++ * @req REQ-CODEC-007
++ */
++void testIsRawInRange() {
++    const SignalDef unsignedByte{0U, 8U, Endianness::Little, false, 1.0, 0.0, 0.0, 255.0};
++    CHECK(!can_fixture::isRawInRange(unsignedByte, -1));
++    CHECK(can_fixture::isRawInRange(unsignedByte, 0));
++    CHECK(can_fixture::isRawInRange(unsignedByte, 255));
++    CHECK(!can_fixture::isRawInRange(unsignedByte, 256));
++
++    const SignalDef signedByte{0U, 8U, Endianness::Little, true, 1.0, 0.0, -128.0, 127.0};
++    CHECK(!can_fixture::isRawInRange(signedByte, -129));
++    CHECK(can_fixture::isRawInRange(signedByte, -128));
++    CHECK(can_fixture::isRawInRange(signedByte, 127));
++    CHECK(!can_fixture::isRawInRange(signedByte, 128));
++}
++
+ }  // namespace
+ 
+ void runCanCodecTests() {
+@@ -138,6 +156,7 @@ void runCanCodecTests() {
+     testBigEndianPackUnpack();
+     testSignedSignalEncodeDecode();
+     testPhysicalScalingAndClamping();
++    testIsRawInRange();
+ }
+ 
+ }  // namespace can_fixture_test

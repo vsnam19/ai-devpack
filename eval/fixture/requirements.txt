@@ -1,0 +1,12 @@
+REQ-CODEC-001: Signal definitions shall have bitLength in [1, 64], startBit + bitLength <= 64, positive scale, and minPhysical <= maxPhysical.
+REQ-CODEC-002: Little-endian signals shall pack and unpack raw unsigned values starting at startBit as the least significant bit.
+REQ-CODEC-003: Big-endian signals shall pack and unpack raw values across byte boundaries in network bit order.
+REQ-CODEC-004: Signed signals shall use two's-complement sign extension when decoding physical values and clamp to signed raw bounds when encoding.
+REQ-CODEC-005: Physical encoding and decoding shall apply scale and offset and clamp values to [minPhysical, maxPhysical].
+REQ-RING-001: FrameRingBuffer shall store up to capacity frames in FIFO order and reject push when full.
+REQ-RING-002: FrameRingBuffer pushOverwrite shall replace the oldest frame when full and increment droppedCount.
+REQ-RING-003: FrameRingBuffer peek and clear shall inspect the oldest frame without removal and reset buffer state respectively.
+REQ-LINK-001: LinkStateMachine shall transition from Idle to Connecting on startConnect and to Active on onHandshakeAck.
+REQ-LINK-002: LinkStateMachine in Connecting shall retry up to maxRetries on handshakeTimeoutMs before entering Fault.
+REQ-LINK-003: LinkStateMachine in Active shall enter Degraded on heartbeatTimeoutMs, recover to Active on onHeartbeat, or enter Fault after maxRetries missed heartbeats.
+REQ-LINK-004: LinkStateMachine reset shall return the state machine from any state to Idle with zero retryCount.

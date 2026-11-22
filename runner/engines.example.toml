@@ -1,0 +1,57 @@
+# engines.example.toml - Example engine and gate configuration for runner/devpack_run.py.
+#
+# Configures the maximum fix rounds (capped at 2 before ESCALATE_TO_HUMAN),
+# the deterministic gate command, and role command templates for implementer,
+# reviewer, and fixer using Claude Sonnet / Haiku.
+
+max_fix_rounds = 2
+gate_cmd = ["python3", "enforcement/gate/gate.py", "--config", "enforcement/gate/gate.example.toml"]
+gate_timeout_s = 300
+
+[roles.implementer]
+model = "sonnet"
+cmd = [
+  "claude",
+  "-p",
+  "--model",
+  "sonnet",
+  "--setting-sources",
+  "project",
+  "--strict-mcp-config",
+  "--no-session-persistence",
+  "--disable-slash-commands",
+  "{prompt}",
+]
+timeout_s = 900
+
+[roles.reviewer]
+model = "sonnet"
+cmd = [
+  "claude",
+  "-p",
+  "--model",
+  "sonnet",
+  "--setting-sources",
+  "project",
+  "--strict-mcp-config",
+  "--no-session-persistence",
+  "--disable-slash-commands",
+  "{prompt}",
+]
+timeout_s = 600
+
+[roles.fixer]
+model = "sonnet"
+cmd = [
+  "claude",
+  "-p",
+  "--model",
+  "sonnet",
+  "--setting-sources",
+  "project",
+  "--strict-mcp-config",
+  "--no-session-persistence",
+  "--disable-slash-commands",
+  "{prompt}",
+]
+timeout_s = 900

@@ -1,0 +1,16 @@
+diff --git a/src/link_state_machine.cpp b/src/link_state_machine.cpp
+index 000ff0f..c945293 100644
+--- a/src/link_state_machine.cpp
++++ b/src/link_state_machine.cpp
+@@ -59,10 +59,9 @@ LinkState LinkStateMachine::onTick(std::uint64_t nowMs) noexcept {
+ 
+     switch (m_state) {
+         case LinkState::Connecting: {
+-            if (elapsedMs >= static_cast<std::uint64_t>(m_config.handshakeTimeoutMs)) {
++            if (elapsedMs > static_cast<std::uint64_t>(m_config.handshakeTimeoutMs)) {
+                 if (m_retryCount < m_config.maxRetries) {
+                     ++m_retryCount;
+-                    m_lastTimestampMs = nowMs;
+                 } else {
+                     m_state = LinkState::Fault;
+                     m_lastTimestampMs = nowMs;
