@@ -934,6 +934,26 @@ def _record_comment_context(
     contexts[id(finding)] = FingerprintContext(comment_text=normalized_comment)
 
 
+def _direction_type_shape(resolved: str) -> str:
+    """Remove balanced template arguments and function declarators from an AST type.
+
+    Clang's JSON parameter nodes expose resolved type spellings rather than
+    pointee type nodes. Nested pointers and const qualifiers belong to those
+    nested types, not the outer parameter. Function pointers passed by value
+    cannot write output through their function pointee.
+    """
+    shape: list[str] = []
+    closing: list[str] = []
+    for character in resolved:
+        if character in "<(":
+            closing.append(">" if character == "<" else ")")
+        elif closing and character == closing[-1]:
+            closing.pop()
+        elif not closing:
+            shape.append(character)
+    return "".join(shape)
+
+
 def check_param_direction_types(
     node: dict[str, Any], raw_text: str, target_file: str,
     findings: list[Finding],
@@ -942,7 +962,7 @@ def check_param_direction_types(
     start = node.get("range", {}).get("begin", {}).get("offset")
     if not isinstance(start, int):
         return
-    prefix = raw_text[:start]
+    prefix = raw_text.encode("utf-8")[:start].decode("utf-8")
     comments = [m for m in CPP_TOKEN_PATTERN.finditer(prefix)
                 if m.group().startswith(("/**", "/*!", "///", "//!"))]
     if not comments:
@@ -968,15 +988,16 @@ def check_param_direction_types(
         spelling = types.get("qualType", "")
         resolved = types.get("desugaredQualType", spelling)
         # Top-level pointer constness does not make its pointee immutable.
-        indirect = re.search(r"[*&]", resolved)
+        shape = _direction_type_shape(resolved)
+        indirect = re.search(r"[*&]", shape)
         readonly = indirect is None
         if indirect:
-            pointee = re.split(r"[*&]", resolved)[-2]
+            pointee = re.split(r"[*&]", shape)[-2]
             readonly = bool(re.search(r"\bconst\b", pointee))
         severity = "error" if readonly and direction != "in" else (
             "warning" if not readonly and direction == "in" else None)
         if severity:
-            findings.append(Finding(target_file, raw_text.count("\n", 0, start) + 1,
+            findings.append(Finding(target_file, prefix.count("\n") + 1,
                                     "DOXYGEN-PARAM-DIR-MISMATCH", severity,
                                     f"Parameter '{name}' of type '{spelling}' documented as [{direction}] "
                                     + ("cannot provide output" if readonly else "may provide output")))

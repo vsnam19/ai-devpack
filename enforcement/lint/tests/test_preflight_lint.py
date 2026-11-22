@@ -130,6 +130,40 @@ class RuleSnippetTests(unittest.TestCase):
                 self.assertFalse(any(f.rule == "DOXYGEN-PARAM-DIR-MISMATCH"
                                      for f in self._lint_snippet("sample.hpp", code, config=cfg)))
 
+    def test_direction_nested_type_declarators(self) -> None:
+        """Ignore template and function signature indirection inside AST types."""
+        for declaration, direction, severity in (
+            ("const std::vector<int*>& items", "in", None),
+            ("const std::vector<int*>& items", "out", "error"),
+            ("Span<int*> items", "in", None),
+            ("Span<int*> items", "out", "error"),
+            ("void (*items)(int)", "in", None),
+            ("void (*items)(int)", "out", "error"),
+            ("std::vector<const int*>& items", "in", "warning"),
+            ("int& items", "in", "warning"),
+        ):
+            with self.subTest(declaration=declaration, direction=direction):
+                code = ("namespace std { template<class T> class vector {}; }\n"
+                        "template<class T> class Span {};\n"
+                        f"/** @brief Process.\n * @param[{direction}] items Values.\n */\n"
+                        f"void processItems({declaration});\n")
+                findings = self._lint_snippet("sample.hpp", code)
+                selected = [f.severity for f in findings
+                            if f.rule == "DOXYGEN-PARAM-DIR-MISMATCH"]
+                self.assertEqual([severity] if severity else [], selected)
+
+    def test_direction_utf8_byte_offsets(self) -> None:
+        """Keep documentation attached after multibyte source comments."""
+        code = ("// Timing in µs — temperature in °C.\n"
+                "/** @brief First.\n * @param[out] value Reading.\n */\n"
+                "void firstReading(int value);\n"
+                "/** @brief Second.\n * @param[out] value Reading.\n */\n"
+                "void secondReading(int value);\n")
+        findings = self._lint_snippet("sample.hpp", code)
+        selected = [(f.line, f.severity) for f in findings
+                    if f.rule == "DOXYGEN-PARAM-DIR-MISMATCH"]
+        self.assertEqual([(5, "error"), (9, "error")], selected)
+
     def test_file_comment_forms(self) -> None:
         """Accept all Doxygen comment forms and ignore tags in string literals."""
         for header in ("/** @file sample.hpp */", "/*! @file sample.hpp */",
