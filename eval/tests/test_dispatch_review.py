@@ -113,7 +113,7 @@ class DispatchReviewTests(unittest.TestCase):
                 "assert any((cmd == x[5:-3] or cmd.startswith(x[5:-3]+' ')) if x.endswith(':*)') else fnmatch.fnmatchcase(cmd,x[5:-1]) for x in s['permissions']['allow'] if x.startswith('Bash('))\n"
                 "allowed=sys.argv[sys.argv.index('--allowedTools')+1:sys.argv.index('--disallowedTools')]\n"
                 "assert 'Bash' not in allowed\nassert s['permissions']['allow']==allowed\n"
-                "prompt=sys.argv[-1]\nassert 'python3 .devpack/pack/runner/devpack_dispatch.py' in prompt\n"
+                "prompt=sys.argv[-1]\nassert prompt.startswith('## Your tools\\n')\nassert 'Write/Edit only under `briefs/`' in prompt\nassert 'You never build, test or lint yourself' in prompt\nassert 'python3 .devpack/pack/runner/devpack_dispatch.py' in prompt\n"
                 "p('briefs/job.md').write_text('Update result.txt')\n"
                 "r=subprocess.run(cmd.split(),capture_output=True,text=True)\nassert r.returncode==0,(r.stdout,r.stderr)\n"
                 "payload=json.loads(r.stdout)\nassert payload['status']=='ok'\n"
@@ -133,6 +133,7 @@ class DispatchReviewTests(unittest.TestCase):
                     agent_bin=str(orchestrator), timeout_s=30, allow_unsandboxed_local=True,
                 )
             self.assertTrue(result.passed, (result.error, result.stderr_tail, result.check_output))
+            self.assertEqual({"count": 0, "commands": []}, result.denied_tool_calls)
             self.assertEqual(1, result.dispatch_calls)
             self.assertEqual(0, result.orchestrator_product_edits)
             transcript = next((root / 'trials').rglob('01-orchestrator-*.jsonl')).read_text()
