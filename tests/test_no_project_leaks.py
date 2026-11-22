@@ -1,11 +1,16 @@
 """Repo-level leak test: no project names, personal data or host paths in the pack.
 
-Walks the repository (excluding ``.git``) and fails when any forbidden pattern
-(SPEC section 5) appears in a text file. The patterns are assembled from fragments at
-import time so that this file does not match itself.
+Scans only the files that could be committed: tracked files plus untracked files that are
+not ignored (``git ls-files -z -co --exclude-standard``, which honours global excludes).
+Outside a git work tree the scan falls back to a plain directory walk and prints a notice.
+Fails when any forbidden pattern (SPEC section 5) appears in a scanned file name or text.
+The patterns are assembled from fragments at import time so that this file does not match itself.
 """
 
+import os
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -23,17 +28,87 @@ _FRAGMENTS = [
     ("nam", "vs"),
 ]
 FORBIDDEN = [a + b for a, b in _FRAGMENTS]
-PATTERN = re.compile("|".join(re.escape(p) for p in FORBIDDEN), re.IGNORECASE)
 SKIP_DIRS = {".git", "__pycache__", ".worktrees"}
+_WORD_CHAR = "A-Za-z0-9"
+
+
+def _build_pattern() -> re.Pattern:
+    """Compile the forbidden-pattern alternation.
+
+    Patterns that start with a word character (project names) must match on word boundaries,
+    so that a short project name does not match inside random base64. Path-like patterns
+    (starting with a slash) are plain substring matches.
+    """
+    alternatives = []
+    for word in FORBIDDEN:
+        escaped = re.escape(word)
+        if word[0].isalnum():
+            escaped = f"(?<![{_WORD_CHAR}]){escaped}(?![{_WORD_CHAR}])"
+        alternatives.append(escaped)
+    return re.compile("|".join(alternatives), re.IGNORECASE)
+
+
+PATTERN = _build_pattern()
+
+
+def _git_env() -> dict:
+    """Return the process environment without GIT_* overrides (so the caller's repo is not used)."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run ``git -C root args`` and return the completed process without raising."""
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        env=_git_env(),
+        check=False,
+    )
+
+
+def _committable_files(root: Path):
+    """Return the repo-relative paths of tracked and untracked-not-ignored files, or None.
+
+    Returns None when ``root`` is not the top level of a git work tree, so the caller can
+    fall back to a directory walk.
+    """
+    top = _git(root, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        return None
+    if Path(top.stdout.decode().strip()).resolve() != root.resolve():
+        return None
+    listing = _git(root, "ls-files", "-z", "-co", "--exclude-standard")
+    if listing.returncode != 0:
+        return None
+    return [Path(p) for p in listing.stdout.decode().split("\0") if p]
+
+
+def _walk_files(root: Path):
+    """Return the repo-relative paths of every regular file under ``root``, skipping SKIP_DIRS."""
+    found = []
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if any(part in SKIP_DIRS for part in rel.parts):
+            continue
+        if path.is_file():
+            found.append(rel)
+    return found
 
 
 def iter_files(root: Path):
-    """Yield every regular file under ``root`` except those inside skipped directories."""
-    for path in sorted(root.rglob("*")):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
-            continue
-        if path.is_file():
-            yield path
+    """Yield the repo-relative paths of regular files that could be committed under ``root``.
+
+    Uses ``git ls-files -z -co --exclude-standard`` when ``root`` is a git work tree. Otherwise
+    prints a notice to stderr and walks the directory, skipping SKIP_DIRS.
+    """
+    listed = _committable_files(root)
+    if listed is None:
+        print(f"leak scan: {root} is not a git work tree; falling back to a directory walk",
+              file=sys.stderr)
+        listed = _walk_files(root)
+    for rel in sorted(listed):
+        if (root / rel).is_file():
+            yield rel
 
 
 def find_leaks(root: Path):
@@ -42,11 +117,10 @@ def find_leaks(root: Path):
     Both file names and file contents are checked. Undecodable bytes are ignored.
     """
     leaks = []
-    for path in iter_files(root):
-        rel = path.relative_to(root)
+    for rel in iter_files(root):
         for m in PATTERN.finditer(str(rel)):
             leaks.append(f"{rel}: (file name) {m.group(0)}")
-        text = path.read_bytes().decode("utf-8", errors="ignore")
+        text = (root / rel).read_bytes().decode("utf-8", errors="ignore")
         for lineno, line in enumerate(text.splitlines(), start=1):
             m = PATTERN.search(line)
             if m:
