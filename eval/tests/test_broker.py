@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from runner.tests.brief_fixtures import valid_brief
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -29,7 +31,8 @@ class BrokerTests(unittest.TestCase):
         for args in (['init', '-q'], ['add', '.'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base']):
             subprocess.run(['git', *args], cwd=self.work, check=True, capture_output=True)
         (self.work / 'briefs').mkdir()
-        (self.work / 'briefs/job.md').write_text('Update result.txt')
+        self.brief_text = valid_brief('Update result.txt', ['result.txt'])
+        (self.work / 'briefs/job.md').write_text(self.brief_text)
         self.credentials = self.root / 'credentials.json'
         self.credentials.write_text('{"accessToken":"fake-broker-secret"}')
         self.worker = self.root / 'fake-worker'
@@ -164,6 +167,18 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual('refused', payload['status'])
         self.assertEqual('before', (self.work / 'result.txt').read_text())
 
+    def test_brief_without_expected_output_refused_with_findings(self):
+        """A brief lacking an Expected output section is refused and its lint findings are returned."""
+        (self.work / 'briefs/no-expected.md').write_text(
+            self.brief_text.replace('## Expected output', '## Notes'))
+        code, payload = self.request(brief='briefs/no-expected.md')
+        self.assertEqual(1, code)
+        self.assertEqual('refused', payload['status'])
+        self.assertIn('brief_lint rejected brief', payload['error'])
+        findings = [(item['rule'], item['severity'], item['message']) for item in payload['brief_lint']]
+        self.assertIn(('BRIEF-HEADINGS', 'error', 'Missing required heading: Expected output'), findings)
+        self.assertEqual('before', (self.work / 'result.txt').read_text())
+
     def test_internal_symlink_brief_refused(self):
         """Even symlinks pointing inside the project cannot supply a brief."""
         (self.work / 'briefs/link.md').symlink_to('job.md')
@@ -194,7 +209,7 @@ class BrokerTests(unittest.TestCase):
              mock.patch.object(self.broker_module, 'dispatch_job', side_effect=dispatch):
             code, payload = self.request()
         self.assertEqual(0, code, payload)
-        self.assertEqual(['Update result.txt'], prompts)
+        self.assertEqual([self.brief_text], prompts)
 
     def test_destination_parent_swap_refused(self):
         """A destination parent replaced just before I/O cannot redirect a write."""

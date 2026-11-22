@@ -10,6 +10,7 @@ from unittest import mock
 from eval import run_eval
 from eval.tests.test_run_eval import _create_mini_fixture_and_task
 from runner import agent_exec, devpack_run
+from runner.tests.brief_fixtures import valid_brief
 
 
 class DispatchReviewTests(unittest.TestCase):
@@ -114,7 +115,7 @@ class DispatchReviewTests(unittest.TestCase):
                 "allowed=sys.argv[sys.argv.index('--allowedTools')+1:sys.argv.index('--disallowedTools')]\n"
                 "assert 'Bash' not in allowed\nassert s['permissions']['allow']==allowed\n"
                 "prompt=sys.argv[-1]\nassert prompt.startswith('## Your tools\\n')\nassert 'Write/Edit only under `briefs/`' in prompt\nassert 'You never build, test or lint yourself' in prompt\nassert 'python3 .devpack/pack/runner/devpack_dispatch.py' in prompt\n"
-                "p('briefs/job.md').write_text('Update result.txt')\n"
+                "p('briefs/job.md').write_text(" + repr(valid_brief('Update result.txt', ['result.txt'])) + ")\n"
                 "r=subprocess.run(cmd.split(),capture_output=True,text=True)\nassert r.returncode==0,(r.stdout,r.stderr)\n"
                 "payload=json.loads(r.stdout)\nassert payload['status']=='ok'\n"
                 "print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','name':'Bash','input':{'command':cmd}}]}}))\n"

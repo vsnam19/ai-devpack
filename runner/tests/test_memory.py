@@ -26,6 +26,7 @@ import devpack_dispatch  # noqa: E402
 import devpack_memory  # noqa: E402
 import devpack_run  # noqa: E402
 from runner import memory  # noqa: E402
+from runner.tests.brief_fixtures import valid_brief  # noqa: E402
 
 
 def _write_exec(path: Path, content: str) -> Path:
@@ -544,7 +545,7 @@ class MemoryRunnerIntegrationTests(unittest.TestCase):
             subprocess.run(["git", "commit", "-q", "-m", "gitignore"], cwd=wt, check=True)
             (wt / "briefs").mkdir()
             brief = wt / "briefs" / "job.md"
-            brief.write_text("Update src/mod.cpp for REQ-MOD-1.\n", encoding="utf-8")
+            brief.write_text(valid_brief("Update src/mod.cpp for REQ-MOD-1.", ["src/mod.cpp"]), encoding="utf-8")
 
             cred = base / "creds.json"
             cred.write_text('{"accessToken":"fake-cred-tok"}', encoding="utf-8")

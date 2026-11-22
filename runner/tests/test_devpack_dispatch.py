@@ -23,6 +23,7 @@ import devpack_dispatch  # noqa: E402
 from skilltest import skilltest  # noqa: E402
 from eval.run_eval import ORCHESTRATOR_PACK_PATH  # noqa: E402
 from runner.devpack_broker import Broker, CLIENT_RELATIVE, CLIENT_SOURCE  # noqa: E402
+from runner.tests.brief_fixtures import valid_brief  # noqa: E402
 
 
 def _init_git_repo(workdir: Path) -> None:
@@ -357,7 +358,7 @@ class DevpackDispatchTests(unittest.TestCase):
             workdir = base / "work"
             _init_git_repo(workdir)
             (workdir / "briefs").mkdir()
-            (workdir / "briefs/job.md").write_text("Inspect the project.\n", encoding="utf-8")
+            (workdir / "briefs/job.md").write_text(valid_brief("Inspect the project.", ["src/**"]), encoding="utf-8")
             worker = _write_fake_agent(
                 base / "worker.py",
                 "print(json.dumps({'type': 'result', 'is_error': False, 'result': 'broker worker done'}))\n",
