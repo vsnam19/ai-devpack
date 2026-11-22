@@ -1,0 +1,21 @@
+[[trigger]]
+name = "document declarations"
+prompt = "Add Doxygen comments to these C++ declarations."
+expect = true
+[[trigger]]
+name = "rename C++ identifiers"
+prompt = "Fix naming in this C++ header."
+expect = true
+[[trigger]]
+name = "unrelated arithmetic"
+prompt = "Calculate the checksum."
+expect = false
+[[trigger]]
+name = "unrelated review"
+prompt = "Summarize this meeting."
+expect = false
+[[behaviour]]
+name = "documentation marker"
+fixture = "fixtures/missing-docs"
+prompt = "Repair output.txt with the required Doxygen marker."
+check = "bash check.sh ."

@@ -1,0 +1,21 @@
+[[trigger]]
+name = "create a skill"
+prompt = "Create a skill for release notes."
+expect = true
+[[trigger]]
+name = "test a skill"
+prompt = "Write skilltest cases for this agent skill."
+expect = true
+[[trigger]]
+name = "fix source"
+prompt = "Fix this C++ source file."
+expect = false
+[[trigger]]
+name = "calculate result"
+prompt = "Calculate this result."
+expect = false
+[[behaviour]]
+name = "test configuration"
+fixture = "fixtures/missing-test-case"
+prompt = "Add a behaviour test case to output.txt."
+check = "bash check.sh ."

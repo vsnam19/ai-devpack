@@ -1,0 +1,21 @@
+[[trigger]]
+name = "review patch"
+prompt = "Review this patch and give a verdict."
+expect = true
+[[trigger]]
+name = "code review"
+prompt = "Perform an exhaustive code review."
+expect = true
+[[trigger]]
+name = "implement feature"
+prompt = "Implement this feature."
+expect = false
+[[trigger]]
+name = "rename variable"
+prompt = "Rename this variable."
+expect = false
+[[behaviour]]
+name = "review verdict"
+fixture = "fixtures/no-verdict"
+prompt = "Add a taxonomy table and final review verdict to output.txt."
+check = "bash check.sh ."
