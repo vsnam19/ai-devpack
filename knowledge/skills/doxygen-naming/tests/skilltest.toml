@@ -1,0 +1,28 @@
+[[trigger]]
+name = "cpp-header-review"
+prompt = "Add documentation to this C++ header so it passes our review."
+expect = true
+[[trigger]]
+name = "cpp-api-review"
+prompt = "Review these C++ declarations for naming and interface documentation."
+expect = true
+[[trigger]]
+name = "python-docstring"
+prompt = "Add Python docstrings to this module."
+expect = false
+[[trigger]]
+name = "markdown-guide"
+prompt = "Write a Markdown contributor guide for this repository."
+expect = false
+[[behaviour]]
+name = "header-contract"
+fixture = "fixtures/header-contract/input"
+grader = "graders/header-contract"
+prompt = "Add documentation and correct declaration naming so this header passes review; rename declarations and callers as needed while preserving types and runtime behavior."
+check = "bash check.sh"
+[[behaviour]]
+name = "direction-contract"
+fixture = "fixtures/direction-contract/input"
+grader = "graders/direction-contract"
+prompt = "Document this signal update API for review and correct any declaration naming issues."
+check = "bash check.sh"

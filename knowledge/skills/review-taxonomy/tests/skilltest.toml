@@ -1,0 +1,34 @@
+[[trigger]]
+name = "review patch"
+prompt = "Review this patch and give a verdict."
+expect = true
+[[trigger]]
+name = "code review"
+prompt = "Perform an exhaustive code review."
+expect = true
+[[trigger]]
+name = "implement feature"
+prompt = "Implement this feature."
+expect = false
+[[trigger]]
+name = "rename variable"
+prompt = "Rename this variable."
+expect = false
+[[behaviour]]
+name = "bounds-review"
+fixture = "fixtures/bounds-review/input"
+grader = "graders/bounds-review"
+category = "COR"
+severity = "major"
+verdict = "REQUEST_CHANGES"
+prompt = "Review this diff and write REVIEW.md with all merge-blocking findings."
+check = "bash check.sh"
+[[behaviour]]
+name = "gate-review"
+fixture = "fixtures/gate-review/input"
+grader = "graders/gate-review"
+category = "GAT"
+severity = "blocker"
+verdict = "REQUEST_CHANGES"
+prompt = "Review this submitted change and write the merge decision in REVIEW.md."
+check = "bash check.sh"

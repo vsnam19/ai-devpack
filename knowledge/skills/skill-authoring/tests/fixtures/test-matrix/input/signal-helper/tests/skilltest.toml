@@ -1,0 +1,9 @@
+[[trigger]]
+name = "signal"
+prompt = "signal report"
+expect = true
+[[behaviour]]
+name = "none"
+fixture = "fixtures/input"
+prompt = "report"
+check = "true"

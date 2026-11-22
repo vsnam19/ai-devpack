@@ -1,0 +1,4 @@
+[[trigger]]
+name = "one"
+prompt = "help"
+expect = true

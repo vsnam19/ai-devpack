@@ -798,7 +798,7 @@ def load_run_dir(run_dir: pathlib.Path, redactor: Redactor) -> RunRecord:
                 agent_stems.add(name[: -len(".meta.json")])
             elif name.endswith(".prompt.md"):
                 agent_stems.add(name[: -len(".prompt.md")])
-            elif name.endswith(".txt") and "gate" in name:
+            elif name.endswith(".txt") and ("gate" in name or name.endswith("-grader.txt")):
                 gate_files.append(path)
 
         for stem in sorted(agent_stems):
