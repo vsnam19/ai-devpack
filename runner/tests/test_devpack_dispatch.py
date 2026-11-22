@@ -134,6 +134,39 @@ class DevpackDispatchTests(unittest.TestCase):
             prompt_saved = (rdir / "steps" / "01-worker-haiku.prompt.md").read_text(encoding="utf-8")
             self.assertIn("Code Quality Checklist", prompt_saved)
 
+    def test_dispatch_shared_comment_aware_lock(self) -> None:
+        """Dispatch permits comment edits and rejects changed assertion values."""
+        for replacement, expected in [("1 == 2", 1), ("1 == 1", 0)]:
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                wt = base / "wt"
+                _init_git_repo(wt)
+                brief = base / "brief.md"
+                brief.write_text("Update protected test.\n", encoding="utf-8")
+                documentation = (
+                    "/**\n * @file test_mod.cpp\n * @brief Sample tests.\n */\n"
+                    "#include <cassert>\n/**\n * @brief Verify one.\n */\n"
+                )
+                test_path = wt / "tests/test_mod.cpp"
+                test_path.write_text(documentation + "void testOne() { assert(1 == 1); }\n")
+                subprocess.run(["git", "commit", "-qam", "document tests"], cwd=wt, check=True)
+                content = documentation + f"void testOne() {{ assert({replacement}); }} // updated\n"
+                agent = _write_fake_agent(
+                    base / "agent.py",
+                    f"pathlib.Path('tests/test_mod.cpp').write_text({content!r})\n"
+                    "print(json.dumps({'type': 'result', 'is_error': False, 'result': 'done'}))\n",
+                )
+                rc, stdout, stderr = self._run_dispatch([
+                    "--engine", "haiku", "--brief", str(brief), "--workdir", str(wt),
+                    "--allow", "tests/**", "--gate-cmd", "true",
+                    "--runs-root", str(base / "runs"), "--agent-bin", str(agent),
+                    "--isolation", "local", "--allow-unsandboxed-local",
+                ])
+                self.assertEqual(rc, expected, stderr + stdout)
+                result = json.loads(stdout)
+                self.assertEqual(result["test_lock"], "fail" if expected else "ok")
+                self.assertEqual(result["gate"], "fail" if expected else "ok")
+
     def test_dispatch_gate_fail_and_preflight_lint_fail(self) -> None:
         """Verify failing gate_cmd or preflight_lint sets gate='fail' and exits 1."""
         with tempfile.TemporaryDirectory() as tmp:

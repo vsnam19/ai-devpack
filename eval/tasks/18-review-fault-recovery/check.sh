@@ -103,11 +103,8 @@ if [[ -z "$BASE_REF" ]]; then
 fi
 
 python3 "$SCOPE_CHECK" --repo "$WORKDIR" --base "$BASE_REF" --allow 'REVIEW.md' 'STOP_REPORT.md' >/dev/null
-python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/*' >/dev/null
-if git -C "$WORKDIR" diff -U0 "$BASE_REF" -- 'tests/' | grep -E '^-' | grep -qvE '^--- ([ab]/|/dev/null)'; then
-    echo "FAIL: existing test lines in tests/ were modified or deleted" >&2
-    exit 1
-fi
+python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' >/dev/null
+
 
 # Verify review.patch applies and compiles cleanly against the fixture in workdir.
 TMP_PATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/devpack-review-18.XXXXXX")"

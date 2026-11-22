@@ -172,6 +172,42 @@ for task_dir in "$TASKS_ROOT"/*/; do
         after_solve="FAIL(BAD)"
     fi
 
+    # Exercise the shared protected-test rule through a grader with test scope.
+    if [[ "$task_id" == "14-feature-dtc-freeze" ]]; then
+        protected_test="$work_dir/tests/test_dtc_debouncer.cpp"
+        saved_test="$TMP_ROOT/protected-test.cpp"
+        cp "$protected_test" "$saved_test"
+        python3 - "$protected_test" <<'PYCOMMENT'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+assert " * @brief " in text
+path.write_text(text.replace(" * @brief ", " * @brief Updated documentation: ", 1), encoding="utf-8")
+PYCOMMENT
+        if ! DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1; then
+            echo "META-CHECK FAIL ($task_id): comment-only test edit rejected" >&2
+            after_solve="FAIL(BAD)"
+        fi
+        cp "$saved_test" "$protected_test"
+        python3 - "$protected_test" <<'PYASSERT'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "CHECK_EQ(debouncer.counter(), static_cast<std::int16_t>(0));"
+assert old in text
+path.write_text(text.replace(old, old.replace("(0)", "(1)"), 1), encoding="utf-8")
+PYASSERT
+        if DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1; then
+            echo "META-CHECK FAIL ($task_id): changed assertion literal accepted" >&2
+            after_solve="FAIL(BAD)"
+        fi
+        cp "$saved_test" "$protected_test"
+    fi
+
     # Structural meta-checks for v2 code-change tasks
     v2_meta_ok=1
     if [[ "$code_change_task" -eq 1 ]]; then

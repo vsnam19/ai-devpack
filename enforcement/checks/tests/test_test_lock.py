@@ -109,6 +109,45 @@ class TestTestLock(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("TEST_LOCK_OK", out)
 
+    def test_comment_aware_line_preservation(self) -> None:
+        """Protect code while allowing comments and inserted tests anywhere."""
+        path = self.repo_dir / "tests/test_codec.cpp"
+        original = path.read_text()
+        baseline = '/**\n * old documentation ASSERT_FAKE(x)\n */\n' + original
+        path.write_text(baseline)
+        subprocess.run(["git", "-C", str(self.repo_dir), "commit", "-am", "document tests"],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cases = [
+            (baseline.replace("old documentation ASSERT_FAKE(x)", "new documentation"), 0),
+            (baseline.replace("ASSERT_EQ(1, 1)", "ASSERT_EQ(1, 2)"), 1),
+            (baseline.replace("void test_decode() {", "void changed_name() {"), 1),
+            (baseline.replace("    EXPECT_TRUE(true);\n", ""), 1),
+            (baseline.replace(original, "void added() { CHECK(true); }\n" + original), 0),
+            (baseline.replace("ASSERT_EQ(1, 1);", "ASSERT_EQ(1, 2); // explanation"), 1),
+            (baseline.replace("ASSERT_EQ(1, 1);", "ASSERT_EQ(1, 1); // explanation"), 0),
+            (baseline.replace("    ASSERT_EQ(1, 1);", "/*    ASSERT_EQ(1, 1); */"), 1),
+        ]
+        for content, expected in cases:
+            with self.subTest(content=content):
+                path.write_text(content)
+                code, output, _ = self._run_lock([
+                    "--repo", str(self.repo_dir), "--base", "HEAD", "--protected", "tests/**"])
+                self.assertEqual(code, expected, output)
+
+    def test_comment_markers_in_literals_are_code(self) -> None:
+        """Quoted strings, escaped quotes, and raw strings retain comment markers."""
+        samples = [
+            'CHECK_EQ("https://example.invalid", "/*literal*/");',
+            "CHECK_EQ('/', '\\'');",
+            'CHECK_EQ(R"tag(first /*literal*/\n//literal)tag", "value");',
+        ]
+        for text in samples:
+            with self.subTest(text=text):
+                self.assertEqual(test_lock.strip_comments(text), text)
+                self.assertFalse(test_lock.preserves_lines(text, text.replace("CHECK_EQ", "CHECK_NE")))
+        self.assertEqual(test_lock.strip_comments("a; /* one\ntwo */ b; // end\n"),
+                         "a;  \n b;  \n")
+
     def test_decreased_assertion_count_fails(self) -> None:
         """Removing an assertion from a protected test file without deviation fails with exit 1."""
         (self.repo_dir / "tests" / "test_codec.cpp").write_text(

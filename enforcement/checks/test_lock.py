@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # Header: Protected test lock and assertion-weakening check.
-# Fails if protected test files matching --protected globs are deleted, renamed,
-# or have fewer assertion tokens than at --base REF, unless the HEAD commit
-# message contains "Deviation: <ID>".
-#
-# Exit codes:
-#   0 - Protected test files intact and assertion counts non-decreasing (or valid Deviation: <ID>).
-#   1 - Protected test file deleted/renamed, assertion count decreased, or git/config error.
+# Fails if protected files lose existing non-comment, non-blank code lines,
+# are deleted/renamed, or lose assertions, unless HEAD has "Deviation: <ID>".
+# Insertions and C/C++ comment edits are allowed.
+# Exit codes: 0 intact or authorized; 1 violation or git/config error; 2 bad CLI.
 """Enforce test lock on protected test files across changes."""
 
 from __future__ import annotations
@@ -117,6 +114,36 @@ def read_file_at_ref(repo_root: pathlib.Path, ref: str, rel_path: str) -> str | 
     return proc.stdout
 
 
+def strip_comments(text: str) -> str:
+    """Remove C/C++ comments, preserving newlines and quoted/raw string contents."""
+    token_rx = re.compile(
+        r'R"(?P<delimiter>[^ ()\\\t\r\n]{0,16})\(.*?\)(?P=delimiter)"'
+        r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+        r'|//(?:\\\n|[^\n])*|/\*.*?(?:\*/|\Z)',
+        re.DOTALL,
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        """Replace comment tokens with whitespace without joining adjacent code."""
+        token = match.group()
+        if token.startswith(("//", "/*")):
+            return " " + "\n" * token.count("\n")
+        return token
+
+    return token_rx.sub(replace, text)
+
+
+def code_lines(text: str) -> list[str]:
+    """Return significant lines, ignoring whitespace at comment boundaries."""
+    return [line.rstrip() for line in text.splitlines() if line.strip()]
+
+
+def preserves_lines(base: str, current: str) -> bool:
+    """Check that existing code lines remain in order, allowing insertions anywhere."""
+    remaining = iter(code_lines(current))
+    return all(any(candidate == line for candidate in remaining) for line in code_lines(base))
+
+
 def count_assertions(text: str, assert_rx: re.Pattern[str]) -> int:
     """Return the number of regex matches of ``assert_rx`` in ``text``."""
     return len(list(assert_rx.finditer(text)))
@@ -127,7 +154,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="test_lock.py",
         description=(
-            "Fail if protected test files are deleted/renamed or their assertion token count "
+            "Fail if protected test code lines are changed/removed, files deleted/renamed, or assertion count "
             "decreases compared to --base, unless HEAD commit message contains 'Deviation: <ID>'."
         ),
     )
@@ -216,6 +243,12 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(f"TEST_LOCK_VIOLATION: unable to read {rel_path}: {exc}")
             continue
 
+        base_content = strip_comments(base_content)
+        current_content = strip_comments(current_content)
+        if not preserves_lines(base_content, current_content):
+            violations.append(
+                f"TEST_LOCK_VIOLATION: existing non-comment test lines modified or deleted in {rel_path}"
+            )
         base_count = count_assertions(base_content, assert_rx)
         current_count = count_assertions(current_content, assert_rx)
         if current_count < base_count:

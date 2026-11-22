@@ -97,12 +97,9 @@ ALLOWED_FILES=(
 )
 
 python3 "$SCOPE_CHECK" --repo "$WORKDIR" --base "$BASE_REF" --allow "${ALLOWED_FILES[@]}" >/dev/null
-python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/*' >/dev/null
+python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' >/dev/null
 
-if git -C "$WORKDIR" diff -U0 "$BASE_REF" -- 'tests/' | grep -E '^-' | grep -qvE '^--- ([ab]/|/dev/null)'; then
-    echo "FAIL: existing test lines in tests/ were modified or deleted" >&2
-    exit 1
-fi
+
 
 # Verify unit tests for REQ-LINK-006 were added to tests/test_link_state_machine.cpp
 if ! grep -q 'recoverFromFault' "$WORKDIR/tests/test_link_state_machine.cpp" ||
