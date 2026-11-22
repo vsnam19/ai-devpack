@@ -1,0 +1,19 @@
+# Header: Example fail-closed gate configuration for the ai-devpack repository itself.
+# Runs the enforcement unit test suite and the repository project-leak test (if present).
+
+[[check]]
+name = "enforcement-unit-tests"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "enforcement", "-t", ".", "-p", "test_*.py"]
+timeout_s = 120
+required = true
+
+[[check]]
+name = "project-leak-check"
+cmd = [
+  "python3",
+  "-B",
+  "-c",
+  "import os, subprocess, sys; sys.exit(subprocess.call([sys.executable, '-B', '-m', 'unittest', 'tests/test_no_project_leaks.py']) if os.path.isfile('tests/test_no_project_leaks.py') else 0)",
+]
+timeout_s = 60
+required = true
