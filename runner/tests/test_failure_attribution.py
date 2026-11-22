@@ -88,8 +88,19 @@ class FailureAttributionTests(unittest.TestCase):
             self.assertTrue(attr_over["signals"]["prompt_over_context"])
             self.assertEqual(32768, attr_over["signals"]["context_window"])
 
-    def _write_local_run(self, base: Path, request_inputs: list[int], result_input: int) -> Path:
-        """Create a minimal run dir whose local step has one assistant turn per ``request_inputs`` entry."""
+    def _write_local_run(
+        self,
+        base: Path,
+        request_inputs: list[int],
+        result_input: int,
+        *,
+        message_usage: bool = True,
+        result_cache_read: int = 0,
+    ) -> Path:
+        """Create a minimal run dir whose local step has one assistant turn per ``request_inputs`` entry.
+
+        ``message_usage=False`` omits per-assistant-message usage so only the result event carries tokens.
+        """
         run_dir = base / "ctx-run"
         steps_dir = run_dir / "steps"
         steps_dir.mkdir(parents=True)
@@ -105,17 +116,14 @@ class FailureAttributionTests(unittest.TestCase):
         (run_dir / "run.json").write_text(json.dumps(run_meta), encoding="utf-8")
         events: list[dict[str, object]] = [{"type": "system", "subtype": "init", "cwd": "/tmp/work", "model": "local-coder"}]
         for n in request_inputs:
-            events.append(
-                {
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "model": "local-coder",
-                        "content": [{"type": "text", "text": "Working on it."}],
-                        "usage": {"input_tokens": n, "output_tokens": 10},
-                    },
-                }
-            )
+            message: dict[str, object] = {
+                "role": "assistant",
+                "model": "local-coder",
+                "content": [{"type": "text", "text": "Working on it."}],
+            }
+            if message_usage:
+                message["usage"] = {"input_tokens": n, "output_tokens": 10}
+            events.append({"type": "assistant", "message": message})
         events.append(
             {
                 "type": "result",
@@ -124,7 +132,11 @@ class FailureAttributionTests(unittest.TestCase):
                 "num_turns": len(request_inputs),
                 "duration_ms": 1000,
                 "total_cost_usd": 0.0,
-                "usage": {"input_tokens": result_input, "output_tokens": 10 * len(request_inputs)},
+                "usage": {
+                    "input_tokens": result_input,
+                    "cache_read_input_tokens": result_cache_read,
+                    "output_tokens": 10 * len(request_inputs),
+                },
                 "result": "Done.",
             }
         )
@@ -158,6 +170,62 @@ class FailureAttributionTests(unittest.TestCase):
             self.assertEqual(33000, attr["signals"]["max_request_tokens_in"])
             self.assertTrue(attr["signals"]["prompt_over_context"])
             self.assertEqual("TOOL", attr["suspected_cause"])
+
+    def test_context_signal_falls_back_to_result_usage_single_turn(self) -> None:
+        """One turn with only result usage of 33k input tokens on a 32k engine is flagged over context."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_local_run(Path(tmp), [0], result_input=33000, message_usage=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = devpack_logs.main(["analyze", str(run_dir), "--engines", str(ENGINES_EXAMPLE)])
+            self.assertEqual(0, rc)
+            attr = json.loads((run_dir / "attribution.json").read_text(encoding="utf-8"))
+            self.assertEqual(33000, attr["signals"]["max_request_tokens_in"])
+            self.assertTrue(attr["signals"]["prompt_over_context"])
+            self.assertEqual("medium", attr["signals"]["context_signal_confidence"])
+            self.assertEqual("TOOL", attr["suspected_cause"])
+
+    def test_context_signal_fallback_counts_cache_tokens(self) -> None:
+        """Fallback total is input + cache read; cache-only context pressure still triggers the signal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_local_run(
+                Path(tmp), [0], result_input=1000, message_usage=False, result_cache_read=32000
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = devpack_logs.main(["analyze", str(run_dir), "--engines", str(ENGINES_EXAMPLE)])
+            self.assertEqual(0, rc)
+            attr = json.loads((run_dir / "attribution.json").read_text(encoding="utf-8"))
+            self.assertEqual(33000, attr["signals"]["max_request_tokens_in"])
+            self.assertTrue(attr["signals"]["prompt_over_context"])
+
+    def test_context_signal_fallback_multi_turn_is_low_confidence(self) -> None:
+        """Three turns with 36k result total and no per-message usage: estimate 12k, never a high-confidence flag."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_local_run(
+                Path(tmp), [0, 0, 0], result_input=36000, message_usage=False
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = devpack_logs.main(["analyze", str(run_dir), "--engines", str(ENGINES_EXAMPLE)])
+            self.assertEqual(0, rc)
+            attr = json.loads((run_dir / "attribution.json").read_text(encoding="utf-8"))
+            self.assertEqual(12000, attr["signals"]["max_request_tokens_in"])
+            self.assertEqual("low", attr["signals"]["context_signal_confidence"])
+            self.assertFalse(attr["signals"]["prompt_over_context"])
+            self.assertNotEqual("high", attr["confidence"])
+
+    def test_context_signal_fallback_multi_turn_over_window_stays_low(self) -> None:
+        """A low-confidence estimate over the window is flagged, but the cause confidence is capped below high."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_local_run(
+                Path(tmp), [0, 0, 0], result_input=120000, message_usage=False
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = devpack_logs.main(["analyze", str(run_dir), "--engines", str(ENGINES_EXAMPLE)])
+            self.assertEqual(0, rc)
+            attr = json.loads((run_dir / "attribution.json").read_text(encoding="utf-8"))
+            self.assertEqual(40000, attr["signals"]["max_request_tokens_in"])
+            self.assertEqual("low", attr["signals"]["context_signal_confidence"])
+            self.assertTrue(attr["signals"]["prompt_over_context"])
+            self.assertNotEqual("high", attr["confidence"])
 
     def test_analyze_env_timeout_and_quota(self) -> None:
         """Crafted ENV fixtures (timeout and quota) yield suspected_cause == 'ENV'."""

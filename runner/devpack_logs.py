@@ -1881,6 +1881,26 @@ def _add_evidence(
         bucket.append({"step": step_id, "line": int(line), "text": excerpt})
 
 
+_CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+
+
+def _fallback_request_tokens(step: StepRecord) -> tuple[int, str]:
+    """Estimate one request's input tokens from result/metadata totals when no per-message usage exists.
+
+    The total is input + cache read + cache creation. With ``num_turns == 1`` the total is the exact
+    single-request value (``medium`` confidence). With more turns, or an unknown turn count, the total is
+    divided by the turn count as an estimate with ``low`` confidence. Returns ``(0, "none")`` when there is
+    no usage data at all.
+    """
+    total = int(step.tokens_in) + int(step.cache_read_tokens) + int(step.cache_creation_tokens)
+    if total <= 0:
+        return 0, "none"
+    if step.num_turns == 1:
+        return total, "medium"
+    turns = step.num_turns if step.num_turns > 1 else 1
+    return total // turns, "low"
+
+
 def analyze_run_dir(
     run_dir: pathlib.Path,
     *,
@@ -1924,6 +1944,7 @@ def analyze_run_dir(
     max_step_tokens_in = 0
     context_window: int | None = None
     prompt_over_context = False
+    context_signal_confidence: str | None = None
     timeout_detected = record.outcome.lower() == "timeout"
     quota_net_detected = False
 
@@ -2034,7 +2055,18 @@ def analyze_run_dir(
             context_window = eng_ctx if context_window is None else min(context_window, eng_ctx)
 
         # tokens_in is cumulative over all turns; only the per-request maximum is compared to the window.
-        max_step_tokens_in = max(max_step_tokens_in, int(step.max_request_tokens_in))
+        # Prefer per-message usage; when a step has none, fall back to its result/metadata totals.
+        step_request_in = int(step.max_request_tokens_in)
+        if step_request_in > 0:
+            step_request_conf = "high"
+        else:
+            step_request_in, step_request_conf = _fallback_request_tokens(step)
+        if step_request_conf != "none":
+            max_step_tokens_in = max(max_step_tokens_in, step_request_in)
+            if context_signal_confidence is None or (
+                _CONFIDENCE_RANK[step_request_conf] < _CONFIDENCE_RANK[context_signal_confidence]
+            ):
+                context_signal_confidence = step_request_conf
         if step.status == "timeout":
             timeout_detected = True
             scores["ENV"] += 4
@@ -2306,7 +2338,9 @@ def analyze_run_dir(
     effective_prompt_tokens = max(prompt_tokens_est, max_step_tokens_in)
     if context_window is not None and effective_prompt_tokens > context_window:
         prompt_over_context = True
-        scores["TOOL"] += 4
+        # A low-confidence estimate alone (no prompt-text or per-message evidence) is weaker than exact usage.
+        flag_weight = 2 if context_signal_confidence == "low" and prompt_tokens_est <= context_window else 4
+        scores["TOOL"] += flag_weight
         _add_evidence(
             evidence_by_cause["TOOL"],
             seen_ev["TOOL"],
@@ -2398,6 +2432,7 @@ def analyze_run_dir(
         "prompt_tokens_est": prompt_tokens_est,
         "max_step_tokens_in": max_step_tokens_in,
         "max_request_tokens_in": max_step_tokens_in,
+        "context_signal_confidence": context_signal_confidence or "none",
         "cumulative_tokens_in": sum(int(s.tokens_in) for s in record.steps),
         "context_window": context_window,
         "prompt_over_context": prompt_over_context,
