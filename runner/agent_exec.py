@@ -46,6 +46,12 @@ DEFAULT_CLAUDE_VERSION = "2.1.330"
 DOCKER_IMAGE_TAG = f"devpack-eval:{DEFAULT_CLAUDE_VERSION}"
 DOCKER_TASK_DIR = "/workspace/task"
 ALLOWED_TOOLS: tuple[str, ...] = ("Read", "Edit", "Write", "Bash", "Glob", "Grep")
+ORCHESTRATOR_TOOLS: tuple[str, ...] = (
+    "Read", "Glob", "Grep", "Write(briefs/**)", "Edit(briefs/**)",
+    "Bash(python3 .devpack/pack/runner/devpack_dispatch.py --submit:*)",
+    "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+)
+ROLE_TOOLS = {"reviewer": ("Read", "Glob", "Grep"), "orchestrator": ORCHESTRATOR_TOOLS}
 DISALLOWED_TOOLS: tuple[str, ...] = ("WebFetch", "WebSearch")
 DEFAULT_GATE_CMD: tuple[str, ...] = (
     "python3",
@@ -162,6 +168,7 @@ class EngineConfig:
     min_context_tokens: int = 0
     timeout_s: int = 900
     cmd: list[str] | None = None
+    role_permissions: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
 
     def __init__(
         self,
@@ -194,6 +201,7 @@ class EngineConfig:
         self.min_context_tokens = int(min_context_tokens or 0)
         self.timeout_s = int(timeout_s or 900)
         self.cmd = list(cmd) if cmd is not None else None
+        self.role_permissions = {}
 
     @property
     def is_local(self) -> bool:
@@ -431,6 +439,21 @@ def load_engines(path: Path | str) -> EnginesConfig:
         gate_cmd = list(DEFAULT_GATE_CMD)
     gate_timeout_s = int(data.get("gate_timeout_s", raw_limits.get("gate_timeout_s", 300)))
 
+    role_permissions = {}
+    raw_policy_roles = data.get("roles", {})
+    if not isinstance(raw_policy_roles, dict):
+        raise ValueError("[roles] must be a table")
+    for role, spec in raw_policy_roles.items():
+        if isinstance(spec, dict):
+            policy = {}
+            for key in ("allowed_tools", "disallowed_tools"):
+                if key in spec:
+                    value = spec[key]
+                    if not isinstance(value, list) or any(not isinstance(x, str) or not x for x in value):
+                        raise ValueError(f"Role '{role}' {key} must be a list of nonempty strings")
+                    policy[key] = tuple(value)
+            role_permissions[role] = policy
+
     # Detect v2 format: version == 2 or [engines] table present
     if data.get("version") == 2 or "engines" in data:
         raw_engines = data.get("engines")
@@ -486,6 +509,12 @@ def load_engines(path: Path | str) -> EnginesConfig:
                     )
                 roles[role_name] = target
                 role_engines[role_name] = engines[target]
+            elif isinstance(target, dict) and "engine" in target:
+                selected = target["engine"]
+                if not isinstance(selected, str) or selected not in engines:
+                    raise ValueError(f"Role '{role_name}' references undefined engine '{selected}'")
+                roles[role_name] = selected
+                role_engines[role_name] = engines[selected]
             elif isinstance(target, dict):
                 # Mixed v0.1 role dict inside a config
                 sys.stderr.write(
@@ -507,6 +536,9 @@ def load_engines(path: Path | str) -> EnginesConfig:
                 roles[role_name] = model
             else:
                 raise ValueError(f"Invalid role specification for '{role_name}'")
+
+        for engine in [*engines.values(), *role_engines.values()]:
+            engine.role_permissions = role_permissions
 
         return EnginesConfig(
             version=int(data.get("version", 2)),
@@ -560,6 +592,9 @@ def load_engines(path: Path | str) -> EnginesConfig:
             )
             engines.setdefault(model, role_ec)
             roles[role_name] = model
+
+        for engine in [*engines.values(), *role_engines.values()]:
+            engine.role_permissions = role_permissions
 
         return EnginesConfig(
             version=1,
@@ -756,8 +791,8 @@ class AgentRequest:
     step_name: str = ""
     isolation: str = "docker"
     allow_unsandboxed_local: bool = False
-    allowed_tools: Sequence[str] = ALLOWED_TOOLS
-    disallowed_tools: Sequence[str] = DISALLOWED_TOOLS
+    allowed_tools: Sequence[str] | None = None
+    disallowed_tools: Sequence[str] | None = None
     timeout_s: int | None = None
     skills_enabled: bool = False
     append_system_prompt: str | None = None
@@ -784,8 +819,8 @@ class AgentRequest:
         step_name: str = "",
         isolation: str = "docker",
         allow_unsandboxed_local: bool = False,
-        allowed_tools: Sequence[str] = ALLOWED_TOOLS,
-        disallowed_tools: Sequence[str] = DISALLOWED_TOOLS,
+        allowed_tools: Sequence[str] | None = None,
+        disallowed_tools: Sequence[str] | None = None,
         timeout_s: int | None = None,
         skills_enabled: bool = False,
         append_system_prompt: str | None = None,
@@ -829,10 +864,11 @@ class AgentRequest:
         self.step_name = str(step_name)
         self.isolation = str(isolation or "docker")
         self.allow_unsandboxed_local = bool(allow_unsandboxed_local)
-        self.allowed_tools = tuple(allowed_tools) if allowed_tools is not None else ALLOWED_TOOLS
-        self.disallowed_tools = (
-            tuple(disallowed_tools) if disallowed_tools is not None else DISALLOWED_TOOLS
-        )
+        policy = self.engine.role_permissions.get(role, {})
+        self.allowed_tools = tuple(allowed_tools) if allowed_tools is not None else policy.get(
+            "allowed_tools", ROLE_TOOLS.get(role, ALLOWED_TOOLS))
+        self.disallowed_tools = tuple(disallowed_tools) if disallowed_tools is not None else policy.get(
+            "disallowed_tools", DISALLOWED_TOOLS)
         self.timeout_s = int(timeout_s) if timeout_s is not None else int(self.engine.timeout_s)
         self.skills_enabled = bool(skills_enabled)
         self.append_system_prompt = append_system_prompt
@@ -989,11 +1025,15 @@ def build_permission_args(
     disallowed_tools: Sequence[str] = DISALLOWED_TOOLS,
 ) -> list[str]:
     """Return command-line permission flags that make workspace trust irrelevant."""
-    args: list[str] = []
+    args: list[str] = ["--permission-mode", "dontAsk"]
     if allowed_tools:
         args.extend(["--allowedTools", *allowed_tools])
     if disallowed_tools:
         args.extend(["--disallowedTools", *disallowed_tools])
+    # Tool availability also constrains project settings that grant broader permissions.
+    names = list(dict.fromkeys(tool.split("(", 1)[0] for tool in allowed_tools))
+    if set(names) != set(ALLOWED_TOOLS):
+        args.extend(["--tools", ",".join(names)])
     return args
 
 
@@ -1171,12 +1211,22 @@ def build_invocation(
     def _build_claude_tail(executable: str) -> list[str]:
         """Build the claude CLI argument list for either host or container execution."""
         if engine.cmd is not None:
-            return format_command(
+            command = format_command(
                 engine.cmd,
                 prompt=prompt,
                 prompt_file=prompt_file,
                 role_model=engine.model,
             )
+            if command and Path(command[0]).name in ("claude", "claude.exe"):
+                permission_flags = {
+                    "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
+                    "--permission-mode", "--permission-prompts", "--tools",
+                    "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+                }
+                if any(part.split("=", 1)[0] in permission_flags for part in engine.cmd):
+                    raise HarnessError("Configure tool permissions in the role table, not the Claude command")
+                command[1:1] = build_permission_args(allowed_tools, disallowed_tools)
+            return command
         tail: list[str] = [
             executable,
             "-p",

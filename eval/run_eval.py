@@ -152,6 +152,7 @@ class TrialResult:
     orchestrator_product_edits: int = 0
     dispatch_calls: int = 0
     orchestrator_compliant: bool = True
+    disallowed_bash_commands: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -339,6 +340,20 @@ def _is_brief_or_runs_path(raw_path: str) -> bool:
     return "briefs" in parts or "runs" in parts
 
 
+def orchestrator_bash_allowed(command: str) -> bool:
+    """Accept only simple allowlisted commands, refusing shell composition and expansion."""
+    import shlex
+    if any(character in command for character in "\n\r;&|<>`$()\\"):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if words[:2] in (["git", "status"], ["git", "diff"], ["git", "log"]):
+        return True
+    return words[:3] == ["python3", ".devpack/pack/runner/devpack_dispatch.py", "--submit"]
+
+
 def analyze_orchestrator_transcript(transcript_or_path: Path | str) -> dict[str, Any]:
     """Inspect an orchestrator stream-json transcript for product edits and dispatch usage.
 
@@ -364,6 +379,7 @@ def analyze_orchestrator_transcript(transcript_or_path: Path | str) -> dict[str,
     product_edit_paths: list[str] = []
     dispatch_commands: list[str] = []
     subagent_calls = 0
+    disallowed_bash_commands: list[str] = []
 
     for raw_line in raw_text.splitlines():
         line = raw_line.strip()
@@ -400,19 +416,23 @@ def analyze_orchestrator_transcript(transcript_or_path: Path | str) -> dict[str,
                     product_edit_paths.append(target or "<unknown>")
             elif tool_name == "Bash":
                 cmd = str(tool_input.get("command") or tool_input.get("cmd") or "")
-                if "devpack_dispatch.py" in cmd:
+                allowed = orchestrator_bash_allowed(cmd)
+                if not allowed:
+                    disallowed_bash_commands.append(cmd)
+                elif cmd.startswith("python3 .devpack/pack/runner/devpack_dispatch.py --submit"):
                     dispatch_commands.append(cmd)
             elif tool_name in ("Task", "Agent"):
                 subagent_calls += 1
 
     product_edits = len(product_edit_paths)
     dispatch_count = len(dispatch_commands)
-    compliant = product_edits == 0 and dispatch_count >= 1 and subagent_calls == 0
+    compliant = product_edits == 0 and dispatch_count >= 1 and subagent_calls == 0 and not disallowed_bash_commands
     return {
         "orchestrator_product_edits": product_edits,
         "product_edit_paths": product_edit_paths,
         "dispatch_calls": dispatch_count,
         "dispatch_commands": dispatch_commands,
+        "disallowed_bash_commands": disallowed_bash_commands,
         "subagent_calls": subagent_calls,
         "compliant": compliant,
     }
@@ -997,6 +1017,8 @@ def run_runner_trial(
             timeout_s=timeout_s,
             cmd=fixer_engine.cmd,
         )
+        for target, source in ((impl_cfg, impl_engine), (rev_cfg, rev_engine), (fix_cfg, fixer_engine)):
+            target.role_permissions = source.role_permissions
         cfg_obj = EnginesConfig(
             version=2,
             engines={
@@ -1252,9 +1274,6 @@ def run_orchestrator_trial(
             engines=[orch_engine.name],
         )
 
-        permissions = json.loads(
-            (work_dir / ".claude/settings.json").read_text(encoding="utf-8")
-        )["permissions"]
         request = AgentRequest(
             engine=orch_engine,
             prompt=prompt_text,
@@ -1262,8 +1281,6 @@ def run_orchestrator_trial(
             run_dir=trial_run_dir,
             step_name=f"01-orchestrator-{orch_engine.name}",
             isolation="local",
-            allowed_tools=permissions["allow"],
-            disallowed_tools=permissions["deny"],
             allow_unsandboxed_local=allow_unsandboxed_local,
             timeout_s=timeout_s,
             skills_enabled=False,
@@ -1399,6 +1416,7 @@ def run_orchestrator_trial(
             orchestrator_product_edits=int(analysis["orchestrator_product_edits"]),
             dispatch_calls=int(analysis["dispatch_calls"]),
             orchestrator_compliant=bool(analysis["compliant"]),
+            disallowed_bash_commands=analysis["disallowed_bash_commands"],
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")

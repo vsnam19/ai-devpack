@@ -722,8 +722,8 @@ class HarnessErrorTests(unittest.TestCase):
         # 2. Compliant transcript (briefs written + 2 dispatch calls, zero product edits)
         compliant_stream = "\n".join([
             json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write", "input": {"file_path": "briefs/t1.md", "content": "..."}}]}}),
-            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 runner/devpack_dispatch.py --engine haiku --brief briefs/t1.md"}}]}}),
-            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 runner/devpack_dispatch.py --engine haiku --brief briefs/t2.md"}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 .devpack/pack/runner/devpack_dispatch.py --submit --engine haiku --brief briefs/t1.md"}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 .devpack/pack/runner/devpack_dispatch.py --submit --engine haiku --brief briefs/t2.md"}}]}}),
         ])
         res_ok = run_eval.analyze_orchestrator_transcript(compliant_stream)
         self.assertTrue(res_ok["compliant"])
@@ -733,7 +733,7 @@ class HarnessErrorTests(unittest.TestCase):
         # 3. Direct product edit detected -> non-compliant
         bad_edit_stream = "\n".join([
             json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "src/link_state_machine.cpp"}}]}}),
-            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 runner/devpack_dispatch.py --engine haiku --brief briefs/t2.md"}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 .devpack/pack/runner/devpack_dispatch.py --submit --engine haiku --brief briefs/t2.md"}}]}}),
         ])
         res_bad = run_eval.analyze_orchestrator_transcript(bad_edit_stream)
         self.assertFalse(res_bad["compliant"])

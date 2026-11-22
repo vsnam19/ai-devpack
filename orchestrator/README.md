@@ -8,7 +8,7 @@ Keep the pack installation, engine configuration, worker credentials, and run di
 
 For an older project installation, remove its legacy `.devpack/pack/` copy before starting; the broker refuses leftover executable pack files.
 
-Copy `orchestrator/CLAUDE.md` to the project root and `orchestrator/.claude/` to the project's `.claude/` directory. Create `briefs/`. The settings allow Read/Glob/Grep, brief and run writes, Git inspection, and Bash for the standalone client only.
+Copy `orchestrator/CLAUDE.md` to the project root and `orchestrator/.claude/` to the project's `.claude/` directory. Create `briefs/`. The settings allow Read/Glob/Grep, brief writes, Git inspection, and Bash for the standalone client only.
 
 Start the broker in a second terminal, using your actual installation and project locations:
 
@@ -57,3 +57,5 @@ python3 /opt/devpack/runner/devpack_logs.py show /tmp/project-runs/RUN_ID
 ```
 
 Native sub-agents share one endpoint. Governed worker jobs and mixed cloud/local jobs must use the broker. Confidential projects require an engine whose declared data-class limit permits the project; secret projects are refused.
+
+The executor selects tools by role: implementers and fixers retain Read/Edit/Write/Bash/Glob/Grep, reviewers receive Read/Glob/Grep, and orchestrators receive Read/Glob/Grep plus Write/Edit limited to `briefs/**` and the four Bash rules in `.claude/settings.json`. Every normal Claude launch passes `--permission-mode dontAsk`, so tools requiring approval are denied without prompting in print mode. Trusted engine configuration may override `allowed_tools` and `disallowed_tools` in `[roles.<role>]` alongside `engine = "<engine-name>"`; string role mappings retain the defaults. The orchestrator's submit rule uses Claude's `:*` argument-prefix syntax and requires `--submit` immediately after the installed client path. Eval independently audits every Bash tool call, reports forbidden commands in `disallowed_bash_commands`, and fails compliance for any command outside this allowlist, including shell composition, redirects, and substitutions. Briefs are read once through non-symlink directory descriptors before copying the product tree; copy-back pins directory descriptors and uses exclusive temporary files with atomic replacement or descriptor-relative deletion.

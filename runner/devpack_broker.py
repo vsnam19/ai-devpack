@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,71 @@ def relative_path(value):
     if path.is_absolute() or '..' in path.parts or '\x00' in value:
         raise ValueError('path traversal refused')
     return path
+
+
+@contextlib.contextmanager
+def parent_fd(root, relative, *, create=False):
+    """Pin each directory component without following links, optionally creating parents."""
+    parts = relative_path(str(relative)).parts
+    if not parts:
+        raise ValueError('file name required')
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(component, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, parts[-1]
+    finally:
+        os.close(descriptor)
+
+
+def read_regular(root, relative):
+    """Open a regular file once beneath root and immediately snapshot its bytes."""
+    with parent_fd(root, relative) as (directory, name):
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=directory)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ValueError('input must be a regular file')
+            return handle.read()
+
+
+def copy_back(source_root, destination_root, relative):
+    """Publish regular output atomically or unlink it through pinned directory descriptors."""
+    try:
+        content = read_regular(source_root, relative)
+    except FileNotFoundError:
+        content = None
+    try:
+        with parent_fd(destination_root, relative, create=content is not None) as (directory, name):
+            if content is None:
+                try:
+                    os.unlink(name, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+                return
+            temporary = '.broker-' + uuid.uuid4().hex + '.tmp'
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o666, dir_fd=directory)
+            try:
+                with os.fdopen(descriptor, 'wb') as handle:
+                    handle.write(content)
+                os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+    except FileNotFoundError:
+        if content is not None:
+            raise
 
 
 class Broker:
@@ -132,9 +198,7 @@ class Broker:
         allowed, reason = check_data_class_allowed(self.engines.engines[engine], self.project['data_class'])
         if not allowed:
             raise ValueError(reason)
-        brief = self.workdir / relative_path(request.get('brief'))
-        if not brief.resolve().is_relative_to(self.workdir) or not brief.is_file():
-            raise ValueError('brief must be inside workdir')
+        brief = read_regular(self.workdir, relative_path(request.get('brief')))
         globs = request.get('allow')
         if not isinstance(globs, list) or not globs or len(globs) > 128:
             raise ValueError('nonempty allow globs required')
@@ -172,7 +236,7 @@ class Broker:
                              ['-c', 'user.name=Broker', '-c', 'user.email=broker@example.invalid', 'commit', '-qm', 'worker base', '--allow-empty']):
                     subprocess.run(['git', *args], cwd=work, env=git_env, check=True, capture_output=True)
                 prompt = sandbox / 'brief.md'
-                prompt.write_text(brief.read_text(encoding='utf-8'), encoding='utf-8')
+                prompt.write_bytes(brief)
                 project = sandbox / 'project.toml'
                 project.write_text('data_class = ' + json.dumps(self.project['data_class']) + '\n', encoding='utf-8')
                 # Freeze the engine file for this launch as well as policy resolution.
@@ -190,19 +254,9 @@ class Broker:
                 if payload['scope'] == 'ok':
                     for name in payload['changed_files']:
                         relative = relative_path(name)
-                        source, destination = work / relative, self.workdir / relative
                         if relative.parts[0] in {'.git', '.devpack', '.claude'}:
                             raise ValueError('worker control path refused')
-                        if (source.is_symlink() or not source.resolve().is_relative_to(work)
-                                or not destination.resolve().is_relative_to(self.workdir)):
-                            raise ValueError('worker output path escape refused')
-                        if source.exists():
-                            if not source.is_file():
-                                raise ValueError('worker output must be a regular file')
-                            destination.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copyfile(source, destination)
-                        else:
-                            destination.unlink(missing_ok=True)
+                        copy_back(work, self.workdir, relative)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             code = 1
             payload.update(status='refused', error=redact_sensitive_text(str(exc)))

@@ -364,16 +364,16 @@ class DevpackDispatchTests(unittest.TestCase):
         self.assertIn("Grep", allow)
         self.assertIn("Edit(briefs/**)", allow)
         self.assertIn("Write(briefs/**)", allow)
-        self.assertIn("Edit(runs/**)", allow)
-        self.assertIn("Write(runs/**)", allow)
+        self.assertNotIn("Edit(runs/**)", allow)
+        self.assertNotIn("Write(runs/**)", allow)
         client_path = ORCHESTRATOR_PACK_PATH / "runner/devpack_dispatch.py"
         client_command = f"python3 {client_path}"
         self.assertEqual(client_path, CLIENT_RELATIVE)
-        self.assertIn(f"Bash({client_command} *)", allow)
+        self.assertIn(f"Bash({client_command} --submit:*)", allow)
         for permission in allow:
             self.assertNotIn("devpack_logs.py", permission)
             if permission.startswith("Bash(") and "devpack_dispatch.py" in permission:
-                self.assertEqual(f"Bash({client_command} *)", permission)
+                self.assertEqual(f"Bash({client_command} --submit:*)", permission)
         for host_script in ("devpack_dispatch.py", "devpack_logs.py"):
             self.assertNotIn(f"Bash(python3 runner/{host_script} *)", allow)
 

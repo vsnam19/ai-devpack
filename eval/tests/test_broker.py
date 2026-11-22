@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -162,3 +163,114 @@ class BrokerTests(unittest.TestCase):
         payload = json.loads((self.broker.queue / (request_id + '.response.json')).read_text())
         self.assertEqual('refused', payload['status'])
         self.assertEqual('before', (self.work / 'result.txt').read_text())
+
+    def test_internal_symlink_brief_refused(self):
+        """Even symlinks pointing inside the project cannot supply a brief."""
+        (self.work / 'briefs/link.md').symlink_to('job.md')
+        code, payload = self.request(brief='briefs/link.md')
+        self.assertEqual(1, code)
+        self.assertEqual('refused', payload['status'])
+
+    def test_brief_snapshot_precedes_copy(self):
+        """A brief swapped during the product copy cannot change the worker prompt."""
+        original_copy = self.broker_module.shutil.copytree
+        outside = self.root / 'outside.md'
+        outside.write_text('UNTRUSTED REPLACEMENT')
+        prompts = []
+
+        def swap_copy(*args, **kwargs):
+            """Replace the brief after validation, before dispatch."""
+            brief = self.work / 'briefs/job.md'
+            brief.unlink()
+            brief.symlink_to(outside)
+            return original_copy(*args, **kwargs)
+
+        def dispatch(**kwargs):
+            """Capture the actual prompt passed across the dispatch boundary."""
+            prompts.append(kwargs['brief_path'].read_text())
+            return 0, {'status': 'ok', 'scope': 'ok', 'gate': 'ok', 'changed_files': []}
+
+        with mock.patch.object(self.broker_module.shutil, 'copytree', side_effect=swap_copy), \
+             mock.patch.object(self.broker_module, 'dispatch_job', side_effect=dispatch):
+            code, payload = self.request()
+        self.assertEqual(0, code, payload)
+        self.assertEqual(['Update result.txt'], prompts)
+
+    def test_destination_parent_swap_refused(self):
+        """A destination parent replaced just before I/O cannot redirect a write."""
+        nested = self.work / 'nested'
+        nested.mkdir()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'output.txt').write_text('protected')
+        original_open = os.open
+        original_copy = self.broker_module.shutil.copyfile
+        swapped = []
+
+        def swap():
+            """Swap the destination directory once at its I/O boundary."""
+            if not swapped:
+                nested.rename(self.work / 'old-nested')
+                nested.symlink_to(outside, target_is_directory=True)
+                swapped.append(True)
+
+        def opening(path, flags, *args, **kwargs):
+            """Race the secure directory walk at the destination parent."""
+            if str(path) == 'nested' and kwargs.get('dir_fd') is not None:
+                swap()
+            return original_open(path, flags, *args, **kwargs)
+
+        def copying(source, destination, *args, **kwargs):
+            """Race the old path-based copy after its containment checks."""
+            if Path(destination) == nested / 'output.txt':
+                swap()
+            return original_copy(source, destination, *args, **kwargs)
+
+        def dispatch(**kwargs):
+            """Provide a worker output without invoking a model."""
+            target = kwargs['workdir'] / 'nested/output.txt'
+            target.write_text('worker output')
+            return 0, {'status': 'ok', 'scope': 'ok', 'gate': 'ok',
+                       'changed_files': ['nested/output.txt']}
+
+        with mock.patch.object(self.broker_module, 'dispatch_job', side_effect=dispatch), \
+             mock.patch.object(self.broker_module.os, 'open', side_effect=opening), \
+             mock.patch.object(self.broker_module.shutil, 'copyfile', side_effect=copying):
+            code, payload = self.request(allow=['nested/**'])
+        self.assertTrue(swapped)
+        self.assertEqual(1, code, payload)
+        self.assertEqual('refused', payload['status'])
+        self.assertEqual('protected', (outside / 'output.txt').read_text())
+
+    def test_copy_back_deletion_and_new_parents(self):
+        """Regular output creates parents and missing output deletes only its own name."""
+        source = self.root / 'source'
+        source.mkdir()
+        (source / 'nested').mkdir()
+        (source / 'nested/new.txt').write_text('new content')
+        self.broker_module.copy_back(source, self.work, Path('nested/new.txt'))
+        self.assertEqual('new content', (self.work / 'nested/new.txt').read_text())
+        self.broker_module.copy_back(source, self.work, Path('result.txt'))
+        self.assertFalse((self.work / 'result.txt').exists())
+        outside = self.root / 'protected.txt'
+        outside.write_text('protected')
+        (self.work / 'link.txt').symlink_to(outside)
+        self.broker_module.copy_back(source, self.work, Path('link.txt'))
+        self.assertFalse((self.work / 'link.txt').is_symlink())
+        self.assertEqual('protected', outside.read_text())
+
+    def test_symlinked_output_parent_refused(self):
+        """Worker output and deletion targets cannot walk through symlinked parents."""
+        source = self.root / 'source'
+        source.mkdir()
+        outside = self.root / 'protected'
+        outside.mkdir()
+        (outside / 'file.txt').write_text('protected')
+        (source / 'link').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError):
+            self.broker_module.copy_back(source, self.work, Path('link/file.txt'))
+        (source / 'link').unlink()
+        (self.work / 'link').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError):
+            self.broker_module.copy_back(source, self.work, Path('link/missing.txt'))
+        self.assertEqual('protected', (outside / 'file.txt').read_text())

@@ -4,16 +4,12 @@
       "Read",
       "Glob",
       "Grep",
-      "Edit(briefs/**)",
       "Write(briefs/**)",
-      "Edit(runs/**)",
-      "Write(runs/**)",
-      "Bash(python3 .devpack/pack/runner/devpack_dispatch.py *)",
-      "Bash(git status)",
-      "Bash(git status *)",
-      "Bash(git diff)",
-      "Bash(git diff *)",
-      "Bash(git log *)"
+      "Edit(briefs/**)",
+      "Bash(python3 .devpack/pack/runner/devpack_dispatch.py --submit:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
     ],
     "deny": [
       "Edit(src/**)",
