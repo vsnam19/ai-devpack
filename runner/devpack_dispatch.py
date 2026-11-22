@@ -82,6 +82,7 @@ from runner.agent_exec import (  # noqa: E402
     save_qualification_data,
     update_run_json,
 )
+from runner.brief_lint import lint_brief_text  # noqa: E402
 from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
 
@@ -367,6 +368,7 @@ def dispatch_job(
     memory_enabled: bool | None = None,
     memory_top_k: int | None = None,
     memory_budget_tokens: int | None = None,
+    brief_lint_findings: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
@@ -401,6 +403,17 @@ def dispatch_job(
     effective_base = base_ref.strip() or head_sha
 
     brief_raw = brief_path.read_text(encoding="utf-8")
+    effective_brief_lint = (
+        list(brief_lint_findings)
+        if brief_lint_findings is not None
+        else lint_brief_text(
+            brief_raw,
+            repo_root=workdir,
+            engine=engine.name,
+            engines_config=effective_engines_path,
+            author="human",
+        )
+    )
     prompt_text = brief_raw if no_checklist else _inject_quality_checklist(brief_raw, pack_root)
     resolved_profile = (
         profile_path
@@ -774,6 +787,7 @@ def dispatch_job(
         scope=scope_status,
         test_lock=test_lock_status,
         lint_findings=lint_findings,
+        brief_lint=effective_brief_lint,
         data_class=project_cfg["data_class"],
         memory_ids=list(agent_res.memory_ids),
         memory_hashes=dict(agent_res.memory_hashes),

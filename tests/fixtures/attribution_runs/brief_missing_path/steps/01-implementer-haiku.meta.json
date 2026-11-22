@@ -1,0 +1,7 @@
+{
+  "role": "implementer",
+  "engine": "haiku",
+  "status": "agent_error",
+  "prompt_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "prompt_file": "01-implementer-haiku.prompt.md"
+}

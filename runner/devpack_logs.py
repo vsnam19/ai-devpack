@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import html
 import json
 import os
@@ -34,9 +34,55 @@ if str(REPO_ROOT) not in sys.path:
 from enforcement.checks import secret_pii_check  # noqa: E402
 
 try:
-    from runner.agent_exec import collect_os_identities, redact_os_identities, redact_value  # noqa: E402
+    import tomllib  # type: ignore[attr-defined]
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    tomllib = None  # type: ignore[assignment]
+
+try:
+    from runner.agent_exec import (  # noqa: E402
+        _minimal_toml_loads,
+        collect_os_identities,
+        redact_os_identities,
+        redact_value,
+    )
 except ModuleNotFoundError:  # pragma: no cover - direct runner/ invocation
-    from agent_exec import collect_os_identities, redact_os_identities, redact_value  # type: ignore[no-redef]  # noqa: E402
+    from agent_exec import (  # type: ignore[no-redef]  # noqa: E402
+        _minimal_toml_loads,
+        collect_os_identities,
+        redact_os_identities,
+        redact_value,
+    )
+
+CAUSE_TAXONOMY: tuple[str, ...] = ("BRIEF", "CONTEXT", "SKILL", "TOOL", "MODEL", "ENV")
+
+_DEFAULT_ENGINE_CONTEXT_TOKENS: dict[str, int] = {
+    "sonnet": 200000,
+    "haiku": 200000,
+    "local": 32768,
+}
+
+_CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
+_SEARCH_TOOL_NAMES = frozenset({"Read", "Grep", "Glob", "Find"})
+_EDIT_TOOL_NAMES = frozenset({"Edit", "Write", "NotebookEdit"})
+_READONLY_BASH_RE = re.compile(r"^\s*(?:rg|grep|ag|ack|find|ls|cat|head|tail|sed\s+-n|wc)\b")
+_CPP_IGNORED_IDENTS = frozenset(
+    {
+        "if", "else", "for", "while", "do", "switch", "case", "default", "break",
+        "continue", "return", "goto", "sizeof", "alignof", "decltype", "noexcept",
+        "static_cast", "const_cast", "reinterpret_cast", "dynamic_cast",
+        "void", "bool", "char", "short", "int", "long", "float", "double",
+        "signed", "unsigned", "const", "volatile", "static", "extern", "inline",
+        "virtual", "override", "final", "explicit", "struct", "class", "enum",
+        "union", "namespace", "using", "typedef", "template", "typename", "public",
+        "private", "protected", "nullptr", "true", "false", "this", "auto",
+        "std", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int8_t",
+        "int16_t", "int32_t", "int64_t", "size_t", "ptrdiff_t", "string",
+        "string_view", "vector", "array", "span", "optional", "unique_ptr",
+        "shared_ptr", "move", "forward", "assert", "printf", "fprintf",
+        "snprintf", "memcpy", "memset", "memcmp", "main",
+    }
+)
+_CPP_SKIP_DIRS = frozenset({".git", "__pycache__", ".worktrees", "runs", "build", ".devpack"})
 
 TRUNCATE_LIMIT_BYTES = 4096
 
@@ -1654,6 +1700,791 @@ def write_rendered_outputs(record: RunRecord, out_dir: pathlib.Path, full: bool 
     return md_path, html_path
 
 
+_MISSING_PATH_ERR_RE = re.compile(
+    r"(?i)(?:no such file or directory|enoent|does not exist|file not found|cannot open)"
+)
+_DENIED_ERR_RE = re.compile(
+    r"(?i)(?:permission denied|was denied|not allowed|requires approval|blocked by policy|command denied|tool denied)"
+)
+_TIMEOUT_TEXT_RE = re.compile(
+    r"(?i)\b(?:timed?\s*out|timeout\s+after|deadline\s+exceeded|TimeoutExpired)\b"
+)
+_QUOTA_NET_RE = re.compile(
+    r"(?i)(?:insufficient_quota|quota\s+exceeded|rate[_\s-]?limit(?:ed|\s+exceeded)?|"
+    r"http\s*429|\b429\b|over\s*capacity|connection\s+(?:refused|reset|timed\s+out)|"
+    r"could\s+not\s+resolve\s+host|network\s+is\s+unreachable|econnrefused|etimedout|enotfound)"
+)
+_COMPILER_UNDECLARED_RE = re.compile(
+    r"(?:use of undeclared identifier\s+'([A-Za-z_][A-Za-z0-9_]*)'|"
+    r"'([A-Za-z_][A-Za-z0-9_]*)'\s+was not declared in this scope|"
+    r"no member named\s+'([A-Za-z_][A-Za-z0-9_]*)'|"
+    r"undefined reference to\s+[`']?([A-Za-z_][A-Za-z0-9_:]*))"
+)
+_NOT_FOUND_CLAIM_RE = re.compile(
+    r"(?i)\b(?:not\s+found|does\s+not\s+exist|cannot\s+find|could\s+not\s+find|no\s+such\s+file)\b"
+)
+_LINT_FINDING_LINE_RE = re.compile(
+    r"^\s*(?:-\s*)?\[(ERROR|WARNING)\]\[([A-Za-z0-9_.-]+)\]\s+(.+)$"
+)
+_PROMPT_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)"
+)
+_CPP_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_CPP_QUAL_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*::([A-Za-z_][A-Za-z0-9_]*)\b")
+_CPP_DEF_RE = re.compile(
+    r"\b(?:void|bool|int|auto|double|float|std::[A-Za-z0-9_:]+|uint\d+_t|int\d+_t|size_t)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+_BACKTICK_SPAN_RE = re.compile(r"`([^`\n]+)`")
+
+
+def _resolve_context_window(
+    engine_name: str,
+    engines_config: pathlib.Path | None = None,
+) -> int | None:
+    """Return configured ``context_tokens`` (or ``min_context_tokens``) for ``engine_name``."""
+    cleaned = engine_name.strip()
+    if not cleaned or cleaned == "-":
+        return None
+    cfg_path = engines_config
+    if cfg_path is None:
+        candidate = RUNNER_DIR / "engines.example.toml"
+        if candidate.is_file():
+            cfg_path = candidate
+    if cfg_path is not None and cfg_path.is_file():
+        try:
+            raw_text = cfg_path.read_text(encoding="utf-8")
+            data = tomllib.loads(raw_text) if tomllib is not None else _minimal_toml_loads(raw_text)
+        except Exception:
+            data = {}
+        engines = data.get("engines", {}) if isinstance(data, dict) else {}
+        if isinstance(engines, dict) and cleaned in engines and isinstance(engines[cleaned], dict):
+            spec = engines[cleaned]
+            val = spec.get("context_tokens") or spec.get("min_context_tokens")
+            if isinstance(val, int) and val > 0:
+                return int(val)
+    return _DEFAULT_ENGINE_CONTEXT_TOKENS.get(cleaned)
+
+
+def _collect_cpp_repo_symbols(repo_root: pathlib.Path) -> set[str]:
+    """Collect C/C++ identifiers across source and header files under ``repo_root``."""
+    symbols: set[str] = set()
+    if not repo_root.is_dir():
+        return symbols
+    ident_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b")
+    for path in repo_root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(repo_root)
+        if any(part in _CPP_SKIP_DIRS for part in rel.parts):
+            continue
+        if path.suffix.lower() not in _CPP_SUFFIXES:
+            continue
+        if path.stat().st_size > 1_048_576:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for match in ident_re.finditer(text):
+            symbols.add(match.group(1))
+    return symbols
+
+
+def _extract_brief_paths_from_prompt(prompt_text: str) -> set[str]:
+    """Extract path-like tokens from the task brief portion of ``prompt_text``."""
+    if not prompt_text:
+        return set()
+    head = prompt_text.split("## Code Quality Checklist", 1)[0]
+    head = head.split("## Relevant project memory", 1)[0]
+    found: set[str] = set()
+    for match in _PROMPT_PATH_RE.finditer(head):
+        tok = match.group(1).strip("`'\"(),;[]")
+        if "://" in tok or tok.startswith(("/", "~", "$")):
+            continue
+        if any(ch in tok for ch in "*?{}<>="):
+            continue
+        found.add(tok)
+    return found
+
+
+def _extract_candidate_cpp_symbols(code_or_claim: str, is_code: bool) -> list[str]:
+    """Extract referenced C/C++ identifiers from code edits or backticked claims."""
+    candidates: list[str] = []
+    locally_defined: set[str] = set()
+    if is_code:
+        for dm in _CPP_DEF_RE.finditer(code_or_claim):
+            locally_defined.add(dm.group(1))
+        for cm in _CPP_CALL_RE.finditer(code_or_claim):
+            candidates.append(cm.group(1))
+        for qm in _CPP_QUAL_RE.finditer(code_or_claim):
+            candidates.append(qm.group(1))
+    else:
+        for span in _BACKTICK_SPAN_RE.findall(code_or_claim):
+            for cm in _CPP_CALL_RE.finditer(span):
+                candidates.append(cm.group(1))
+            for qm in _CPP_QUAL_RE.finditer(span):
+                candidates.append(qm.group(1))
+    out: list[str] = []
+    seen: set[str] = set()
+    for sym in candidates:
+        if len(sym) < 3 or sym in _CPP_IGNORED_IDENTS or sym in locally_defined or sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return out
+
+
+def _normalize_repo_rel(raw_path: str, repo_root: pathlib.Path | None, init_cwd: str) -> str:
+    """Normalize a tool file_path relative to ``repo_root`` or ``init_cwd`` when possible."""
+    cleaned = raw_path.strip()
+    if not cleaned:
+        return ""
+    if init_cwd and cleaned.startswith(init_cwd.rstrip("/") + "/"):
+        return cleaned[len(init_cwd.rstrip("/")) + 1:]
+    if repo_root is not None:
+        try:
+            p = pathlib.Path(cleaned)
+            if p.is_absolute():
+                return p.resolve().relative_to(repo_root.resolve()).as_posix()
+        except (OSError, ValueError):
+            pass
+    return cleaned
+
+
+def _add_evidence(
+    bucket: list[dict[str, Any]],
+    seen: set[tuple[str, int, str]],
+    step_id: str,
+    line: int,
+    text: str,
+    redactor: Redactor,
+) -> None:
+    """Append a deduplicated, redacted evidence line entry."""
+    excerpt = redactor.redact(text.strip()).replace("\n", " ")
+    if len(excerpt) > 220:
+        excerpt = excerpt[:217] + "..."
+    key = (step_id, line, excerpt)
+    if excerpt and key not in seen:
+        seen.add(key)
+        bucket.append({"step": step_id, "line": int(line), "text": excerpt})
+
+
+def analyze_run_dir(
+    run_dir: pathlib.Path,
+    *,
+    repo_root: pathlib.Path | None = None,
+    engines_config: pathlib.Path | None = None,
+    redactor: Redactor | None = None,
+    write: bool = True,
+) -> dict[str, Any]:
+    """Compute deterministic heuristic failure-attribution signals and write ``attribution.json``."""
+    active_redactor = redactor or Redactor()
+    record = load_run_dir(run_dir, active_redactor)
+
+    run_json_path = run_dir / "run.json"
+    run_meta: dict[str, Any] = {}
+    if run_json_path.is_file():
+        try:
+            loaded = json.loads(run_json_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(loaded, dict):
+                run_meta = loaded
+        except json.JSONDecodeError:
+            run_meta = {}
+
+    repo_symbols = _collect_cpp_repo_symbols(repo_root) if repo_root is not None else set()
+
+    tool_calls_by_kind: dict[str, int] = {}
+    search_calls_before_first_edit = 0
+    saw_first_edit = False
+    files_read_list: list[str] = []
+    files_read_set: set[str] = set()
+    files_touched_list: list[str] = []
+    files_touched_set: set[str] = set()
+    missing_path_reads: list[dict[str, Any]] = []
+    denied_calls: list[dict[str, Any]] = []
+    missing_symbols: list[dict[str, Any]] = []
+    skill_triggers: list[dict[str, Any]] = []
+    not_found_claims: list[dict[str, Any]] = []
+    prompt_missing_paths: list[dict[str, Any]] = []
+    brief_lint_findings: list[dict[str, Any]] = list(run_meta.get("brief_lint", [])) if isinstance(run_meta.get("brief_lint"), list) else []
+
+    prompt_tokens_est = 0
+    max_step_tokens_in = 0
+    context_window: int | None = None
+    prompt_over_context = False
+    timeout_detected = record.outcome.lower() == "timeout"
+    quota_net_detected = False
+
+    evidence_by_cause: dict[str, list[dict[str, Any]]] = {c: [] for c in CAUSE_TAXONOMY}
+    seen_ev: dict[str, set[tuple[str, int, str]]] = {c: set() for c in CAUSE_TAXONOMY}
+    scores: dict[str, int] = {c: 0 for c in CAUSE_TAXONOMY}
+
+    # Check run.json refusal / error fields
+    refusal_reason = str(run_meta.get("refusal_reason") or run_meta.get("error") or "")
+    if refusal_reason:
+        if "brief_lint" in refusal_reason or "BRIEF-" in refusal_reason:
+            scores["BRIEF"] += 4
+            _add_evidence(evidence_by_cause["BRIEF"], seen_ev["BRIEF"], "run.json", 1, refusal_reason, active_redactor)
+        if _TIMEOUT_TEXT_RE.search(refusal_reason):
+            timeout_detected = True
+            scores["ENV"] += 4
+            _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], "run.json", 1, refusal_reason, active_redactor)
+        if _QUOTA_NET_RE.search(refusal_reason):
+            quota_net_detected = True
+            scores["ENV"] += 4
+            _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], "run.json", 1, refusal_reason, active_redactor)
+        if _DENIED_ERR_RE.search(refusal_reason):
+            scores["TOOL"] += 3
+            _add_evidence(evidence_by_cause["TOOL"], seen_ev["TOOL"], "run.json", 1, refusal_reason, active_redactor)
+
+    if any(str(item.get("severity", "")).lower() == "error" for item in brief_lint_findings if isinstance(item, dict)):
+        scores["BRIEF"] += 4
+        for item in brief_lint_findings:
+            if isinstance(item, dict) and str(item.get("severity", "")).lower() == "error":
+                _add_evidence(
+                    evidence_by_cause["BRIEF"],
+                    seen_ev["BRIEF"],
+                    "run.json",
+                    int(item.get("line", 1) or 1),
+                    f"{item.get('rule', 'BRIEF')}: {item.get('message', '')}",
+                    active_redactor,
+                )
+
+    steps_dir = run_dir / "steps"
+    brief_named_paths: set[str] = set()
+    lint_findings_count = int(run_meta.get("lint_findings", 0) or 0)
+    gate_failed = str(run_meta.get("gate", "")).lower() == "fail"
+    test_lock_failed = str(run_meta.get("test_lock", "")).lower() == "fail"
+    scope_violated = str(run_meta.get("scope", "")).lower() == "violation"
+
+    for step in record.steps:
+        if step.is_gate:
+            gate_lines = step.gate_text.splitlines()
+            for g_lineno, g_line in enumerate(gate_lines, start=1):
+                if _TIMEOUT_TEXT_RE.search(g_line):
+                    timeout_detected = True
+                    scores["ENV"] += 4
+                    _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, g_lineno, g_line, active_redactor)
+                if _QUOTA_NET_RE.search(g_line):
+                    quota_net_detected = True
+                    scores["ENV"] += 4
+                    _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, g_lineno, g_line, active_redactor)
+                cm = _COMPILER_UNDECLARED_RE.search(g_line)
+                if cm:
+                    sym = next((g for g in cm.groups() if g), "")
+                    if sym and (repo_root is None or sym not in repo_symbols):
+                        missing_symbols.append({"step": step.step_id, "line": g_lineno, "symbol": sym, "source": "compiler"})
+                        scores["CONTEXT"] += 2
+                        _add_evidence(evidence_by_cause["CONTEXT"], seen_ev["CONTEXT"], step.step_id, g_lineno, g_line, active_redactor)
+                lm = _LINT_FINDING_LINE_RE.match(g_line)
+                if lm and lm.group(1) == "ERROR":
+                    lint_findings_count += 1
+                    _add_evidence(evidence_by_cause["SKILL"], seen_ev["SKILL"], step.step_id, g_lineno, g_line, active_redactor)
+                if "TEST_LOCK_FAIL" in g_line or "protected test" in g_line.lower():
+                    test_lock_failed = True
+                    scores["MODEL"] += 3
+                    _add_evidence(evidence_by_cause["MODEL"], seen_ev["MODEL"], step.step_id, g_lineno, g_line, active_redactor)
+                if "SCOPE_VIOLATION" in g_line:
+                    scope_violated = True
+                    scores["MODEL"] += 2
+                    _add_evidence(evidence_by_cause["MODEL"], seen_ev["MODEL"], step.step_id, g_lineno, g_line, active_redactor)
+            if step.status == "fail":
+                gate_failed = True
+            continue
+
+        # Agent step prompt and metadata
+        if step.prompt_text:
+            est = (len(step.prompt_text) + 3) // 4
+            prompt_tokens_est = max(prompt_tokens_est, est)
+            brief_named_paths.update(_extract_brief_paths_from_prompt(step.prompt_text))
+
+        if repo_root is not None and step.prompt_text:
+            head_prompt = step.prompt_text.split("## Code Quality Checklist", 1)[0]
+            for p_lineno, p_line in enumerate(head_prompt.splitlines(), start=1):
+                for pm in _PROMPT_PATH_RE.finditer(p_line):
+                    cand = pm.group(1).strip("`'\"(),;[]")
+                    if "://" in cand or cand.startswith(("/", "~", "$")) or any(c in cand for c in "*?{}<>="):
+                        continue
+                    if cand.endswith(_CPP_SUFFIXES + (".md", ".toml", ".json", ".sh", ".txt", ".py")) and not (repo_root / cand).exists():
+                        prompt_missing_paths.append({"step": step.step_id, "line": p_lineno, "path": cand})
+                        scores["BRIEF"] += 3
+                        _add_evidence(
+                            evidence_by_cause["BRIEF"],
+                            seen_ev["BRIEF"],
+                            step.step_id,
+                            p_lineno,
+                            f"Brief prompt references missing path '{cand}'",
+                            active_redactor,
+                        )
+
+        eng_ctx = _resolve_context_window(step.engine, engines_config)
+        if eng_ctx is not None:
+            context_window = eng_ctx if context_window is None else min(context_window, eng_ctx)
+
+        max_step_tokens_in = max(max_step_tokens_in, int(step.tokens_in))
+        if step.status == "timeout":
+            timeout_detected = True
+            scores["ENV"] += 4
+            _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, 1, f"Step {step.step_id} timed out", active_redactor)
+
+        meta_path = steps_dir / f"{step.step_id}.meta.json"
+        if meta_path.is_file():
+            try:
+                meta_obj = json.loads(meta_path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                meta_obj = {}
+            if isinstance(meta_obj, dict):
+                err_txt = str(meta_obj.get("error") or "")
+                if err_txt:
+                    if _TIMEOUT_TEXT_RE.search(err_txt):
+                        timeout_detected = True
+                        scores["ENV"] += 4
+                        _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, 1, err_txt, active_redactor)
+                    if _QUOTA_NET_RE.search(err_txt):
+                        quota_net_detected = True
+                        scores["ENV"] += 4
+                        _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, 1, err_txt, active_redactor)
+                    if _DENIED_ERR_RE.search(err_txt):
+                        scores["TOOL"] += 3
+                        _add_evidence(evidence_by_cause["TOOL"], seen_ev["TOOL"], step.step_id, 1, err_txt, active_redactor)
+                for denial in meta_obj.get("permission_denials", []) if isinstance(meta_obj.get("permission_denials"), list) else []:
+                    denied_calls.append({"step": step.step_id, "line": 1, "tool": str(denial), "reason": "permission_denials"})
+                    scores["TOOL"] += 3
+                    _add_evidence(evidence_by_cause["TOOL"], seen_ev["TOOL"], step.step_id, 1, f"Denied tool call: {denial}", active_redactor)
+
+        # Scan raw .jsonl with exact 1-based line numbers
+        jsonl_path = steps_dir / f"{step.step_id}.jsonl"
+        if jsonl_path.is_file():
+            raw_lines = jsonl_path.read_text(encoding="utf-8", errors="replace").split("\n")
+            init_cwd = ""
+            pending_tool_calls: dict[str, tuple[str, dict[str, Any], int]] = {}
+            for lineno, raw_line in enumerate(raw_lines, start=1):
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    ev = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                ev_type = ev.get("type")
+                if ev_type == "system" and ev.get("subtype") == "init":
+                    init_cwd = str(ev.get("cwd") or "")
+                elif ev_type == "rate_limit_event":
+                    rl_info = ev.get("rate_limit_info", {})
+                    if isinstance(rl_info, dict) and str(rl_info.get("status", "")).lower() in ("rejected", "blocked", "exceeded", "denied"):
+                        quota_net_detected = True
+                        scores["ENV"] += 4
+                        _add_evidence(
+                            evidence_by_cause["ENV"],
+                            seen_ev["ENV"],
+                            step.step_id,
+                            lineno,
+                            f"Rate limit rejected: {rl_info}",
+                            active_redactor,
+                        )
+                elif ev_type == "assistant":
+                    msg = ev.get("message", {})
+                    if not isinstance(msg, dict):
+                        continue
+                    usage = msg.get("usage", {})
+                    if isinstance(usage, dict):
+                        turn_in = int(usage.get("input_tokens", 0) or 0) + int(usage.get("cache_read_input_tokens", 0) or 0) + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                        max_step_tokens_in = max(max_step_tokens_in, turn_in)
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        has_tu = False
+                        text_chunks: list[str] = []
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            btype = block.get("type")
+                            if btype == "tool_use":
+                                has_tu = True
+                                tname = str(block.get("name") or "unknown")
+                                tid = str(block.get("id") or "")
+                                tinput = block.get("input", {})
+                                if not isinstance(tinput, dict):
+                                    tinput = {}
+                                tool_calls_by_kind[tname] = tool_calls_by_kind.get(tname, 0) + 1
+                                if tid:
+                                    pending_tool_calls[tid] = (tname, tinput, lineno)
+                                if tname in _EDIT_TOOL_NAMES:
+                                    saw_first_edit = True
+                                    fpath = _normalize_repo_rel(str(tinput.get("file_path") or ""), repo_root, init_cwd)
+                                    if fpath and fpath not in files_touched_set:
+                                        files_touched_set.add(fpath)
+                                        files_touched_list.append(fpath)
+                                    code_text = str(tinput.get("new_string") or tinput.get("content") or "")
+                                    if repo_root is not None and code_text:
+                                        for sym in _extract_candidate_cpp_symbols(code_text, is_code=True):
+                                            if sym not in repo_symbols:
+                                                missing_symbols.append({"step": step.step_id, "line": lineno, "symbol": sym, "source": f"tool_use:{tname}"})
+                                                scores["CONTEXT"] += 2
+                                                _add_evidence(
+                                                    evidence_by_cause["CONTEXT"],
+                                                    seen_ev["CONTEXT"],
+                                                    step.step_id,
+                                                    lineno,
+                                                    f"{tname} references unknown symbol '{sym}'",
+                                                    active_redactor,
+                                                )
+                                elif tname in _SEARCH_TOOL_NAMES:
+                                    if not saw_first_edit:
+                                        search_calls_before_first_edit += 1
+                                    if tname == "Read":
+                                        fpath = _normalize_repo_rel(str(tinput.get("file_path") or ""), repo_root, init_cwd)
+                                        if fpath:
+                                            if fpath not in files_read_set:
+                                                files_read_set.add(fpath)
+                                                files_read_list.append(fpath)
+                                            if fpath.endswith("SKILL.md") or "/skills/" in fpath:
+                                                skill_triggers.append({"step": step.step_id, "line": lineno, "skill": fpath})
+                                            if repo_root is not None and not (repo_root / fpath).exists():
+                                                missing_path_reads.append({"step": step.step_id, "line": lineno, "path": fpath})
+                                                if fpath in brief_named_paths or any(fpath.endswith("/" + b) or b.endswith("/" + fpath) or fpath == b for b in brief_named_paths):
+                                                    scores["BRIEF"] += 3
+                                                    _add_evidence(
+                                                        evidence_by_cause["BRIEF"],
+                                                        seen_ev["BRIEF"],
+                                                        step.step_id,
+                                                        lineno,
+                                                        f"Read of brief-named missing path '{fpath}'",
+                                                        active_redactor,
+                                                    )
+                                                else:
+                                                    scores["CONTEXT"] += 2
+                                                    _add_evidence(
+                                                        evidence_by_cause["CONTEXT"],
+                                                        seen_ev["CONTEXT"],
+                                                        step.step_id,
+                                                        lineno,
+                                                        f"Read of non-existent path '{fpath}'",
+                                                        active_redactor,
+                                                    )
+                                elif tname == "Bash":
+                                    cmd_txt = str(tinput.get("command") or "")
+                                    if not saw_first_edit and _READONLY_BASH_RE.match(cmd_txt):
+                                        search_calls_before_first_edit += 1
+                                elif tname == "Skill":
+                                    sk_name = str(tinput.get("skill") or tinput.get("name") or "unknown")
+                                    skill_triggers.append({"step": step.step_id, "line": lineno, "skill": sk_name})
+                            elif btype == "text":
+                                txt = str(block.get("text") or "")
+                                if txt:
+                                    text_chunks.append(txt)
+                        combined = "\n".join(text_chunks).strip()
+                        if combined:
+                            if not has_tu and _looks_like_json_tool_call(combined):
+                                scores["TOOL"] += 2
+                                scores["MODEL"] += 1
+                                _add_evidence(
+                                    evidence_by_cause["TOOL"],
+                                    seen_ev["TOOL"],
+                                    step.step_id,
+                                    lineno,
+                                    "Tool protocol error: JSON tool call printed as plain text",
+                                    active_redactor,
+                                )
+                            if _NOT_FOUND_CLAIM_RE.search(combined) and repo_root is not None:
+                                for pm in _PROMPT_PATH_RE.finditer(combined):
+                                    cand = pm.group(1).strip("`'\"(),;[]")
+                                    if (repo_root / cand).exists():
+                                        not_found_claims.append({"step": step.step_id, "line": lineno, "target": cand})
+                                        scores["CONTEXT"] += 2
+                                        _add_evidence(evidence_by_cause["CONTEXT"], seen_ev["CONTEXT"], step.step_id, lineno, combined, active_redactor)
+                            if repo_root is not None:
+                                for sym in _extract_candidate_cpp_symbols(combined, is_code=False):
+                                    if sym not in repo_symbols:
+                                        missing_symbols.append({"step": step.step_id, "line": lineno, "symbol": sym, "source": "claim"})
+                                        scores["CONTEXT"] += 2
+                                        _add_evidence(
+                                            evidence_by_cause["CONTEXT"],
+                                            seen_ev["CONTEXT"],
+                                            step.step_id,
+                                            lineno,
+                                            f"Claim references unknown symbol '{sym}'",
+                                            active_redactor,
+                                        )
+                            if _QUOTA_NET_RE.search(combined):
+                                quota_net_detected = True
+                                scores["ENV"] += 3
+                                _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, lineno, combined, active_redactor)
+                            if _TIMEOUT_TEXT_RE.search(combined):
+                                timeout_detected = True
+                                scores["ENV"] += 3
+                                _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, lineno, combined, active_redactor)
+                elif ev_type == "user":
+                    msg = ev.get("message", {})
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    if isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                                continue
+                            tid = str(block.get("tool_use_id") or "")
+                            tname, tinput, _ = pending_tool_calls.get(tid, ("", {}, lineno))
+                            is_err = bool(block.get("is_error", False))
+                            res_txt = _normalize_tool_result_content(block.get("content"))
+                            if is_err and _DENIED_ERR_RE.search(res_txt):
+                                denied_calls.append({"step": step.step_id, "line": lineno, "tool": tname or "unknown", "reason": active_redactor.redact(res_txt[:160])})
+                                scores["TOOL"] += 3
+                                _add_evidence(evidence_by_cause["TOOL"], seen_ev["TOOL"], step.step_id, lineno, res_txt, active_redactor)
+                            if (is_err or _MISSING_PATH_ERR_RE.search(res_txt)) and tname == "Read":
+                                fpath = _normalize_repo_rel(str(tinput.get("file_path") or ""), repo_root, init_cwd)
+                                if fpath and not any(m["path"] == fpath and m["step"] == step.step_id for m in missing_path_reads):
+                                    missing_path_reads.append({"step": step.step_id, "line": lineno, "path": fpath})
+                                    if fpath in brief_named_paths or any(fpath.endswith("/" + b) or b.endswith("/" + fpath) or fpath == b for b in brief_named_paths):
+                                        scores["BRIEF"] += 3
+                                        _add_evidence(evidence_by_cause["BRIEF"], seen_ev["BRIEF"], step.step_id, lineno, f"Missing brief-named path '{fpath}': {res_txt}", active_redactor)
+                                    else:
+                                        scores["CONTEXT"] += 2
+                                        _add_evidence(evidence_by_cause["CONTEXT"], seen_ev["CONTEXT"], step.step_id, lineno, f"Missing path '{fpath}': {res_txt}", active_redactor)
+                            if is_err and _QUOTA_NET_RE.search(res_txt):
+                                quota_net_detected = True
+                                scores["ENV"] += 3
+                                _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, lineno, res_txt, active_redactor)
+                            if is_err and _TIMEOUT_TEXT_RE.search(res_txt):
+                                timeout_detected = True
+                                scores["ENV"] += 3
+                                _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, lineno, res_txt, active_redactor)
+                            cm = _COMPILER_UNDECLARED_RE.search(res_txt)
+                            if cm:
+                                sym = next((g for g in cm.groups() if g), "")
+                                if sym and (repo_root is None or sym not in repo_symbols):
+                                    missing_symbols.append({"step": step.step_id, "line": lineno, "symbol": sym, "source": "compiler"})
+                                    scores["CONTEXT"] += 2
+                                    _add_evidence(evidence_by_cause["CONTEXT"], seen_ev["CONTEXT"], step.step_id, lineno, res_txt, active_redactor)
+                elif ev_type == "result":
+                    denials = ev.get("permission_denials", [])
+                    if isinstance(denials, list):
+                        for denial in denials:
+                            denied_calls.append({"step": step.step_id, "line": lineno, "tool": str(denial), "reason": "permission_denials"})
+                            scores["TOOL"] += 3
+                            _add_evidence(evidence_by_cause["TOOL"], seen_ev["TOOL"], step.step_id, lineno, f"Permission denial: {denial}", active_redactor)
+                    res_txt = str(ev.get("result") or "")
+                    is_res_err = bool(ev.get("is_error", False)) or str(ev.get("subtype", "")) in ("error", "error_max_turns", "error_during_execution")
+                    if is_res_err or step.status != "ok":
+                        if _TIMEOUT_TEXT_RE.search(res_txt):
+                            timeout_detected = True
+                            scores["ENV"] += 4
+                            _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, lineno, res_txt, active_redactor)
+                        if _QUOTA_NET_RE.search(res_txt):
+                            quota_net_detected = True
+                            scores["ENV"] += 4
+                            _add_evidence(evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, lineno, res_txt, active_redactor)
+                        if _DENIED_ERR_RE.search(res_txt):
+                            scores["TOOL"] += 3
+                            _add_evidence(evidence_by_cause["TOOL"], seen_ev["TOOL"], step.step_id, lineno, res_txt, active_redactor)
+
+    # Search-before-edit threshold
+    if search_calls_before_first_edit >= 5:
+        scores["CONTEXT"] += 3 if search_calls_before_first_edit >= 8 else 2
+        _add_evidence(
+            evidence_by_cause["CONTEXT"],
+            seen_ev["CONTEXT"],
+            record.steps[0].step_id if record.steps else "01",
+            1,
+            f"High search count before first edit ({search_calls_before_first_edit} search calls)",
+            active_redactor,
+        )
+
+    # Prompt over context window
+    effective_prompt_tokens = max(prompt_tokens_est, max_step_tokens_in)
+    if context_window is not None and effective_prompt_tokens > context_window:
+        prompt_over_context = True
+        scores["TOOL"] += 4
+        _add_evidence(
+            evidence_by_cause["TOOL"],
+            seen_ev["TOOL"],
+            record.steps[0].step_id if record.steps else "01",
+            1,
+            f"Prompt/input tokens ({effective_prompt_tokens}) exceeded engine context window ({context_window})",
+            active_redactor,
+        )
+
+    # Skill not triggered when lint findings occurred
+    if lint_findings_count > 0 and not skill_triggers:
+        scores["SKILL"] += 2
+        _add_evidence(
+            evidence_by_cause["SKILL"],
+            seen_ev["SKILL"],
+            "gate",
+            1,
+            f"{lint_findings_count} lint finding(s) with zero skill trigger events",
+            active_redactor,
+        )
+
+    # Determine if run failed or required rework
+    outcome_low = record.outcome.lower()
+    is_clean_pass = (
+        outcome_low in ("pass", "ok", "approved", "verdict: approve")
+        and not gate_failed
+        and not test_lock_failed
+        and not scope_violated
+        and not timeout_detected
+        and not quota_net_detected
+        and not denied_calls
+        and not prompt_over_context
+        and len(record.steps) <= 2
+    )
+    if not is_clean_pass and all(v == 0 for v in scores.values()):
+        scores["MODEL"] = 1
+        _add_evidence(
+            evidence_by_cause["MODEL"],
+            seen_ev["MODEL"],
+            record.steps[-1].step_id if record.steps else "run",
+            1,
+            f"Run outcome '{record.outcome}' failed without BRIEF/CONTEXT/SKILL/TOOL/ENV markers",
+            active_redactor,
+        )
+    elif not is_clean_pass and (gate_failed or "agent_error" in outcome_low or "fail" in outcome_low or "escalate" in outcome_low):
+        if scores["MODEL"] == 0:
+            scores["MODEL"] = 1
+
+    ranked = sorted(
+        ((cause, sc) for cause, sc in scores.items() if sc > 0),
+        key=lambda kv: (-kv[1], CAUSE_TAXONOMY.index(kv[0])),
+    )
+
+    suspected_cause: str | None = None
+    secondary: str | None = None
+    confidence = "low"
+    evidence: list[dict[str, Any]] = []
+
+    if not is_clean_pass and ranked:
+        suspected_cause, top_score = ranked[0]
+        if len(ranked) > 1 and ranked[1][1] >= 2:
+            secondary = ranked[1][0]
+        if top_score >= 3:
+            confidence = "high"
+        elif top_score == 2:
+            confidence = "medium"
+        else:
+            confidence = "low"
+        evidence = list(evidence_by_cause[suspected_cause])
+        if secondary:
+            evidence.extend(evidence_by_cause[secondary])
+
+    signals: dict[str, Any] = {
+        "outcome": record.outcome,
+        "tool_calls_by_kind": tool_calls_by_kind,
+        "search_calls_before_first_edit": search_calls_before_first_edit,
+        "files_read": files_read_list,
+        "files_touched": files_touched_list,
+        "files_read_vs_touched": {
+            "read_count": len(files_read_list),
+            "touched_count": len(files_touched_list),
+            "overlap_count": len(files_read_set & files_touched_set),
+        },
+        "missing_path_reads": missing_path_reads,
+        "prompt_missing_paths": prompt_missing_paths,
+        "denied_calls": denied_calls,
+        "missing_symbols": missing_symbols,
+        "skill_triggers": skill_triggers,
+        "prompt_tokens_est": prompt_tokens_est,
+        "max_step_tokens_in": max_step_tokens_in,
+        "context_window": context_window,
+        "prompt_over_context": prompt_over_context,
+        "tool_protocol_errors": record.total_protocol_errors,
+        "timeout": timeout_detected,
+        "quota_or_network_error": quota_net_detected,
+        "not_found_claims": not_found_claims,
+        "lint_findings": lint_findings_count,
+        "brief_lint_findings": brief_lint_findings,
+    }
+
+    attribution_path = run_dir / "attribution.json"
+    existing_confirmed: list[dict[str, Any]] = []
+    if attribution_path.is_file():
+        try:
+            old = json.loads(attribution_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(old, dict) and isinstance(old.get("confirmed"), list):
+                existing_confirmed = old["confirmed"]
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    result: dict[str, Any] = {
+        "run_id": record.run_id,
+        "suspected_cause": suspected_cause,
+        "secondary": secondary,
+        "confidence": confidence,
+        "signals": active_redactor.redact_value(signals),
+        "evidence": evidence,
+        "analyzed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if existing_confirmed:
+        result["confirmed"] = existing_confirmed
+
+    if write:
+        attribution_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    return result
+
+
+def attribute_run_dir(
+    run_dir: pathlib.Path,
+    *,
+    cause: str,
+    note: str,
+    by: str,
+    secondary: str | None = None,
+    redactor: Redactor | None = None,
+) -> dict[str, Any]:
+    """Validate human failure attribution against ``CAUSE_TAXONOMY`` and append to ``attribution.json``."""
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+    cause_norm = cause.strip().upper()
+    if cause_norm not in CAUSE_TAXONOMY:
+        raise ValueError(
+            f"Invalid --cause '{cause}' (must be one of {', '.join(CAUSE_TAXONOMY)})"
+        )
+
+    sec_norm: str | None = None
+    if secondary is not None and secondary.strip():
+        sec_norm = secondary.strip().upper()
+        if sec_norm not in CAUSE_TAXONOMY:
+            raise ValueError(
+                f"Invalid --secondary '{secondary}' (must be one of {', '.join(CAUSE_TAXONOMY)})"
+            )
+        if sec_norm == cause_norm:
+            raise ValueError("--secondary must differ from --cause")
+
+    if not note.strip():
+        raise ValueError("--note must be a non-empty string")
+    if not by.strip():
+        raise ValueError("--by must be a non-empty string")
+
+    active_redactor = redactor or Redactor()
+    attribution_path = run_dir / "attribution.json"
+    if attribution_path.is_file():
+        try:
+            data = json.loads(attribution_path.read_text(encoding="utf-8", errors="replace"))
+            if not isinstance(data, dict):
+                data = {}
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in {attribution_path}: {exc}") from exc
+    else:
+        data = analyze_run_dir(run_dir, redactor=active_redactor, write=False)
+
+    confirmed = data.get("confirmed")
+    if not isinstance(confirmed, list):
+        confirmed = []
+
+    entry = {
+        "cause": cause_norm,
+        "secondary": sec_norm,
+        "note": active_redactor.redact(note.strip()),
+        "by": active_redactor.redact(by.strip()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    confirmed.append(entry)
+    data["confirmed"] = confirmed
+    attribution_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return data
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build and return the CLI argument parser for ``devpack_logs.py``."""
     common = argparse.ArgumentParser(add_help=False)
@@ -1752,6 +2583,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Root directory containing run subdirectories.",
     )
 
+    p_analyze = subparsers.add_parser(
+        "analyze",
+        parents=[common],
+        help="Compute deterministic failure attribution heuristics and write attribution.json.",
+    )
+    p_analyze.add_argument("run_dir", help="Path to the run directory.")
+    p_analyze.add_argument(
+        "--repo",
+        default="",
+        help="Optional repository root for path and C/C++ symbol existence checks.",
+    )
+    p_analyze.add_argument(
+        "--engines",
+        default="",
+        help="Optional path to engines.toml for context_tokens lookup.",
+    )
+    p_analyze.add_argument(
+        "--json",
+        action="store_true",
+        help="Print attribution JSON to stdout.",
+    )
+
+    p_attr = subparsers.add_parser(
+        "attribute",
+        parents=[common],
+        help="Record human-confirmed failure attribution cause in attribution.json.",
+    )
+    p_attr.add_argument("run_dir", help="Path to the run directory.")
+    p_attr.add_argument(
+        "--cause",
+        required=True,
+        help=f"Primary cause ({', '.join(CAUSE_TAXONOMY)}).",
+    )
+    p_attr.add_argument(
+        "--secondary",
+        default="",
+        help=f"Optional secondary cause ({', '.join(CAUSE_TAXONOMY)}).",
+    )
+    p_attr.add_argument("--note", required=True, help="Explanation note for confirmation.")
+    p_attr.add_argument("--by", required=True, help="Name or role of the confirming human.")
+
     return parser
 
 
@@ -1833,6 +2705,53 @@ def main(argv: Sequence[str] | None = None) -> int:
                 write_rendered_outputs(rec, rec.run_dir, full=bool(args.full))
             site_html = render_site_index_html(records)
             (runs_root / "index.html").write_text(site_html, encoding="utf-8")
+            return 0
+
+        if args.subcommand == "analyze":
+            run_dir = pathlib.Path(args.run_dir)
+            repo_root = pathlib.Path(args.repo) if args.repo else None
+            if repo_root is not None and not repo_root.is_dir():
+                print(f"ERROR: repo directory not found: {repo_root}", file=sys.stderr)
+                return 2
+            engines_cfg = pathlib.Path(args.engines) if args.engines else None
+            if engines_cfg is not None and not engines_cfg.is_file():
+                print(f"ERROR: engines config not found: {engines_cfg}", file=sys.stderr)
+                return 2
+            res = analyze_run_dir(
+                run_dir,
+                repo_root=repo_root,
+                engines_config=engines_cfg,
+                redactor=redactor,
+                write=True,
+            )
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(
+                    f"attribution: cause={res['suspected_cause']} "
+                    f"secondary={res['secondary']} confidence={res['confidence']} "
+                    f"-> {run_dir / 'attribution.json'}"
+                )
+            return 0
+
+        if args.subcommand == "attribute":
+            run_dir = pathlib.Path(args.run_dir)
+            if not run_dir.is_dir():
+                print(f"ERROR: Run directory not found: {run_dir}", file=sys.stderr)
+                return 1
+            try:
+                res = attribute_run_dir(
+                    run_dir,
+                    cause=args.cause,
+                    secondary=args.secondary or None,
+                    note=args.note,
+                    by=args.by,
+                    redactor=redactor,
+                )
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 2
+            print(json.dumps(res["confirmed"][-1], indent=2))
             return 0
 
     except (FileNotFoundError, ValueError, OSError) as exc:

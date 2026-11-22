@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","cwd":"/tmp/work","model":"claude-haiku-5-5"}
+{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"t_den1","name":"Bash","input":{"command":"bash build_and_test.sh"}}],"usage":{"input_tokens":300,"output_tokens":20}}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t_den1","is_error":true,"content":"Permission denied: Bash tool is not allowed in current mode"}]}}
+{"type":"result","subtype":"error","is_error":true,"num_turns":1,"duration_ms":900,"total_cost_usd":0.001,"permission_denials":[{"tool_name":"Bash"}],"usage":{"input_tokens":300,"output_tokens":30},"result":"Permission denied for Bash."}

@@ -1,0 +1,2 @@
+src/link_state_machine.cpp:42: error: use of undeclared identifier 'phantomRecoverLink'
+GATE_FAIL
