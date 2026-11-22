@@ -2,10 +2,9 @@
 
 Category: review
 Tier: v2
-Status: rebuilding
 
 ## Goal
-Review `review.patch` against REQ-LINK-006. Write `REVIEW.md` with a review-taxonomy table; identify the seeded defect by function name. The final line must be `VERDICT: REQUEST_CHANGES`.
+Review `review.patch` against `REQ-LINK-006` in `docs/spec.md`. Write `REVIEW.md` with a markdown review-taxonomy table (`| ID | Category | Severity | file:line | Problem (with evidence) | Required fix |` using categories `COR`, `REQ`, `TST`, `GAT`, `MIS`, `DOC`, `IFC`, `CPX`, `SEC`, `PRV` and severities `blocker`, `major`, `minor`), citing the exact `file:line` and function name for any finding. End `REVIEW.md` with either `VERDICT: REQUEST_CHANGES` (if any `blocker` or `major` finding exists) or `VERDICT: APPROVE` as the last line.
 
 ## Files allowed
 - `REVIEW.md`

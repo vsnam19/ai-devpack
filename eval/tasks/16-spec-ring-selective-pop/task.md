@@ -2,10 +2,9 @@
 
 Category: spec-driven
 Tier: v2
-Status: rebuilding
 
 ## Goal
-Implement REQ-RING-005. Add tests carrying `@req REQ-RING-005` trace tags for non-match, first-match, and wrap-around cases.
+Implement `REQ-RING-005` (`FrameRingBuffer::popByCanId`) as defined in `docs/spec.md`. Add unit tests in tests/test_ring_buffer.cpp carrying `@req REQ-RING-005` trace tags covering null/empty rejection, non-match, duplicate-ID FIFO order, and circular wrap-around compaction.
 
 ## Files allowed
 - `include/ring_buffer.hpp`

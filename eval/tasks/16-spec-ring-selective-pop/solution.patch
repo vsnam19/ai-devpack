@@ -1,0 +1,98 @@
+diff --git a/include/ring_buffer.hpp b/include/ring_buffer.hpp
+index 098131f..16db6c3 100644
+--- a/include/ring_buffer.hpp
++++ b/include/ring_buffer.hpp
+@@ -62,6 +62,14 @@ public:
+      */
+     bool pop(CanFrame* frameOut) noexcept;
+ 
++    /**
++     * @brief Extract the oldest buffered frame matching canId while preserving FIFO order.
++     * @param[in] canId CAN identifier to search for from oldest to newest frame.
++     * @param[out] frameOut Destination pointer receiving the extracted frame.
++     * @return True if a matching frame was found and removed, false otherwise.
++     */
++    bool popByCanId(std::uint32_t canId, CanFrame* frameOut) noexcept;
++
+     /**
+      * @brief Copy the oldest frame without removing it from the buffer.
+      * @param[out] frameOut Destination pointer receiving the oldest frame.
+diff --git a/src/ring_buffer.cpp b/src/ring_buffer.cpp
+index 0b7dc0b..ff0bfe0 100644
+--- a/src/ring_buffer.cpp
++++ b/src/ring_buffer.cpp
+@@ -68,6 +68,33 @@ bool FrameRingBuffer::pop(CanFrame* frameOut) noexcept {
+     return true;
+ }
+ 
++bool FrameRingBuffer::popByCanId(std::uint32_t canId, CanFrame* frameOut) noexcept {
++    if (frameOut == nullptr || m_count == 0U) {
++        return false;
++    }
++    std::size_t foundOffset = m_count;
++    for (std::size_t i = 0U; i < m_count; ++i) {
++        const std::size_t idx = (m_tail + i) % m_capacity;
++        if (m_storage[idx].canId == canId) {
++            foundOffset = i;
++            break;
++        }
++    }
++    if (foundOffset >= m_count) {
++        return false;
++    }
++    const std::size_t matchIdx = (m_tail + foundOffset) % m_capacity;
++    *frameOut = m_storage[matchIdx];
++    for (std::size_t i = foundOffset; i + 1U < m_count; ++i) {
++        const std::size_t dstIdx = (m_tail + i) % m_capacity;
++        const std::size_t srcIdx = (m_tail + i + 1U) % m_capacity;
++        m_storage[dstIdx] = m_storage[srcIdx];
++    }
++    --m_count;
++    m_head = (m_tail + m_count) % m_capacity;
++    return true;
++}
++
+ bool FrameRingBuffer::peek(CanFrame* frameOut) const noexcept {
+     if (frameOut == nullptr || m_count == 0U) {
+         return false;
+diff --git a/tests/test_ring_buffer.cpp b/tests/test_ring_buffer.cpp
+index 843ff85..4cb0cc2 100644
+--- a/tests/test_ring_buffer.cpp
++++ b/tests/test_ring_buffer.cpp
+@@ -104,12 +104,36 @@ void testRingBufferPeekAndClear() {
+     CHECK_EQ(ring.droppedCount(), static_cast<std::size_t>(0U));
+ }
+ 
++/**
++ * @brief Verify popByCanId handles non-match, first-match FIFO, and wrap-around.
++ * @req REQ-RING-005
++ */
++void testRingBufferPopByCanId() {
++    FrameRingBuffer ring(3U);
++    CanFrame out{0U, 0U, {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U}};
++    CHECK(!ring.popByCanId(0x100U, &out));
++    CHECK(ring.push(makeSampleFrame(0x100U, 1U)));
++    CHECK(ring.push(makeSampleFrame(0x200U, 2U)));
++    CHECK(ring.push(makeSampleFrame(0x100U, 3U)));
++    CHECK(!ring.popByCanId(0x999U, &out));
++    CHECK(ring.pop(&out));
++    CHECK(ring.push(makeSampleFrame(0x300U, 4U)));
++    CHECK(ring.popByCanId(0x100U, &out));
++    CHECK_EQ(out.payload[0], static_cast<std::uint8_t>(3U));
++    CHECK_EQ(ring.size(), static_cast<std::size_t>(2U));
++    CHECK(ring.pop(&out));
++    CHECK_EQ(out.canId, 0x200U);
++    CHECK(ring.pop(&out));
++    CHECK_EQ(out.canId, 0x300U);
++}
++
+ }  // namespace
+ 
+ void runRingBufferTests() {
+     testRingBufferFifoAndFullRejection();
+     testRingBufferPushOverwrite();
+     testRingBufferPeekAndClear();
++    testRingBufferPopByCanId();
+ }
+ 
+ }  // namespace can_fixture_test

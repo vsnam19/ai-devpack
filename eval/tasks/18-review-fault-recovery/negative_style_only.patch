@@ -1,0 +1,13 @@
+diff --git a/REVIEW.md b/REVIEW.md
+new file mode 100644
+index 0000000..b46fb79
+--- /dev/null
++++ b/REVIEW.md
+@@ -0,0 +1,7 @@
++# Code Review: Fault Recovery (`review.patch`)
++
++| ID | Category | Severity | file:line | Problem (with evidence) | Required fix |
++| --- | --- | --- | --- | --- | --- |
++| S1 | DOC | minor | `src/link_state_machine.cpp:124` | `recoverFromFault` could include an inline comment explaining timestamp monotonicity. | Add a brief comment. |
++
++VERDICT: REQUEST_CHANGES

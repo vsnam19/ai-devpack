@@ -1,0 +1,70 @@
+diff --git a/include/dtc_debouncer.hpp b/include/dtc_debouncer.hpp
+index bd617c6..737df0e 100644
+--- a/include/dtc_debouncer.hpp
++++ b/include/dtc_debouncer.hpp
+@@ -106,6 +106,12 @@ public:
+      */
+     bool isConfirmed() const noexcept;
+ 
++    /**
++     * @brief Return remaining positive counter distance before fault confirmation.
++     * @return Zero if config is invalid or fault is confirmed/healing, else confirmThreshold - counter().
++     */
++    std::int16_t remainingToConfirm() const noexcept;
++
+ private:
+     DtcConfig m_config;
+     DtcState m_state;
+diff --git a/src/dtc_debouncer.cpp b/src/dtc_debouncer.cpp
+index ed31f39..a26ad94 100644
+--- a/src/dtc_debouncer.cpp
++++ b/src/dtc_debouncer.cpp
+@@ -105,4 +105,13 @@ bool DtcDebouncer::isConfirmed() const noexcept {
+     return m_isLatched;
+ }
+ 
++std::int16_t DtcDebouncer::remainingToConfirm() const noexcept {
++    if (!isConfigValid() || m_isLatched || m_counter >= m_config.confirmThreshold) {
++        return 0;
++    }
++    const std::int32_t margin =
++        static_cast<std::int32_t>(m_config.confirmThreshold) - static_cast<std::int32_t>(m_counter);
++    return static_cast<std::int16_t>(margin);
++}
++
+ }  // namespace can_fixture
+diff --git a/tests/test_dtc_debouncer.cpp b/tests/test_dtc_debouncer.cpp
+index 517f3f8..75c3c03 100644
+--- a/tests/test_dtc_debouncer.cpp
++++ b/tests/test_dtc_debouncer.cpp
+@@ -141,6 +141,22 @@ void testResetAndUnconfirmedPassRecovery() {
+     CHECK(!debouncer.isConfirmed());
+ }
+ 
++/**
++ * @brief Verify remainingToConfirm for invalid config, pending, and confirmed states.
++ * @req REQ-DTC-006
++ */
++void testRemainingToConfirmMargin() {
++    DtcDebouncer invalid(DtcConfig{0, 0, 1, 1, 1U});
++    CHECK_EQ(invalid.remainingToConfirm(), static_cast<std::int16_t>(0));
++    DtcDebouncer debouncer(DtcConfig{10, -4, 4, 2, 2U});
++    CHECK_EQ(debouncer.remainingToConfirm(), static_cast<std::int16_t>(10));
++    CHECK_EQ(debouncer.reportSample(true), DtcState::Pending);
++    CHECK_EQ(debouncer.remainingToConfirm(), static_cast<std::int16_t>(6));
++    CHECK_EQ(debouncer.reportSample(true), DtcState::Pending);
++    CHECK_EQ(debouncer.reportSample(true), DtcState::Confirmed);
++    CHECK_EQ(debouncer.remainingToConfirm(), static_cast<std::int16_t>(0));
++}
++
+ }  // namespace
+ 
+ void runDtcDebouncerTests() {
+@@ -148,6 +164,7 @@ void runDtcDebouncerTests() {
+     testPendingAndConfirmDebounceThresholds();
+     testOperationCycleAgingAndHealing();
+     testResetAndUnconfirmedPassRecovery();
++    testRemainingToConfirmMargin();
+ }
+ 
+ }  // namespace can_fixture_test

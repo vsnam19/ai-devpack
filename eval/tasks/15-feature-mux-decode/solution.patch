@@ -1,0 +1,97 @@
+diff --git a/include/can_codec.hpp b/include/can_codec.hpp
+index ca3e8de..250220d 100644
+--- a/include/can_codec.hpp
++++ b/include/can_codec.hpp
+@@ -133,6 +133,22 @@ bool decodePhysical(
+     std::size_t frameLength,
+     double* physicalOut) noexcept;
+ 
++/**
++ * @brief Decode a multiplexed physical signal value when the selector signal matches expectedMuxValue.
++ * @param[in] muxSelectorSignal Unsigned selector signal descriptor (bitLength in [1, 16]).
++ * @param[in] expectedMuxValue Expected raw selector value enabling decoding.
++ * @param[in] valueSignal Payload value signal descriptor to decode on selector match.
++ * @param[in] frameBytes Source 8-byte CAN frame buffer.
++ * @param[out] physicalOut Destination pointer receiving decoded physical value on match.
++ * @return True if selector matched and valueSignal decoded successfully, false otherwise.
++ */
++bool decodeMultiplexedPhysical(
++    const SignalDef& muxSelectorSignal,
++    std::uint64_t expectedMuxValue,
++    const SignalDef& valueSignal,
++    const std::uint8_t* frameBytes,
++    double* physicalOut) noexcept;
++
+ }  // namespace can_fixture
+ 
+ #endif  // CAN_FIXTURE_CAN_CODEC_HPP
+diff --git a/src/can_codec.cpp b/src/can_codec.cpp
+index c96dd47..2af389f 100644
+--- a/src/can_codec.cpp
++++ b/src/can_codec.cpp
+@@ -220,4 +220,29 @@ bool decodePhysical(
+     return true;
+ }
+ 
++bool decodeMultiplexedPhysical(
++    const SignalDef& muxSelectorSignal,
++    std::uint64_t expectedMuxValue,
++    const SignalDef& valueSignal,
++    const std::uint8_t* frameBytes,
++    double* physicalOut) noexcept {
++    if (!isValidSignal(muxSelectorSignal) || !isValidSignal(valueSignal)) {
++        return false;
++    }
++    if (muxSelectorSignal.isSigned || muxSelectorSignal.bitLength > 16U) {
++        return false;
++    }
++    if (frameBytes == nullptr || physicalOut == nullptr) {
++        return false;
++    }
++    std::uint64_t actualMux = 0ULL;
++    if (!unpackRaw(muxSelectorSignal, frameBytes, kMaxFrameBytes, &actualMux)) {
++        return false;
++    }
++    if (actualMux != expectedMuxValue) {
++        return false;
++    }
++    return decodePhysical(valueSignal, frameBytes, kMaxFrameBytes, physicalOut);
++}
++
+ }  // namespace can_fixture
+diff --git a/tests/test_can_codec.cpp b/tests/test_can_codec.cpp
+index bc4e33c..f68c088 100644
+--- a/tests/test_can_codec.cpp
++++ b/tests/test_can_codec.cpp
+@@ -130,6 +130,23 @@ void testPhysicalScalingAndClamping() {
+     CHECK_NEAR(decodedTemp, -40.0, 1e-6);
+ }
+ 
++/**
++ * @brief Verify decodeMultiplexedPhysical selector match, mismatch, and guard checks.
++ * @req REQ-CODEC-008
++ */
++void testMultiplexedSignalDecoding() {
++    std::array<std::uint8_t, kMaxFrameBytes> frameBytes{};
++    const SignalDef muxSignal{0U, 8U, Endianness::Little, false, 1.0, 0.0, 0.0, 255.0};
++    const SignalDef valueSignal{8U, 12U, Endianness::Little, true, 0.5, 0.0, -500.0, 500.0};
++    CHECK(can_fixture::packRaw(muxSignal, 5ULL, frameBytes.data(), frameBytes.size()));
++    CHECK(can_fixture::encodePhysical(valueSignal, -42.5, frameBytes.data(), frameBytes.size()));
++    double out = 123.0;
++    CHECK(!can_fixture::decodeMultiplexedPhysical(muxSignal, 4ULL, valueSignal, frameBytes.data(), &out));
++    CHECK_NEAR(out, 123.0, 1e-9);
++    CHECK(can_fixture::decodeMultiplexedPhysical(muxSignal, 5ULL, valueSignal, frameBytes.data(), &out));
++    CHECK_NEAR(out, -42.5, 1e-6);
++}
++
+ }  // namespace
+ 
+ void runCanCodecTests() {
+@@ -138,6 +155,7 @@ void runCanCodecTests() {
+     testBigEndianPackUnpack();
+     testSignedSignalEncodeDecode();
+     testPhysicalScalingAndClamping();
++    testMultiplexedSignalDecoding();
+ }
+ 
+ }  // namespace can_fixture_test

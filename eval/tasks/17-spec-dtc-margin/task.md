@@ -2,10 +2,9 @@
 
 Category: spec-driven
 Tier: v2
-Status: rebuilding
 
 ## Goal
-Implement REQ-DTC-006 and add trace-tagged boundary tests (`@req REQ-DTC-006`) for invalid configuration, pending, and confirmed states.
+Implement `REQ-DTC-006` (`DtcDebouncer::remainingToConfirm`) as defined in `docs/spec.md`, and add trace-tagged boundary unit tests (`@req REQ-DTC-006`) in tests/test_dtc_debouncer.cpp for invalid configuration, negative/pending counters, and confirmed/healing states.
 
 ## Files allowed
 - `include/dtc_debouncer.hpp`

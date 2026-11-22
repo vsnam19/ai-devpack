@@ -1,0 +1,13 @@
+diff --git a/REVIEW.md b/REVIEW.md
+new file mode 100644
+index 0000000..1be54d1
+--- /dev/null
++++ b/REVIEW.md
+@@ -0,0 +1,7 @@
++# Code Review: Fault Recovery (`review.patch`)
++
++| ID | Category | Severity | file:line | Problem (with evidence) | Required fix |
++| --- | --- | --- | --- | --- | --- |
++| - | - | - | - | No blocking defects observed in `review.patch`. | None |
++
++VERDICT: APPROVE

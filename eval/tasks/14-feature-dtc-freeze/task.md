@@ -2,10 +2,9 @@
 
 Category: multi-file-feature
 Tier: v2
-Status: rebuilding
 
 ## Goal
-Implement the monitor freeze control specified by REQ-DTC-005, including boundary tests and Doxygen-compliant public API.
+Implement the diagnostic monitor freeze control (`setFrozen`, `isFrozen`) specified by `REQ-DTC-005` in `docs/spec.md`, including header declaration, source implementation, Doxygen documentation on the public API, and boundary unit tests in tests/test_dtc_debouncer.cpp.
 
 ## Files allowed
 - `include/dtc_debouncer.hpp`

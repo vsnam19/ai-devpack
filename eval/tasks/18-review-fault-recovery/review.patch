@@ -1,10 +1,75 @@
+diff --git a/include/link_state_machine.hpp b/include/link_state_machine.hpp
+index a4da18a..6b413b4 100644
+--- a/include/link_state_machine.hpp
++++ b/include/link_state_machine.hpp
+@@ -106,11 +106,25 @@ public:
+      */
+     std::uint64_t lastTimestampMs() const noexcept;
+ 
++    /**
++     * @brief Attempt controlled recovery from Fault back to Connecting.
++     * @param[in] nowMs Current monotonic timestamp in milliseconds (must be >= lastTimestampMs()).
++     * @return True if recovered from Fault to Connecting, false otherwise.
++     */
++    bool recoverFromFault(std::uint64_t nowMs) noexcept;
++
++    /**
++     * @brief Return the cumulative number of Fault transitions since construction or reset.
++     * @return Total number of transitions into Fault state.
++     */
++    std::uint32_t faultCount() const noexcept;
++
+ private:
+     LinkConfig m_config;
+     LinkState m_state;
+     std::uint64_t m_lastTimestampMs;
+     std::uint8_t m_retryCount;
++    std::uint32_t m_faultCount;
+ };
+ 
+ }  // namespace can_fixture
 diff --git a/src/link_state_machine.cpp b/src/link_state_machine.cpp
-index 000ff0f..745f634 100644
+index 000ff0f..f576bc6 100644
 --- a/src/link_state_machine.cpp
 +++ b/src/link_state_machine.cpp
-@@ -120,0 +121,12 @@ std::uint64_t LinkStateMachine::lastTimestampMs() const noexcept {
-+
-+/* Seeded review defect: recoverFromFault clears m_faultCount. */
+@@ -11,7 +11,8 @@ LinkStateMachine::LinkStateMachine(const LinkConfig& config) noexcept
+     : m_config(config),
+       m_state(LinkState::Idle),
+       m_lastTimestampMs(0ULL),
+-      m_retryCount(0U) {
++      m_retryCount(0U),
++      m_faultCount(0U) {
+ }
+ 
+ bool LinkStateMachine::isConfigValid() const noexcept {
+@@ -66,6 +67,7 @@ LinkState LinkStateMachine::onTick(std::uint64_t nowMs) noexcept {
+                 } else {
+                     m_state = LinkState::Fault;
+                     m_lastTimestampMs = nowMs;
++                    ++m_faultCount;
+                 }
+             }
+             break;
+@@ -86,6 +88,7 @@ LinkState LinkStateMachine::onTick(std::uint64_t nowMs) noexcept {
+                 } else {
+                     m_state = LinkState::Fault;
+                     m_lastTimestampMs = nowMs;
++                    ++m_faultCount;
+                 }
+             }
+             break;
+@@ -103,6 +106,7 @@ void LinkStateMachine::reset() noexcept {
+     m_state = LinkState::Idle;
+     m_lastTimestampMs = 0ULL;
+     m_retryCount = 0U;
++    m_faultCount = 0U;
+ }
+ 
+ LinkState LinkStateMachine::state() const noexcept {
+@@ -117,4 +121,19 @@ std::uint64_t LinkStateMachine::lastTimestampMs() const noexcept {
+     return m_lastTimestampMs;
+ }
+ 
 +bool LinkStateMachine::recoverFromFault(std::uint64_t nowMs) noexcept {
 +    if (m_state != LinkState::Fault || !isConfigValid() || nowMs < m_lastTimestampMs) {
 +        return false;
@@ -15,3 +80,46 @@ index 000ff0f..745f634 100644
 +    m_faultCount = 0U;
 +    return true;
 +}
++
++std::uint32_t LinkStateMachine::faultCount() const noexcept {
++    return m_faultCount;
++}
++
+ }  // namespace can_fixture
+diff --git a/tests/test_link_state_machine.cpp b/tests/test_link_state_machine.cpp
+index 199f640..00c4836 100644
+--- a/tests/test_link_state_machine.cpp
++++ b/tests/test_link_state_machine.cpp
+@@ -112,6 +112,24 @@ void testResetFromAnyState() {
+     CHECK_EQ(machine.state(), LinkState::Connecting);
+ }
+ 
++/**
++ * @brief Verify fault count increments on Fault and recoverFromFault transitions to Connecting.
++ * @req REQ-LINK-006
++ */
++void testFaultCountAndRecoveryTransition() {
++    const LinkConfig config{50U, 100U, 1U};
++    LinkStateMachine machine(config);
++    CHECK_EQ(machine.faultCount(), static_cast<std::uint32_t>(0U));
++    CHECK(!machine.recoverFromFault(10ULL));
++    CHECK(machine.startConnect(10ULL));
++    CHECK_EQ(machine.onTick(60ULL), LinkState::Connecting);
++    CHECK_EQ(machine.onTick(110ULL), LinkState::Fault);
++    CHECK_EQ(machine.faultCount(), static_cast<std::uint32_t>(1U));
++    CHECK(machine.recoverFromFault(120ULL));
++    CHECK_EQ(machine.state(), LinkState::Connecting);
++    CHECK_EQ(machine.retryCount(), static_cast<std::uint8_t>(0U));
++}
++
+ }  // namespace
+ 
+ void runLinkStateMachineTests() {
+@@ -119,6 +137,7 @@ void runLinkStateMachineTests() {
+     testHandshakeRetryAndFault();
+     testHeartbeatSupervisionAndDegradedEscalation();
+     testResetFromAnyState();
++    testFaultCountAndRecoveryTransition();
+ }
+ 
+ }  // namespace can_fixture_test
