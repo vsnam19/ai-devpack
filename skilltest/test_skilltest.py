@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
-import tomllib
+from skilltest.skilltest import load_config
 import unittest
 from pathlib import Path
 
@@ -89,7 +89,7 @@ class SkilltestCliTests(unittest.TestCase):
         """Every declared check rejects its input and accepts its reference output."""
         for name in ("doxygen-naming", "misra-cpp-2023", "review-taxonomy", "skill-authoring"):
             tests = ROOT / "knowledge" / "skills" / name / "tests"
-            config = tomllib.loads((tests / "skilltest.toml").read_text(encoding="utf-8"))
+            config = load_config(tests.parent)
             self.assertGreaterEqual(len(config["behaviour"]), 2, name)
             for case in config["behaviour"]:
                 fixture = case["fixture"].split("/")[-2]
@@ -155,7 +155,7 @@ class SkilltestCliTests(unittest.TestCase):
             )
             fake.chmod(0o755)
             _, passed, _ = _execute_trial(
-                skill, "fake", "do nothing", False, root / "run", fixture, str(fake), "local",
+                skill, "haiku", "do nothing", False, root / "run", fixture, str(fake), "local",
                 "bash check.sh", grader,
             )
             self.assertFalse(passed)

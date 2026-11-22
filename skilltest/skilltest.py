@@ -30,7 +30,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-from runner.agent_exec import AgentRequest, EngineConfig, run_agent
+from runner.agent_exec import AgentRequest, load_engines, run_agent
 
 
 MAX_DESCRIPTION_LENGTH = 1024
@@ -39,13 +39,63 @@ ABSOLUTE_PATH_PATTERN = re.compile(r"(?:^|[\s`(])(?:/(?:Users|home|opt|usr|var|e
 MARKDOWN_LINK_PATTERN = re.compile(r"\]\(([^)]+)\)")
 
 
+def _minimal_toml_loads(text: str) -> dict[str, Any]:
+    """Parse flat TOML scalars and arrays of tables used by skilltest on Python 3.10.
+
+    Support quoted strings, booleans, and integers; reject unsupported syntax.
+    """
+    root: dict[str, Any] = {}
+    current = root
+    for line_number, line in enumerate(text.splitlines(), 1):
+        quote = None
+        escaped = False
+        for index, char in enumerate(line):
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+            elif quote is None and char in ("'", '"'):
+                quote = char
+            elif quote is None and char == '#':
+                line = line[:index]
+                break
+        line = line.strip()
+        if not line:
+            continue
+        table = re.fullmatch(r"\[\[([A-Za-z_][\w-]*)\]\]", line)
+        if table:
+            current = {}
+            root.setdefault(table[1], []).append(current)
+            continue
+        entry = re.fullmatch(r"([A-Za-z_][\w-]*)\s*=\s*(.+)", line)
+        if not entry:
+            raise ValueError(f"unsupported TOML at line {line_number}")
+        key, value = entry.groups()
+        if key in current:
+            raise ValueError(f"duplicate TOML key at line {line_number}")
+        if value in ('true', 'false'):
+            parsed = value == 'true'
+        elif re.fullmatch(r'[+-]?[0-9]+', value):
+            parsed = int(value)
+        elif value.startswith('"') and value.endswith('"'):
+            parsed = json.loads(value)
+        elif value.startswith("'") and value.endswith("'"):
+            parsed = value[1:-1]
+        else:
+            raise ValueError(f"unsupported TOML value at line {line_number}")
+        current[key] = parsed
+    return root
+
+
 def load_config(skill_dir: Path) -> dict[str, Any]:
-    """Load a skill test configuration, returning an empty mapping when unavailable."""
+    """Load a skill test configuration with a Python 3.10 stdlib fallback."""
     config = skill_dir / "tests" / "skilltest.toml"
-    if not config.is_file() or tomllib is None:
+    if not config.is_file():
         return {}
-    with config.open("rb") as handle:
-        return tomllib.load(handle)
+    text = config.read_text(encoding="utf-8")
+    return tomllib.loads(text) if tomllib is not None else _minimal_toml_loads(text)
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, str], list[str], list[str]]:
@@ -100,7 +150,10 @@ def lint_skill(skill_dir: Path) -> list[str]:
                 if not (skill_dir / target).resolve().is_file():
                     errors.append(f"relative link does not resolve: {target}")
     config_path = skill_dir / "tests" / "skilltest.toml"
-    config = load_config(skill_dir)
+    try:
+        config = load_config(skill_dir)
+    except ValueError as error:
+        return [*errors, f"invalid tests/skilltest.toml: {error}"]
     if not config_path.is_file() or not config:
         errors.append("missing tests/skilltest.toml")
         return errors
@@ -115,19 +168,20 @@ def lint_skill(skill_dir: Path) -> list[str]:
         errors.append("requires at least one behaviour case")
     fixtures_root = skill_dir / "tests" / "fixtures"
     input_dirs = list(fixtures_root.glob("*/input")) if fixtures_root.is_dir() else []
-    if input_dirs:
-        declared_inputs = {item.get("fixture") for item in config.get("behaviour", [])}
-        for item in config.get("behaviour", []):
-            fixture = item.get("fixture")
-            grader = item.get("grader")
-            if not isinstance(fixture, str) or not (skill_dir / "tests" / fixture).is_dir():
-                errors.append(f"behaviour fixture does not resolve: {fixture}")
-            if not isinstance(grader, str) or not (skill_dir / "tests" / grader / "check.sh").is_file():
-                errors.append(f"behaviour grader does not resolve: {grader}")
-        for input_dir in input_dirs:
-            relative = input_dir.relative_to(skill_dir / "tests").as_posix()
-            if relative not in declared_inputs:
-                errors.append(f"unreferenced fixture directory: {relative}")
+    declared_inputs = {item.get("fixture") for item in config.get("behaviour", [])}
+    for item in config.get("behaviour", []):
+        fixture = item.get("fixture")
+        grader = item.get("grader")
+        if not isinstance(fixture, str) or not (skill_dir / "tests" / fixture).is_dir():
+            errors.append(f"behaviour fixture does not resolve: {fixture}")
+        if not isinstance(grader, str) or not (skill_dir / "tests" / grader / "check.sh").is_file():
+            errors.append(f"behaviour grader does not resolve: {grader}")
+        if not isinstance(item.get("check"), str) or not item["check"].strip():
+            errors.append("behaviour check must be a non-empty command")
+    for input_dir in input_dirs:
+        relative = input_dir.relative_to(skill_dir / "tests").as_posix()
+        if relative not in declared_inputs:
+            errors.append(f"unreferenced fixture directory: {relative}")
     return errors
 
 
@@ -166,7 +220,7 @@ def _copy_skill(skill_dir: Path, workdir: Path, name: str) -> None:
     """Install one skill at the project location used by Claude Code."""
     target = workdir / ".claude" / "skills" / name
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(skill_dir, target)
+    shutil.copytree(skill_dir, target, ignore=shutil.ignore_patterns("tests", "__pycache__"))
 
 
 def _trial_run_dir(root: Path, label: str) -> Path:
@@ -179,7 +233,8 @@ def _trial_run_dir(root: Path, label: str) -> Path:
 def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run_dir: Path,
                    fixture: Path | None, agent_bin: str, isolation: str,
                    check_command: str | None = None, grader: Path | None = None,
-                   expectations: dict[str, Any] | None = None) -> tuple[bool, bool, dict[str, Any]]:
+                   expectations: dict[str, Any] | None = None,
+                   engines_config: Path | str = REPOSITORY_ROOT / "runner/engines.example.toml") -> tuple[bool, bool, dict[str, Any]]:
     """Run one agent trial and return trigger status plus serialized telemetry."""
     with tempfile.TemporaryDirectory(prefix="skilltest-") as temp:
         workdir = Path(temp) / "work"
@@ -189,7 +244,7 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
         if enabled:
             _copy_skill(skill_dir, workdir, skill_dir.name)
         result = run_agent(AgentRequest(
-            engine=EngineConfig(name=engine, model=engine), prompt=prompt, workdir=workdir,
+            engine=load_engines(engines_config).get_engine(engine), prompt=prompt, workdir=workdir,
             run_dir=run_dir, step_name="skilltest", role="skilltest", skills_enabled=enabled,
             agent_bin=agent_bin, isolation=isolation,
         ))
@@ -238,7 +293,7 @@ def run_experiment(args: argparse.Namespace) -> int:
             for _ in range(args.k):
                 serial += 1
                 triggered, _, telemetry = _execute_trial(skill_dir, engine, case["prompt"], True,
-                    _trial_run_dir(output, f"{serial:03d}-trigger-{engine}"), None, args.agent_bin, args.isolation)
+                    _trial_run_dir(output, f"{serial:03d}-trigger-{engine}"), None, args.agent_bin, args.isolation, engines_config=args.engines_config)
                 trials.append({"engine": engine, "arm": "trigger", "case": case["name"], "expected": case["expect"], "triggered": triggered, "telemetry": telemetry})
         for arm, enabled in (("with_skill", True), ("without_skill", False)):
             for case in config["behaviour"]:
@@ -248,7 +303,8 @@ def run_experiment(args: argparse.Namespace) -> int:
                     serial += 1
                     _, passed, telemetry = _execute_trial(skill_dir, engine, case["prompt"], enabled,
                         _trial_run_dir(output, f"{serial:03d}-{arm}-{engine}"), fixture, args.agent_bin, args.isolation,
-                        case["check"], grader, {key: case[key] for key in ("category", "severity", "verdict") if key in case})
+                        case["check"], grader, {key: case[key] for key in ("category", "severity", "verdict") if key in case},
+                        engines_config=args.engines_config)
                     trials.append({"engine": engine, "arm": arm, "case": case["name"], "passed": passed, "telemetry": telemetry})
     report = {"skill": skill_dir.name, "trials": trials}
     trigger_report: dict[str, Any] = {}
@@ -291,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="run or plan an A/B experiment")
     run.add_argument("skill_dir")
     run.add_argument("--engines", required=True)
+    run.add_argument("--engines-config", default=str(REPOSITORY_ROOT / "runner/engines.example.toml"))
     run.add_argument("--k", type=int, default=3)
     run.add_argument("--isolation", choices=("local", "docker"), default="local")
     run.add_argument("--dry-run", action="store_true")

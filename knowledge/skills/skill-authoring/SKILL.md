@@ -14,7 +14,7 @@ Write for the weakest intended model. A skill is a short, executable instruction
 5. Put optional detail in `references/` and link it relatively. Never include absolute paths, credentials, tokens, or personal data.
 6. Make every rule observable: pair it with an output, command, or check.
 7. Add the skill test configuration before declaring the skill ready. Include at least two prompts that should trigger, two that should not, and one behaviour case.
-8. Run `python3 skilltest/skilltest.py lint <skill-dir>`. Then inspect `skilltest run --dry-run`; ask before a paid run.
+8. Run `python3 skilltest/skilltest.py lint <skill-dir>`. Then inspect `python3 skilltest/skilltest.py run <skill-dir> --engines haiku,sonnet --dry-run`; ask before a paid run.
 
 ## Worked example
 

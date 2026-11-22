@@ -23,9 +23,12 @@ expect = false
 
 [[behaviour]]
 name = "output meets rule"
-fixture = "fixtures/input"
+fixture = "fixtures/example/input"
+grader = "graders/example"
 prompt = "edit the fixture to meet the skill rule"
-check = "bash check.sh ."
+check = "bash check.sh"
 ```
 
 Supply two positive and two negative trigger entries. The fixture must initially fail its check. Store a corrected copy under the tests/expected/ directory; add a unit test that proves the check passes there.
+
+Run the check from the grader directory. The harness appends the candidate work directory as the LAST argument; read it with `"${@: -1}"`. Keep graders and expected outputs under `tests/`, outside the installed skill.

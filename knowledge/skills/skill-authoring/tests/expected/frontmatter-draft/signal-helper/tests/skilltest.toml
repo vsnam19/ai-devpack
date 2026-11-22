@@ -16,6 +16,7 @@ prompt = "review this patch"
 expect = false
 [[behaviour]]
 name = "summary"
-fixture = "fixtures/input"
+fixture = "fixtures/summary/input"
+grader = "graders/summary"
 prompt = "summarize the supplied signal"
-check = "test -f SUMMARY.md"
+check = "bash check.sh"
