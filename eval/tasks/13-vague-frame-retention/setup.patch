@@ -1,0 +1,70 @@
+diff --git a/src/can_codec.cpp b/src/can_codec.cpp
+index c96dd47..fdac4f4 100644
+--- a/src/can_codec.cpp
++++ b/src/can_codec.cpp
+@@ -87,6 +87,12 @@ bool packRaw(
+         return false;
+     }
+     const std::uint64_t maskedValue = rawValue & computeBitMask(signal.bitLength);
++    if (signal.endianness == Endianness::Little &&
++        (signal.startBit % 8U) == 0U &&
++        signal.bitLength <= 8U) {
++        frameBytes[signal.startBit / 8U] = static_cast<std::uint8_t>(maskedValue);
++        return true;
++    }
+     for (std::uint8_t i = 0U; i < signal.bitLength; ++i) {
+         std::size_t byteIndex = 0U;
+         std::uint8_t bitInByte = 0U;
+diff --git a/tests/test_ring_buffer.cpp b/tests/test_ring_buffer.cpp
+index 843ff85..8225c77 100644
+--- a/tests/test_ring_buffer.cpp
++++ b/tests/test_ring_buffer.cpp
+@@ -104,12 +104,48 @@ void testRingBufferPeekAndClear() {
+     CHECK_EQ(ring.droppedCount(), static_cast<std::size_t>(0U));
+ }
+ 
++
++/**
++ * @brief Verify sustained pushOverwrite retention preserves co-packed payload signals.
++ * @req REQ-RING-002
++ */
++void testRetainedBurstPreservesCoPackedSignals() {
++    using can_fixture::Endianness;
++    using can_fixture::kMaxFrameBytes;
++    using can_fixture::SignalDef;
++
++    const SignalDef statusNibble{0U, 4U, Endianness::Little, false, 1.0, 0.0, 0.0, 15.0};
++    const SignalDef counterNibble{4U, 4U, Endianness::Little, false, 1.0, 0.0, 0.0, 15.0};
++
++    FrameRingBuffer ring(2U);
++    for (std::uint32_t seq = 0U; seq < 4U; ++seq) {
++        CanFrame frame{0x400U + seq, 8U, {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U}};
++        CHECK(can_fixture::packRaw(counterNibble, seq + 5ULL, frame.payload, kMaxFrameBytes));
++        CHECK(can_fixture::packRaw(statusNibble, seq + 1ULL, frame.payload, kMaxFrameBytes));
++        CHECK_EQ(ring.pushOverwrite(frame), seq >= 2U);
++    }
++
++    CHECK_EQ(ring.droppedCount(), static_cast<std::size_t>(2U));
++    for (std::uint32_t expectedSeq = 2U; expectedSeq < 4U; ++expectedSeq) {
++        CanFrame retained{0U, 0U, {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U}};
++        CHECK(ring.pop(&retained));
++        CHECK_EQ(retained.canId, 0x400U + expectedSeq);
++        std::uint64_t counterRaw = 0ULL;
++        std::uint64_t statusRaw = 0ULL;
++        CHECK(can_fixture::unpackRaw(counterNibble, retained.payload, kMaxFrameBytes, &counterRaw));
++        CHECK(can_fixture::unpackRaw(statusNibble, retained.payload, kMaxFrameBytes, &statusRaw));
++        CHECK_EQ(counterRaw, static_cast<std::uint64_t>(expectedSeq + 5U));
++        CHECK_EQ(statusRaw, static_cast<std::uint64_t>(expectedSeq + 1U));
++    }
++}
++
+ }  // namespace
+ 
+ void runRingBufferTests() {
+     testRingBufferFifoAndFullRejection();
+     testRingBufferPushOverwrite();
+     testRingBufferPeekAndClear();
++    testRetainedBurstPreservesCoPackedSignals();
+ }
+ 
+ }  // namespace can_fixture_test

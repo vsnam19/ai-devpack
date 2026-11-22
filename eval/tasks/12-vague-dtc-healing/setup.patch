@@ -1,0 +1,13 @@
+diff --git a/src/dtc_debouncer.cpp b/src/dtc_debouncer.cpp
+index ed31f39..60aeb94 100644
+--- a/src/dtc_debouncer.cpp
++++ b/src/dtc_debouncer.cpp
+@@ -71,7 +71,7 @@ bool DtcDebouncer::onOperationCycleEnd() noexcept {
+         return false;
+     }
+     ++m_healingCounter;
+-    if (m_healingCounter >= m_config.agingThreshold) {
++    if (m_state == DtcState::Healing && m_healingCounter >= m_config.agingThreshold) {
+         m_isLatched = false;
+         m_healingCounter = 0U;
+         m_counter = 0;

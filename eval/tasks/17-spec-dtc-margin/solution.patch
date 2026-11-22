@@ -1,6 +1,0 @@
-diff --git a/.eval_v2_17-spec-dtc-margin.md b/.eval_v2_17-spec-dtc-margin.md
-new file mode 100644
---- /dev/null
-+++ b/.eval_v2_17-spec-dtc-margin.md
-@@ -0,0 +1 @@
-+REQ-DTC-006: remaining confirmation margin is zero after latching.

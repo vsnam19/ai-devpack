@@ -1,6 +1,0 @@
-diff --git a/.eval_v2_16-spec-ring-selective-pop.md b/.eval_v2_16-spec-ring-selective-pop.md
-new file mode 100644
---- /dev/null
-+++ b/.eval_v2_16-spec-ring-selective-pop.md
-@@ -0,0 +1 @@
-+REQ-RING-005: first matching frame is removed while FIFO order remains.

@@ -1,6 +1,0 @@
-diff --git a/.eval_v2_15-feature-mux-decode.md b/.eval_v2_15-feature-mux-decode.md
-new file mode 100644
---- /dev/null
-+++ b/.eval_v2_15-feature-mux-decode.md
-@@ -0,0 +1 @@
-+REQ-CODEC-008: selector mismatch leaves the output unchanged.

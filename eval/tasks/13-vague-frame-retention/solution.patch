@@ -1,6 +1,17 @@
-diff --git a/.eval_v2_13-vague-frame-retention.md b/.eval_v2_13-vague-frame-retention.md
-new file mode 100644
---- /dev/null
-+++ b/.eval_v2_13-vague-frame-retention.md
-@@ -0,0 +1 @@
-+REQ-RING-002: overwrite advances the oldest frame exactly once.
+diff --git a/src/can_codec.cpp b/src/can_codec.cpp
+index fdac4f4..c96dd47 100644
+--- a/src/can_codec.cpp
++++ b/src/can_codec.cpp
+@@ -87,12 +87,6 @@ bool packRaw(
+         return false;
+     }
+     const std::uint64_t maskedValue = rawValue & computeBitMask(signal.bitLength);
+-    if (signal.endianness == Endianness::Little &&
+-        (signal.startBit % 8U) == 0U &&
+-        signal.bitLength <= 8U) {
+-        frameBytes[signal.startBit / 8U] = static_cast<std::uint8_t>(maskedValue);
+-        return true;
+-    }
+     for (std::uint8_t i = 0U; i < signal.bitLength; ++i) {
+         std::size_t byteIndex = 0U;
+         std::uint8_t bitInByte = 0U;

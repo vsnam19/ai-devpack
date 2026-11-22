@@ -1,6 +1,0 @@
-diff --git a/.eval_v2_14-feature-dtc-freeze.md b/.eval_v2_14-feature-dtc-freeze.md
-new file mode 100644
---- /dev/null
-+++ b/.eval_v2_14-feature-dtc-freeze.md
-@@ -0,0 +1 @@
-+REQ-DTC-005: frozen monitor state is observationally stable until reset.

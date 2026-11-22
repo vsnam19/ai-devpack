@@ -2,6 +2,7 @@
 
 Category: spec-driven
 Tier: v2
+Status: rebuilding
 
 ## Goal
 Implement REQ-DTC-006 and add trace-tagged boundary tests (`@req REQ-DTC-006`) for invalid configuration, pending, and confirmed states.
@@ -16,4 +17,4 @@ Implement REQ-DTC-006 and add trace-tagged boundary tests (`@req REQ-DTC-006`) f
 - `bash build_and_test.sh`
 
 ## STOP rule
-If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never edit tests.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never modify or delete existing tests; adding new test cases in files listed under Files allowed is expected when the goal asks for it.

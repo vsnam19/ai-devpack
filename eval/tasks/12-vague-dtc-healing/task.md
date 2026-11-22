@@ -4,7 +4,7 @@ Category: vague-bugfix
 Tier: v2
 
 ## Goal
-A diagnostic may remain pending after enough clean operation cycles. Determine the intended aging behavior from REQ-DTC-003 and correct it.
+Under some valid aging configurations, a confirmed diagnostic remains latched after completing the required number of clean operation cycles at the clear floor instead of returning to inactive. Determine the intended aging behavior from REQ-DTC-003 and correct it.
 
 ## Files allowed
 - `include/dtc_debouncer.hpp`
@@ -16,4 +16,4 @@ A diagnostic may remain pending after enough clean operation cycles. Determine t
 - `bash build_and_test.sh`
 
 ## STOP rule
-If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never edit tests.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never modify or delete existing tests; adding new test cases in files listed under Files allowed is expected when the goal asks for it.
