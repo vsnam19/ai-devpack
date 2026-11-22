@@ -97,7 +97,7 @@ ALLOWED_FILES=(
 )
 
 python3 "$SCOPE_CHECK" --repo "$WORKDIR" --base "$BASE_REF" --allow "${ALLOWED_FILES[@]}" >/dev/null
-python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' >/dev/null
+python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' --no-deviation >/dev/null
 
 
 

@@ -167,7 +167,7 @@ fi
 python3 "$SCOPE_CHECK" --repo "$WORKDIR" --base "$BASE_REF" --allow "${ALLOWED_FILES[@]}" >/dev/null
 
 # 2. Verify no existing tests were weakened, modified out-of-scope, or deleted
-python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' >/dev/null
+python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' --no-deviation >/dev/null
 
 
 # Require at least one changed or newly created file relative to post-setup baseline

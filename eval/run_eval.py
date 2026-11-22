@@ -1703,50 +1703,55 @@ def _run_step_enforcement(
     """Run the test lock then the scope check for one step, using the pack-root scripts.
 
     Returns ``("", "")`` when the step is clean, ``("test_lock_violation" | "scope_violation", detail)``
-    on a violation, or ``("harness_error", detail)`` when a check could not run.
+    on a violation, or ``("harness_error", detail)`` when a check could not run. A checker that exceeds
+    ``timeout_s`` yields ``("harness_error", "enforcement_timeout: ...")`` instead of raising.
     """
     if not allowed_files:
         return "harness_error", "memory step has no allowed_files; cannot run scope check"
     env = dict(git_env)
-    lock = subprocess.run(
-        [
-            sys.executable,
-            "-B",  # never write __pycache__ into the pack root
-            str(TEST_LOCK_SCRIPT),
-            "--repo",
-            str(work_dir),
-            "--base",
-            base_ref,
-            "--protected",
-            *MEMORY_PROTECTED_GLOBS,
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout_s,
-        check=False,
-    )
-    kind, detail = _classify_enforcement_proc(lock, "TEST_LOCK_VIOLATION", "test_lock_violation", "test_lock")
-    if kind:
-        return kind, detail
-    scope = subprocess.run(
-        [
-            sys.executable,
-            "-B",  # never write __pycache__ into the pack root
-            str(SCOPE_CHECK_SCRIPT),
-            "--repo",
-            str(work_dir),
-            "--base",
-            base_ref,
-            "--allow",
-            *allowed_files,
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout_s,
-        check=False,
-    )
+    try:
+        lock = subprocess.run(
+            [
+                sys.executable,
+                "-B",  # never write __pycache__ into the pack root
+                str(TEST_LOCK_SCRIPT),
+                "--repo",
+                str(work_dir),
+                "--base",
+                base_ref,
+                "--protected",
+                *MEMORY_PROTECTED_GLOBS,
+                "--no-deviation",  # the agent under test may commit its own Deviation trailer
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_s,
+            check=False,
+        )
+        kind, detail = _classify_enforcement_proc(lock, "TEST_LOCK_VIOLATION", "test_lock_violation", "test_lock")
+        if kind:
+            return kind, detail
+        scope = subprocess.run(
+            [
+                sys.executable,
+                "-B",  # never write __pycache__ into the pack root
+                str(SCOPE_CHECK_SCRIPT),
+                "--repo",
+                str(work_dir),
+                "--base",
+                base_ref,
+                "--allow",
+                *allowed_files,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "harness_error", f"enforcement_timeout: checker timed out after {timeout_s}s"
     return _classify_enforcement_proc(scope, "SCOPE_VIOLATION", "scope_violation", "scope_check")
 
 
@@ -1937,20 +1942,8 @@ def run_memory_trial(
             if agent_res.status != "ok" and not last_error:
                 last_error = agent_res.error
 
-            # Enforce scope and the test lock before grading or accepting this step's proposals.
-            enforce_kind, enforce_detail = _run_step_enforcement(
-                work_dir, step_base_ref, step.allowed_files, git_env, timeout_s
-            )
-            if enforce_kind == "harness_error":
-                any_harness_err = True
-                if not harness_reason:
-                    harness_reason = _redact(f"step {step_idx}: {enforce_detail}")
-                break
-            if enforce_kind:
-                violation_reason = enforce_kind
-                violation_detail = _redact(f"step {step_idx}: {enforce_detail}")
-                break
-
+            # Recall and over-recall are counted for every step that ran, including a step that
+            # then violates enforcement, so the violating step is reflected in the trial metrics.
             if mem_enabled:
                 expected_set = set(step.expected_ids)
                 if step.expect_prior_proposals:
@@ -1970,24 +1963,38 @@ def run_memory_trial(
                 total_over_recall_hits += len(bad_total)
                 total_over_recall_denom += max(1, len(injected_set | cited_forbidden))
 
-                # Auto-accept deterministic handoff/known-gap proposals after step build gate passes
-                if agent_res.status == "ok":
-                    build_proc = subprocess.run(
-                        ["bash", str(work_dir / "build_and_test.sh"), "--no-cmake"],
-                        cwd=str(work_dir),
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout_s,
-                        check=False,
+            # Enforce scope and the test lock before accepting this step's proposals.
+            enforce_kind, enforce_detail = _run_step_enforcement(
+                work_dir, step_base_ref, step.allowed_files, git_env, timeout_s
+            )
+            if enforce_kind == "harness_error":
+                any_harness_err = True
+                if not harness_reason:
+                    harness_reason = _redact(f"step {step_idx}: {enforce_detail}")
+                break
+            if enforce_kind:
+                violation_reason = enforce_kind
+                violation_detail = _redact(f"step {step_idx}: {enforce_detail}")
+                break
+
+            # Auto-accept deterministic handoff/known-gap proposals after step build gate passes
+            if mem_enabled and agent_res.status == "ok":
+                build_proc = subprocess.run(
+                    ["bash", str(work_dir / "build_and_test.sh"), "--no-cmake"],
+                    cwd=str(work_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                )
+                if build_proc.returncode == 0:
+                    prop_res = process_memory_proposals(
+                        mem_root,
+                        agent_res.final_text,
+                        source=f"run:{trial_run_dir.name}-step{step_idx}",
+                        extra_secrets=extra_secrets,
                     )
-                    if build_proc.returncode == 0:
-                        prop_res = process_memory_proposals(
-                            mem_root,
-                            agent_res.final_text,
-                            source=f"run:{trial_run_dir.name}-step{step_idx}",
-                            extra_secrets=extra_secrets,
-                        )
-                        prior_proposed_ids.extend(e.id for e in prop_res.accepted)
+                    prior_proposed_ids.extend(e.id for e in prop_res.accepted)
 
             if any_harness_err or any_timeout:
                 break

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -183,10 +184,19 @@ class MemoryEvalTests(unittest.TestCase):
             self.assertIn("## Memory Metrics", summary_md)
             self.assertIn("01-recall-seq", summary_md)
 
-    def _run_enforcement_trial(self, base: Path, edit_snippet: str) -> tuple[list[dict], Path]:
-        """Run a 2-step memory sequence whose step 1 agent runs ``edit_snippet``; return run.json records and log.
+    def _run_enforcement_trial(
+        self,
+        base: Path,
+        edit_snippet: str,
+        step1_expected: tuple[str, ...] = (),
+        checker_timeout: bool = False,
+    ) -> tuple[list[dict], Path, str]:
+        """Run a 2-step memory sequence whose step 1 agent runs ``edit_snippet``.
 
+        Returns ``(run.json records, call log, concatenated text of every file under the output dir)``.
         The stub agent records each call in a log outside the workdir, so tests can tell whether step 2 ran.
+        ``step1_expected`` sets step 1's ``expected_ids``. ``checker_timeout`` makes the test_lock
+        checker raise ``subprocess.TimeoutExpired`` while every other subprocess runs for real.
         """
         fixture_dir = base / "fixture"
         (fixture_dir / "src").mkdir(parents=True)
@@ -216,7 +226,8 @@ class MemoryEvalTests(unittest.TestCase):
             "[step_1]\n"
             'role = "implementer"\n'
             'prompt_file = "step1.md"\n'
-            'allowed_files = ["src/val.txt"]\n\n'
+            'allowed_files = ["src/val.txt"]\n'
+            f"expected_ids = {json.dumps(list(step1_expected))}\n\n"
             "[step_2]\n"
             'role = "implementer"\n'
             'prompt_file = "step2.md"\n'
@@ -252,7 +263,20 @@ class MemoryEvalTests(unittest.TestCase):
         cred = base / "creds.json"
         cred.write_text('{"accessToken":"fake-eval-tok"}', encoding="utf-8")
         work_root = base / "work_root"
-        with contextlib.redirect_stdout(io.StringIO()):
+        real_run = subprocess.run
+
+        def run_with_checker_timeout(cmd: object, *args: object, **kwargs: object) -> object:
+            """Raise TimeoutExpired for the test_lock checker; run every other subprocess for real."""
+            if isinstance(cmd, list) and any(str(part).endswith("test_lock.py") for part in cmd):
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=float(kwargs.get("timeout") or 0))
+            return real_run(cmd, *args, **kwargs)
+
+        run_patch = (
+            mock.patch("subprocess.run", side_effect=run_with_checker_timeout)
+            if checker_timeout
+            else contextlib.nullcontext()
+        )
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), run_patch:
             run_eval.main(
                 [
                     "--mode",
@@ -276,6 +300,7 @@ class MemoryEvalTests(unittest.TestCase):
                     str(base / "out"),
                     "--agent-bin",
                     str(fake_agent),
+                    "--allow-harness-errors",
                 ]
             )
         records = []
@@ -283,7 +308,8 @@ class MemoryEvalTests(unittest.TestCase):
             data = json.loads(run_json.read_text(encoding="utf-8"))
             if "memory_arm" in data:
                 records.append(data)
-        return records, log
+        out_text = "".join(p.read_text(encoding="utf-8") for p in sorted((base / "out").rglob("*.json")))
+        return records, log, out_text
 
     def test_step_editing_test_lock_file_fails_trial_with_test_lock_violation(self) -> None:
         """A step removing a line from tests/test_framework.hpp fails the trial; its proposals and later steps drop."""
@@ -293,7 +319,7 @@ class MemoryEvalTests(unittest.TestCase):
                 "pathlib.Path('tests/test_framework.hpp').write_text("
                 "'// Test framework header.\\nint check_one() { return 1; }\\n', encoding='utf-8')"
             )
-            records, log = self._run_enforcement_trial(base, edit)
+            records, log, _ = self._run_enforcement_trial(base, edit)
             self.assertEqual(2, len(records), "expected one trial per arm")
             for data in records:
                 self.assertEqual("test_lock_violation", data["violation_reason"])
@@ -308,13 +334,42 @@ class MemoryEvalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             edit = "pathlib.Path('notes.txt').write_text('scratch\\n', encoding='utf-8')"
-            records, log = self._run_enforcement_trial(base, edit)
+            records, log, _ = self._run_enforcement_trial(base, edit)
             self.assertEqual(2, len(records), "expected one trial per arm")
             for data in records:
                 self.assertEqual("scope_violation", data["violation_reason"])
                 self.assertEqual("scope_violation", data["outcome"])
             self.assertEqual(len(records), log.read_text(encoding="utf-8").count("call"))
             self.assertEqual([], list(base.rglob("mem-violation-handoff.md")))
+
+    def test_checker_timeout_is_harness_error_and_evaluation_continues(self) -> None:
+        """A test_lock checker timeout marks the trial harness_error with enforcement_timeout; no exception escapes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            records, log, out_text = self._run_enforcement_trial(base, "pass", checker_timeout=True)
+            # Both arms still produce a trial: the timeout does not abort the evaluation.
+            self.assertEqual(2, len(records), "expected one trial per arm after a checker timeout")
+            for data in records:
+                self.assertEqual("harness_error", data["outcome"])
+            self.assertIn("enforcement_timeout", out_text)
+            # Step 2 never ran after the harness error: one agent call per trial.
+            self.assertEqual(len(records), log.read_text(encoding="utf-8").count("call"))
+
+    def test_violating_step_counts_toward_recall(self) -> None:
+        """A violating step expecting 2 memories and recalling 0 gives memory_recall_rate 0.0, not 1.0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            edit = (
+                "pathlib.Path('tests/test_framework.hpp').write_text("
+                "'// Test framework header.\\nint check_one() { return 1; }\\n', encoding='utf-8')"
+            )
+            records, _, _ = self._run_enforcement_trial(
+                base, edit, step1_expected=("mem-alpha", "mem-beta")
+            )
+            with_memory = [d for d in records if d.get("memory_arm") == "with_memory"]
+            self.assertEqual(1, len(with_memory))
+            self.assertEqual("test_lock_violation", with_memory[0]["outcome"])
+            self.assertEqual(0.0, with_memory[0]["memory_recall_rate"])
 
 
 if __name__ == "__main__":
