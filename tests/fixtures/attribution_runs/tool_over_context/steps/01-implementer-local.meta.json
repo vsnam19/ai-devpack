@@ -1,0 +1,10 @@
+{
+  "role": "implementer",
+  "engine": "local",
+  "status": "ok",
+  "tool_protocol_errors": 1,
+  "tokens_in": 41000,
+  "tokens_out": 35,
+  "prompt_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+  "prompt_file": "01-implementer-local.prompt.md"
+}

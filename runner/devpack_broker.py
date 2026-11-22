@@ -27,6 +27,7 @@ PACK_ROOT = Path(__file__).resolve().parent.parent
 if str(PACK_ROOT) not in sys.path:
     sys.path.insert(0, str(PACK_ROOT))
 from runner.agent_exec import DOCKER_IMAGE_TAG, check_data_class_allowed, load_engines, load_project_config, new_run_dir, redact_sensitive_text, update_run_json
+from runner.brief_lint import has_errors as brief_has_errors, lint_brief_text
 from runner.devpack_dispatch import dispatch_job, _render_run_dir_quietly
 
 CLIENT_SOURCE = Path(__file__).with_name('devpack_submit.py')
@@ -217,10 +218,22 @@ class Broker:
         payload = {'run_dir': str(run), 'status': 'refused', 'gate': 'skipped',
                    'scope': 'ok', 'changed_files': [], 'final_text_tail': '', 'cost_usd': None}
         acquired = self._execution_lock.acquire(blocking=False)
+        brief_findings = []
         try:
             if not acquired:
                 raise ValueError('broker concurrency limit is 1')
             brief, globs = self._validate(request)
+            brief_findings = lint_brief_text(
+                brief.decode('utf-8', errors='replace'),
+                repo_root=self.workdir,
+                engine=request['engine'],
+                engines_config=self.engines_path,
+                author='orchestrator',
+            )
+            if brief_has_errors(brief_findings):
+                payload['brief_lint'] = brief_findings
+                err_count = sum(1 for item in brief_findings if item.get('severity') == 'error')
+                raise ValueError(f'brief_lint rejected brief with {err_count} error(s)')
             with tempfile.TemporaryDirectory(prefix='devpack-broker-') as temporary:
                 sandbox = Path(temporary)
                 work = sandbox / 'work'
@@ -260,6 +273,7 @@ class Broker:
                         agent_bin=self.agent_bin, docker_bin=self.docker_bin,
                         image_tag=self.image_tag or DOCKER_IMAGE_TAG, role='broker-worker', pack_root=PACK_ROOT,
                         memory_root=sandbox_memory,
+                        brief_lint_findings=brief_findings,
                     )
                 if payload.get('gate') == 'ok' and payload.get('scope') == 'ok' and sandbox_memory.is_dir():
                     changed_mem = [
@@ -284,7 +298,10 @@ class Broker:
                 self._execution_lock.release()
         payload = json.loads(redact_sensitive_text(json.dumps(payload)))
         write_json(run / (request_id + '.response.json'), payload)
-        update_run_json(run, outcome='pass' if code == 0 else 'fail', response=payload)
+        run_updates = {'outcome': 'pass' if code == 0 else 'fail', 'response': payload}
+        if brief_findings:
+            run_updates['brief_lint'] = brief_findings
+        update_run_json(run, **run_updates)
         _render_run_dir_quietly(run)
         return code, payload
 

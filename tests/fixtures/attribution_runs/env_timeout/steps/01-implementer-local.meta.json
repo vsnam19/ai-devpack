@@ -1,0 +1,8 @@
+{
+  "role": "implementer",
+  "engine": "local",
+  "status": "timeout",
+  "error": "Agent timed out after 900s",
+  "prompt_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "prompt_file": "01-implementer-local.prompt.md"
+}

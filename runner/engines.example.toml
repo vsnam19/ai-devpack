@@ -12,12 +12,14 @@ gate_timeout_s = 300
 model = "sonnet"
 class = "cloud"             # cloud | local
 max_data_class = "internal" # highest confidentiality class this engine may see (policy/data_governance.md)
+context_tokens = 200000
 timeout_s = 900
 
 [engines.haiku]
 model = "haiku"
 class = "cloud"
 max_data_class = "internal"
+context_tokens = 200000
 timeout_s = 900
 
 [engines.local]
@@ -26,6 +28,7 @@ class = "local"
 max_data_class = "confidential"
 base_url_env = "DEVPACK_LOCAL_BASE_URL"      # env var NAME holding the URL; never the URL itself in repo
 auth_token_env = "DEVPACK_LOCAL_AUTH_TOKEN"  # env var NAME; value never logged
+context_tokens = 32768
 min_context_tokens = 32768
 timeout_s = 900
 

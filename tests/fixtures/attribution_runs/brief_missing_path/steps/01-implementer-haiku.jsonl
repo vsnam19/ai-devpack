@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/tmp/work","model":"claude-haiku-5-5"}
+{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"toolu_b1","name":"Read","input":{"file_path":"src/nonexistent_driver.cpp"}}],"usage":{"input_tokens":400,"output_tokens":20}}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b1","is_error":true,"content":"ENOENT: no such file or directory, open 'src/nonexistent_driver.cpp'"}]}}
+{"type":"assistant","message":{"role":"assistant","model":"claude-haiku-5-5","content":[{"type":"text","text":"Blocked: src/nonexistent_driver.cpp does not exist in the repository."}]}}
+{"type":"result","subtype":"error","is_error":true,"num_turns":1,"duration_ms":1200,"total_cost_usd":0.001,"usage":{"input_tokens":400,"output_tokens":40},"result":"Blocked: src/nonexistent_driver.cpp does not exist in the repository."}

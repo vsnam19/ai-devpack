@@ -119,6 +119,27 @@ timeout_s = 120
 required = true
 
 [[check]]
+name = "brief-lint-example"
+cmd = [
+  "python3", "-B", "runner/brief_lint.py",
+  "orchestrator/briefs/example_implement.md",
+  "--repo", "eval/fixture",
+  "--engine", "haiku",
+  "--engines-config", "runner/engines.example.toml",
+]
+timeout_s = 120
+required = true
+
+[[check]]
+name = "logs-analyze-fixture"
+cmd = [
+  "bash", "-c",
+  "set -euo pipefail; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; cp -r tests/fixtures/sample_run \"$tmp/run\"; python3 -B runner/devpack_logs.py analyze \"$tmp/run\" --engines runner/engines.example.toml; test -s \"$tmp/run/attribution.json\"",
+]
+timeout_s = 120
+required = true
+
+[[check]]
 name = "eval-fixture-preflight-lint"
 cmd = [
   "python3", "-B", "enforcement/lint/preflight_lint.py",

@@ -1,0 +1,8 @@
+{
+  "role": "implementer",
+  "engine": "haiku",
+  "status": "agent_error",
+  "permission_denials": ["Bash"],
+  "prompt_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "prompt_file": "01-implementer-haiku.prompt.md"
+}
