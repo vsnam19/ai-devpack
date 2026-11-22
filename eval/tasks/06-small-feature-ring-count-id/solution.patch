@@ -1,0 +1,78 @@
+diff --git a/include/ring_buffer.hpp b/include/ring_buffer.hpp
+index 098131f..2018ef0 100644
+--- a/include/ring_buffer.hpp
++++ b/include/ring_buffer.hpp
+@@ -104,6 +104,13 @@ public:
+      */
+     bool isFull() const noexcept;
+ 
++    /**
++     * @brief Count currently buffered frames whose identifier matches canId.
++     * @param[in] canId CAN identifier to match against buffered frames.
++     * @return Number of buffered frames with matching canId.
++     */
++    std::size_t countByCanId(std::uint32_t canId) const noexcept;
++
+ private:
+     CanFrame m_storage[kMaxRingCapacity];
+     std::size_t m_capacity;
+diff --git a/src/ring_buffer.cpp b/src/ring_buffer.cpp
+index 0b7dc0b..dc8bfc5 100644
+--- a/src/ring_buffer.cpp
++++ b/src/ring_buffer.cpp
+@@ -103,4 +103,15 @@ bool FrameRingBuffer::isFull() const noexcept {
+     return m_count >= m_capacity;
+ }
+ 
++std::size_t FrameRingBuffer::countByCanId(std::uint32_t canId) const noexcept {
++    std::size_t matches = 0U;
++    for (std::size_t i = 0U; i < m_count; ++i) {
++        const std::size_t slotIndex = (m_tail + i) % m_capacity;
++        if (m_storage[slotIndex].canId == canId) {
++            ++matches;
++        }
++    }
++    return matches;
++}
++
+ }  // namespace can_fixture
+diff --git a/tests/test_ring_buffer.cpp b/tests/test_ring_buffer.cpp
+index 843ff85..a30f79e 100644
+--- a/tests/test_ring_buffer.cpp
++++ b/tests/test_ring_buffer.cpp
+@@ -104,12 +104,35 @@ void testRingBufferPeekAndClear() {
+     CHECK_EQ(ring.droppedCount(), static_cast<std::size_t>(0U));
+ }
+ 
++/**
++ * @brief Verify countByCanId counts matching frames across wrap-around without mutating state.
++ * @req REQ-RING-004
++ */
++void testRingBufferCountByCanId() {
++    FrameRingBuffer ring(3U);
++    CHECK_EQ(ring.countByCanId(0x100U), static_cast<std::size_t>(0U));
++
++    CHECK(ring.push(makeSampleFrame(0x100U, 1U)));
++    CHECK(ring.push(makeSampleFrame(0x200U, 2U)));
++    CHECK(ring.push(makeSampleFrame(0x100U, 3U)));
++    CHECK_EQ(ring.countByCanId(0x100U), static_cast<std::size_t>(2U));
++    CHECK_EQ(ring.countByCanId(0x200U), static_cast<std::size_t>(1U));
++    CHECK_EQ(ring.countByCanId(0x300U), static_cast<std::size_t>(0U));
++
++    CanFrame dequeued{0U, 0U, {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U}};
++    CHECK(ring.pop(&dequeued));
++    CHECK(ring.push(makeSampleFrame(0x100U, 4U)));
++    CHECK_EQ(ring.countByCanId(0x100U), static_cast<std::size_t>(2U));
++    CHECK_EQ(ring.size(), static_cast<std::size_t>(3U));
++}
++
+ }  // namespace
+ 
+ void runRingBufferTests() {
+     testRingBufferFifoAndFullRejection();
+     testRingBufferPushOverwrite();
+     testRingBufferPeekAndClear();
++    testRingBufferCountByCanId();
+ }
+ 
+ }  // namespace can_fixture_test
