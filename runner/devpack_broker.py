@@ -242,6 +242,15 @@ class Broker:
                 # Freeze the engine file for this launch as well as policy resolution.
                 engines = sandbox / 'engines.toml'
                 shutil.copyfile(self.engines_path, engines)
+                host_memory = self.workdir / '.devpack' / 'memory'
+                sandbox_memory = sandbox / 'memory'
+                if host_memory.is_dir() and not host_memory.is_symlink():
+                    shutil.copytree(host_memory, sandbox_memory, symlinks=False)
+                before_mem = {
+                    p.relative_to(sandbox_memory).as_posix(): p.read_bytes()
+                    for p in sandbox_memory.rglob('*')
+                    if p.is_file()
+                } if sandbox_memory.is_dir() else {}
                 with contextlib.redirect_stdout(io.StringIO()):
                     code, payload = dispatch_job(
                         engine_name=request['engine'], brief_path=prompt, workdir=work, allow_globs=globs,
@@ -250,7 +259,17 @@ class Broker:
                         allow_unsandboxed_local=self.allow_local, credentials_path=self.credentials,
                         agent_bin=self.agent_bin, docker_bin=self.docker_bin,
                         image_tag=self.image_tag or DOCKER_IMAGE_TAG, role='broker-worker', pack_root=PACK_ROOT,
+                        memory_root=sandbox_memory,
                     )
+                if payload.get('gate') == 'ok' and payload.get('scope') == 'ok' and sandbox_memory.is_dir():
+                    changed_mem = [
+                        mem_file for mem_file in sorted(sandbox_memory.rglob('*'))
+                        if mem_file.is_file() and before_mem.get(mem_file.relative_to(sandbox_memory).as_posix()) != mem_file.read_bytes()
+                    ]
+                    if changed_mem:
+                        host_memory.mkdir(parents=True, exist_ok=True)
+                        for mem_file in changed_mem:
+                            copy_back(sandbox_memory, host_memory, mem_file.relative_to(sandbox_memory))
                 if payload['scope'] == 'ok':
                     for name in payload['changed_files']:
                         relative = relative_path(name)

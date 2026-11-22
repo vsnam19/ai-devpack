@@ -1,0 +1,30 @@
+diff --git a/include/link_state_machine.hpp b/include/link_state_machine.hpp
+index a4da18a..6008076 100644
+--- a/include/link_state_machine.hpp
++++ b/include/link_state_machine.hpp
+@@ -106,6 +106,12 @@ public:
+      */
+     std::uint64_t lastTimestampMs() const noexcept;
+ 
++    /**
++     * @brief Return configured recovery backoff ticks per REQ-LINK-006.
++     * @return Number of backoff ticks before fault recovery retry.
++     */
++    std::uint8_t recoveryBackoffTicks() const noexcept;
++
+ private:
+     LinkConfig m_config;
+     LinkState m_state;
+diff --git a/src/link_state_machine.cpp b/src/link_state_machine.cpp
+index 000ff0f..2fd39e6 100644
+--- a/src/link_state_machine.cpp
++++ b/src/link_state_machine.cpp
+@@ -117,4 +117,8 @@ std::uint64_t LinkStateMachine::lastTimestampMs() const noexcept {
+     return m_lastTimestampMs;
+ }
+ 
++std::uint8_t LinkStateMachine::recoveryBackoffTicks() const noexcept {
++    return static_cast<std::uint8_t>(3U);
++}
++
+ }  // namespace can_fixture

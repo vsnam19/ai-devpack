@@ -62,6 +62,7 @@ from agent_exec import (  # noqa: E402
 )
 from devpack_dispatch import run_preflight_lint_on_changed  # noqa: E402
 from enforcement.checks.scope_check import get_changed_files  # noqa: E402
+from memory import memory_root_for, process_memory_proposals  # noqa: E402
 
 ESCALATE_TO_HUMAN = "ESCALATE_TO_HUMAN"
 VERDICT_APPROVE = "APPROVE"
@@ -475,6 +476,10 @@ def run_task_workflow(
     path_replacements: Sequence[tuple[str, str]] = (),
     home_placeholder: str = "~",
     profile_overrides: Mapping[str, Path | None] | None = None,
+    memory_root: Path | None = None,
+    memory_enabled: bool | None = None,
+    memory_top_k: int | None = None,
+    memory_budget_tokens: int | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -604,12 +609,21 @@ def run_task_workflow(
     lint_findings_first_attempt: int | None = None
     last_lint_clean = True
     rounds_to_clean: int | None = None
+    effective_mem_root = memory_root if memory_root is not None else memory_root_for(worktree)
+    mem_cfg = config.memory if isinstance(config, EnginesConfig) else None
+    all_memory_ids: list[str] = []
+    total_memory_tokens = 0
+    accepted_proposals: list[str] = []
+    pending_proposals: list[str] = []
+    rejected_proposals: list[dict[str, str]] = []
+    pending_proposal_texts: list[str] = []
 
     def _invoke_role(role_name: str, engine: EngineConfig, prompt_text: str) -> agent_exec.AgentResult:
         """Run a role via agent_exec.run_agent and accumulate telemetry."""
         nonlocal local_tokens, local_wall_s
         nonlocal total_cost_usd, total_tokens_in, total_tokens_out, total_duration_s
         nonlocal total_tool_protocol_errors, any_timeout, any_harness_error, first_harness_error
+        nonlocal total_memory_tokens
         step_stem = f"{step_index:02d}-{role_name}-{engine.name}"
         if profile_overrides is not None and engine.name in profile_overrides:
             resolved_profile = profile_overrides[engine.name]
@@ -637,8 +651,24 @@ def run_task_workflow(
             role=role_name,
             step_index=step_index,
             profile_path=resolved_profile,
+            memory_enabled=memory_enabled,
+            memory_root=effective_mem_root,
+            memory_top_k=memory_top_k,
+            memory_budget_tokens=memory_budget_tokens,
+            memory_config=mem_cfg,
+            memory_task_text=(
+                context.get("ONE_PARAGRAPH_GOAL", "")
+                + "\n"
+                + context.get("REQ_IDS", "")
+                + "\n"
+                + context.get("ALLOWED_GLOB_1", "")
+            ),
         )
         res = run_agent(req)
+        for mid in res.memory_ids:
+            if mid not in all_memory_ids:
+                all_memory_ids.append(mid)
+        total_memory_tokens += int(res.memory_tokens or 0)
         if engine.is_cloud:
             total_cost_usd += float(res.cost_usd or 0.0)
         else:
@@ -659,6 +689,8 @@ def run_task_workflow(
     # Step 1: Implement
     step_index += 1
     impl_res = _invoke_role("implementer", impl_engine, impl_brief)
+    if impl_res.status == "ok" and impl_res.final_text:
+        pending_proposal_texts.append(impl_res.final_text)
     log_file = write_step_log(
         log_dir,
         step_index,
@@ -767,6 +799,8 @@ def run_task_workflow(
                 failure_details=failure_details,
             )
             fix_res = _invoke_role("fixer", fix_engine, fix_brief)
+            if fix_res.status == "ok" and fix_res.final_text:
+                pending_proposal_texts.append(fix_res.final_text)
             log_file = write_step_log(
                 log_dir,
                 step_index,
@@ -792,7 +826,27 @@ def run_task_workflow(
             step_logs.append(log_file.name)
             continue
 
-        # Gate passed -> Run Reviewer
+        # Gate passed -> accept queued implementer/fixer memory proposals, then Run Reviewer
+        if pending_proposal_texts:
+            stop_report_path = worktree / "STOP_REPORT.md"
+            stop_report_text = (
+                stop_report_path.read_text(encoding="utf-8", errors="replace")
+                if stop_report_path.is_file()
+                else ""
+            )
+            for idx_p, prop_text in enumerate(pending_proposal_texts):
+                prop_res = process_memory_proposals(
+                    effective_mem_root,
+                    prop_text,
+                    source=f"run:{active_run_dir.name}",
+                    stop_report_text=stop_report_text if idx_p == len(pending_proposal_texts) - 1 else "",
+                    extra_secrets=extra_secrets,
+                )
+                accepted_proposals.extend(e.id for e in prop_res.accepted)
+                pending_proposals.extend(e.id for e in prop_res.pending)
+                rejected_proposals.extend(prop_res.rejected)
+            pending_proposal_texts.clear()
+
         step_index += 1
         diff_text = compute_worktree_diff(worktree)
         rev_brief, rev_tpl_src = render_review_brief(
@@ -832,6 +886,16 @@ def run_task_workflow(
         step_logs.append(log_file.name)
 
         if verdict == VERDICT_APPROVE:
+            if rev_res.final_text:
+                rev_prop = process_memory_proposals(
+                    effective_mem_root,
+                    rev_res.final_text,
+                    source=f"run:{active_run_dir.name}",
+                    extra_secrets=extra_secrets,
+                )
+                accepted_proposals.extend(e.id for e in rev_prop.accepted)
+                pending_proposals.extend(e.id for e in rev_prop.pending)
+                rejected_proposals.extend(rev_prop.rejected)
             final_status = "APPROVED"
             break
 
@@ -859,6 +923,8 @@ def run_task_workflow(
             failure_details=failure_details,
         )
         fix_res = _invoke_role("fixer", fix_engine, fix_brief)
+        if fix_res.status == "ok" and fix_res.final_text:
+            pending_proposal_texts.append(fix_res.final_text)
         log_file = write_step_log(
             log_dir,
             step_index,
@@ -932,6 +998,13 @@ def run_task_workflow(
         "harness_error_reason": first_harness_error,
         "run_dir": str(active_run_dir),
         "step_logs": step_logs,
+        "memory_ids": all_memory_ids,
+        "memory_tokens": total_memory_tokens,
+        "memory_proposals": {
+            "accepted": accepted_proposals,
+            "pending": pending_proposals,
+            "rejected": rejected_proposals,
+        },
     }
     (log_dir / "run_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n",

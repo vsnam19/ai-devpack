@@ -1,0 +1,21 @@
+id = "01-recall-decision"
+category = "recall"
+tier = "v2"
+title = "Recall step 1 handoff decision in fresh step 2 session"
+ab_compare = true
+
+[step_1]
+role = "implementer"
+prompt_file = "step1.md"
+allowed_files = ["include/dtc_debouncer.hpp", "src/dtc_debouncer.cpp"]
+expect_proposals = true
+expected_ids = []
+forbidden_ids = []
+
+[step_2]
+role = "implementer"
+prompt_file = "step2.md"
+allowed_files = ["include/dtc_debouncer.hpp", "src/dtc_debouncer.cpp"]
+expect_prior_proposals = true
+expected_ids = []
+forbidden_ids = []

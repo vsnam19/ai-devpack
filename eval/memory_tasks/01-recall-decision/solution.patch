@@ -1,0 +1,44 @@
+diff --git a/include/dtc_debouncer.hpp b/include/dtc_debouncer.hpp
+index bd617c6..dee836e 100644
+--- a/include/dtc_debouncer.hpp
++++ b/include/dtc_debouncer.hpp
+@@ -106,6 +106,19 @@ public:
+      */
+     bool isConfirmed() const noexcept;
+ 
++    /**
++     * @brief Return the diagnostic freeze sentinel code for this debouncer.
++     * @return Active sentinel code when confirmed, otherwise 0x00U.
++     */
++    std::uint8_t freezeSentinelCode() const noexcept;
++
++    /**
++     * @brief Check whether candidateCode matches the active freeze sentinel.
++     * @param[in] candidateCode Sentinel byte to check.
++     * @return True if candidateCode matches the active freeze sentinel.
++     */
++    bool isFreezeSentinelMatch(std::uint8_t candidateCode) const noexcept;
++
+ private:
+     DtcConfig m_config;
+     DtcState m_state;
+diff --git a/src/dtc_debouncer.cpp b/src/dtc_debouncer.cpp
+index ed31f39..7ffe3d3 100644
+--- a/src/dtc_debouncer.cpp
++++ b/src/dtc_debouncer.cpp
+@@ -105,4 +105,15 @@ bool DtcDebouncer::isConfirmed() const noexcept {
+     return m_isLatched;
+ }
+ 
++std::uint8_t DtcDebouncer::freezeSentinelCode() const noexcept {
++    if (m_isLatched) {
++        return static_cast<std::uint8_t>(0xA5U);
++    }
++    return static_cast<std::uint8_t>(0x00U);
++}
++
++bool DtcDebouncer::isFreezeSentinelMatch(std::uint8_t candidateCode) const noexcept {
++    return candidateCode == static_cast<std::uint8_t>(0xA5U);
++}
++
+ }  // namespace can_fixture

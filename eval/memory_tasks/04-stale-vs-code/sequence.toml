@@ -1,0 +1,12 @@
+id = "04-stale-vs-code"
+category = "stale-vs-code"
+tier = "v2"
+title = "Current code/spec wins over stale memory and conflict is reported"
+ab_compare = false
+
+[step_1]
+role = "implementer"
+prompt_file = "step1.md"
+allowed_files = ["include/can_codec.hpp", "src/can_codec.cpp", "MEMORY_CONFLICTS.md"]
+expected_ids = ["mem-codec-stale"]
+forbidden_ids = []

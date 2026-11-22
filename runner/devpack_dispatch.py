@@ -83,6 +83,7 @@ from runner.agent_exec import (  # noqa: E402
     update_run_json,
 )
 from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs  # noqa: E402
+from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
 
 CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
 _LINT_SUMMARY_RE = re.compile(r"Summary:\s+\d+\s+file\(s\)\s+checked,\s+(\d+)\s+finding\(s\)\.")
@@ -362,6 +363,10 @@ def dispatch_job(
     docker_bin: str = "docker",
     image_tag: str = agent_exec.DOCKER_IMAGE_TAG,
     pack_root: Path = PACK_ROOT,
+    memory_root: Path | None = None,
+    memory_enabled: bool | None = None,
+    memory_top_k: int | None = None,
+    memory_budget_tokens: int | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
@@ -589,6 +594,12 @@ def dispatch_job(
         role=role,
         step_index=1,
         profile_path=resolved_profile,
+        memory_enabled=memory_enabled,
+        memory_root=memory_root,
+        memory_top_k=memory_top_k,
+        memory_budget_tokens=memory_budget_tokens,
+        memory_config=engines_cfg.memory if engines_cfg is not None else None,
+        memory_task_text=brief_raw,
     )
     control_before = _control_snapshot(workdir)
     agent_res = run_agent(req)
@@ -736,15 +747,38 @@ def dispatch_job(
             (steps_dir / "02-gate.txt").write_text(redacted_gate + "\n", encoding="utf-8")
 
     passed = agent_res.status == "ok" and gate_status == "ok" and scope_status == "ok"
+
+    mem_proposal_summary: dict[str, Any] = {"accepted": [], "pending": [], "rejected": []}
+    if agent_res.status == "ok" and gate_status == "ok" and scope_status == "ok":
+        effective_mem_root = memory_root if memory_root is not None else memory_root_for(workdir)
+        stop_report_path = workdir / "STOP_REPORT.md"
+        stop_report_text = (
+            stop_report_path.read_text(encoding="utf-8", errors="replace")
+            if stop_report_path.is_file()
+            else ""
+        )
+        prop_res = process_memory_proposals(
+            effective_mem_root,
+            agent_res.final_text,
+            source=f"run:{run_dir.name}",
+            stop_report_text=stop_report_text,
+        )
+        mem_proposal_summary = prop_res.to_dict()
+
     outcome = "pass" if passed else ("timeout" if agent_res.status == "timeout" else "fail")
     update_run_json(
         run_dir,
+        task=brief_path.stem,
         outcome=outcome,
         gate=gate_status,
         scope=scope_status,
         test_lock=test_lock_status,
         lint_findings=lint_findings,
         data_class=project_cfg["data_class"],
+        memory_ids=list(agent_res.memory_ids),
+        memory_hashes=dict(agent_res.memory_hashes),
+        memory_tokens=int(agent_res.memory_tokens),
+        memory_proposals=mem_proposal_summary,
         finished=datetime.now(timezone.utc).isoformat(),
     )
     _render_run_dir_quietly(run_dir)
@@ -764,7 +798,12 @@ def dispatch_job(
         "tool_protocol_errors": agent_res.tool_protocol_errors,
         "test_lock": test_lock_status,
         "lint_findings": lint_findings,
+        "memory_ids": list(agent_res.memory_ids),
+        "memory_hashes": dict(agent_res.memory_hashes),
+        "memory_tokens": int(agent_res.memory_tokens),
     }
+    if any(mem_proposal_summary.values()):
+        payload["memory_proposals"] = mem_proposal_summary
     if agent_res.error:
         payload["error"] = agent_res.error
     if scope_out and scope_status != "ok":
@@ -915,6 +954,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate configuration, data-class, and sandbox policy without running an agent",
     )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Disable project memory retrieval and injection for this dispatch",
+    )
     return parser
 
 
@@ -979,6 +1023,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             deviation_id=args.deviation,
             require_qualification=args.require_qualification,
             dry_run=args.dry_run,
+            memory_enabled=False if args.no_memory else None,
         )
         return rc
     except ValueError as exc:

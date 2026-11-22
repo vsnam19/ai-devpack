@@ -1,0 +1,21 @@
+id = "05-scope-isolation"
+category = "scope-isolation"
+tier = "v2"
+title = "Role and engine scoped memory entries are isolated across roles"
+ab_compare = false
+
+[step_1]
+role = "reviewer"
+engine = "sonnet"
+prompt_file = "step1_reviewer.md"
+allowed_files = ["REVIEW.md"]
+expected_ids = ["mem-rev-policy", "mem-proj-link"]
+forbidden_ids = ["mem-impl-handoff", "mem-impl-note", "mem-eng-local"]
+
+[step_2]
+role = "implementer"
+engine = "haiku"
+prompt_file = "step2_implementer.md"
+allowed_files = ["include/link_state_machine.hpp", "src/link_state_machine.cpp"]
+expected_ids = ["mem-impl-note", "mem-proj-link"]
+forbidden_ids = ["mem-rev-policy", "mem-eng-local"]

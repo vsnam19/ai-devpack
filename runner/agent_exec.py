@@ -43,6 +43,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     tomllib = None  # type: ignore[assignment]
 
+try:
+    from runner import memory as devpack_memory  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover
+    import memory as devpack_memory  # type: ignore[no-redef]
+
 DEFAULT_CLAUDE_VERSION = "2.1.330"
 DOCKER_IMAGE_TAG = f"devpack-eval:{DEFAULT_CLAUDE_VERSION}"
 DOCKER_TASK_DIR = "/workspace/task"
@@ -246,6 +251,17 @@ setattr(EngineConfig, "class", property(lambda self: self.engine_class))
 
 
 @dataclass
+class MemoryConfig:
+    """Configuration for bounded project memory retrieval and injection."""
+
+    enabled: bool = True
+    top_k: int = 5
+    budget_tokens: int = 800
+    reviewer_sees_handoffs: bool = False
+    role_scopes: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+@dataclass
 class EnginesConfig:
     """Loaded engines configuration containing engines, role mappings, and limits."""
 
@@ -257,6 +273,7 @@ class EnginesConfig:
     gate_cmd: list[str] = field(default_factory=lambda: list(DEFAULT_GATE_CMD))
     gate_timeout_s: int = 300
     role_engines: dict[str, EngineConfig] = field(default_factory=dict)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
     def get_engine(self, name_or_role: str) -> EngineConfig:
         """Resolve an engine by engine name or by role name."""
@@ -284,7 +301,7 @@ class EnginesConfig:
 
     def __getitem__(self, key: str) -> Any:
         """Support indexing by top-level section name or directly by engine/role name."""
-        if key in ("version", "engines", "roles", "limits", "max_fix_rounds", "gate_cmd", "gate_timeout_s"):
+        if key in ("version", "engines", "roles", "limits", "max_fix_rounds", "gate_cmd", "gate_timeout_s", "memory"):
             return getattr(self, key)
         if key in self.engines:
             return self.engines[key]
@@ -309,7 +326,7 @@ class EnginesConfig:
             key in self.engines
             or key in self.roles
             or key in self.role_engines
-            or key in ("version", "engines", "roles", "limits", "max_fix_rounds", "gate_cmd", "gate_timeout_s")
+            or key in ("version", "engines", "roles", "limits", "max_fix_rounds", "gate_cmd", "gate_timeout_s", "memory")
         )
 
     def __iter__(self) -> Iterator[str]:
@@ -400,6 +417,34 @@ def _minimal_toml_loads(text: str) -> dict[str, Any]:
             except ValueError:
                 current[key] = val_str
     return root
+
+
+def _parse_memory_config(data: Mapping[str, Any]) -> MemoryConfig:
+    """Parse optional ``[memory]`` configuration table from engines.toml."""
+    raw_mem = data.get("memory", {})
+    if raw_mem is None:
+        return MemoryConfig()
+    if not isinstance(raw_mem, Mapping):
+        raise ValueError("[memory] must be a TOML table")
+    enabled = bool(raw_mem.get("enabled", True))
+    top_k = int(raw_mem.get("top_k", 5))
+    budget_tokens = int(raw_mem.get("budget_tokens", 800))
+    if top_k < 0 or budget_tokens < 0:
+        raise ValueError("[memory] top_k and budget_tokens must be >= 0")
+    reviewer_sees_handoffs = bool(raw_mem.get("reviewer_sees_handoffs", False))
+    role_scopes: dict[str, tuple[str, ...]] = {}
+    raw_role_scopes = raw_mem.get("role_scopes", {})
+    if isinstance(raw_role_scopes, Mapping):
+        for role_k, scopes_v in raw_role_scopes.items():
+            if isinstance(scopes_v, list):
+                role_scopes[str(role_k)] = tuple(str(x).strip() for x in scopes_v if str(x).strip())
+    return MemoryConfig(
+        enabled=enabled,
+        top_k=top_k,
+        budget_tokens=budget_tokens,
+        reviewer_sees_handoffs=reviewer_sees_handoffs,
+        role_scopes=role_scopes,
+    )
 
 
 def load_engines(path: Path | str) -> EnginesConfig:
@@ -541,6 +586,7 @@ def load_engines(path: Path | str) -> EnginesConfig:
         for engine in [*engines.values(), *role_engines.values()]:
             engine.role_permissions = role_permissions
 
+        memory_cfg = _parse_memory_config(data)
         return EnginesConfig(
             version=int(data.get("version", 2)),
             engines=engines,
@@ -550,6 +596,7 @@ def load_engines(path: Path | str) -> EnginesConfig:
             gate_cmd=gate_cmd,
             gate_timeout_s=gate_timeout_s,
             role_engines=role_engines,
+            memory=memory_cfg,
         )
 
     # Check v0.1 format: [roles.<name>] tables with cmd = [...]
@@ -597,6 +644,7 @@ def load_engines(path: Path | str) -> EnginesConfig:
         for engine in [*engines.values(), *role_engines.values()]:
             engine.role_permissions = role_permissions
 
+        memory_cfg = _parse_memory_config(data)
         return EnginesConfig(
             version=1,
             engines=engines,
@@ -606,6 +654,7 @@ def load_engines(path: Path | str) -> EnginesConfig:
             gate_cmd=gate_cmd,
             gate_timeout_s=gate_timeout_s,
             role_engines=role_engines,
+            memory=memory_cfg,
         )
 
     raise ValueError(f"Configuration in {config_path} defines neither [engines] (v2) nor [roles] (v0.1)")
@@ -925,6 +974,12 @@ class AgentRequest:
     env_overrides: dict[str, str] | None = None
     home_placeholder: str = "~"
     profile_path: Path | None = None
+    memory_enabled: bool | None = None
+    memory_root: Path | None = None
+    memory_top_k: int | None = None
+    memory_budget_tokens: int | None = None
+    memory_config: MemoryConfig | None = None
+    memory_task_text: str | None = None
 
     def __init__(
         self,
@@ -954,6 +1009,12 @@ class AgentRequest:
         env_overrides: dict[str, str] | None = None,
         home_placeholder: str = "~",
         profile_path: Path | str | None = None,
+        memory_enabled: bool | None = None,
+        memory_root: Path | str | None = None,
+        memory_top_k: int | None = None,
+        memory_budget_tokens: int | None = None,
+        memory_config: MemoryConfig | None = None,
+        memory_task_text: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize AgentRequest with support for SPEC parameter aliases (timeout, engine_config, prompt_text)."""
@@ -1007,6 +1068,16 @@ class AgentRequest:
         self.profile_path = (
             Path(profile_path) if profile_path is not None and str(profile_path) else None
         )
+        self.memory_enabled = memory_enabled
+        self.memory_root = (
+            Path(memory_root) if memory_root is not None and str(memory_root) else None
+        )
+        self.memory_top_k = int(memory_top_k) if memory_top_k is not None else None
+        self.memory_budget_tokens = (
+            int(memory_budget_tokens) if memory_budget_tokens is not None else None
+        )
+        self.memory_config = memory_config
+        self.memory_task_text = memory_task_text
 
     @property
     def timeout(self) -> int:
@@ -1054,6 +1125,10 @@ class AgentResult:
     profile_file: str = ""
     init_model: str = ""
     init_digest: str = ""
+    memory_ids: list[str] = field(default_factory=list)
+    memory_hashes: dict[str, str] = field(default_factory=dict)
+    memory_tokens: int = 0
+    memory_enabled: bool = True
 
     def __post_init__(self) -> None:
         """Synchronize token field aliases and coerce transcript_path to Path."""
@@ -2035,6 +2110,52 @@ def run_agent(request: AgentRequest) -> AgentResult:
             + profile_body
             + "\n"
         )
+
+    mem_cfg = request.memory_config if request.memory_config is not None else MemoryConfig()
+    effective_mem_enabled = (
+        bool(request.memory_enabled)
+        if request.memory_enabled is not None
+        else bool(mem_cfg.enabled)
+    )
+    effective_top_k = (
+        request.memory_top_k if request.memory_top_k is not None else int(mem_cfg.top_k)
+    )
+    effective_budget_tokens = (
+        request.memory_budget_tokens
+        if request.memory_budget_tokens is not None
+        else int(mem_cfg.budget_tokens)
+    )
+    mem_root = (
+        request.memory_root
+        if request.memory_root is not None
+        else devpack_memory.memory_root_for(request.workdir)
+    )
+    memory_ids: list[str] = []
+    memory_hashes: dict[str, str] = {}
+    memory_tokens = 0
+    if (
+        effective_mem_enabled
+        and mem_root.is_dir()
+        and "## Relevant project memory" not in effective_prompt
+    ):
+        q_res = devpack_memory.retrieve_memory(
+            mem_root,
+            request.memory_task_text or request.prompt,
+            role=request.role,
+            engine=request.engine.name,
+            top_k=effective_top_k,
+            budget_tokens=effective_budget_tokens,
+            reviewer_sees_handoffs=bool(mem_cfg.reviewer_sees_handoffs),
+            role_scopes=mem_cfg.role_scopes,
+        )
+        if q_res.formatted_prompt:
+            effective_prompt = (
+                effective_prompt.rstrip() + "\n\n" + q_res.formatted_prompt.rstrip() + "\n"
+            )
+            memory_ids = list(q_res.ids)
+            memory_hashes = dict(q_res.hashes)
+            memory_tokens = int(q_res.total_tokens)
+
     effective_request = copy.copy(request)
     effective_request.prompt = effective_prompt
     prompt_sha256 = hashlib.sha256(effective_prompt.encode("utf-8")).hexdigest()
@@ -2089,6 +2210,10 @@ def run_agent(request: AgentRequest) -> AgentResult:
         res.profile_sha256 = profile_sha256
         res.profile_version = profile_version
         res.profile_file = profile_file
+        res.memory_ids = list(memory_ids)
+        res.memory_hashes = dict(memory_hashes)
+        res.memory_tokens = memory_tokens
+        res.memory_enabled = effective_mem_enabled
         res.final_text = _redact(res.final_text)
         res.error = _redact(res.error)
         res.stderr = _redact(res.stderr)
