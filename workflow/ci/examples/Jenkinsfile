@@ -1,0 +1,43 @@
+// Example only: Jenkins declarative pipeline for ai-devpack. Adapt agents and credentials.
+// Every stage calls a local script; a non-zero exit code fails the stage.
+pipeline {
+  agent any
+  environment {
+    DEVPACK_DIR = '.'
+    GATE_CONFIG = 'enforcement/gate/gate.example.toml'
+  }
+  stages {
+    stage('preflight') {
+      steps {
+        sh 'python3 $DEVPACK_DIR/enforcement/lint/preflight_lint.py --help'
+        sh 'python3 $DEVPACK_DIR/enforcement/checks/secret_pii_check.py --help'
+      }
+    }
+    stage('implement (sandboxed)') {
+      when { expression { return params.DEVPACK_TASK } }
+      steps {
+        // run inside the container defined by policy/sandbox.md
+        sh 'python3 $DEVPACK_DIR/runner/devpack_run.py --task "$DEVPACK_TASK"'
+      }
+    }
+    stage('gate') {
+      steps {
+        sh 'python3 $DEVPACK_DIR/enforcement/gate/gate.py --config $GATE_CONFIG'
+      }
+    }
+    stage('review') {
+      when { expression { return params.DEVPACK_TASK } }
+      steps {
+        sh 'python3 $DEVPACK_DIR/runner/devpack_run.py --task "$DEVPACK_TASK" --review-only'
+      }
+    }
+    stage('human approval') {
+      steps {
+        input message: 'Independent human reviewer approves the merge?'
+      }
+    }
+  }
+  parameters {
+    string(name: 'DEVPACK_TASK', defaultValue: '', description: 'Brief file of the task')
+  }
+}

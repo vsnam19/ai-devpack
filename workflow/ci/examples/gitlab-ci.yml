@@ -1,0 +1,55 @@
+# Example only: GitLab CI wiring for ai-devpack. Adapt image, tags and variables.
+# The pack is CI-neutral; every job just calls local scripts. Exit code != 0 fails the job.
+stages:
+  - preflight
+  - implement
+  - gate
+  - review
+  - human
+
+variables:
+  DEVPACK_DIR: "."                       # path of the pack inside the project
+  GATE_CONFIG: "enforcement/gate/gate.example.toml"
+
+preflight:
+  stage: preflight
+  image: python:3.11
+  script:
+    - python3 $DEVPACK_DIR/enforcement/checks/secret_pii_check.py --help >/dev/null
+    - python3 $DEVPACK_DIR/enforcement/lint/preflight_lint.py --help >/dev/null
+
+implement:
+  stage: implement
+  image: devpack-agent-sandbox:latest      # container built per policy/sandbox.md
+  rules:
+    - if: '$DEVPACK_TASK'
+  script:
+    - python3 $DEVPACK_DIR/runner/devpack_run.py --help >/dev/null
+    - python3 $DEVPACK_DIR/runner/devpack_run.py --task "$DEVPACK_TASK"
+  artifacts:
+    paths: [evidence/]
+    when: always
+
+gate:
+  stage: gate
+  image: python:3.11
+  script:
+    - python3 $DEVPACK_DIR/enforcement/gate/gate.py --config $GATE_CONFIG
+  artifacts:
+    paths: [gate_receipt.json]
+    when: always
+
+review:
+  stage: review
+  image: devpack-agent-sandbox:latest
+  rules:
+    - if: '$DEVPACK_TASK'
+  script:
+    - python3 $DEVPACK_DIR/runner/devpack_run.py --task "$DEVPACK_TASK" --review-only
+
+human_approval:
+  stage: human
+  when: manual                             # a human approves; only then a merge job may run
+  allow_failure: false
+  script:
+    - echo "Independent human reviewer approves in the merge request"
