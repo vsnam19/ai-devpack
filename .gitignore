@@ -3,3 +3,4 @@ evidence/*.json
 .worktrees/
 runs/
 skilltest/results/
+learning/reports/

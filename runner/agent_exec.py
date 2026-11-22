@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -672,6 +673,7 @@ def load_project_config(
         "runs_root": "runs",
         "default_engines": {},
         "allow_unsandboxed_local": False,
+        "require_qualification": False,
         "config_found": False,
     }
     if project_config_path is not None and str(project_config_path):
@@ -709,6 +711,7 @@ def load_project_config(
     if isinstance(raw_defaults, dict):
         defaults["default_engines"] = {str(k): str(v) for k, v in raw_defaults.items()}
     defaults["allow_unsandboxed_local"] = bool(raw.get("allow_unsandboxed_local", False))
+    defaults["require_qualification"] = bool(raw.get("require_qualification", False))
     defaults["config_found"] = True
     return defaults
 
@@ -780,6 +783,118 @@ def load_quality_checklist(repo_root: Path | str | None = None) -> str:
     return ""
 
 
+_PROFILE_VERSION_RE = re.compile(r"^\s*Version\s*:\s*(\d+)\s*$", re.IGNORECASE)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def parse_profile_version(text: str) -> int | None:
+    """Extract the integer ``Version: N`` header from an engine profile, or None."""
+    for line in text.splitlines():
+        match = _PROFILE_VERSION_RE.match(line)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def extract_profile_body(text: str) -> str:
+    """Return substantive guidance lines from an engine profile, stripping headers and comments."""
+    cleaned = _HTML_COMMENT_RE.sub("", text)
+    body_lines: list[str] = []
+    for raw_line in cleaned.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            if body_lines and body_lines[-1] != "":
+                body_lines.append("")
+            continue
+        if stripped.startswith("# Engine Profile:"):
+            continue
+        if _PROFILE_VERSION_RE.match(stripped):
+            continue
+        body_lines.append(raw_line.rstrip())
+    while body_lines and body_lines[-1] == "":
+        body_lines.pop()
+    return "\n".join(body_lines).strip()
+
+
+def load_engine_profile(
+    profile_path: Path | str | None,
+) -> tuple[str, str, int | None, str]:
+    """Read an engine profile from disk on demand.
+
+    Returns ``(body_text, sha256_hex, version_or_none, file_name)``. When the file
+    is absent or ``profile_path`` is None, returns ``("", "", None, "")``.
+    """
+    if profile_path is None or not str(profile_path):
+        return "", "", None, ""
+    path = Path(profile_path)
+    if not path.is_file():
+        return "", "", None, ""
+    raw_bytes = path.read_bytes()
+    sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
+    text = raw_bytes.decode("utf-8", errors="replace")
+    version = parse_profile_version(text)
+    body = extract_profile_body(text)
+    return body, sha256_hex, version, path.name
+
+
+def resolve_engine_profile_path(
+    engine_name: str,
+    *roots: Path | str | None,
+) -> Path | None:
+    """Locate ``knowledge/engine_profiles/<engine_name>.md`` across candidate roots."""
+    if not engine_name:
+        return None
+    for root in roots:
+        if root is None or not str(root):
+            continue
+        candidate = Path(root) / "knowledge" / "engine_profiles" / f"{engine_name}.md"
+        if candidate.is_file():
+            return candidate
+    pack_default = Path(__file__).resolve().parent.parent / "knowledge" / "engine_profiles" / f"{engine_name}.md"
+    return pack_default if pack_default.is_file() else None
+
+
+def compute_engine_config_hash(engine: EngineConfig) -> str:
+    """Return a deterministic SHA-256 hex digest of an ``EngineConfig`` specification."""
+    payload = {
+        "name": engine.name,
+        "model": engine.model,
+        "engine_class": engine.engine_class,
+        "max_data_class": engine.max_data_class,
+        "base_url_env": engine.base_url_env,
+        "auth_token_env": engine.auth_token_env,
+        "min_context_tokens": int(engine.min_context_tokens),
+        "timeout_s": int(engine.timeout_s),
+        "cmd": list(engine.cmd) if engine.cmd is not None else None,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_qualification_data(qual_path: Path) -> dict[str, Any]:
+    """Load ``.devpack/qualification.json`` if present, else return an empty record."""
+    if not qual_path.is_file():
+        return {"version": 1, "engines": {}}
+    try:
+        loaded = json.loads(qual_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Failed to parse qualification file {qual_path}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Invalid qualification JSON in {qual_path}: expected object")
+    engines = loaded.get("engines")
+    if not isinstance(engines, dict):
+        engines = {}
+    return {"version": int(loaded.get("version", 1)), "engines": dict(engines)}
+
+
+def save_qualification_data(qual_path: Path, data: Mapping[str, Any]) -> None:
+    """Persist ``qualification.json`` atomically with deterministic formatting."""
+    qual_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = qual_path.with_name(f"{qual_path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(dict(data), indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, qual_path)
+
+
 @dataclass
 class AgentRequest:
     """Input contract for launching a single isolated agent via ``run_agent``."""
@@ -809,6 +924,7 @@ class AgentRequest:
     tmp_dir: Path | None = None
     env_overrides: dict[str, str] | None = None
     home_placeholder: str = "~"
+    profile_path: Path | None = None
 
     def __init__(
         self,
@@ -837,6 +953,7 @@ class AgentRequest:
         tmp_dir: Path | str | None = None,
         env_overrides: dict[str, str] | None = None,
         home_placeholder: str = "~",
+        profile_path: Path | str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize AgentRequest with support for SPEC parameter aliases (timeout, engine_config, prompt_text)."""
@@ -887,6 +1004,9 @@ class AgentRequest:
         self.tmp_dir = Path(tmp_dir) if tmp_dir is not None else None
         self.env_overrides = dict(env_overrides) if env_overrides is not None else None
         self.home_placeholder = str(home_placeholder or "~")
+        self.profile_path = (
+            Path(profile_path) if profile_path is not None and str(profile_path) else None
+        )
 
     @property
     def timeout(self) -> int:
@@ -929,6 +1049,11 @@ class AgentResult:
     role: str = ""
     prompt_sha256: str = ""
     prompt_file: str = ""
+    profile_sha256: str = ""
+    profile_version: int | None = None
+    profile_file: str = ""
+    init_model: str = ""
+    init_digest: str = ""
 
     def __post_init__(self) -> None:
         """Synchronize token field aliases and coerce transcript_path to Path."""
@@ -1535,6 +1660,8 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
     assistant_messages_seen = 0
     last_assistant_text = ""
     detected_model = ""
+    init_model = ""
+    init_digest = ""
     summed_in_tokens = 0
     summed_out_tokens = 0
     permission_denials: list[Any] = []
@@ -1556,6 +1683,11 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
         if ev_type == "system" and event.get("subtype") == "init":
             if isinstance(event.get("model"), str) and event["model"]:
                 detected_model = event["model"]
+                init_model = event["model"]
+            for dkey in ("model_digest", "digest"):
+                if isinstance(event.get(dkey), str) and event[dkey]:
+                    init_digest = event[dkey]
+                    break
 
         elif ev_type == "assistant":
             assistant_messages_seen += 1
@@ -1620,6 +1752,8 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
             tool_protocol_errors=tool_protocol_errors,
             error="no result event in stream (agent output JSON is missing or unparsable)",
             model=detected_model,
+            init_model=init_model,
+            init_digest=init_digest,
         )
 
     final_text = ""
@@ -1689,6 +1823,8 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
         error=error_msg,
         permission_denials=permission_denials,
         model=detected_model,
+        init_model=init_model,
+        init_digest=init_digest,
     )
 
 
@@ -1887,7 +2023,21 @@ def run_agent(request: AgentRequest) -> AgentResult:
     jsonl_path = steps_dir / f"{stem}.jsonl"
     meta_path = steps_dir / f"{stem}.meta.json"
     prompt_path = steps_dir / f"{stem}.prompt.md"
-    prompt_sha256 = hashlib.sha256(request.prompt.encode("utf-8")).hexdigest()
+
+    profile_body, profile_sha256, profile_version, profile_file = load_engine_profile(
+        request.profile_path
+    )
+    effective_prompt = request.prompt
+    if profile_body and "## Known mistakes for this engine" not in effective_prompt:
+        effective_prompt = (
+            effective_prompt.rstrip()
+            + "\n\n## Known mistakes for this engine\n"
+            + profile_body
+            + "\n"
+        )
+    effective_request = copy.copy(request)
+    effective_request.prompt = effective_prompt
+    prompt_sha256 = hashlib.sha256(effective_prompt.encode("utf-8")).hexdigest()
 
     # Collect all secrets to redact before writing any files
     secrets_list: list[str] = list(request.extra_secrets)
@@ -1926,7 +2076,7 @@ def run_agent(request: AgentRequest) -> AgentResult:
             home_placeholder=request.home_placeholder,
         )
 
-    prompt_path.write_text(_redact(request.prompt), encoding="utf-8")
+    prompt_path.write_text(_redact(effective_prompt), encoding="utf-8")
 
     def _write_meta_and_return(res: AgentResult) -> AgentResult:
         """Populate metadata fields, write .meta.json, and return the result."""
@@ -1936,6 +2086,9 @@ def run_agent(request: AgentRequest) -> AgentResult:
         res.role = request.role
         res.prompt_sha256 = prompt_sha256
         res.prompt_file = prompt_path.name
+        res.profile_sha256 = profile_sha256
+        res.profile_version = profile_version
+        res.profile_file = profile_file
         res.final_text = _redact(res.final_text)
         res.error = _redact(res.error)
         res.stderr = _redact(res.stderr)
@@ -2033,7 +2186,7 @@ def run_agent(request: AgentRequest) -> AgentResult:
 
         try:
             argv, env = build_invocation(
-                request,
+                effective_request,
                 home_dir=home_dir,
                 cfg_dir=cfg_dir,
                 tmp_dir=tmp_dir,

@@ -33,7 +33,7 @@ import time
 import stat
 import subprocess
 import sys
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 EVAL_DIR = Path(__file__).resolve().parent
@@ -61,17 +61,21 @@ from runner.agent_exec import (  # noqa: E402
     build_project_settings,
     check_local_isolation_allowed,
     cleanup_cfg_dir,
+    compute_engine_config_hash,
     detect_harness_error,
     extract_agent_json_object,
     json_string_leaves,
     load_engines,
+    load_qualification_data,
     new_run_dir,
     parse_agent_json_output,
     parse_stream,
     redact_sensitive_text,
     redact_structure,
     resolve_engine,
+    resolve_engine_profile_path,
     run_agent,
+    save_qualification_data,
     update_run_json,
 )
 from runner.devpack_dispatch import run_preflight_lint_on_changed  # noqa: E402
@@ -154,6 +158,8 @@ class TrialResult:
     orchestrator_compliant: bool = True
     disallowed_bash_commands: list[str] = field(default_factory=list)
     denied_tool_calls: dict[str, Any] = field(default_factory=lambda: {"count": 0, "commands": []})
+    init_model: str = ""
+    init_digest: str = ""
 
 
 @dataclass
@@ -172,6 +178,7 @@ class TaskModelSummary:
     mean_turns: float | None
     mean_duration_s: float
     runs: list[TrialResult] = field(default_factory=list)
+    tier: str = "smoke"
     harness_errors: int = 0
     timeouts: int = 0
     valid_runs: int = 0
@@ -756,6 +763,7 @@ def run_single_trial(
     runs_root: Path | None = None,
     engine_config: EngineConfig | None = None,
     allow_unsandboxed_local: bool = False,
+    profile_overrides: Mapping[str, Path | None] | None = None,
 ) -> TrialResult:
     """Execute one (task, model, run_index) trial in an isolated workspace.
 
@@ -782,6 +790,7 @@ def run_single_trial(
             runs_root=runs_root or (run_root / "runs"),
             engine_config=engine_config,
             allow_unsandboxed_local=allow_unsandboxed_local,
+            profile_overrides=profile_overrides,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")
@@ -804,6 +813,7 @@ def _run_trial_body(
     runs_root: Path | None = None,
     engine_config: EngineConfig | None = None,
     allow_unsandboxed_local: bool = False,
+    profile_overrides: Mapping[str, Path | None] | None = None,
 ) -> TrialResult:
     """Run the agent via agent_exec and execute check.sh for one single-mode trial."""
     if isolation not in ("local", "docker"):
@@ -830,6 +840,11 @@ def _run_trial_body(
         engines=[engine.name],
     )
 
+    if profile_overrides is not None and engine.name in profile_overrides:
+        resolved_profile = profile_overrides[engine.name]
+    else:
+        resolved_profile = resolve_engine_profile_path(engine.name, REPO_ROOT)
+
     request = AgentRequest(
         engine=engine,
         prompt=prompt_text,
@@ -852,6 +867,7 @@ def _run_trial_body(
         cfg_dir=paths["cfg_dir"],
         tmp_dir=paths["tmp_dir"],
         home_placeholder="$HOME",
+        profile_path=resolved_profile,
     )
     agent_res = run_agent(request)
 
@@ -958,6 +974,8 @@ def _run_trial_body(
         lint_clean_final=lint_clean_final,
         rounds_to_clean=rounds_to_clean,
         mode="single",
+        init_model=agent_res.init_model,
+        init_digest=agent_res.init_digest,
     )
 
 
@@ -981,6 +999,7 @@ def run_runner_trial(
     image_tag: str = DOCKER_IMAGE_TAG,
     runs_root: Path | None = None,
     allow_unsandboxed_local: bool = False,
+    profile_overrides: Mapping[str, Path | None] | None = None,
 ) -> TrialResult:
     """Execute one runner-mode trial (implement -> gate -> review -> fix) and grade it."""
     safe_pair = pair_label.replace(":", "-")
@@ -1097,6 +1116,7 @@ def run_runner_trial(
             extra_secrets=extra_secrets,
             path_replacements=path_replacements,
             home_placeholder="$HOME",
+            profile_overrides=profile_overrides,
         )
 
         task_prompt_in_work = work_dir / "TASK_PROMPT.md"
@@ -1544,6 +1564,7 @@ def aggregate_results(
                         round(sum(durations) / len(durations), 4) if durations else 0.0
                     ),
                     runs=runs,
+                    tier=getattr(task, "tier", "smoke"),
                     harness_errors=harness_errors,
                     timeouts=timeouts,
                     valid_runs=len(valid),
@@ -1977,7 +1998,150 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit 0 even when some runs were harness errors (default: exit 1)",
     )
+    parser.add_argument(
+        "--record-qualification",
+        action="store_true",
+        help="Evaluate SPEC 5.3 criteria and write .devpack/qualification.json when met",
+    )
+    parser.add_argument(
+        "--qualification-file",
+        default="",
+        help="Path to qualification.json (default: <repo_root>/.devpack/qualification.json)",
+    )
+    parser.add_argument(
+        "--profile-override",
+        action="append",
+        default=[],
+        metavar="ENGINE=PATH",
+        help="Override engine profile path for an engine during evaluation (repeatable)",
+    )
     return parser
+
+
+def _parse_profile_overrides(raw_items: Sequence[str]) -> dict[str, Path | None]:
+    """Parse ``ENGINE=PATH`` CLI flags into a mapping of engine name to profile Path."""
+    overrides: dict[str, Path | None] = {}
+    for item in raw_items:
+        if "=" not in item:
+            raise ValueError(f"Invalid --profile-override '{item}': expected ENGINE=PATH")
+        eng_name, raw_path = item.split("=", 1)
+        eng_name = eng_name.strip()
+        raw_path = raw_path.strip()
+        if not eng_name:
+            raise ValueError(f"Invalid --profile-override '{item}': empty engine name")
+        overrides[eng_name] = Path(raw_path).resolve() if raw_path else None
+    return overrides
+
+
+def evaluate_and_record_qualification(
+    *,
+    tier: str,
+    mode: str,
+    unit_labels: Sequence[str],
+    engine_map: Mapping[str, EngineConfig],
+    task_summaries: Sequence[TaskModelSummary],
+    qualification_file: Path,
+    eval_summary_path: Path,
+    repo_root: Path,
+) -> tuple[bool, list[str]]:
+    """Check SPEC 5.3 qualification criteria and write ``qualification.json`` when met.
+
+    Returns ``(all_qualified, messages)``.
+    """
+    if tier not in ("smoke", "all"):
+        return False, [f"Qualification requires --tier smoke or --tier all (got '{tier}')."]
+    if mode not in ("single", "runner"):
+        return False, [f"Qualification requires --mode single or --mode runner (got '{mode}')."]
+
+    try:
+        summary_rel = str(eval_summary_path.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        summary_rel = redact_sensitive_text(str(eval_summary_path), home_placeholder="$HOME")
+
+    qual_data = load_qualification_data(qualification_file) if qualification_file.is_file() else {"version": 1, "engines": {}}
+    all_ok = True
+    messages: list[str] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    changed_existing = False
+
+    for label in unit_labels:
+        eng_name = label.split(":", 1)[0] if mode == "runner" else label
+        engine_cfg = engine_map.get(eng_name)
+        if engine_cfg is None:
+            all_ok = False
+            messages.append(f"{eng_name}: engine configuration not found")
+            continue
+
+        smoke_sums = [
+            ts for ts in task_summaries if ts.model == label and ts.tier == "smoke"
+        ]
+        if not smoke_sums:
+            all_ok = False
+            messages.append(f"{eng_name}: no smoke-tier tasks evaluated")
+            continue
+
+        pow3_values = [
+            compute_pass_pow_k(ts.passes, ts.valid_runs, k=3) if ts.valid_runs > 0 else 0.0
+            for ts in smoke_sums
+        ]
+        mean_pass_pow_3 = sum(pow3_values) / len(pow3_values)
+        total_proto_errors = sum(ts.tool_protocol_errors for ts in smoke_sums)
+        passing_trials = [
+            r for ts in smoke_sums for r in ts.runs if not r.harness_error and r.passed
+        ]
+        lint_clean_rate = (
+            sum(1 for r in passing_trials if r.lint_clean_final is True) / len(passing_trials)
+            if passing_trials
+            else 0.0
+        )
+
+        failures: list[str] = []
+        if mean_pass_pow_3 < 0.8:
+            failures.append(f"smoke pass^3={mean_pass_pow_3:.4f} < 0.8")
+        if total_proto_errors != 0:
+            failures.append(f"tool_protocol_errors={total_proto_errors} != 0")
+        if not passing_trials:
+            failures.append("no passing smoke trials for lint_clean_final check")
+        elif lint_clean_rate < 0.9:
+            failures.append(f"lint_clean_final_rate={lint_clean_rate:.4f} < 0.9")
+
+        if failures:
+            all_ok = False
+            reason = "; ".join(failures)
+            messages.append(f"{eng_name}: unqualified ({reason})")
+            if eng_name in qual_data["engines"] and isinstance(qual_data["engines"][eng_name], dict):
+                qual_data["engines"][eng_name]["status"] = "unqualified"
+                qual_data["engines"][eng_name]["unqualified_reason"] = reason
+                qual_data["engines"][eng_name]["updated"] = now_iso
+                changed_existing = True
+            continue
+
+        all_trials = [r for ts in smoke_sums for r in ts.runs]
+        init_model = next((r.init_model for r in all_trials if r.init_model), "") or engine_cfg.model
+        init_digest = next((r.init_digest for r in all_trials if r.init_digest), "")
+        qual_data["engines"][eng_name] = {
+            "engine": eng_name,
+            "status": "qualified",
+            "model_id": init_model,
+            "model_digest": init_digest,
+            "config_hash": compute_engine_config_hash(engine_cfg),
+            "date": now_iso,
+            "eval_summary_path": summary_rel,
+            "metrics": {
+                "pass_pow_3": round(mean_pass_pow_3, 4),
+                "tool_protocol_errors": total_proto_errors,
+                "lint_clean_final_rate": round(lint_clean_rate, 4),
+            },
+        }
+        changed_existing = True
+        messages.append(
+            f"{eng_name}: qualified (model_id={init_model}, pass^3={mean_pass_pow_3:.4f}, "
+            f"lint_clean={lint_clean_rate:.4f})"
+        )
+
+    if changed_existing:
+        save_qualification_data(qualification_file, qual_data)
+    return all_ok, messages
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2056,6 +2220,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     engine_map: dict[str, EngineConfig] = {
         name: resolve_engine(name, loaded_engines) for name in dict.fromkeys(engine_names_for_creds)
     }
+
+    try:
+        profile_overrides = _parse_profile_overrides(args.profile_override)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.dry_run:
         if mode == "orchestrator":
@@ -2262,6 +2432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             image_tag=image_tag,
                             runs_root=runs_root,
                             allow_unsandboxed_local=args.allow_unsandboxed_local,
+                            profile_overrides=profile_overrides,
                         )
                     )
             else:
@@ -2288,6 +2459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             image_tag,
                             runs_root,
                             args.allow_unsandboxed_local,
+                            profile_overrides,
                         )
                         for t, lbl, imp_e, rev_e, fix_e, run_idx in runner_jobs
                     ]
@@ -2320,6 +2492,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             runs_root=runs_root,
                             engine_config=engine_map[model],
                             allow_unsandboxed_local=args.allow_unsandboxed_local,
+                            profile_overrides=profile_overrides,
                         )
                     )
             else:
@@ -2343,6 +2516,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             runs_root,
                             engine_map[model],
                             args.allow_unsandboxed_local,
+                            profile_overrides,
                         )
                         for task, model, run_idx in plan_items
                     ]
@@ -2415,6 +2589,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         if not args.allow_harness_errors:
+            return 1
+
+    if args.record_qualification:
+        qual_path = (
+            Path(args.qualification_file).resolve()
+            if args.qualification_file
+            else (repo_root / ".devpack" / "qualification.json")
+        )
+        qual_ok, qual_messages = evaluate_and_record_qualification(
+            tier=args.tier,
+            mode=mode,
+            unit_labels=unit_labels,
+            engine_map=engine_map,
+            task_summaries=task_summaries,
+            qualification_file=qual_path,
+            eval_summary_path=dated_dir / "summary.md",
+            repo_root=repo_root,
+        )
+        for msg in qual_messages:
+            stream = sys.stdout if qual_ok else sys.stderr
+            print(msg, file=stream)
+        if not qual_ok:
             return 1
     return 0
 

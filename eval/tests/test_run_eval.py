@@ -775,6 +775,94 @@ class HarnessErrorTests(unittest.TestCase):
             )
             self.assertEqual(0, r_pass.returncode, r_pass.stdout + r_pass.stderr)
 
+    def test_record_qualification_writes_record_when_spec_5_3_criteria_met_and_refuses_otherwise(self) -> None:
+        """Verify --record-qualification writes qualification.json iff pass^3>=0.8, proto_errors==0, lint_clean>=90%."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            # Ensure fixture has preflight.toml and clean C++ header/source after fix
+            (fixture_dir / "preflight.toml").write_text('[general]\nstd = "c++17"\n', encoding="utf-8")
+            (fixture_dir / "src" / "sample.cpp").write_text(
+                "/**\n * @file sample.cpp\n * @brief Sample.\n */\n"
+                "/**\n * @brief Value.\n * @return Int.\n */\n"
+                "int value() { return 0; }\n",
+                encoding="utf-8",
+            )
+            (tasks_dir / "01-mini-bugfix" / "setup.patch").write_text(
+                "diff --git a/src/sample.cpp b/src/sample.cpp\n"
+                "--- a/src/sample.cpp\n+++ b/src/sample.cpp\n"
+                "@@ -4 +4 @@\n-int value() { return 0; }\n+int value() { return -1; }\n",
+                encoding="utf-8",
+            )
+
+            agent_ok = _write_agent(
+                base,
+                "(cwd / 'src' / 'sample.cpp').write_text("
+                "'/**\\n * @file sample.cpp\\n * @brief Sample.\\n */\\n'\n"
+                "'/**\\n * @brief Value.\\n * @return 42.\\n */\\n'\n"
+                "'int value() { return 42; }\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'qwen3-local-32b'}))\n"
+                "print(json.dumps({'type': 'result', 'result': 'done', 'num_turns': 1, 'usage': {'input_tokens': 10, 'output_tokens': 5}}))\n",
+            )
+            qual_file = base / "qual" / "qualification.json"
+            out_ok = base / "out_ok"
+            with mock.patch.dict(
+                os.environ,
+                {"DEVPACK_LOCAL_BASE_URL": "http://127.0.0.1:11434", "DEVPACK_LOCAL_AUTH_TOKEN": "TOK"},
+                clear=False,
+            ):
+                rc_ok = run_eval.main(
+                    [
+                        "--isolation", "local", "--allow-unsandboxed-local",
+                        "--engines", "local", "--tier", "smoke", "--k", "3",
+                        "--tasks", "01-mini-bugfix",
+                        "--work-root", str(base / "wr_ok"),
+                        "--fixture-dir", str(fixture_dir),
+                        "--tasks-dir", str(tasks_dir),
+                        "--agent-bin", str(agent_ok),
+                        "--out", str(out_ok),
+                        "--record-qualification",
+                        "--qualification-file", str(qual_file),
+                    ]
+                )
+                self.assertEqual(0, rc_ok)
+                self.assertTrue(qual_file.is_file())
+                qdata = json.loads(qual_file.read_text(encoding="utf-8"))
+                rec = qdata["engines"]["local"]
+                self.assertEqual("qualified", rec["status"])
+                self.assertEqual("qwen3-local-32b", rec["model_id"])
+                self.assertEqual(64, len(rec["config_hash"]))
+                self.assertTrue(rec["date"])
+                self.assertIn("summary.md", rec["eval_summary_path"])
+                self.assertGreaterEqual(rec["metrics"]["pass_pow_3"], 0.8)
+                self.assertEqual(0, rec["metrics"]["tool_protocol_errors"])
+                self.assertGreaterEqual(rec["metrics"]["lint_clean_final_rate"], 0.9)
+
+                # Now fail lint_clean criteria (C-style cast) -> marks unqualified and exits 1
+                agent_lint_bad = _write_agent(
+                    base,
+                    "(cwd / 'src' / 'sample.cpp').write_text('int value() { return (int)42.0; }\\n', encoding='utf-8')\n"
+                    "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'qwen3-local-32b'}))\n"
+                    "print(json.dumps({'type': 'result', 'result': 'done', 'num_turns': 1}))\n",
+                )
+                rc_bad = run_eval.main(
+                    [
+                        "--isolation", "local", "--allow-unsandboxed-local",
+                        "--engines", "local", "--tier", "smoke", "--k", "3",
+                        "--tasks", "01-mini-bugfix",
+                        "--work-root", str(base / "wr_bad"),
+                        "--fixture-dir", str(fixture_dir),
+                        "--tasks-dir", str(tasks_dir),
+                        "--agent-bin", str(agent_lint_bad),
+                        "--out", str(base / "out_bad"),
+                        "--record-qualification",
+                        "--qualification-file", str(qual_file),
+                    ]
+                )
+                self.assertEqual(1, rc_bad)
+                qdata2 = json.loads(qual_file.read_text(encoding="utf-8"))
+                self.assertEqual("unqualified", qdata2["engines"]["local"]["status"])
+
 
 if __name__ == "__main__":
     unittest.main()

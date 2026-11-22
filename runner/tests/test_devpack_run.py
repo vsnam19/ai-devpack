@@ -492,6 +492,105 @@ class DevpackRunUnitTests(unittest.TestCase):
             self.assertEqual(1, rc)
             self.assertEqual([], json.loads(state_path.read_text()).get("calls", []))
 
+    def test_fix_rounds_are_fresh_sessions_without_resume_and_include_verbatim_findings(self) -> None:
+        """Verify each fix round starts a fresh agent process with --no-session-persistence, no --resume/--continue, and verbatim findings."""
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "worktree"
+            (wt / "src").mkdir(parents=True)
+            (wt / "preflight.toml").write_text('[general]\nstd = "c++17"\n', encoding="utf-8")
+            (wt / "src" / "calc.cpp").write_text(
+                "/**\n * @file calc.cpp\n * @brief Calc.\n */\n"
+                "/**\n * @brief Add.\n * @param[in] value Input.\n * @return Output.\n */\n"
+                "int addOne(int value) { return value + 1; }\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=wt, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=wt, check=True)
+
+            calls_log = base / "invocations.json"
+            calls_log.write_text("[]", encoding="utf-8")
+            fake_claude = base / "fake_claude.py"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"log_path = pathlib.Path({str(calls_log)!r})\n"
+                "calls = json.loads(log_path.read_text(encoding='utf-8'))\n"
+                "calls.append(sys.argv[1:])\n"
+                "n = len(calls)\n"
+                "log_path.write_text(json.dumps(calls), encoding='utf-8')\n"
+                "target = pathlib.Path('src/calc.cpp')\n"
+                "if n == 1:\n"
+                "    # Implementer writes C-style cast + tmp name\n"
+                "    target.write_text('int addOne(int tmp) { return (int)tmp + 1; }\\n', encoding='utf-8')\n"
+                "    res = 'Impl done'\n"
+                "elif n == 2:\n"
+                "    # Fix round 1 fixes cast but keeps tmp name\n"
+                "    target.write_text('/**\\n * @file calc.cpp\\n * @brief Calc.\\n */\\n/**\\n * @brief Add.\\n * @param[in] tmp Input.\\n * @return Out.\\n */\\nint addOne(int tmp) { return static_cast<int>(tmp) + 1; }\\n', encoding='utf-8')\n"
+                "    res = 'Fix 1 done'\n"
+                "elif n == 3:\n"
+                "    # Fix round 2 fixes naming\n"
+                "    target.write_text('/**\\n * @file calc.cpp\\n * @brief Calc.\\n */\\n/**\\n * @brief Add.\\n * @param[in] inputVal Input.\\n * @return Out.\\n */\\nint addOne(int inputVal) { return static_cast<int>(inputVal) + 1; }\\n', encoding='utf-8')\n"
+                "    res = 'Fix 2 done'\n"
+                "else:\n"
+                "    res = 'Clean\\nVERDICT: APPROVE'\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 1, 'result': res}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_claude, stat.S_IRWXU)
+
+            fake_gate = base / "fake_gate.py"
+            fake_gate.write_text("#!/usr/bin/env python3\nprint('BUILD_OK')\n", encoding="utf-8")
+            os.chmod(fake_gate, stat.S_IRWXU)
+
+            config_path = base / "engines.toml"
+            config_path.write_text(
+                "version = 2\n"
+                f'gate_cmd = ["python3", "{fake_gate}"]\n'
+                "[engines.haiku]\n"
+                'model = "haiku"\n'
+                'class = "cloud"\n'
+                "[roles]\n"
+                'implementer = "haiku"\n'
+                'reviewer = "haiku"\n'
+                'fixer = "haiku"\n'
+                "[limits]\n"
+                "max_fix_rounds = 2\n",
+                encoding="utf-8",
+            )
+
+            runs_root = base / "runs"
+            rc = devpack_run.main(
+                [
+                    "--config", str(config_path),
+                    "--worktree", str(wt),
+                    "--runs-root", str(runs_root),
+                    "--agent-bin", str(fake_claude),
+                    "--task-id", "fresh-fix-rounds",
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(0, rc)
+            recorded_calls = json.loads(calls_log.read_text(encoding="utf-8"))
+            self.assertEqual(4, len(recorded_calls))
+            for argv in recorded_calls:
+                self.assertNotIn("--resume", argv)
+                self.assertNotIn("--continue", argv)
+                self.assertIn("--no-session-persistence", argv)
+
+            rdir = next(runs_root.iterdir())
+            fix1_prompt = (rdir / "steps" / "03-fixer-haiku.prompt.md").read_text(encoding="utf-8")
+            fix2_prompt = (rdir / "steps" / "05-fixer-haiku.prompt.md").read_text(encoding="utf-8")
+            self.assertIn("[ERROR][MISRA-8.2.2]", fix1_prompt)
+            self.assertIn("[ERROR][NAMING-MEANINGFUL]", fix2_prompt)
+            self.assertNotIn("Fix 1 done", fix2_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

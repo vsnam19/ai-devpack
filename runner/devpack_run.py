@@ -37,7 +37,7 @@ import shlex
 import subprocess
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 RUNNER_DIR = Path(__file__).resolve().parent
 REPO_ROOT = RUNNER_DIR.parent
@@ -56,6 +56,7 @@ from agent_exec import (  # noqa: E402
     load_quality_checklist,
     new_run_dir,
     redact_sensitive_text,
+    resolve_engine_profile_path,
     run_agent,
     update_run_json,
 )
@@ -473,6 +474,7 @@ def run_task_workflow(
     extra_secrets: Sequence[str] = (),
     path_replacements: Sequence[tuple[str, str]] = (),
     home_placeholder: str = "~",
+    profile_overrides: Mapping[str, Path | None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -609,6 +611,10 @@ def run_task_workflow(
         nonlocal total_cost_usd, total_tokens_in, total_tokens_out, total_duration_s
         nonlocal total_tool_protocol_errors, any_timeout, any_harness_error, first_harness_error
         step_stem = f"{step_index:02d}-{role_name}-{engine.name}"
+        if profile_overrides is not None and engine.name in profile_overrides:
+            resolved_profile = profile_overrides[engine.name]
+        else:
+            resolved_profile = resolve_engine_profile_path(engine.name, repo_root, REPO_ROOT)
         req = AgentRequest(
             engine=engine,
             prompt=prompt_text,
@@ -630,6 +636,7 @@ def run_task_workflow(
             home_placeholder=home_placeholder,
             role=role_name,
             step_index=step_index,
+            profile_path=resolved_profile,
         )
         res = run_agent(req)
         if engine.is_cloud:
