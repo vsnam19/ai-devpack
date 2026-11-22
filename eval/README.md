@@ -23,7 +23,7 @@ machine memory, user plugins, MCP servers, or global instructions.
 - `eval/run_eval.py`: Runs `tasks x models x k` in an isolated workspace, runs
   each task's deterministic `check.sh` grader, and writes `results.json` and
   `summary.md`.
-- `eval/Dockerfile`: Container image definition (`devpack-eval:0.1`) with Node
+- `eval/Dockerfile`: Container image definition (`devpack-eval:<version>`) with Node
   LTS, pinned `@anthropic-ai/claude-code`, `g++`, `cmake`, `python3`, `git`, and
   a non-root user (`1000:1000`).
 - `eval/tests/`: Unit test suite for `run_eval.py` using a mocked agent script.
@@ -55,7 +55,9 @@ python3 eval/run_eval.py \
 ```
 
 In Docker mode:
-- `eval/Dockerfile` is built once with tag `devpack-eval:0.1`.
+- `eval/Dockerfile` is built once with tag `devpack-eval:<version>` and
+  `--build-arg CLAUDE_CODE_VERSION=<version>`; set the version with
+  `--claude-version` (default `2.1.330`).
 - Each trial runs in a fresh container as non-root (`--user 1000:1000`) with
   `--network default` (required for API access).
 - Only two host paths are mounted into the container:
@@ -119,6 +121,25 @@ passing runs (`0 <= c <= k`):
 - **Per-category summary**: Aggregates `pass@1`, `pass^k`, mean cost (USD),
   mean turns, and mean duration (seconds) across all tasks in each category
   (`bugfix`, `add-test`, `small-feature`, `doxygen/naming`, `trap`).
+
+### Permissions, harness errors, and cleanup
+
+- Tool permissions are passed on the command line (`--allowedTools Read Edit
+  Write Bash Glob Grep`, `--disallowedTools WebFetch WebSearch`) and the
+  workspace is pre-trusted through `<cfg>/.claude.json`
+  (`hasTrustDialogAccepted`), so the agent can edit files regardless of the
+  trust dialog. `.claude/settings.json` is still written in the task dir.
+- A run is a **harness error** (`harness_error=true` plus a reason) when the
+  agent output mentions ignored permissions or an untrusted workspace, the
+  agent exits non-zero or times out, or the output JSON is unparsable. Harness
+  errors are never scored as model failures: pass metrics use valid runs only
+  and the summary shows harness-error counts per task and model. The CLI exits
+  `1` if any harness error occurred unless `--allow-harness-errors` is given.
+- Each run records `agent_result_excerpt` (first 4000 chars of the final
+  result), `permission_denials`, and `stderr_tail` (last 2000 chars), all
+  redacted.
+- After every trial (success, failure, timeout, or exception) the credentials
+  copy and the `cfg` directory contents are deleted.
 
 All outputs in `results.json` and `summary.md` automatically redact credential
 contents, credential paths, and host home directory paths (`$HOME`).

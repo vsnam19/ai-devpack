@@ -7,7 +7,7 @@
 
 FROM node:20-bookworm-slim
 
-ARG CLAUDE_CODE_VERSION=1.0.17
+ARG CLAUDE_CODE_VERSION=2.1.330
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash \

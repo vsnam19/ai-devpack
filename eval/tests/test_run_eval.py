@@ -195,8 +195,8 @@ class RunEvalUnitTests(unittest.TestCase):
             self.assertTrue(dump["CLAUDE_CONFIG_DIR"].startswith(str(work_root)))
             self.assertTrue(dump["cwd"].startswith(str(work_root)))
 
-            # Only the credentials copy is inside CLAUDE_CONFIG_DIR
-            self.assertEqual([".credentials.json"], dump["cfg_files"])
+            # Only the credentials copy and the trust state are inside CLAUDE_CONFIG_DIR
+            self.assertEqual([".claude.json", ".credentials.json"], dump["cfg_files"])
             self.assertTrue(dump["has_settings"])
 
             # Verify CLI arguments passed to the agent
@@ -273,6 +273,230 @@ class RunEvalUnitTests(unittest.TestCase):
                     which_fn=lambda _name: None,
                 )
             self.assertIn("no silent fallback to local", str(ctx.exception))
+
+
+_OK_JSON = (
+    "print(json.dumps({'type': 'result', 'result': RESULT, 'total_cost_usd': 0.01, "
+    "'num_turns': 2, 'permission_denials': DENIALS}))\n"
+)
+
+
+def _write_agent(base: Path, body: str) -> Path:
+    """Write an executable fake agent script whose body follows a dump of its state."""
+    agent = base / "fake_agent.py"
+    agent.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, sys\n"
+        "cwd = pathlib.Path.cwd()\n"
+        "cfg = pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])\n"
+        + body,
+        encoding="utf-8",
+    )
+    os.chmod(agent, stat.S_IRWXU)
+    return agent
+
+
+class HarnessErrorTests(unittest.TestCase):
+    """Tests for permissions, harness-error detection, excerpts, and cleanup."""
+
+    def _run(self, body: str, extra_args: list[str] | None = None, k: int = 1):
+        """Run main() with a fake agent; return (rc, results dict, work_root, base)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+        cred = base / "creds.json"
+        cred.write_text(json.dumps({"accessToken": "TOKEN_ABC_123456"}), encoding="utf-8")
+        agent = _write_agent(base, body)
+        work_root = base / "wr"
+        out = base / "out"
+        rc = run_eval.main(
+            [
+                "--isolation", "local", "--models", "haiku", "--k", str(k),
+                "--tasks", "01-mini-bugfix", "--credentials", str(cred),
+                "--work-root", str(work_root), "--fixture-dir", str(fixture_dir),
+                "--tasks-dir", str(tasks_dir), "--agent-bin", str(agent),
+                "--out", str(out), *(extra_args or []),
+            ]
+        )
+        results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+        return rc, results, work_root, base
+
+    _FIX = "(cwd / 'src' / 'sample.cpp').write_text('int value() { return 42; }\\n')\n"
+
+    def test_permission_flags_and_trust_state(self) -> None:
+        """Agent gets permission flags on argv and a pre-written trusted .claude.json."""
+        body = (
+            "state = json.loads((cfg / '.claude.json').read_text())\n"
+            "pathlib.Path(str(cwd.parent / 'dump.json')).write_text(json.dumps("
+            "{'argv': sys.argv[1:], 'state': state, 'cwd': str(cwd)}))\n"
+            + self._FIX
+            + _OK_JSON.replace("RESULT", "'done'").replace("DENIALS", "[]")
+        )
+        rc, results, work_root, _ = self._run(body)
+        self.assertEqual(0, rc)
+        dump = json.loads(next(work_root.rglob("dump.json")).read_text())
+        argv = dump["argv"]
+        i = argv.index("--allowedTools")
+        self.assertEqual(["Read", "Edit", "Write", "Bash", "Glob", "Grep"], argv[i + 1 : i + 7])
+        j = argv.index("--disallowedTools")
+        self.assertEqual(["WebFetch", "WebSearch"], argv[j + 1 : j + 3])
+        self.assertTrue(dump["state"]["projects"][dump["cwd"]]["hasTrustDialogAccepted"])
+        self.assertFalse(results["tasks"][0]["runs"][0]["harness_error"])
+
+    def test_docker_trust_state_uses_container_path_and_tag(self) -> None:
+        """Docker mode trusts the container task dir; build gets version build-arg."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            task = run_eval.load_and_validate_tasks(tasks_dir, "all")[0]
+            cred = base / "c.json"
+            cred.write_text("{}", encoding="utf-8")
+            paths = run_eval.prepare_isolated_trial_dir(
+                base / "trial", fixture_dir, task, cred, agent_cwd="/workspace/task"
+            )
+            state = json.loads((paths["cfg_dir"] / ".claude.json").read_text())
+            self.assertEqual(
+                {"projects": {"/workspace/task": {"hasTrustDialogAccepted": True}}}, state
+            )
+            cmd, _, _ = run_eval.build_docker_agent_invocation(
+                "docker", "devpack-eval:2.1.330", "haiku", "p", paths
+            )
+            self.assertIn("--allowedTools", cmd)
+            self.assertIn("--disallowedTools", cmd)
+
+            calls: list[list[str]] = []
+
+            def fake_run(argv, **_kw):
+                calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            run_eval.ensure_docker_image(
+                EVAL_DIR / "Dockerfile",
+                image_tag=run_eval.docker_image_tag("9.9.9"),
+                claude_version="9.9.9",
+                which_fn=lambda _n: "docker",
+                run_fn=fake_run,
+            )
+            self.assertIn("CLAUDE_CODE_VERSION=9.9.9", calls[0])
+            self.assertIn("devpack-eval:9.9.9", calls[0])
+        self.assertEqual("devpack-eval:2.1.330", run_eval.DOCKER_IMAGE_TAG)
+        dockerfile = (EVAL_DIR / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG CLAUDE_CODE_VERSION=2.1.330", dockerfile)
+        args = run_eval.build_arg_parser().parse_args([])
+        self.assertEqual("2.1.330", args.claude_version)
+
+    def test_trust_warning_is_harness_error_and_exits_1(self) -> None:
+        """A trust warning marks a harness error excluded from pass metrics; CLI exits 1."""
+        body = (
+            "sys.stderr.write('Ignoring 4 permissions.allow entries: workspace has not been trusted\\n')\n"
+            + _OK_JSON.replace("RESULT", "'no edits'").replace("DENIALS", "[{'tool_name': 'Edit'}]")
+        )
+        rc, results, _, _ = self._run(body)
+        self.assertEqual(1, rc)
+        task = results["tasks"][0]
+        run = task["runs"][0]
+        self.assertTrue(run["harness_error"])
+        self.assertIn("trusted", run["harness_error_reason"])
+        self.assertEqual(1, task["harness_errors"])
+        self.assertEqual(0, task["valid_runs"])
+        self.assertIsNone(task["pass_at_1"])
+        self.assertEqual("no edits", run["agent_result_excerpt"])
+        self.assertEqual([{"tool_name": "Edit"}], run["permission_denials"])
+        self.assertIn("not been trusted", run["stderr_tail"])
+        self.assertEqual(1, results["categories"][0]["harness_errors"])
+
+    def test_allow_harness_errors_flag_exits_0(self) -> None:
+        """--allow-harness-errors suppresses the non-zero exit code."""
+        body = "sys.exit(3)\n"
+        rc, results, _, _ = self._run(body, ["--allow-harness-errors"])
+        self.assertEqual(0, rc)
+        run = results["tasks"][0]["runs"][0]
+        self.assertTrue(run["harness_error"])
+        self.assertIn("non-zero", run["harness_error_reason"])
+
+    def test_unparsable_json_is_harness_error(self) -> None:
+        """Garbage stdout with exit 0 is a harness error."""
+        rc, results, _, _ = self._run("print('not json at all')\n")
+        self.assertEqual(1, rc)
+        self.assertIn("unparsable", results["tasks"][0]["runs"][0]["harness_error_reason"])
+
+    def test_metrics_use_valid_runs_only(self) -> None:
+        """A harness-error run does not count as a model failure in pass metrics."""
+        body = (
+            "marker = cwd.parent / 'count'\n"
+            "n = int(marker.read_text()) + 1 if marker.exists() else 1\n"
+            "marker.write_text(str(n))\n"
+            "if n == 1:\n"
+            "    sys.exit(2)\n"
+            + self._FIX
+            + _OK_JSON.replace("RESULT", "'ok'").replace("DENIALS", "[]")
+        )
+        # Per-trial dirs differ so n is always 1; use a shared marker via env-free path.
+        body = body.replace("cwd.parent / 'count'", "pathlib.Path(__file__).parent / 'count'")
+        rc, results, _, _ = self._run(body, k=2)
+        self.assertEqual(1, rc)
+        task = results["tasks"][0]
+        self.assertEqual(1, task["harness_errors"])
+        self.assertEqual(1, task["valid_runs"])
+        self.assertEqual(1, task["passes"])
+        self.assertAlmostEqual(1.0, task["pass_at_1"])
+
+    def test_excerpt_and_tail_truncated_and_redacted(self) -> None:
+        """Excerpt keeps first 4000 chars, stderr tail last 2000, no secrets or home paths."""
+        leaked = "/" + "ho" + "me/someone/x"
+        body = (
+            "sys.stderr.write('A' * 5000 + 'END TOKEN_ABC_123456 ' + " + repr(leaked) + ")\n"
+            + self._FIX
+            + _OK_JSON.replace("RESULT", "'R' * 5000 + 'TOKEN_ABC_123456'").replace("DENIALS", "[]")
+        )
+        _, results, _, _ = self._run(body)
+        run = results["tasks"][0]["runs"][0]
+        self.assertEqual(4000, len(run["agent_result_excerpt"]))
+        self.assertLessEqual(len(run["stderr_tail"]), 2000)
+        self.assertTrue(run["stderr_tail"].endswith("$HOME/x"))
+        text = json.dumps(results)
+        self.assertNotIn("TOKEN_ABC_123456", text)
+        self.assertNotIn(leaked, text)
+
+    def test_credentials_removed_after_trial(self) -> None:
+        """Credentials copy and cfg contents are gone after success and after failure."""
+        ok = self._FIX + _OK_JSON.replace("RESULT", "'ok'").replace("DENIALS", "[]")
+        for body in (ok, "sys.exit(5)\n"):
+            _, _, work_root, _ = self._run(body)
+            self.assertEqual([], list(work_root.rglob(".credentials.json")))
+            for cfg in work_root.rglob("cfg"):
+                self.assertEqual([], list(cfg.iterdir()))
+
+    def test_credentials_removed_after_timeout_and_exception(self) -> None:
+        """Cleanup runs on timeout and on unexpected exceptions."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            task = run_eval.load_and_validate_tasks(tasks_dir, "all")[0]
+            cred = base / "c.json"
+            cred.write_text("{}", encoding="utf-8")
+            agent = _write_agent(base, "import time\ntime.sleep(5)\n")
+            for exc in (None, RuntimeError("boom")):
+                run_root = base / ("rr_timeout" if exc is None else "rr_exc")
+                kwargs = dict(
+                    task=task, model="haiku", run_index=1, run_root=run_root,
+                    fixture_dir=fixture_dir, credentials_path=cred, isolation="local",
+                    agent_bin=str(agent), timeout_s=1,
+                )
+                if exc is None:
+                    result = run_eval.run_single_trial(**kwargs)
+                    self.assertTrue(result.harness_error)
+                    self.assertIn("timed out", result.harness_error_reason)
+                else:
+                    with mock.patch.object(
+                        run_eval, "parse_agent_json_output", side_effect=RuntimeError("boom")
+                    ):
+                        with self.assertRaises(RuntimeError):
+                            run_eval.run_single_trial(**kwargs)
+                cfg = run_root / "01-mini-bugfix__haiku__run1" / "cfg"
+                self.assertTrue(cfg.is_dir())
+                self.assertEqual([], list(cfg.iterdir()))
 
 
 if __name__ == "__main__":
