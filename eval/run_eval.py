@@ -5,11 +5,12 @@
 #   python3 eval/run_eval.py [--help] [--models sonnet,haiku] [--k 5]
 #       [--tasks all|id,...] [--isolation docker|local] [--out eval/results]
 #       [--dry-run] [--timeout-s 900] [--max-parallel 1] [--credentials PATH]
-#       [--work-root PATH]
+#       [--work-root PATH] [--claude-version 2.1.330] [--allow-harness-errors]
 #
 # Exit codes:
 #   0 - Evaluation (or dry-run plan validation) completed without runner errors
-#   1 - Runtime or environment error (e.g. missing docker, missing credentials)
+#   1 - Runtime or environment error (e.g. missing docker, missing credentials),
+#       or at least one run was a harness error (unless --allow-harness-errors)
 #   2 - Invalid command-line arguments or malformed task directory
 """Isolated evaluation runner for measuring agents across the ai-devpack task set."""
 
@@ -31,7 +32,13 @@ import time
 from typing import Any, Callable, Sequence
 import uuid
 
-DOCKER_IMAGE_TAG = "devpack-eval:0.1"
+DEFAULT_CLAUDE_VERSION = "2.1.330"
+DOCKER_IMAGE_TAG = f"devpack-eval:{DEFAULT_CLAUDE_VERSION}"
+DOCKER_TASK_DIR = "/workspace/task"
+ALLOWED_TOOLS = ("Read", "Edit", "Write", "Bash", "Glob", "Grep")
+DISALLOWED_TOOLS = ("WebFetch", "WebSearch")
+EXCERPT_MAX_CHARS = 4000
+STDERR_TAIL_MAX_CHARS = 2000
 REQUIRED_TASK_FILES = ("task.md", "check.sh", "setup.patch", "solution.patch")
 
 # Assemble host-home regex from fragments so forbidden literal substrings never appear.
@@ -71,6 +78,11 @@ class TrialResult:
     duration_s: float
     error: str = ""
     check_output: str = ""
+    harness_error: bool = False
+    harness_error_reason: str = ""
+    agent_result_excerpt: str = ""
+    permission_denials: list[Any] = field(default_factory=list)
+    stderr_tail: str = ""
 
 
 @dataclass
@@ -82,13 +94,15 @@ class TaskModelSummary:
     model: str
     k: int
     passes: int
-    pass_at_1: float
-    pass_hat_k: float
-    pass_pow_k: float
+    pass_at_1: float | None
+    pass_hat_k: float | None
+    pass_pow_k: float | None
     mean_cost_usd: float | None
     mean_turns: float | None
     mean_duration_s: float
     runs: list[TrialResult] = field(default_factory=list)
+    harness_errors: int = 0
+    valid_runs: int = 0
 
 
 def parse_category(task_md_text: str) -> str:
@@ -158,6 +172,26 @@ def validate_fixture_dir(fixture_dir: Path) -> None:
             raise ValueError(f"Fixture directory is missing '{expected}': {fixture_dir}")
 
 
+def docker_image_tag(claude_version: str) -> str:
+    """Return the docker image tag for a given Claude Code version."""
+    return f"devpack-eval:{claude_version}"
+
+
+def build_permission_args() -> list[str]:
+    """Return command-line permission flags that make workspace trust irrelevant."""
+    return [
+        "--allowedTools",
+        *ALLOWED_TOOLS,
+        "--disallowedTools",
+        *DISALLOWED_TOOLS,
+    ]
+
+
+def build_claude_state(agent_cwd: str) -> dict[str, Any]:
+    """Return ``.claude.json`` content marking ``agent_cwd`` as a trusted project."""
+    return {"projects": {agent_cwd: {"hasTrustDialogAccepted": True}}}
+
+
 def build_project_settings() -> dict[str, Any]:
     """Return the Claude project settings JSON enforcing tool permissions in cwd."""
     return {
@@ -181,12 +215,15 @@ def prepare_isolated_trial_dir(
     fixture_dir: Path,
     task: TaskSpec,
     credentials_path: Path,
+    agent_cwd: str | None = None,
 ) -> dict[str, Path]:
     """Create an isolated trial directory with home, cfg, and git-initialized task workdir.
 
     Copies only the credentials file into ``<trial_root>/cfg/.credentials.json``,
     initializes git on a fresh copy of ``fixture_dir``, applies ``setup.patch``,
     commits the setup state, and writes the task prompt and ``.claude/settings.json``.
+    Also pre-writes ``<cfg>/.claude.json`` trusting ``agent_cwd`` (the working
+    directory as seen by the agent; defaults to the host task dir).
     """
     home_dir = trial_root / "home"
     cfg_dir = trial_root / "cfg"
@@ -204,6 +241,12 @@ def prepare_isolated_trial_dir(
     cred_dest = cfg_dir / ".credentials.json"
     shutil.copyfile(credentials_path, cred_dest)
     os.chmod(cred_dest, stat.S_IRUSR | stat.S_IWUSR)
+
+    state_path = cfg_dir / ".claude.json"
+    state_path.write_text(
+        json.dumps(build_claude_state(agent_cwd or str(work_dir)), indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     shutil.copytree(fixture_dir, work_dir, dirs_exist_ok=True)
 
@@ -283,6 +326,7 @@ def build_local_agent_invocation(
     cmd = [
         agent_bin,
         "-p",
+        *build_permission_args(),
         "--model",
         model,
         "--setting-sources",
@@ -323,18 +367,19 @@ def build_docker_agent_invocation(
         "--user",
         "1000:1000",
         "--workdir",
-        "/workspace/task",
+        DOCKER_TASK_DIR,
         "-e",
         "HOME=/workspace/home",
         "-e",
         "CLAUDE_CONFIG_DIR=/workspace/cfg",
         "-v",
-        f"{paths['work_dir']}:/workspace/task:rw",
+        f"{paths['work_dir']}:{DOCKER_TASK_DIR}:rw",
         "-v",
         f"{paths['cfg_dir']}:/workspace/cfg:ro",
         image_tag,
         agent_bin_in_container,
         "-p",
+        *build_permission_args(),
         "--model",
         model,
         "--setting-sources",
@@ -359,6 +404,7 @@ def build_docker_agent_invocation(
 def ensure_docker_image(
     dockerfile_path: Path,
     image_tag: str = DOCKER_IMAGE_TAG,
+    claude_version: str = DEFAULT_CLAUDE_VERSION,
     which_fn: Callable[[str], str | None] = shutil.which,
     run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> str:
@@ -376,6 +422,8 @@ def ensure_docker_image(
         [
             docker_bin,
             "build",
+            "--build-arg",
+            f"CLAUDE_CODE_VERSION={claude_version}",
             "-t",
             image_tag,
             "-f",
@@ -393,16 +441,11 @@ def ensure_docker_image(
     return docker_bin
 
 
-def parse_agent_json_output(stdout_text: str) -> dict[str, Any]:
-    """Parse cost, turns, and duration telemetry from agent JSON output if present."""
-    metrics: dict[str, Any] = {
-        "cost_usd": None,
-        "turns": None,
-        "duration_s": None,
-    }
+def extract_agent_json_object(stdout_text: str) -> dict[str, Any] | None:
+    """Return the JSON object printed by the agent, or None when unparsable."""
     stripped = stdout_text.strip()
     if not stripped:
-        return metrics
+        return None
 
     candidates = [stripped]
     lines = [line.strip() for line in stripped.splitlines() if line.strip()]
@@ -421,6 +464,17 @@ def parse_agent_json_output(stdout_text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
 
+    return parsed
+
+
+def parse_agent_json_output(stdout_text: str) -> dict[str, Any]:
+    """Parse cost, turns, and duration telemetry from agent JSON output if present."""
+    metrics: dict[str, Any] = {
+        "cost_usd": None,
+        "turns": None,
+        "duration_s": None,
+    }
+    parsed = extract_agent_json_object(stdout_text)
     if not parsed:
         return metrics
 
@@ -442,6 +496,32 @@ def parse_agent_json_output(stdout_text: str) -> dict[str, Any]:
         metrics["duration_s"] = float(parsed["duration_ms"]) / 1000.0
 
     return metrics
+
+
+def detect_harness_error(
+    agent_rc: int,
+    stdout_text: str,
+    stderr_text: str,
+    timeout_error: str = "",
+) -> str:
+    """Return a reason string when the run is a harness error, else an empty string.
+
+    A harness error means the agent could not work under valid conditions
+    (untrusted workspace, ignored permissions, crash, unparsable output).
+    """
+    if timeout_error:
+        return timeout_error
+    combined = f"{stdout_text}\n{stderr_text}"
+    lowered = combined.lower()
+    if "not been trusted" in lowered:
+        return "workspace not trusted: agent ignored project permissions"
+    if "ignoring" in lowered and "permissions" in lowered:
+        return "agent ignored permissions entries"
+    if agent_rc != 0:
+        return f"agent exited with non-zero status {agent_rc}"
+    if extract_agent_json_object(stdout_text) is None:
+        return "agent output JSON is missing or unparsable"
+    return ""
 
 
 def compute_pass_at_1(passes: int, total: int) -> float:
@@ -529,6 +609,35 @@ def redact_structure(
     return value
 
 
+def _json_string_leaves(value: Any, min_len: int = 8) -> list[str]:
+    """Return every string value (length >= ``min_len``) found inside a JSON structure."""
+    if isinstance(value, str):
+        return [value] if len(value) >= min_len else []
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _json_string_leaves(item, min_len)]
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in _json_string_leaves(item, min_len)]
+    return []
+
+
+def cleanup_cfg_dir(cfg_dir: Path) -> None:
+    """Delete the credentials copy and every other entry inside ``cfg_dir``."""
+    try:
+        (cfg_dir / ".credentials.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not cfg_dir.is_dir():
+        return
+    for entry in cfg_dir.iterdir():
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def run_single_trial(
     task: TaskSpec,
     model: str,
@@ -542,15 +651,49 @@ def run_single_trial(
     docker_bin: str | None = None,
     extra_secrets: Sequence[str] = (),
     path_replacements: Sequence[tuple[str, str]] = (),
+    image_tag: str = DOCKER_IMAGE_TAG,
 ) -> TrialResult:
-    """Execute one (task, model, run_index) trial in an isolated workspace."""
+    """Execute one (task, model, run_index) trial in an isolated workspace.
+
+    Credentials and the config directory contents are always deleted afterwards,
+    whether the trial succeeds, fails, times out, or raises.
+    """
     trial_name = f"{task.task_id}__{model}__run{run_index}"
     trial_root = run_root / trial_name
+    try:
+        return _run_trial_body(
+            task, model, run_index, trial_root, fixture_dir, credentials_path,
+            isolation, agent_bin, timeout_s, docker_bin, extra_secrets,
+            path_replacements, image_tag,
+        )
+    finally:
+        cleanup_cfg_dir(trial_root / "cfg")
+
+
+def _run_trial_body(
+    task: TaskSpec,
+    model: str,
+    run_index: int,
+    trial_root: Path,
+    fixture_dir: Path,
+    credentials_path: Path,
+    isolation: str,
+    agent_bin: str,
+    timeout_s: int,
+    docker_bin: str | None,
+    extra_secrets: Sequence[str],
+    path_replacements: Sequence[tuple[str, str]],
+    image_tag: str,
+) -> TrialResult:
+    """Run the agent and the check for one trial (cleanup is done by the caller)."""
+    if isolation not in ("local", "docker"):
+        raise ValueError(f"Unsupported isolation mode: {isolation}")
     paths = prepare_isolated_trial_dir(
         trial_root=trial_root,
         fixture_dir=fixture_dir,
         task=task,
         credentials_path=credentials_path,
+        agent_cwd=DOCKER_TASK_DIR if isolation == "docker" else None,
     )
     prompt_text = paths["prompt_file"].read_text(encoding="utf-8")
     work_dir = paths["work_dir"]
@@ -562,26 +705,24 @@ def run_single_trial(
             prompt_text=prompt_text,
             paths=paths,
         )
-    elif isolation == "docker":
+    else:
         if not docker_bin:
             raise RuntimeError("docker_bin is required for docker isolation mode")
         cmd, env, cwd = build_docker_agent_invocation(
             docker_bin=docker_bin,
-            image_tag=DOCKER_IMAGE_TAG,
+            image_tag=image_tag,
             model=model,
             prompt_text=prompt_text,
             paths=paths,
         )
-    else:
-        raise ValueError(f"Unsupported isolation mode: {isolation}")
 
     start_ts = time.monotonic()
     agent_rc = -1
     agent_stdout = ""
+    agent_stderr = ""
     error_msg = ""
+    timeout_error = ""
 
-    # Remove TASK_PROMPT.md from work_dir before check.sh just in case, though
-    # keep it during agent execution so the agent can read it if needed.
     try:
         proc = subprocess.run(
             cmd,
@@ -593,23 +734,52 @@ def run_single_trial(
             check=False,
         )
         agent_rc = proc.returncode
-        agent_stdout = proc.stdout
-        if proc.returncode != 0 and proc.stderr.strip():
-            error_msg = proc.stderr.strip()
-    except subprocess.TimeoutExpired:
+        agent_stdout = proc.stdout or ""
+        agent_stderr = proc.stderr or ""
+        if proc.returncode != 0 and agent_stderr.strip():
+            error_msg = agent_stderr.strip()
+    except subprocess.TimeoutExpired as exc:
         agent_rc = 124
         error_msg = f"Agent timed out after {timeout_s}s"
+        timeout_error = error_msg
+        for attr in ("stdout", "stderr"):
+            raw = getattr(exc, attr, None)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if attr == "stdout":
+                agent_stdout = raw or ""
+            else:
+                agent_stderr = raw or ""
     except OSError as exc:
         agent_rc = 127
         error_msg = f"Failed to execute agent command: {exc}"
+        timeout_error = error_msg
 
     elapsed_s = time.monotonic() - start_ts
     parsed_metrics = parse_agent_json_output(agent_stdout)
+    parsed_obj = extract_agent_json_object(agent_stdout) or {}
     duration_s = (
         parsed_metrics["duration_s"]
         if parsed_metrics["duration_s"] is not None
         else round(elapsed_s, 4)
     )
+    harness_reason = detect_harness_error(
+        agent_rc, agent_stdout, agent_stderr, timeout_error
+    )
+
+    def _redact(text: str) -> str:
+        """Redact a string using this run's secrets and path replacements."""
+        return redact_sensitive_text(text, extra_secrets, path_replacements)
+
+    result_text = parsed_obj.get("result")
+    excerpt = _redact(result_text)[:EXCERPT_MAX_CHARS] if isinstance(result_text, str) else ""
+    denials = parsed_obj.get("permission_denials")
+    denials_out = (
+        redact_structure(denials, extra_secrets, path_replacements)
+        if isinstance(denials, list)
+        else []
+    )
+    stderr_tail = _redact(agent_stderr)[-STDERR_TAIL_MAX_CHARS:]
 
     task_prompt_in_work = work_dir / "TASK_PROMPT.md"
     if task_prompt_in_work.exists():
@@ -638,7 +808,7 @@ def run_single_trial(
         check_rc = 124
         check_out = f"check.sh timed out after {timeout_s}s"
 
-    passed = check_rc == 0
+    passed = check_rc == 0 and not harness_reason
     return TrialResult(
         task_id=task.task_id,
         category=task.category,
@@ -650,8 +820,13 @@ def run_single_trial(
         cost_usd=parsed_metrics["cost_usd"],
         turns=parsed_metrics["turns"],
         duration_s=float(duration_s),
-        error=redact_sensitive_text(error_msg, extra_secrets, path_replacements),
-        check_output=redact_sensitive_text(check_out, extra_secrets, path_replacements),
+        error=_redact(error_msg),
+        check_output=_redact(check_out),
+        harness_error=bool(harness_reason),
+        harness_error_reason=_redact(harness_reason),
+        agent_result_excerpt=excerpt,
+        permission_denials=denials_out,
+        stderr_tail=stderr_tail,
     )
 
 
@@ -673,22 +848,33 @@ def aggregate_results(
                 by_task_model.get((task.task_id, model), []),
                 key=lambda r: r.run_index,
             )
-            total = len(runs) if runs else k
-            passes = sum(1 for r in runs if r.passed)
-            costs = [r.cost_usd for r in runs if r.cost_usd is not None]
-            turns_list = [r.turns for r in runs if r.turns is not None]
-            durations = [r.duration_s for r in runs]
+            harness_errors = sum(1 for r in runs if r.harness_error)
+            valid = [r for r in runs if not r.harness_error]
+            has_valid = bool(valid)
+            total = len(valid) if has_valid else 0
+            passes = sum(1 for r in valid if r.passed)
+            costs = [r.cost_usd for r in valid if r.cost_usd is not None]
+            turns_list = [r.turns for r in valid if r.turns is not None]
+            durations = [r.duration_s for r in valid]
 
             task_summaries.append(
                 TaskModelSummary(
                     task_id=task.task_id,
                     category=task.category,
                     model=model,
-                    k=total,
+                    k=len(runs) if runs else k,
                     passes=passes,
-                    pass_at_1=round(compute_pass_at_1(passes, total), 4),
-                    pass_hat_k=round(compute_pass_hat_k(passes, total), 4),
-                    pass_pow_k=round(compute_pass_pow_k(passes, total, total), 4),
+                    pass_at_1=(
+                        round(compute_pass_at_1(passes, total), 4) if has_valid else None
+                    ),
+                    pass_hat_k=(
+                        round(compute_pass_hat_k(passes, total), 4) if has_valid else None
+                    ),
+                    pass_pow_k=(
+                        round(compute_pass_pow_k(passes, total, total), 4)
+                        if has_valid
+                        else None
+                    ),
                     mean_cost_usd=(
                         round(sum(costs) / len(costs), 6) if costs else None
                     ),
@@ -701,6 +887,8 @@ def aggregate_results(
                         round(sum(durations) / len(durations), 4) if durations else 0.0
                     ),
                     runs=runs,
+                    harness_errors=harness_errors,
+                    valid_runs=len(valid),
                 )
             )
 
@@ -716,15 +904,15 @@ def aggregate_results(
             if not matching:
                 continue
             n_tasks = len(matching)
-            mean_pass_at_1 = round(
-                sum(s.pass_at_1 for s in matching) / n_tasks, 4
-            )
-            mean_pass_hat_k = round(
-                sum(s.pass_hat_k for s in matching) / n_tasks, 4
-            )
-            mean_pass_pow_k = round(
-                sum(s.pass_pow_k for s in matching) / n_tasks, 4
-            )
+            scored = [s for s in matching if s.pass_at_1 is not None]
+
+            def _mean(values: list[float]) -> float | None:
+                """Average ``values`` rounded to 4 places, or None when empty."""
+                return round(sum(values) / len(values), 4) if values else None
+
+            mean_pass_at_1 = _mean([s.pass_at_1 for s in scored])
+            mean_pass_hat_k = _mean([s.pass_hat_k for s in scored])
+            mean_pass_pow_k = _mean([s.pass_pow_k for s in scored])
             cat_costs = [
                 s.mean_cost_usd for s in matching if s.mean_cost_usd is not None
             ]
@@ -738,6 +926,7 @@ def aggregate_results(
                     "pass_at_1": mean_pass_at_1,
                     "pass_hat_k": mean_pass_hat_k,
                     "pass_pow_k": mean_pass_pow_k,
+                    "harness_errors": sum(s.harness_errors for s in matching),
                     "mean_cost_usd": (
                         round(sum(cat_costs) / len(cat_costs), 6)
                         if cat_costs
@@ -752,6 +941,11 @@ def aggregate_results(
             )
 
     return task_summaries, category_summaries
+
+
+def _fmt(value: float | None) -> str:
+    """Format a metric with two decimals, or ``n/a`` when there are no valid runs."""
+    return "n/a" if value is None else f"{value:.2f}"
 
 
 def render_summary_markdown(
@@ -774,8 +968,10 @@ def render_summary_markdown(
         "",
         "## Per-Category Summary",
         "",
-        "| Category | Model | Tasks | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Duration (s) |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "Pass metrics are computed over valid runs only (harness errors excluded).",
+        "",
+        "| Category | Model | Tasks | Harness errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Duration (s) |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for cat in category_summaries:
         cost_str = (
@@ -785,8 +981,9 @@ def render_summary_markdown(
         )
         lines.append(
             f"| {cat['category']} | {cat['model']} | {cat['tasks_count']} | "
-            f"{cat['pass_at_1']:.2f} | {cat['pass_hat_k']:.2f} | "
-            f"{cat['pass_pow_k']:.2f} | {cost_str} | {cat['mean_duration_s']:.2f} |"
+            f"{cat['harness_errors']} | "
+            f"{_fmt(cat['pass_at_1'])} | {_fmt(cat['pass_hat_k'])} | "
+            f"{_fmt(cat['pass_pow_k'])} | {cost_str} | {cat['mean_duration_s']:.2f} |"
         )
 
     lines.extend(
@@ -794,8 +991,8 @@ def render_summary_markdown(
             "",
             "## Per-Task Summary",
             "",
-            "| Task | Category | Model | Passes (c/k) | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Duration (s) |",
-            "|---|---|---|---|---:|---:|---:|---:|---:|",
+            "| Task | Category | Model | Passes (c/valid) | Harness errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Duration (s) |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for ts in task_summaries:
@@ -804,8 +1001,9 @@ def render_summary_markdown(
         )
         lines.append(
             f"| {ts.task_id} | {ts.category} | {ts.model} | "
-            f"{ts.passes}/{ts.k} | {ts.pass_at_1:.2f} | {ts.pass_hat_k:.2f} | "
-            f"{ts.pass_pow_k:.2f} | {cost_str} | {ts.mean_duration_s:.2f} |"
+            f"{ts.passes}/{ts.valid_runs} | {ts.harness_errors} | "
+            f"{_fmt(ts.pass_at_1)} | {_fmt(ts.pass_hat_k)} | "
+            f"{_fmt(ts.pass_pow_k)} | {cost_str} | {ts.mean_duration_s:.2f} |"
         )
 
     lines.append("")
@@ -898,6 +1096,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=os.environ.get("DEVPACK_EVAL_AGENT_BIN", "claude"),
         help="Agent CLI executable name or path (default: claude)",
     )
+    parser.add_argument(
+        "--claude-version",
+        default=DEFAULT_CLAUDE_VERSION,
+        help=(
+            "Claude Code version baked into the docker image via --build-arg "
+            f"(default: {DEFAULT_CLAUDE_VERSION})"
+        ),
+    )
+    parser.add_argument(
+        "--allow-harness-errors",
+        action="store_true",
+        help="Exit 0 even when some runs were harness errors (default: exit 1)",
+    )
     return parser
 
 
@@ -977,6 +1188,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         for s in (cred_secret_text, str(credentials_path), args.credentials)
         if s
     ]
+    try:
+        extra_secrets.extend(_json_string_leaves(json.loads(cred_secret_text)))
+    except json.JSONDecodeError:
+        pass
     repo_root = Path(__file__).resolve().parent.parent
     work_root = Path(args.work_root).resolve()
     path_replacements = [
@@ -984,12 +1199,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         (str(repo_root), "<REPO_ROOT>"),
     ]
 
+    image_tag = docker_image_tag(args.claude_version)
     docker_bin: str | None = None
     if args.isolation == "docker":
         try:
             docker_bin = ensure_docker_image(
                 dockerfile_path=dockerfile_path,
-                image_tag=DOCKER_IMAGE_TAG,
+                image_tag=image_tag,
+                claude_version=args.claude_version,
             )
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -1016,6 +1233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         docker_bin=docker_bin,
                         extra_secrets=extra_secrets,
                         path_replacements=path_replacements,
+                        image_tag=image_tag,
                     )
                 )
         else:
@@ -1035,6 +1253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         docker_bin,
                         extra_secrets,
                         path_replacements,
+                        image_tag,
                     )
                     for task, model, run_idx in plan_items
                 ]
@@ -1094,6 +1313,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             encoding="utf-8",
         )
 
+    harness_total = sum(1 for t in trials if t.harness_error)
+    if harness_total:
+        print(
+            f"warning: {harness_total} run(s) were harness errors "
+            "(excluded from pass metrics); see results.json",
+            file=sys.stderr,
+        )
+        if not args.allow_harness_errors:
+            return 1
     return 0
 
 
