@@ -84,7 +84,7 @@ class TaskSpec:
     check_sh: Path
     setup_patch: Path
     solution_patch: Path
-    hidden_dir: Path
+    hidden_dir: Path | None
 
 
 @dataclass
@@ -170,12 +170,21 @@ def load_and_validate_tasks(tasks_dir: Path, task_selector: str) -> list[TaskSpe
             req_path = tdir / req_name
             if not req_path.is_file():
                 raise ValueError(f"Task '{tdir.name}' is missing required file '{req_name}'")
-        hidden_dir = tdir / "hidden"
-        if not hidden_dir.is_dir():
-            raise ValueError(f"Task '{tdir.name}' is missing required 'hidden/' directory")
-
         task_md_path = tdir / "task.md"
         category = parse_category(task_md_path.read_text(encoding="utf-8"))
+        hidden_dir: Path | None = tdir / "hidden"
+        if category.strip().lower() == "review":
+            # Review tasks are graded on REVIEW.md and carry no hidden tests; they must ship
+            # the seeded diff instead.
+            if not (tdir / "review.patch").is_file():
+                raise ValueError(
+                    f"Review task '{tdir.name}' is missing required 'review.patch'"
+                )
+            if not hidden_dir.is_dir():
+                hidden_dir = None
+        elif not hidden_dir.is_dir():
+            raise ValueError(f"Task '{tdir.name}' is missing required 'hidden/' directory")
+
         specs.append(
             TaskSpec(
                 task_id=tdir.name,
