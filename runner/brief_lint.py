@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 from pathlib import Path
 import re
@@ -351,6 +352,21 @@ def _looks_like_repo_path(token: str, repo_root: Path, top_dirs: frozenset[str])
     return None
 
 
+def _is_declared_new_path(rel_path: str, scope_entries: Sequence[str]) -> bool:
+    """Return True when ``rel_path`` is named by an allowed-files entry (exact, glob or directory prefix)."""
+    for entry in scope_entries:
+        item = entry.strip().strip("`").strip()
+        if not item:
+            continue
+        if item.endswith("/"):
+            if rel_path.startswith(item):
+                return True
+            continue
+        if rel_path == item or fnmatch.fnmatchcase(rel_path, item):
+            return True
+    return False
+
+
 def _collect_repo_identifiers(repo_root: Path) -> set[str]:
     """Build a set of identifiers found across source and header files in ``repo_root``."""
     idents: set[str] = set()
@@ -553,6 +569,9 @@ def lint_brief_text(
                 for part in span.split():
                     candidates.append((part, bm.start()))
             for pm in _PATH_TOKEN_RE.finditer(line):
+                # A token cut short by a glob metacharacter (e.g. ``src/gen_*.cpp``) is not a path.
+                if line[pm.end(1):pm.end(1) + 1] in ("*", "?", "[", "{"):
+                    continue
                 candidates.append((pm.group(1), pm.start()))
 
             line_files: list[Path] = []
@@ -568,8 +587,11 @@ def lint_brief_text(
                         line_files.append(resolved)
                         last_existing_file = resolved
                     continue
-                # Allow newly created files explicitly introduced with creation verbs in Expected output
+                # Allow newly created files: named in the allowed-files list / globs, or introduced
+                # with a creation verb in Expected output. Paths only mentioned in Input stay errors.
                 prefix_ctx = line[:pos]
+                if _is_declared_new_path(rel_path, scope_entries):
+                    continue
                 if canon == "Expected output" and _CREATE_PREFIX_RE.search(prefix_ctx):
                     continue
                 if (lineno, rel_path) not in seen_missing_paths:

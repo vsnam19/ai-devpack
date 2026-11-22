@@ -88,6 +88,77 @@ class FailureAttributionTests(unittest.TestCase):
             self.assertTrue(attr_over["signals"]["prompt_over_context"])
             self.assertEqual(32768, attr_over["signals"]["context_window"])
 
+    def _write_local_run(self, base: Path, request_inputs: list[int], result_input: int) -> Path:
+        """Create a minimal run dir whose local step has one assistant turn per ``request_inputs`` entry."""
+        run_dir = base / "ctx-run"
+        steps_dir = run_dir / "steps"
+        steps_dir.mkdir(parents=True)
+        run_meta = {
+            "run_id": "20261123T010300Z-t00009",
+            "kind": "dispatch",
+            "started": "2026-11-23T01:03:00Z",
+            "finished": "2026-11-23T01:03:20Z",
+            "engines": {"implementer": "local"},
+            "task": "context-window-signal",
+            "outcome": "ok",
+        }
+        (run_dir / "run.json").write_text(json.dumps(run_meta), encoding="utf-8")
+        events: list[dict[str, object]] = [{"type": "system", "subtype": "init", "cwd": "/tmp/work", "model": "local-coder"}]
+        for n in request_inputs:
+            events.append(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "model": "local-coder",
+                        "content": [{"type": "text", "text": "Working on it."}],
+                        "usage": {"input_tokens": n, "output_tokens": 10},
+                    },
+                }
+            )
+        events.append(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "num_turns": len(request_inputs),
+                "duration_ms": 1000,
+                "total_cost_usd": 0.0,
+                "usage": {"input_tokens": result_input, "output_tokens": 10 * len(request_inputs)},
+                "result": "Done.",
+            }
+        )
+        (steps_dir / "01-implementer-local.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8"
+        )
+        return run_dir
+
+    def test_context_signal_uses_per_request_max_not_cumulative(self) -> None:
+        """Three 12k turns on a 32k engine are not a prompt-over-context TOOL failure; cumulative is reported apart."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_local_run(Path(tmp), [12000, 12000, 12000], result_input=36000)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = devpack_logs.main(["analyze", str(run_dir), "--engines", str(ENGINES_EXAMPLE)])
+            self.assertEqual(0, rc)
+            attr = json.loads((run_dir / "attribution.json").read_text(encoding="utf-8"))
+            self.assertEqual(12000, attr["signals"]["max_request_tokens_in"])
+            self.assertEqual(36000, attr["signals"]["cumulative_tokens_in"])
+            self.assertEqual(32768, attr["signals"]["context_window"])
+            self.assertFalse(attr["signals"]["prompt_over_context"])
+            self.assertNotEqual("TOOL", attr["suspected_cause"])
+
+    def test_context_signal_fires_on_single_oversized_request(self) -> None:
+        """One request of 33k input tokens on a 32k engine yields the prompt-over-context TOOL signal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_local_run(Path(tmp), [33000], result_input=33000)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = devpack_logs.main(["analyze", str(run_dir), "--engines", str(ENGINES_EXAMPLE)])
+            self.assertEqual(0, rc)
+            attr = json.loads((run_dir / "attribution.json").read_text(encoding="utf-8"))
+            self.assertEqual(33000, attr["signals"]["max_request_tokens_in"])
+            self.assertTrue(attr["signals"]["prompt_over_context"])
+            self.assertEqual("TOOL", attr["suspected_cause"])
+
     def test_analyze_env_timeout_and_quota(self) -> None:
         """Crafted ENV fixtures (timeout and quota) yield suspected_cause == 'ENV'."""
         with tempfile.TemporaryDirectory() as tmp:

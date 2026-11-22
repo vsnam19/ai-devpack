@@ -171,6 +171,7 @@ class StepRecord:
     tokens_out: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    max_request_tokens_in: int = 0
     cost_usd: float = 0.0
     prompt_text: str = ""
     prompt_sha256: str = ""
@@ -447,6 +448,7 @@ def parse_stream_jsonl(
     sum_out_tokens = 0
     sum_cache_read = 0
     sum_cache_create = 0
+    max_request_in = 0
     saw_result_usage = False
     protocol_errors_detected = 0
     text_items_with_json_call: list[StreamItem] = []
@@ -512,6 +514,13 @@ def parse_stream_jsonl(
                 sum_out_tokens += int(usage.get("output_tokens", 0) or 0)
                 sum_cache_read += int(usage.get("cache_read_input_tokens", 0) or 0)
                 sum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
+                # Context pressure is per request: one request's full input (fresh + cached).
+                request_in = (
+                    int(usage.get("input_tokens", 0) or 0)
+                    + int(usage.get("cache_read_input_tokens", 0) or 0)
+                    + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                )
+                max_request_in = max(max_request_in, request_in)
 
             content = msg.get("content")
             if isinstance(content, str):
@@ -653,6 +662,8 @@ def parse_stream_jsonl(
 
     if step.num_turns == 0 and assistant_turns > 0:
         step.num_turns = assistant_turns
+
+    step.max_request_tokens_in = max(step.max_request_tokens_in, max_request_in)
 
     if not saw_result_usage:
         if step.tokens_in == 0:
@@ -2022,7 +2033,8 @@ def analyze_run_dir(
         if eng_ctx is not None:
             context_window = eng_ctx if context_window is None else min(context_window, eng_ctx)
 
-        max_step_tokens_in = max(max_step_tokens_in, int(step.tokens_in))
+        # tokens_in is cumulative over all turns; only the per-request maximum is compared to the window.
+        max_step_tokens_in = max(max_step_tokens_in, int(step.max_request_tokens_in))
         if step.status == "timeout":
             timeout_detected = True
             scores["ENV"] += 4
@@ -2385,6 +2397,8 @@ def analyze_run_dir(
         "skill_triggers": skill_triggers,
         "prompt_tokens_est": prompt_tokens_est,
         "max_step_tokens_in": max_step_tokens_in,
+        "max_request_tokens_in": max_step_tokens_in,
+        "cumulative_tokens_in": sum(int(s.tokens_in) for s in record.steps),
         "context_window": context_window,
         "prompt_over_context": prompt_over_context,
         "tool_protocol_errors": record.total_protocol_errors,
