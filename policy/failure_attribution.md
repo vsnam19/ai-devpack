@@ -25,7 +25,10 @@ the target repository and engine budget:
 - `BRIEF-HEADINGS`: required sections present (`Goal`, `Input`, `Expected output`,
   `Constraints` / `STOP conditions`, `Gate` / `Commands`).
 - `BRIEF-NO-SCOPE`: non-empty allowed-files declaration (`## Files allowed`).
-- `BRIEF-PATH-MISSING`: path-like tokens resolve to existing files in `--repo`.
+- `BRIEF-PATH-MISSING`: path-like tokens resolve to existing files in `--repo`. Section rule:
+  a missing path named in `Goal` or `Input` is an error, unless `Expected output` also names it
+  (then warning). A missing path mentioned only in `Expected output`, `Files allowed` (or its
+  globs), `Gate`, or any other section is a warning and never blocks.
 - `BRIEF-LINE-OUT-OF-RANGE`: `file:line` or `line N` references stay within file length.
 - `BRIEF-SYMBOL-MISSING`: backticked function calls or named functions/classes checked
   against the repository (emitted as `warning` only, because new symbols may be created).

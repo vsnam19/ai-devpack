@@ -221,15 +221,6 @@ _FORBID_VERB_RE = re.compile(
 _MODIFY_VERB_RE = re.compile(
     r"(?i)\b(?:modify|edit|update|change|alter|delete|remove|rewrite)\b"
 )
-# A path is "created" when the text right before it (same line) says create/add/new/generate, optionally
-# followed by a short article or noun ("Create the new file `x`", "Add generated unit `x`").
-_CREATE_PREFIX_RE = re.compile(
-    r"(?i)\b(?:create|creates|write|output|generate|save|produce|add|adds|new)\s+"
-    r"(?:(?:a|an|the|new|generated|empty|separate|additional)\s+){0,2}"
-    r"(?:(?:file|unit|module|header|source|helper|test)\s+)?[`'\"]*$"
-)
-_NEGATED_CREATE_RE = re.compile(r"(?i)\b(?:not|never|don't|do\s+not|must\s+not)\b")
-
 
 def estimate_tokens(text: str) -> int:
     """Estimate token count deterministically using a 4-characters-per-token heuristic."""
@@ -370,16 +361,11 @@ def _line_path_candidates(line: str) -> list[tuple[str, int]]:
     return candidates
 
 
-def _is_create_context(prefix: str) -> bool:
-    """Return True when the text before a path announces that the path is created (and not negated)."""
-    return bool(_CREATE_PREFIX_RE.search(prefix)) and not _NEGATED_CREATE_RE.search(prefix)
-
-
-def _collect_created_paths(
+def _collect_expected_output_paths(
     sections: Sequence[dict[str, Any]], repo: Path, top_dirs: frozenset[str]
 ) -> set[str]:
-    """Return repo-relative paths that the brief's Expected output says will be created."""
-    created: set[str] = set()
+    """Return repo-relative paths mentioned anywhere in the brief's Expected output section."""
+    mentioned: set[str] = set()
     for sec in sections:
         if _match_canonical_section(sec["normalized"]) != "Expected output":
             continue
@@ -390,11 +376,11 @@ def _collect_created_paths(
                 continue
             if in_fence:
                 continue
-            for raw_tok, pos in _line_path_candidates(line):
+            for raw_tok, _pos in _line_path_candidates(line):
                 rel_path = _looks_like_repo_path(raw_tok, repo, top_dirs)
-                if rel_path and _is_create_context(line[:pos]):
-                    created.add(rel_path)
-    return created
+                if rel_path:
+                    mentioned.add(rel_path)
+    return mentioned
 
 
 def _collect_repo_identifiers(repo_root: Path) -> set[str]:
@@ -559,9 +545,10 @@ def lint_brief_text(
     seen_missing_paths: set[tuple[int, str]] = set()
     seen_oob: set[tuple[int, str, int]] = set()
     last_existing_file: Path | None = None
-    created_paths = _collect_created_paths(sections, repo, top_dirs)
+    expected_paths = _collect_expected_output_paths(sections, repo, top_dirs)
 
     for sec in sections:
+        sec_canon = _match_canonical_section(sec["normalized"])
         in_fence = False
         for lineno, line in sec["body_lines"]:
             if _FENCE_RE.match(line):
@@ -605,16 +592,16 @@ def lint_brief_text(
                         line_files.append(resolved)
                         last_existing_file = resolved
                     continue
-                # Allow newly created files only when Expected output says they are created. Being
-                # listed under Files allowed or only mentioned in Input is not enough (stays an error).
-                if rel_path in created_paths:
-                    continue
+                # Section rule: a missing path blocks only when Goal or Input names it and Expected
+                # output does not. Mentions elsewhere (Expected output, Files allowed, Gate, ...)
+                # are warnings, because they may describe files the work is meant to create.
+                blocking = sec_canon in ("Goal", "Input") and rel_path not in expected_paths
                 if (lineno, rel_path) not in seen_missing_paths:
                     seen_missing_paths.add((lineno, rel_path))
                     findings.append(
                         {
                             "rule": "BRIEF-PATH-MISSING",
-                            "severity": err_sev,
+                            "severity": err_sev if blocking else "warning",
                             "line": lineno,
                             "message": f"Referenced path '{rel_path}' does not exist in repository.",
                         }
