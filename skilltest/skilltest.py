@@ -30,7 +30,14 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-from runner.agent_exec import AgentRequest, load_engines, run_agent, update_run_json
+from runner.agent_exec import (
+    AgentRequest,
+    check_local_isolation_allowed,
+    load_engines,
+    load_project_config,
+    run_agent,
+    update_run_json,
+)
 from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs
 
 
@@ -248,7 +255,8 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
                    check_command: str | None = None, grader: Path | None = None,
                    expectations: dict[str, Any] | None = None,
                    engines_config: Path | str = REPOSITORY_ROOT / "runner/engines.example.toml",
-                   expected_trigger: bool | None = None) -> tuple[bool, bool, dict[str, Any]]:
+                   expected_trigger: bool | None = None,
+                   allow_unsandboxed_local: bool = False) -> tuple[bool, bool, dict[str, Any]]:
     """Run one agent trial and return trigger status plus serialized telemetry."""
     run_dir.mkdir(parents=True, exist_ok=True)
     update_run_json(run_dir, kind="skilltest", engines=[engine], task=prompt, outcome="running")
@@ -270,6 +278,7 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
                 engine=load_engines(engines_config).get_engine(engine), prompt=prompt, workdir=workdir,
                 run_dir=run_dir, step_name="skilltest", role="skilltest", skills_enabled=enabled,
                 agent_bin=agent_bin, isolation=isolation,
+                allow_unsandboxed_local=allow_unsandboxed_local,
             ))
             telemetry = asdict(result)
             raw = result.transcript_path.read_text(encoding="utf-8") if result.transcript_path.is_file() else ""
@@ -338,6 +347,18 @@ def run_experiment(args: argparse.Namespace) -> int:
         for engine, arm, count, name in plan:
             print(f"{engine} {arm} {count}/{args.k} {name}")
         return 0
+    project_cfg = load_project_config(REPOSITORY_ROOT)
+    allow_local = bool(getattr(args, "allow_unsandboxed_local", False)) or bool(
+        project_cfg.get("allow_unsandboxed_local", False)
+    )
+    iso_ok, iso_msg = check_local_isolation_allowed(
+        args.isolation,
+        allow_unsandboxed_local=allow_local,
+        project_config=project_cfg,
+    )
+    if not iso_ok:
+        print(iso_msg, file=sys.stderr)
+        return 1
     date = datetime.now(timezone.utc).strftime("%Y%m%d")
     output = Path(args.results_root) / date / skill_dir.name
     output.mkdir(parents=True, exist_ok=True)
@@ -348,7 +369,7 @@ def run_experiment(args: argparse.Namespace) -> int:
             for _ in range(args.k):
                 serial += 1
                 triggered, _, telemetry = _execute_trial(skill_dir, engine, case["prompt"], True,
-                    _trial_run_dir(output, f"{serial:03d}-trigger-{engine}"), None, args.agent_bin, args.isolation, engines_config=args.engines_config, expected_trigger=case["expect"])
+                    _trial_run_dir(output, f"{serial:03d}-trigger-{engine}"), None, args.agent_bin, args.isolation, engines_config=args.engines_config, expected_trigger=case["expect"], allow_unsandboxed_local=allow_local)
                 trials.append({"engine": engine, "arm": "trigger", "case": case["name"], "expected": case["expect"], "triggered": triggered, "reason": telemetry["reason"], "telemetry": telemetry})
         for arm, enabled in (("with_skill", True), ("without_skill", False)):
             for case in config["behaviour"]:
@@ -359,7 +380,7 @@ def run_experiment(args: argparse.Namespace) -> int:
                     _, passed, telemetry = _execute_trial(skill_dir, engine, case["prompt"], enabled,
                         _trial_run_dir(output, f"{serial:03d}-{arm}-{engine}"), fixture, args.agent_bin, args.isolation,
                         case["check"], grader, {key: case[key] for key in ("category", "severity", "verdict") if key in case},
-                        engines_config=args.engines_config)
+                        engines_config=args.engines_config, allow_unsandboxed_local=allow_local)
                     trials.append({"engine": engine, "arm": arm, "case": case["name"], "passed": passed, "reason": telemetry["reason"], "telemetry": telemetry})
     report = {"skill": skill_dir.name, "trials": trials}
     trigger_report: dict[str, Any] = {}
@@ -406,7 +427,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--engines", required=True)
     run.add_argument("--engines-config", default=str(REPOSITORY_ROOT / "runner/engines.example.toml"))
     run.add_argument("--k", type=int, default=3)
-    run.add_argument("--isolation", choices=("local", "docker"), default="local")
+    run.add_argument("--isolation", choices=("local", "docker"), default="docker")
+    run.add_argument("--allow-unsandboxed-local", action="store_true")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--agent-bin", default="claude")
     run.add_argument("--results-root", default="skilltest/results")

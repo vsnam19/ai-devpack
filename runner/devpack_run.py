@@ -5,7 +5,8 @@
 #   python3 runner/devpack_run.py [--help] [--config runner/engines.example.toml]
 #       [--task-file PATH] [--task-id ID] [--title TITLE] [--goal GOAL]
 #       [--worktree DIR] [--log-dir DIR] [--runs-root DIR] [--max-fix-rounds 2]
-#       [--isolation local|docker] [--credentials PATH] [--agent-bin claude] [--dry-run]
+#       [--isolation docker|local] [--allow-unsandboxed-local] [--credentials PATH]
+#       [--agent-bin claude] [--dry-run]
 #
 # Drives a single closed task through:
 #   1. Render workflow/templates/brief_implement.md (or built-in fallback) with task data
@@ -49,13 +50,17 @@ from agent_exec import (  # noqa: E402
     AgentRequest,
     EngineConfig,
     EnginesConfig,
+    check_local_isolation_allowed,
     format_command,
     load_engines,
+    load_quality_checklist,
     new_run_dir,
     redact_sensitive_text,
     run_agent,
     update_run_json,
 )
+from devpack_dispatch import run_preflight_lint_on_changed  # noqa: E402
+from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 
 ESCALATE_TO_HUMAN = "ESCALATE_TO_HUMAN"
 VERDICT_APPROVE = "APPROVE"
@@ -222,6 +227,14 @@ def resolve_template_file(repo_root: Path, relative_path: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _append_quality_checklist(brief_text: str, repo_root: Path) -> str:
+    """Append ``runner/quality_checklist.md`` (read from disk) to a worker brief."""
+    checklist = load_quality_checklist(repo_root)
+    if not checklist or checklist in brief_text or "## Code Quality Checklist" in brief_text:
+        return brief_text
+    return brief_text.rstrip() + "\n\n" + checklist + "\n"
+
+
 def render_implement_brief(repo_root: Path, context: dict[str, str]) -> tuple[str, str]:
     """Render ``workflow/templates/brief_implement.md`` if present, else built-in fallback.
 
@@ -230,8 +243,12 @@ def render_implement_brief(repo_root: Path, context: dict[str, str]) -> tuple[st
     tpl_path = resolve_template_file(repo_root, "workflow/templates/brief_implement.md")
     if tpl_path is not None:
         raw = tpl_path.read_text(encoding="utf-8")
-        return render_template_text(raw, context), str(tpl_path.relative_to(repo_root))
-    return render_template_text(BUILTIN_IMPLEMENT_TEMPLATE, context), "built-in:brief_implement"
+        return _append_quality_checklist(render_template_text(raw, context), repo_root), str(
+            tpl_path.relative_to(repo_root)
+        )
+    return _append_quality_checklist(
+        render_template_text(BUILTIN_IMPLEMENT_TEMPLATE, context), repo_root
+    ), "built-in:brief_implement"
 
 
 def render_review_brief(
@@ -275,8 +292,10 @@ def render_fix_brief(
                 f"\n\n## Failure Source: {failure_source}\n\n"
                 f"## Failure Details\n{failure_details}\n"
             )
-        return rendered, str(tpl_path.relative_to(repo_root))
-    return render_template_text(BUILTIN_FIX_TEMPLATE, fix_ctx), "built-in:brief_fix"
+        return _append_quality_checklist(rendered, repo_root), str(tpl_path.relative_to(repo_root))
+    return _append_quality_checklist(
+        render_template_text(BUILTIN_FIX_TEMPLATE, fix_ctx), repo_root
+    ), "built-in:brief_fix"
 
 
 def parse_review_verdict(review_output: str) -> str:
@@ -414,6 +433,24 @@ def _coerce_role_engine(config: EnginesConfig | dict[str, Any], role: str, fallb
     raise ValueError(f"Cannot resolve engine for role '{role}'")
 
 
+def _resolve_git_base_ref(worktree: Path) -> str | None:
+    """Return HEAD SHA if ``worktree`` is a git repository with a commit, else None."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode == 0:
+            sha = proc.stdout.strip()
+            return sha if sha else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return None
+
+
 def run_task_workflow(
     config: EnginesConfig | dict[str, Any],
     context: dict[str, str],
@@ -424,9 +461,18 @@ def run_task_workflow(
     dry_run: bool = False,
     *,
     run_dir: Path | None = None,
-    isolation: str = "local",
+    isolation: str = "docker",
+    allow_unsandboxed_local: bool = False,
     credentials_path: Path | None = None,
     agent_bin: str = "claude",
+    docker_bin: str = "docker",
+    image_tag: str = agent_exec.DOCKER_IMAGE_TAG,
+    home_dir: Path | None = None,
+    cfg_dir: Path | None = None,
+    tmp_dir: Path | None = None,
+    extra_secrets: Sequence[str] = (),
+    path_replacements: Sequence[tuple[str, str]] = (),
+    home_placeholder: str = "~",
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -508,13 +554,57 @@ def run_task_workflow(
             outcome="running",
         )
 
+    iso_ok, iso_msg = check_local_isolation_allowed(
+        isolation,
+        allow_unsandboxed_local=allow_unsandboxed_local,
+        workdir=worktree,
+    )
+    if not iso_ok:
+        sys.stderr.write(iso_msg + "\n")
+        update_run_json(
+            active_run_dir,
+            outcome="refused",
+            isolation=isolation,
+            refusal_reason=iso_msg,
+            finished=datetime.now(timezone.utc).isoformat(),
+        )
+        return 1, {
+            "task_id": context["TASK_ID"],
+            "task_title": context["TASK_TITLE"],
+            "status": "refused",
+            "verdict": "",
+            "fix_rounds_used": 0,
+            "max_fix_rounds": max_fix_rounds,
+            "escalation_reason": iso_msg,
+            "cost_usd": 0.0,
+            "run_dir": str(active_run_dir),
+            "step_logs": [],
+            "harness_error": True,
+            "harness_error_reason": iso_msg,
+            "timed_out": False,
+        }
+
+    base_ref = _resolve_git_base_ref(worktree)
+    lint_pack_root = repo_root if (repo_root / "enforcement" / "lint" / "preflight_lint.py").is_file() else REPO_ROOT
+
     step_index = 0
     step_logs: list[str] = []
     total_cost_usd = 0.0
+    total_tokens_in = 0
+    total_tokens_out = 0
+    total_duration_s = 0.0
+    total_tool_protocol_errors = 0
+    any_timeout = False
+    any_harness_error = False
+    first_harness_error = ""
+    lint_findings_first_attempt: int | None = None
+    last_lint_clean = True
+    rounds_to_clean: int | None = None
 
     def _invoke_role(role_name: str, engine: EngineConfig, prompt_text: str) -> agent_exec.AgentResult:
-        """Run a role via agent_exec.run_agent and accumulate cost."""
-        nonlocal total_cost_usd
+        """Run a role via agent_exec.run_agent and accumulate telemetry."""
+        nonlocal total_cost_usd, total_tokens_in, total_tokens_out, total_duration_s
+        nonlocal total_tool_protocol_errors, any_timeout, any_harness_error, first_harness_error
         step_stem = f"{step_index:02d}-{role_name}-{engine.name}"
         req = AgentRequest(
             engine=engine,
@@ -523,14 +613,33 @@ def run_task_workflow(
             run_dir=active_run_dir,
             step_name=step_stem,
             isolation=isolation,
+            allow_unsandboxed_local=allow_unsandboxed_local,
             timeout_s=engine.timeout_s,
             credentials_path=credentials_path,
             agent_bin=agent_bin,
+            docker_bin=docker_bin,
+            image_tag=image_tag,
+            home_dir=home_dir,
+            cfg_dir=cfg_dir,
+            tmp_dir=tmp_dir,
+            extra_secrets=extra_secrets,
+            path_replacements=path_replacements,
+            home_placeholder=home_placeholder,
             role=role_name,
             step_index=step_index,
         )
         res = run_agent(req)
         total_cost_usd += float(res.cost_usd or 0.0)
+        total_tokens_in += int(res.tokens_in or 0)
+        total_tokens_out += int(res.tokens_out or 0)
+        total_duration_s += float(res.duration_s or 0.0)
+        total_tool_protocol_errors += int(res.tool_protocol_errors or 0)
+        if res.status == "timeout":
+            any_timeout = True
+        elif res.status == "harness_error":
+            any_harness_error = True
+            if not first_harness_error:
+                first_harness_error = res.error or "agent harness_error"
         return res
 
     # Step 1: Implement
@@ -565,7 +674,7 @@ def run_task_workflow(
     escalation_reason = ""
 
     while True:
-        # Step: Gate
+        # Step: Gate (configured gate_cmd + preflight lint on changed C/C++ files)
         step_index += 1
         gate_rc, gate_out, gate_err, gate_dur = execute_command(
             gate_cmd,
@@ -574,6 +683,29 @@ def run_task_workflow(
         )
         gate_passed = gate_rc == 0
         combined_gate_output = (gate_out + ("\n" + gate_err if gate_err else "")).strip()
+
+        lint_findings = 0
+        lint_ok = True
+        if base_ref is not None:
+            changed_files, _ = get_changed_files(worktree, base_ref)
+            lint_ok, lint_findings, lint_out = run_preflight_lint_on_changed(
+                worktree, changed_files or [], pack_root=lint_pack_root
+            )
+            if lint_out:
+                combined_gate_output = (
+                    (combined_gate_output + "\n\n" if combined_gate_output else "")
+                    + "[preflight_lint]\n"
+                    + lint_out
+                )
+            if not lint_ok:
+                gate_passed = False
+
+        if lint_findings_first_attempt is None:
+            lint_findings_first_attempt = lint_findings
+        last_lint_clean = lint_ok
+        if rounds_to_clean is None and lint_ok:
+            rounds_to_clean = fix_rounds_used
+
         write_gate_step_file(
             active_run_dir,
             step_index,
@@ -590,6 +722,8 @@ def run_task_workflow(
                 "command": gate_cmd,
                 "returncode": gate_rc,
                 "gate_passed": gate_passed,
+                "lint_findings": lint_findings,
+                "lint_clean": lint_ok,
                 "stdout": gate_out,
                 "stderr": gate_err,
                 "duration_s": gate_dur,
@@ -770,6 +904,16 @@ def run_task_workflow(
         "max_fix_rounds": max_fix_rounds,
         "escalation_reason": escalation_reason,
         "cost_usd": round(total_cost_usd, 6),
+        "tokens_in": total_tokens_in,
+        "tokens_out": total_tokens_out,
+        "duration_s": round(total_duration_s, 4),
+        "tool_protocol_errors": total_tool_protocol_errors,
+        "lint_findings_first_attempt": lint_findings_first_attempt,
+        "lint_clean_final": bool(last_lint_clean),
+        "rounds_to_clean": rounds_to_clean,
+        "timed_out": any_timeout,
+        "harness_error": any_harness_error,
+        "harness_error_reason": first_harness_error,
         "run_dir": str(active_run_dir),
         "step_logs": step_logs,
     }
@@ -861,9 +1005,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--isolation",
-        choices=("local", "docker"),
-        default="local",
-        help="Agent isolation mode (default: local)",
+        choices=("docker", "local"),
+        default="docker",
+        help="Agent isolation mode (default: docker)",
+    )
+    parser.add_argument(
+        "--allow-unsandboxed-local",
+        action="store_true",
+        help="Explicitly authorize unsandboxed --isolation local (sandbox deviation)",
     )
     parser.add_argument(
         "--credentials",
@@ -945,6 +1094,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=args.dry_run,
         run_dir=run_dir,
         isolation=args.isolation,
+        allow_unsandboxed_local=args.allow_unsandboxed_local,
         credentials_path=credentials_path,
         agent_bin=args.agent_bin,
     )

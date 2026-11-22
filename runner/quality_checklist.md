@@ -1,0 +1,12 @@
+## Code Quality Checklist (C/C++17, enforced by preflight_lint.py)
+- Add `@file` and `@brief` Doxygen header on every `.h`/`.hpp`/`.c`/`.cpp` file.
+- Add `@brief` Doxygen on every class, struct, enum, function, and method.
+- Document every param with `@param[in]`, `@param[out]`, or `@param[in,out]` matching direction & order.
+- Add `@return` on every non-void function; keep `<= 5` parameters (group extras in a struct).
+- Naming: `CamelCase` types/enums; `camelBack` functions/vars; `m_` private members; `kCamelCase` constexpr.
+- Use meaningful names (avoid `tmp`, `temp`, `val`, `var`, `foo`, `bar`, `baz`, `obj`, `dat`, `buf`, `ptr`).
+- No dynamic heap allocation (`new`, `delete`, `malloc`, `free`) in runtime paths.
+- No C-style casts (`(T)x`); use `static_cast<T>(x)`. No exceptions or RTTI (`-fno-exceptions -fno-rtti`).
+- Use `{}` braces on every `if`/`else`/`for`/`while`/`do` body; include `default:` in every `switch`.
+- Mark single-arg constructors `explicit` and overridden virtuals `override`; avoid `goto`, `[=]`, `[&]`.
+- Initialize all variables; use fixed-width integers (`std::uint8_t`, etc.); no commented-out code.

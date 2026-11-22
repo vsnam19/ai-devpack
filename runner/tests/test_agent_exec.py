@@ -141,6 +141,8 @@ class AgentExecUnitTests(unittest.TestCase):
                         workdir=workdir,
                         run_dir=run_dir,
                         step_name="01-implementer-local",
+                        isolation="local",
+                        allow_unsandboxed_local=True,
                     )
                 )
                 self.assertEqual("harness_error", res_missing.status)
@@ -202,6 +204,8 @@ class AgentExecUnitTests(unittest.TestCase):
                         workdir=workdir,
                         run_dir=run_dir,
                         step_name="02-implementer-local",
+                        isolation="local",
+                        allow_unsandboxed_local=True,
                         agent_bin=str(fake_claude),
                     )
                 )
@@ -340,6 +344,8 @@ class AgentExecUnitTests(unittest.TestCase):
                     workdir=workdir,
                     run_dir=run_dir,
                     step_name="01-implementer-haiku",
+                    isolation="local",
+                    allow_unsandboxed_local=True,
                     credentials_path=cred_file,
                     agent_bin=str(fake_claude),
                     home_dir=home_dir,
@@ -418,6 +424,8 @@ class AgentExecUnitTests(unittest.TestCase):
                         workdir=workdir,
                         run_dir=run_dir,
                         step_name="01-implementer-haiku",
+                        isolation="local",
+                        allow_unsandboxed_local=True,
                         agent_bin="claude",
                         timeout_s=1,
                     )
@@ -433,6 +441,8 @@ class AgentExecUnitTests(unittest.TestCase):
                         workdir=workdir,
                         run_dir=run_dir,
                         step_name="02-implementer-haiku",
+                        isolation="local",
+                        allow_unsandboxed_local=True,
                         agent_bin="claude",
                         timeout_s=5,
                     )
@@ -447,6 +457,8 @@ class AgentExecUnitTests(unittest.TestCase):
                         workdir=workdir,
                         run_dir=run_dir,
                         step_name="03-implementer-haiku",
+                        isolation="local",
+                        allow_unsandboxed_local=True,
                         agent_bin="claude",
                         timeout_s=5,
                     )
@@ -461,12 +473,98 @@ class AgentExecUnitTests(unittest.TestCase):
                         workdir=workdir,
                         run_dir=run_dir,
                         step_name="04-implementer-haiku",
+                        isolation="local",
+                        allow_unsandboxed_local=True,
                         agent_bin="claude",
                         timeout_s=5,
                     )
                 )
                 self.assertEqual("agent_error", res_agent_err.status)
                 self.assertEqual(5, res_agent_err.num_turns)
+
+    def test_sandbox_local_isolation_refused_without_explicit_allow_and_warns_when_allowed(self) -> None:
+        """Verify AgentRequest defaults to docker and isolation='local' refuses unless explicitly authorized."""
+        default_req = AgentRequest(engine="haiku", prompt="hi")
+        self.assertEqual("docker", default_req.isolation)
+        self.assertFalse(default_req.allow_unsandboxed_local)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workdir = base / "work"
+            workdir.mkdir()
+            marker = base / "invoked.txt"
+            fake_claude = _write_executable(
+                base / "fake_claude.py",
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'total_cost_usd': 0.0, 'num_turns': 1, 'result': 'ok'}))\n",
+            )
+            eng = EngineConfig(name="haiku", model="haiku", engine_class="cloud")
+
+            # 1. Refused without allow_unsandboxed_local or project.toml override
+            run_refused = new_run_dir(base / "runs", kind="task", task="refuse", engines=["haiku"])
+            stderr_buf = io.StringIO()
+            with mock.patch("sys.stderr", stderr_buf):
+                res_refused = run_agent(
+                    AgentRequest(
+                        engine=eng,
+                        prompt="test",
+                        workdir=workdir,
+                        run_dir=run_refused,
+                        isolation="local",
+                        agent_bin=str(fake_claude),
+                    )
+                )
+            self.assertEqual("harness_error", res_refused.status)
+            self.assertIn("--allow-unsandboxed-local", res_refused.error)
+            self.assertFalse(marker.exists())
+
+            # 2. Allowed via explicit flag -> prints warning and records in run.json
+            run_flag = new_run_dir(base / "runs", kind="task", task="allow-flag", engines=["haiku"])
+            stderr_buf2 = io.StringIO()
+            with mock.patch("sys.stderr", stderr_buf2):
+                res_flag = run_agent(
+                    AgentRequest(
+                        engine=eng,
+                        prompt="test",
+                        workdir=workdir,
+                        run_dir=run_flag,
+                        isolation="local",
+                        allow_unsandboxed_local=True,
+                        agent_bin=str(fake_claude),
+                    )
+                )
+            self.assertEqual("ok", res_flag.status)
+            self.assertTrue(marker.exists())
+            self.assertIn("WARNING:", stderr_buf2.getvalue())
+            rj = json.loads((run_flag / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("local", rj["isolation"])
+            self.assertIn("WARNING:", rj["sandbox_warning"])
+
+            # 3. Allowed via .devpack/project.toml allow_unsandboxed_local = true
+            (workdir / ".devpack").mkdir()
+            (workdir / ".devpack" / "project.toml").write_text(
+                'data_class = "internal"\nallow_unsandboxed_local = true\n',
+                encoding="utf-8",
+            )
+            run_proj = new_run_dir(base / "runs", kind="task", task="allow-proj", engines=["haiku"])
+            stderr_buf3 = io.StringIO()
+            with mock.patch("sys.stderr", stderr_buf3):
+                res_proj = run_agent(
+                    AgentRequest(
+                        engine=eng,
+                        prompt="test",
+                        workdir=workdir,
+                        run_dir=run_proj,
+                        isolation="local",
+                        agent_bin=str(fake_claude),
+                    )
+                )
+            self.assertEqual("ok", res_proj.status)
+            self.assertIn("WARNING:", stderr_buf3.getvalue())
+            rj_proj = json.loads((run_proj / "run.json").read_text(encoding="utf-8"))
+            self.assertIn("WARNING:", rj_proj["sandbox_warning"])
 
 
 if __name__ == "__main__":

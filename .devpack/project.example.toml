@@ -1,0 +1,36 @@
+# project.example.toml - Example project configuration for ai-devpack (.devpack/project.toml).
+#
+# Copy this file to .devpack/project.toml in the target repository to configure
+# data classification bounds, default engines, log output directory, and
+# sandbox deviation policy.
+#
+# If .devpack/project.toml is absent, devpack_dispatch.py and agent_exec.py
+# fail closed on data classification using the default: data_class = "internal".
+
+# Confidentiality class of this repository (see policy/data_governance.md).
+# Valid values (ordered lowest to highest sensitivity):
+#   "public" | "internal" | "confidential" | "customer-restricted" | "secret"
+# Dispatch refuses any engine whose max_data_class is lower than data_class,
+# and always refuses "secret".
+data_class = "internal"
+
+# Path (relative to the repository root) to the engines configuration file.
+engines_config = "runner/engines.example.toml"
+
+# Directory where v0.2 run logs (runs/<run-id>/) are written (must stay in .gitignore).
+runs_root = "runs"
+
+# Default engine names (must match [engines.<name>] entries in engines_config).
+[default_engines]
+implementer = "haiku"
+reviewer = "sonnet"
+fixer = "haiku"
+orchestrator = "sonnet"
+
+# Sandbox policy override (see policy/sandbox.md).
+# Container isolation ("docker") is the default for all runners.
+# Setting allow_unsandboxed_local = true permits --isolation local without
+# passing --allow-unsandboxed-local on every CLI invocation; treat this as a
+# documented deviation (policy/deviations.md) because local isolation exposes
+# the host filesystem and network to the agent's Bash tool.
+allow_unsandboxed_local = false

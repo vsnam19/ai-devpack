@@ -55,6 +55,17 @@ DEFAULT_GATE_CMD: tuple[str, ...] = (
 )
 VALID_ENGINE_CLASSES = ("cloud", "local")
 VALID_RUN_KINDS = ("task", "eval", "dispatch", "skilltest")
+DATA_CLASS_ORDER: tuple[str, ...] = (
+    "public",
+    "internal",
+    "confidential",
+    "customer-restricted",
+    "secret",
+)
+LOCAL_ISOLATION_WARNING = (
+    "WARNING: running with isolation='local' (unsandboxed host filesystem and "
+    "network access; sandbox deviation per policy/sandbox.md)."
+)
 
 # Assemble host-home regex from fragments so forbidden literal substrings never appear.
 _HOME_PREFIX = "/" + "ho" + "me/"
@@ -615,6 +626,125 @@ def resolve_engine(
     return default_engine_config(name)
 
 
+def load_project_config(
+    workdir: Path | str | None = None,
+    project_config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Load ``.devpack/project.toml`` from ``workdir`` (missing file defaults to ``internal``)."""
+    defaults: dict[str, Any] = {
+        "data_class": "internal",
+        "engines_config": "runner/engines.example.toml",
+        "runs_root": "runs",
+        "default_engines": {},
+        "allow_unsandboxed_local": False,
+        "config_found": False,
+    }
+    if project_config_path is not None and str(project_config_path):
+        cfg_path = Path(project_config_path)
+    elif workdir is not None:
+        cfg_path = Path(workdir) / ".devpack" / "project.toml"
+    else:
+        return defaults
+
+    if not cfg_path.is_file():
+        return defaults
+
+    text = cfg_path.read_text(encoding="utf-8")
+    if tomllib is not None:
+        try:
+            raw = tomllib.loads(text)
+        except Exception as exc:
+            raise ValueError(f"Failed to parse TOML in {cfg_path}: {exc}") from exc
+    else:  # pragma: no cover
+        raw = _minimal_toml_loads(text)
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"Invalid TOML project configuration in {cfg_path}")
+
+    data_class = str(raw.get("data_class", "internal")).strip().lower()
+    if data_class not in DATA_CLASS_ORDER:
+        raise ValueError(
+            f"Invalid data_class '{data_class}' in {cfg_path} "
+            f"(must be one of {', '.join(DATA_CLASS_ORDER)})"
+        )
+    defaults["data_class"] = data_class
+    defaults["engines_config"] = str(raw.get("engines_config", defaults["engines_config"])).strip()
+    defaults["runs_root"] = str(raw.get("runs_root", defaults["runs_root"])).strip()
+    raw_defaults = raw.get("default_engines", {})
+    if isinstance(raw_defaults, dict):
+        defaults["default_engines"] = {str(k): str(v) for k, v in raw_defaults.items()}
+    defaults["allow_unsandboxed_local"] = bool(raw.get("allow_unsandboxed_local", False))
+    defaults["config_found"] = True
+    return defaults
+
+
+def check_data_class_allowed(engine: EngineConfig, data_class: str) -> tuple[bool, str]:
+    """Return ``(allowed, reason)`` checking ``engine.max_data_class`` against ``data_class``."""
+    proj_cls = data_class.strip().lower() or "internal"
+    eng_cls = engine.max_data_class.strip().lower() or "internal"
+    if proj_cls not in DATA_CLASS_ORDER:
+        return False, f"Unknown project data_class '{proj_cls}' (fail closed)."
+    if eng_cls not in DATA_CLASS_ORDER:
+        return (
+            False,
+            f"Engine '{engine.name}' has unknown max_data_class '{eng_cls}' (fail closed).",
+        )
+    if proj_cls == "secret":
+        return (
+            False,
+            f"Refused: project data_class is 'secret'; no AI engine ('{engine.name}') may process secret data (policy/data_governance.md).",
+        )
+    if DATA_CLASS_ORDER.index(proj_cls) > DATA_CLASS_ORDER.index(eng_cls):
+        return (
+            False,
+            f"Refused: engine '{engine.name}' (max_data_class='{eng_cls}') is not permitted for project data_class='{proj_cls}' (policy/data_governance.md).",
+        )
+    return True, ""
+
+
+def check_local_isolation_allowed(
+    isolation: str,
+    *,
+    allow_unsandboxed_local: bool = False,
+    workdir: Path | str | None = None,
+    project_config: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Enforce fail-safe sandbox policy for ``isolation='local'`` (refuse unless explicitly allowed)."""
+    if isolation == "docker":
+        return True, ""
+    if isolation != "local":
+        raise ValueError(f"Unsupported isolation mode: {isolation}")
+
+    cfg = dict(project_config) if project_config is not None else {}
+    if not cfg and workdir is not None:
+        try:
+            cfg = load_project_config(workdir)
+        except ValueError:
+            cfg = {}
+
+    if allow_unsandboxed_local or bool(cfg.get("allow_unsandboxed_local", False)):
+        return True, LOCAL_ISOLATION_WARNING
+
+    return (
+        False,
+        "Refused: isolation='local' runs unsandboxed on the host filesystem and network "
+        "(policy/sandbox.md). Use --isolation docker (default), or pass "
+        "--allow-unsandboxed-local / set allow_unsandboxed_local = true in .devpack/project.toml.",
+    )
+
+
+def load_quality_checklist(repo_root: Path | str | None = None) -> str:
+    """Read ``runner/quality_checklist.md`` from disk at call time (empty string if absent)."""
+    candidates: list[Path] = []
+    if repo_root is not None:
+        candidates.append(Path(repo_root) / "runner" / "quality_checklist.md")
+    candidates.append(Path(__file__).resolve().parent / "quality_checklist.md")
+    for path in candidates:
+        if path.is_file():
+            return path.read_text(encoding="utf-8").strip()
+    return ""
+
+
 @dataclass
 class AgentRequest:
     """Input contract for launching a single isolated agent via ``run_agent``."""
@@ -624,7 +754,8 @@ class AgentRequest:
     workdir: Path
     run_dir: Path
     step_name: str = ""
-    isolation: str = "local"
+    isolation: str = "docker"
+    allow_unsandboxed_local: bool = False
     allowed_tools: Sequence[str] = ALLOWED_TOOLS
     disallowed_tools: Sequence[str] = DISALLOWED_TOOLS
     timeout_s: int | None = None
@@ -651,7 +782,8 @@ class AgentRequest:
         workdir: Path | str = ".",
         run_dir: Path | str | None = None,
         step_name: str = "",
-        isolation: str = "local",
+        isolation: str = "docker",
+        allow_unsandboxed_local: bool = False,
         allowed_tools: Sequence[str] = ALLOWED_TOOLS,
         disallowed_tools: Sequence[str] = DISALLOWED_TOOLS,
         timeout_s: int | None = None,
@@ -695,7 +827,8 @@ class AgentRequest:
         self.workdir = Path(workdir)
         self.run_dir = Path(run_dir) if run_dir is not None else (self.workdir / "runs" / "default")
         self.step_name = str(step_name)
-        self.isolation = str(isolation or "local")
+        self.isolation = str(isolation or "docker")
+        self.allow_unsandboxed_local = bool(allow_unsandboxed_local)
         self.allowed_tools = tuple(allowed_tools) if allowed_tools is not None else ALLOWED_TOOLS
         self.disallowed_tools = (
             tuple(disallowed_tools) if disallowed_tools is not None else DISALLOWED_TOOLS
@@ -1768,6 +1901,26 @@ def run_agent(request: AgentRequest) -> AgentResult:
         )
         meta_path.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
         return res
+
+    iso_allowed, iso_msg = check_local_isolation_allowed(
+        request.isolation,
+        allow_unsandboxed_local=request.allow_unsandboxed_local,
+        workdir=request.workdir,
+    )
+    if not iso_allowed:
+        sys.stderr.write(iso_msg + "\n")
+        jsonl_path.write_text("", encoding="utf-8")
+        update_run_json(request.run_dir, isolation=request.isolation, outcome="refused")
+        return _write_meta_and_return(
+            AgentResult(
+                status="harness_error",
+                exit_code=126,
+                error=iso_msg,
+            )
+        )
+    if request.isolation == "local" and iso_msg:
+        sys.stderr.write(iso_msg + "\n")
+        update_run_json(request.run_dir, isolation="local", sandbox_warning=iso_msg)
 
     # Set up temporary isolation directories if not already provided by caller
     created_temp_iso: Path | None = None
