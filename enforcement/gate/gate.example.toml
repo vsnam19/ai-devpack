@@ -17,6 +17,12 @@ timeout_s = 120
 required = true
 
 [[check]]
+name = "tests-unit-tests"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
+timeout_s = 300
+required = true
+
+[[check]]
 name = "enforcement-unit-tests"
 cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "enforcement", "-t", ".", "-p", "test_*.py"]
 timeout_s = 300
@@ -41,6 +47,27 @@ timeout_s = 300
 required = true
 
 [[check]]
+name = "skilltest-unit-tests"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "skilltest", "-t", ".", "-p", "test_*.py"]
+timeout_s = 300
+required = true
+
+[[check]]
+name = "learning-unit-tests"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "learning", "-t", ".", "-p", "test_*.py"]
+timeout_s = 300
+required = true
+
+[[check]]
+name = "skilltest-lint"
+cmd = [
+  "bash", "-c",
+  "set -euo pipefail; count=0; for d in knowledge/skills/*/; do [ -d \"$d\" ] || continue; count=$((count + 1)); echo \"== skilltest lint: $d\"; python3 -B skilltest/skilltest.py lint \"$d\"; done; test \"$count\" -gt 0",
+]
+timeout_s = 120
+required = true
+
+[[check]]
 name = "eval-fixture-build-and-test"
 cmd = ["bash", "eval/fixture/build_and_test.sh"]
 timeout_s = 600
@@ -53,8 +80,41 @@ timeout_s = 1800
 required = true
 
 [[check]]
+name = "eval-orchestrator-goals-verify"
+cmd = ["python3", "-B", "tests/verify_orchestrator_goals.py"]
+timeout_s = 600
+required = true
+
+[[check]]
 name = "eval-dry-run"
 cmd = ["python3", "-B", "eval/run_eval.py", "--dry-run", "--tasks", "all", "--models", "sonnet,haiku", "--k", "1"]
+timeout_s = 120
+required = true
+
+[[check]]
+name = "eval-dry-run-runner"
+cmd = ["python3", "-B", "eval/run_eval.py", "--dry-run", "--mode", "runner", "--pairs", "haiku:sonnet", "--tier", "all", "--k", "1"]
+timeout_s = 120
+required = true
+
+[[check]]
+name = "eval-dry-run-orchestrator"
+cmd = ["python3", "-B", "eval/run_eval.py", "--dry-run", "--mode", "orchestrator", "--orchestrator", "sonnet", "--workers", "haiku", "--tier", "all", "--k", "1"]
+timeout_s = 120
+required = true
+
+[[check]]
+name = "eval-dry-run-memory"
+cmd = ["python3", "-B", "eval/run_eval.py", "--dry-run", "--mode", "memory", "--engines", "haiku", "--tier", "all", "--k", "1"]
+timeout_s = 120
+required = true
+
+[[check]]
+name = "logs-render-fixture"
+cmd = [
+  "bash", "-c",
+  "set -euo pipefail; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; python3 -B runner/devpack_logs.py render tests/fixtures/sample_run --out \"$tmp\"; test -s \"$tmp/transcript.md\" && test -s \"$tmp/index.html\"",
+]
 timeout_s = 120
 required = true
 

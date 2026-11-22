@@ -33,6 +33,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from enforcement.checks import secret_pii_check  # noqa: E402
 
+try:
+    from runner.agent_exec import collect_os_identities, redact_os_identities, redact_value  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - direct runner/ invocation
+    from agent_exec import collect_os_identities, redact_os_identities, redact_value  # type: ignore[no-redef]  # noqa: E402
+
 TRUNCATE_LIMIT_BYTES = 4096
 
 # Construct home prefix dynamically so literal forbidden pattern never appears in source.
@@ -222,9 +227,10 @@ class Redactor:
             if current_home and current_home not in ("~", "/")
             else None
         )
+        self._os_identities = collect_os_identities()
 
     def redact(self, text: str) -> str:
-        """Return a redacted copy of ``text`` with secrets and home paths scrubbed."""
+        """Return a redacted copy of ``text`` with secrets, home paths, and OS IDs scrubbed."""
         if not text:
             return text
 
@@ -247,8 +253,13 @@ class Redactor:
         if self.current_home and self.current_home in out:
             out = out.replace(self.current_home, "~")
         out = _HOME_PATH_RE.sub("~", out)
+        out = redact_os_identities(out, self._os_identities)
 
         return out
+
+    def redact_value(self, value: Any) -> Any:
+        """Recursively redact strings and dict keys in ``value`` with no exemptions."""
+        return redact_value(value, _text_fn=self.redact)
 
 
 def _extract_credential_file_secrets(raw_text: str) -> list[str]:
@@ -377,7 +388,8 @@ def parse_stream_jsonl(
 ) -> None:
     """Parse a stream-json or session ``.jsonl`` file into ``step`` with redaction applied."""
     try:
-        raw_lines = jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        # Split on "\n" only: splitlines() would also break on U+2028, U+0085 and similar characters.
+        raw_lines = jsonl_path.read_text(encoding="utf-8", errors="replace").split("\n")
     except OSError:
         step.status = "harness_error"
         return
@@ -482,7 +494,7 @@ def parse_stream_jsonl(
                         saw_tool_use = True
                         t_name = redactor.redact(str(block.get("name", "unknown_tool")))
                         t_id = redactor.redact(str(block.get("id", "")))
-                        t_input = block.get("input", {})
+                        t_input = redactor.redact_value(block.get("input", {}))
                         try:
                             pretty_in = json.dumps(t_input, indent=2, ensure_ascii=False)
                         except (TypeError, ValueError):
@@ -522,7 +534,9 @@ def parse_stream_jsonl(
                     if b_type == "tool_result":
                         t_id = redactor.redact(str(block.get("tool_use_id", "")))
                         t_name = tool_id_to_name.get(t_id, "")
-                        raw_res = _normalize_tool_result_content(block.get("content"))
+                        raw_res = _normalize_tool_result_content(
+                            redactor.redact_value(block.get("content"))
+                        )
                         redacted_res = redactor.redact(raw_res)
                         is_err = bool(block.get("is_error", False))
                         step.items.append(

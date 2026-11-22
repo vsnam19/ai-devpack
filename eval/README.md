@@ -1,163 +1,186 @@
 # Evaluation Harness (`eval/`)
 
-This directory contains the isolated agent evaluation suite for `ai-devpack` v0.1.
-It measures agent capability and consistency (`pass@1` and `pass^k`) across a
-self-contained C++17 automotive fixture and 10 graded tasks without leaking host
-machine memory, user plugins, MCP servers, or global instructions.
+This directory contains the isolated agent evaluation suite for `ai-devpack` v0.2.
+It measures agent capability, reliability (`pass@1` and `pass^k`), code-quality
+conformance, reviewer accuracy, orchestrator compliance, and bounded memory recall
+across a self-contained C++17 automotive fixture without leaking host machine memory,
+user plugins, MCP servers, or global instructions.
 
 ## Directory Layout
 
-- `eval/fixture/`: Self-contained C++17 automotive library (CAN signal codec,
-  fixed-capacity frame ring buffer, and supervised link state machine) with a
-  header-only unit test framework and requirement traceability file.
-- `eval/tasks/<id>/`: 10 graded evaluation tasks across 5 categories:
-  - `bugfix` (3 tasks)
-  - `add-test` (2 tasks, verified with mutation testing)
-  - `small-feature` (2 tasks)
-  - `doxygen/naming` (2 tasks)
-  - `trap` (1 canary task with an impossible contradictory test assertion where
-    passing the test implies test tampering; the agent must stop and write
-    `STOP_REPORT.md`)
-- `eval/tasks/verify_tasks.sh`: Verifies every task in an isolated temporary
-  directory (`check.sh` fails after `setup.patch` and passes after `solution.patch`).
-- `eval/run_eval.py`: Runs `tasks x models x k` in an isolated workspace, runs
-  each task's deterministic `check.sh` grader, and writes `results.json` and
+- `eval/fixture/`: Self-contained C++17 automotive library (`can_codec`, `ring_buffer`,
+  `link_state_machine`, `dtc_debouncer`), `docs/spec.md` with requirement IDs, a
+  header-only unit test framework, `preflight.toml`, and `build_and_test.sh`.
+- `eval/tasks/<id>/`: 20 graded tasks partitioned into two tiers:
+  - **`smoke` (`01`-`10`)**: `bugfix` (3), `add-test` (2), `small-feature` (2),
+    `doxygen/naming` (2), `trap` (1). Used for baseline regression and local-model
+    qualification (`policy/local_models.md`).
+  - **`v2` (`11`-`20`)**: `vague-bugfix` (3, symptom-only reports), `multi-file-feature`
+    (2, `>= 3` files), `spec-driven` (2, `docs/spec.md` requirement IDs and trace tags),
+    `review` (1, `REVIEW.md` taxonomy table and `VERDICT: REQUEST_CHANGES`), `trap` (2,
+    conflicting protected test and out-of-scope requirement where passing requires
+    `STOP_REPORT.md` and zero protected edits).
+- `eval/tasks/verify_tasks.sh`: Verifies every task in an isolated temporary directory
+  (`check.sh` fails after `setup.patch` and passes after `solution.patch`), plus v2
+  structural meta-checks (hidden test compile-probe, `src/`/`include/` edits,
+  `solution.patch` minus `src/` failure, negative review patches, `cheat.patch`).
+- `eval/orchestrator_goals/`: Multi-subtask goals (`01-link-fault-recovery`) for
+  `--mode orchestrator`, verified offline by `tests/verify_orchestrator_goals.py`.
+- `eval/memory_tasks/`: 5 multi-step memory evaluation sequences (`01-recall-decision`,
+  `02-superseded-decision`, `03-distractors-overrecall`, `04-stale-vs-code`,
+  `05-scope-isolation`) for `--mode memory`.
+- `eval/run_eval.py`: Runs `single`, `runner`, `orchestrator`, or `memory` modes in
+  isolation, invokes deterministic graders (`check.sh` using `DEVPACK_ROOT`), writes
+  per-trial run directories under `--runs-root`, and writes `results.json` and
   `summary.md`.
 - `eval/Dockerfile`: Container image definition (`devpack-eval:<version>`) with Node
   LTS, pinned `@anthropic-ai/claude-code`, `g++`, `cmake`, `python3`, `git`, and
   a non-root user (`1000:1000`).
-- `eval/tests/`: Unit test suite for `run_eval.py` using a mocked agent script.
+- `eval/tests/`: Unit test suite for `run_eval.py` and the broker using fake agents.
 
-## Running the Evaluation Suite
+## Tiers and Modes
+
+### Tiers (`--tier smoke|v2|all`)
+
+- `--tier smoke`: tasks `01`-`10` (qualification and baseline regression).
+- `--tier v2`: tasks `11`-`20` (discriminating capability tasks).
+- `--tier all` (default): all 20 tasks.
 
 ### 1. Dry-run (validate tasks and print execution plan)
 
 ```bash
-python3 eval/run_eval.py --dry-run --tasks all --models sonnet,haiku --k 5
+python3 eval/run_eval.py --dry-run --mode single --tier all --engines sonnet,haiku --k 1
+python3 eval/run_eval.py --dry-run --mode runner --pairs haiku:sonnet --tier all --k 1
+python3 eval/run_eval.py --dry-run --mode orchestrator --orchestrator sonnet --workers haiku --k 1
+python3 eval/run_eval.py --dry-run --mode memory --engines haiku --k 1
 ```
 
-`--dry-run` validates the fixture directory and all selected task directories
-(`task.md`, `check.sh`, `setup.patch`, `solution.patch`, `hidden/`) and prints
-the planned trials without calling any model or requiring credentials.
+`--dry-run` validates the fixture, task/goal/memory directories, and engine config
+without calling any model or requiring credentials.
 
-### 2. Docker Isolation Mode (`--isolation docker`)
+### 2. Single Mode (`--mode single`)
 
-Docker mode is the primary isolation mechanism:
+Runs each `(task, engine)` pair `k` times independently:
 
 ```bash
 python3 eval/run_eval.py \
+  --mode single --tier smoke \
+  --engines sonnet,haiku --k 3 \
   --isolation docker \
-  --models sonnet,haiku \
-  --k 5 \
-  --tasks all \
-  --credentials "$DEVPACK_CLAUDE_CREDENTIALS" \
-  --out /tmp/devpack-eval-results
+  --credentials "$DEVPACK_CLAUDE_CREDENTIALS"
 ```
 
-In Docker mode:
-- `eval/Dockerfile` is built once with tag `devpack-eval:<version>` and
-  `--build-arg CLAUDE_CODE_VERSION=<version>`; set the version with
-  `--claude-version` (default `2.1.330`).
-- Each trial runs in a fresh container as non-root (`--user 1000:1000`) with
-  `--network default` (required for API access).
-- Only two host paths are mounted into the container:
-  1. The per-trial task workspace (`/workspace/task:rw`).
-  2. A temporary directory containing only a copy of the credentials file
-     (`/workspace/cfg:ro`, mounted read-only).
-- If `docker` is missing or the image build fails, `run_eval.py` exits with an
-  explicit error and never silently falls back to `local` mode.
+### 3. Runner Mode (`--mode runner --pairs imp:rev`)
 
-### 3. Local Isolation Mode (`--isolation local`)
-
-When Docker is unavailable on a developer workstation, `--isolation local`
-isolates the CLI configuration environment:
+Runs the full `runner/devpack_run.py` loop (`implement -> gate -> review -> fix`, up to
+`--max-fix-rounds`) per trial for each `implementer:reviewer` pair:
 
 ```bash
 python3 eval/run_eval.py \
-  --isolation local \
-  --models haiku \
-  --k 3 \
-  --tasks 01-bugfix-codec-sign \
-  --credentials "$DEVPACK_CLAUDE_CREDENTIALS" \
-  --out /tmp/devpack-eval-results
+  --mode runner --tier v2 \
+  --pairs haiku:sonnet,local:haiku --k 3 \
+  --isolation docker \
+  --credentials "$DEVPACK_CLAUDE_CREDENTIALS"
 ```
 
-In local mode:
-- Each trial creates a fresh directory under `/tmp/devpack-eval/<run-id>/`
-  (overridable via `--work-root`).
-- `HOME` points to `<trial-dir>/home` and `CLAUDE_CONFIG_DIR` points to
-  `<trial-dir>/cfg`, which contains only a copy of the credentials file.
-- The agent is invoked with:
-  ```bash
-  HOME=<trial>/home CLAUDE_CONFIG_DIR=<trial>/cfg \
-    claude -p --model <model> \
-    --setting-sources project \
-    --strict-mcp-config \
-    --no-session-persistence \
-    --disable-slash-commands \
-    --output-format json \
-    "<prompt>"
-  ```
-- A project settings file (`.claude/settings.json`) is written into the task
-  workspace allowing `Read`, `Edit`, `Write`, and `Bash` in the working
-  directory and denying `WebFetch` and `WebSearch`.
-- **Security limitation**: In `--isolation local` mode, commands executed via
-   the `Bash` tool still run on the host kernel and can read host files outside
-  the task directory. Always prefer `--isolation docker` for untrusted code or
-  strict benchmark runs.
+### 4. Orchestrator Mode (`--mode orchestrator`)
 
-## Metrics (`pass@1` and `pass^k`)
+Launches a Sonnet orchestrator session (`orchestrator/` config) paired with a live host
+`runner/devpack_broker.py` instance serving `--workers` (`haiku`, `local`, or both):
 
-For each `(task, model)` pair evaluated over `k` independent runs with `c`
-passing runs (`0 <= c <= k`):
+```bash
+python3 eval/run_eval.py \
+  --mode orchestrator \
+  --orchestrator sonnet --workers haiku --k 3 \
+  --isolation local --allow-unsandboxed-local \
+  --credentials "$DEVPACK_CLAUDE_CREDENTIALS"
+```
 
-- **`pass@1`**: Empirical single-run pass rate `p = c / k`.
-- **`pass^k` (all `k` runs pass)**: Measures agent reliability and consistency
-  across repeated runs rather than best-of-`k` luck:
-  - `pass_hat_k` (strict all-`k` pass indicator): `1.0` if `c == k` (every one
-    of the `k` trials passed), else `0.0`.
-  - `pass_pow_k` (Bernoulli consistency estimate): `p^k = (c / k)^k` (for
-    example, a 75% single-run pass rate yields `0.75^3 = 42.2%` at `k = 3`).
-- **Per-category summary**: Aggregates `pass@1`, `pass^k`, mean cost (USD),
-  mean turns, and mean duration (seconds) across all tasks in each category
-  (`bugfix`, `add-test`, `small-feature`, `doxygen/naming`, `trap`).
+A trial passes only if the goal's `check.sh` passes, the orchestrator made zero
+`Edit`/`Write` tool calls to product files, and no disallowed Bash commands or native
+subagent bypasses occurred.
 
-### Permissions, harness errors, and cleanup
+### 5. Memory Mode (`--mode memory`)
 
-- Tool permissions are passed on the command line (`--allowedTools Read Edit
-  Write Bash Glob Grep`, `--disallowedTools WebFetch WebSearch`) and the
-  workspace is pre-trusted through `<cfg>/.claude.json`
-  (`hasTrustDialogAccepted`), so the agent can edit files regardless of the
-  trust dialog. `.claude/settings.json` is still written in the task dir.
-- A run is a **harness error** (`harness_error=true` plus a reason) when the
-  agent output mentions ignored permissions or an untrusted workspace, the
-  agent exits non-zero or times out, or the output JSON is unparsable. Harness
-  errors are never scored as model failures: pass metrics use valid runs only
-  and the summary shows harness-error counts per task and model. The CLI exits
-  `1` if any harness error occurred unless `--allow-harness-errors` is given.
-- Each run records `agent_result_excerpt` (first 4000 chars of the final
-  result), `permission_denials`, and `stderr_tail` (last 2000 chars), all
-  redacted.
-- After every trial (success, failure, timeout, or exception) the credentials
-  copy and the `cfg` directory contents are deleted.
+Runs multi-step sequences under `eval/memory_tasks/` in A/B arms (`with_memory` vs
+`without_memory`; pass `--no-memory-ab` to run `with_memory` only), starting a fresh
+agent session per step and enforcing `scope_check.py` + `test_lock.py --no-deviation`
+before accepting `handoff`/`known-gap` proposals.
 
-All outputs in `results.json` and `summary.md` automatically redact credential
-contents, credential paths, and host home directory paths (`$HOME`).
+## Isolation and `DEVPACK_ROOT`
+
+- `--isolation docker` (default): builds `eval/Dockerfile` (`devpack-eval:<version>`),
+  mounts only `/workspace/task:rw` and a temporary credentials directory `/workspace/cfg:ro`.
+- `--isolation local`: uses temporary `HOME` and `CLAUDE_CONFIG_DIR` on the host; requires
+  `--allow-unsandboxed-local` (or `allow_unsandboxed_local = true` in `.devpack/project.toml`).
+- **`DEVPACK_ROOT`**: exported by `run_eval.py`, `verify_tasks.sh`, and
+  `tests/verify_orchestrator_goals.py` when running `check.sh` graders so each grader
+  resolves `enforcement/lint/preflight_lint.py`, `enforcement/checks/scope_check.py`,
+  `enforcement/checks/test_lock.py` (invoked with `--no-deviation` so agents under test
+  cannot self-exempt), and `eval/fixture/preflight.toml`.
+
+## Local Engine Setup
+
+Local engines are configured in `runner/engines.example.toml` (`[engines.local]`,
+`class = "local"`) using **environment variable names** (`base_url_env` and
+`auth_token_env`) — never literal URLs or tokens in the repository:
+
+```bash
+export DEVPACK_LOCAL_BASE_URL="http://127.0.0.1:11434"
+export DEVPACK_LOCAL_AUTH_TOKEN="your-local-token"
+
+# Run smoke qualification and write .devpack/qualification.json when criteria pass
+python3 eval/run_eval.py \
+  --mode single --tier smoke \
+  --engines local --k 3 \
+  --engines-config runner/engines.example.toml \
+  --isolation docker --record-qualification
+```
+
+`runner/agent_exec.py` exports `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, and `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+unsets `ANTHROPIC_API_KEY`, and verifies server-side requirements from
+`policy/local_models.md` (`min_context_tokens = 32768`).
+
+## Metrics
+
+For each `(task, engine/pair)` over `k` valid runs (`c` passing):
+
+- **`pass@1`**: single-run pass rate `c / k`.
+- **`pass^k`**: `pass_hat_k` (`1.0` if `c == k`, else `0.0`) and `pass_pow_k` (`(c / k)^k`).
+- **Cost, tokens, duration**: `cost_usd` (`n/a` for `class = "local"` engines),
+  `tokens_in`, `tokens_out`, `duration_s`, `num_turns`.
+- **`tool_protocol_errors`**: count of assistant turns that printed a JSON tool call as
+  plain text instead of emitting a `tool_use` block (must be `0` for qualification).
+- **Code-quality metrics** (`single` and `runner`): `lint_findings_first_attempt`,
+  `lint_clean_final`, and `rounds_to_clean`.
+- **Runner / reviewer metrics** (`runner` mode): `escalate` rate, `reviewer_false_approve`
+  (`VERDICT: APPROVE` on a failing change), and `reviewer_false_reject`
+  (`VERDICT: REQUEST_CHANGES` on a passing change).
+- **Orchestrator metrics** (`orchestrator` mode): `orchestrator_product_edits`,
+  `disallowed_bash_commands`, and compliance rate.
+- **Memory metrics** (`memory` mode): `memory_recall_rate`, `memory_over_recall_rate`,
+  `injected_tokens`, and `with_memory` vs `without_memory` pass-rate delta.
+
+### Harness errors and cleanup
+
+- Non-zero agent exits without a stream result, untrusted-workspace or ignored-permissions
+  messages, or timed-out enforcement/build scripts (`enforcement_timeout`, `build_timeout`)
+  are classified as `harness_error=true` and excluded from pass metrics; the CLI exits `1`
+  unless `--allow-harness-errors` is passed. Agent timeouts are counted as `timeout` (not
+  passed).
+- Every trial writes a redacted run directory under `--runs-root` (rendered via
+  `runner/devpack_logs.py`) and deletes credentials copies immediately after the run.
 
 ## Adding a New Task
 
-1. Create a directory `eval/tasks/<NN-category-slug>/`.
-2. Add `task.md` starting with `# Task: <id>` and `Category: <category>`,
-   followed by `## Goal`, `## Files allowed`, `## Commands to run`, and
-   `## STOP rule`.
-3. Create `setup.patch` (applied on top of `eval/fixture/` to introduce the bug
-   or task starting state) and `solution.patch` (the reference solution).
-4. Add `hidden/hidden_test.cpp` containing independent tests that grade the
-   requirement without being visible to the agent during the trial.
-5. Add `check.sh` supporting `--help` and `--workdir DIR` that verifies file
-   scope against post-setup SHA-256 hashes, runs `build_and_test.sh`, compiles
-   and runs `hidden/hidden_test.cpp`, and exits `0` on pass or `1` on fail.
-6. Verify the task with:
+1. Create `eval/tasks/<NN-category-slug>/` with `task.md` (`# Task: <id>`,
+   `Category: <category>`, `Tier: smoke|v2`), `setup.patch`, `solution.patch`,
+   `hidden/` test sources, and `check.sh` (`--help`, `--workdir DIR`).
+2. For `trap` tasks, also provide `cheat.patch`. For `review` tasks, provide
+   `review.patch` and at least one `negative_*.patch`.
+3. Graders calling `enforcement/checks/test_lock.py` must pass `--no-deviation` (LSN-019).
+4. Verify offline with:
    ```bash
    bash eval/tasks/verify_tasks.sh --task <NN-category-slug>
    ```

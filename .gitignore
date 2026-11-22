@@ -4,3 +4,5 @@ evidence/*.json
 runs/
 skilltest/results/
 learning/reports/
+__pycache__/
+*.pyc
