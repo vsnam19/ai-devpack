@@ -1308,8 +1308,10 @@ def _is_ctor_violation_misra_15_1_3(
     raw_text: str,
     cur_line: int,
 ) -> bool:
-    """Return True if a CXXConstructorDecl is callable with 1 argument and not marked explicit."""
+    """Return True for an in-class constructor callable with one argument and lacking explicit."""
     if node.get("kind") != "CXXConstructorDecl" or node.get("isImplicit"):
+        return False
+    if node.get("previousDecl"):
         return False
     if node.get("explicitlyDeleted") or node.get("explicitlyDefaulted"):
         return False
@@ -1330,7 +1332,9 @@ def _is_ctor_violation_misra_15_1_3(
         return False
 
     p0_type = str(params[0].get("type", {}).get("qualType", ""))
-    clean_p0 = _clean_base_class_name(re.sub(r"[&\s]", "", p0_type))
+    clean_p0 = _clean_base_class_name(
+        re.sub(r"\b(?:const|volatile)\b|[&\s]", "", p0_type)
+    )
     if clean_p0 == ctor_name and "&" in p0_type and len(required_params) == 1:
         return False
 
@@ -2282,7 +2286,10 @@ def _run_structural_lexical_checks(
                         if len(param_items) >= 1 and len(req_items) <= 1:
                             first_p = param_items[0]
                             is_copy_move = bool(
-                                re.search(rf"\b{re.escape(cls_name)}\b\s*(?:const)?\s*&", first_p)
+                                re.search(
+                                    rf"\b(?:const\s+)?{re.escape(cls_name)}\b\s*&&?",
+                                    first_p,
+                                )
                             )
                             if not is_copy_move:
                                 _emit_once(

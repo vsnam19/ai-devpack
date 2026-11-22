@@ -225,6 +225,34 @@ class RuleSnippetTests(unittest.TestCase):
         good_findings = self._lint_snippet("ctor_good.cpp", good_ctor)
         self.assertEqual([], [f.rule for f in good_findings])
 
+    def test_explicit_constructor_declarations_do_not_flag_out_of_class_definitions(self) -> None:
+        """Verify MISRA-15.1.3 checks only in-class constructors and retains its copy/move exemption."""
+        source = (
+            "/** @file ctor_declarations.cpp\n * @brief Constructor declaration coverage.\n */\n"
+            "class ExplicitCodec {\n"
+            "public:\n"
+            "  explicit ExplicitCodec(int channelId);\n"
+            "};\n"
+            "ExplicitCodec::ExplicitCodec(int channelId) {}\n"
+            "class ImplicitCodec {\n"
+            "public:\n"
+            "  ImplicitCodec(int channelId);\n"
+            "};\n"
+            "ImplicitCodec::ImplicitCodec(int channelId) {}\n"
+            "class CopyMoveCodec {\n"
+            "public:\n"
+            "  CopyMoveCodec(const CopyMoveCodec& otherCodec);\n"
+            "  CopyMoveCodec(CopyMoveCodec&& otherCodec);\n"
+            "};\n"
+            "CopyMoveCodec::CopyMoveCodec(const CopyMoveCodec& otherCodec) {}\n"
+            "CopyMoveCodec::CopyMoveCodec(CopyMoveCodec&& otherCodec) {}\n"
+        )
+        findings = self._lint_snippet("ctor_declarations.cpp", source)
+        ctor_findings = [f for f in findings if f.rule == "MISRA-15.1.3"]
+        self.assertTrue(ctor_findings)
+        self.assertTrue(all(finding.line == 11 for finding in ctor_findings))
+        self.assertTrue(all("ImplicitCodec" in finding.message for finding in ctor_findings))
+
     def test_override_on_virtual_methods_positive_and_negative(self) -> None:
         """Verify MISRA-13.3.1 flags overridden virtual methods missing override/final."""
         bad_override = (
