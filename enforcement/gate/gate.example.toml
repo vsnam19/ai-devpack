@@ -2,8 +2,7 @@
 # Run from the repository root:
 #   python3 enforcement/gate/gate.py --config enforcement/gate/gate.example.toml
 # Projects copy this file and replace the checks with their own build, test and lint commands.
-# The eval fixture lint run uses eval/fixture/preflight.toml with the documented baseline
-# eval/fixture/lint_baseline.json (see eval/fixture/LINT_BASELINE.md); no rule is disabled.
+# The eval fixture lint run uses eval/fixture/preflight.toml; no rule is disabled and no baseline is used.
 
 [[check]]
 name = "project-leak-check"
@@ -65,7 +64,6 @@ cmd = [
   "python3", "-B", "enforcement/lint/preflight_lint.py",
   "--config", "eval/fixture/preflight.toml",
   "--repo-root", "eval/fixture",
-  "--baseline", "eval/fixture/lint_baseline.json",
   "eval/fixture",
 ]
 timeout_s = 600
