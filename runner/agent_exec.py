@@ -1777,44 +1777,77 @@ def redact_os_identities(
     return out
 
 
-# Stream-json protocol fields whose string values must never be rewritten by OS identity
-# redaction: rewriting them (e.g. ``"type":"result"`` when the host is named ``result``)
-# breaks stream parsing. Keys are never redacted either.
-_PROTOCOL_FIELD_NAMES = frozenset(
-    {
-        "type",
-        "subtype",
-        "role",
-        "model",
-        "id",
-        "tool_use_id",
-        "session_id",
-        "uuid",
-        "stop_reason",
-        "name",
-    }
-)
+# Stream-json protocol fields whose values must never be rewritten by OS identity redaction:
+# rewriting them (e.g. ``"type":"result"`` when the host is named ``result``) breaks stream
+# parsing. An exemption applies only at its exact position in one stdout event (one JSON line):
+#   event top level:              type, subtype, session_id, uuid, model, stop_reason
+#   event.message:                role, model, id, stop_reason, type
+#   event.message.content[]:      type, id, tool_use_id, and name only when type == "tool_use"
+# The same key name anywhere else (tool input, tool result text, nested objects) is redacted.
+_EVENT_PROTOCOL_KEYS = frozenset({"type", "subtype", "session_id", "uuid", "model", "stop_reason"})
+_MESSAGE_PROTOCOL_KEYS = frozenset({"role", "model", "id", "stop_reason", "type"})
+_CONTENT_BLOCK_PROTOCOL_KEYS = frozenset({"type", "id", "tool_use_id"})
 
 
 def _redact_identities_in_json_value(
     value: Any,
     identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
 ) -> Any:
-    """Return ``value`` with OS identities redacted in string values, skipping protocol fields."""
+    """Return ``value`` with OS identities redacted in every string value; dict keys are kept."""
     if isinstance(value, str):
         return redact_os_identities(value, identities)
     if isinstance(value, list):
         return [_redact_identities_in_json_value(item, identities) for item in value]
     if isinstance(value, dict):
-        return {
-            key: (
-                item
-                if key in _PROTOCOL_FIELD_NAMES
-                else _redact_identities_in_json_value(item, identities)
-            )
-            for key, item in value.items()
-        }
+        return {key: _redact_identities_in_json_value(item, identities) for key, item in value.items()}
     return value
+
+
+def _redact_content_block(
+    block: Any,
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
+) -> Any:
+    """Redact one ``message.content[]`` block, exempting only its protocol positions."""
+    if not isinstance(block, dict):
+        return _redact_identities_in_json_value(block, identities)
+    is_tool_use = block.get("type") == "tool_use"
+    out: dict[str, Any] = {}
+    for key, item in block.items():
+        exempt = key in _CONTENT_BLOCK_PROTOCOL_KEYS or (key == "name" and is_tool_use)
+        out[key] = item if exempt else _redact_identities_in_json_value(item, identities)
+    return out
+
+
+def _redact_message(
+    message: dict[str, Any],
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
+) -> dict[str, Any]:
+    """Redact ``event.message``, exempting its protocol fields and redacting each content block."""
+    out: dict[str, Any] = {}
+    for key, item in message.items():
+        if key in _MESSAGE_PROTOCOL_KEYS:
+            out[key] = item
+        elif key == "content" and isinstance(item, list):
+            out[key] = [_redact_content_block(block, identities) for block in item]
+        else:
+            out[key] = _redact_identities_in_json_value(item, identities)
+    return out
+
+
+def _redact_stream_event(
+    event: dict[str, Any],
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
+) -> dict[str, Any]:
+    """Redact one stream-json event object, exempting protocol fields only at their positions."""
+    out: dict[str, Any] = {}
+    for key, item in event.items():
+        if key in _EVENT_PROTOCOL_KEYS:
+            out[key] = item
+        elif key == "message" and isinstance(item, dict):
+            out[key] = _redact_message(item, identities)
+        else:
+            out[key] = _redact_identities_in_json_value(item, identities)
+    return out
 
 
 def redact_os_identities_line(
@@ -1824,7 +1857,8 @@ def redact_os_identities_line(
     """Redact OS identities in one log line, structurally when it is a JSON object.
 
     A line that parses as a JSON object is re-serialized with identities redacted only inside
-    string values (never keys, never protocol fields such as ``type`` or ``role``). Any other
+    string values. Keys are never rewritten, and protocol fields (``type``, ``role``, ...) are
+    exempt only at their stream-json positions (see :func:`_redact_stream_event`). Any other
     text gets the plain whole-word text redaction of :func:`redact_os_identities`. A trailing
     line ending is preserved.
     """
@@ -1840,7 +1874,7 @@ def redact_os_identities_line(
         except ValueError:
             parsed = None
         if isinstance(parsed, dict):
-            redacted_obj = _redact_identities_in_json_value(parsed, ids)
+            redacted_obj = _redact_stream_event(parsed, ids)
             return json.dumps(redacted_obj, ensure_ascii=False, separators=(",", ":")) + ending
     return redact_os_identities(text, ids)
 
@@ -1899,7 +1933,10 @@ def redact_structure(
     path_replacements: Sequence[tuple[str, str]] = (),
     home_placeholder: str = "~",
 ) -> Any:
-    """Recursively redact sensitive strings in a JSON-serializable structure."""
+    """Recursively redact sensitive string values in a JSON-serializable structure.
+
+    Dict keys are never rewritten; only string values are redacted.
+    """
     if isinstance(value, str):
         return redact_sensitive_text(value, extra_secrets, path_replacements, home_placeholder)
     if isinstance(value, list):
@@ -1909,9 +1946,7 @@ def redact_structure(
         ]
     if isinstance(value, dict):
         return {
-            redact_sensitive_text(str(k), extra_secrets, path_replacements, home_placeholder): redact_structure(
-                v, extra_secrets, path_replacements, home_placeholder
-            )
+            k: redact_structure(v, extra_secrets, path_replacements, home_placeholder)
             for k, v in value.items()
         }
     return value

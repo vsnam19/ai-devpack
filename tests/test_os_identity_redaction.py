@@ -291,15 +291,25 @@ class OsIdentityRedactionTests(unittest.TestCase):
         self.assertEqual("success", result_obj["subtype"])
 
     def test_identity_redaction_never_touches_json_keys_or_protocol_values(self) -> None:
-        """Keys and protocol values are preserved while free-text string values are redacted."""
+        """Keys and protocol values at protocol positions are preserved; free text is redacted."""
         line = json.dumps(
             {
                 "type": "assistant",
-                "role": "jdoe_eng",
-                "model": "jdoe_eng",
-                "id": "jdoe_eng",
-                "name": "jdoe_eng",
-                "message": {"content": [{"type": "text", "text": "owner is jdoe_eng"}]},
+                "uuid": "jdoe_eng",
+                "message": {
+                    "role": "jdoe_eng",
+                    "model": "jdoe_eng",
+                    "id": "jdoe_eng",
+                    "content": [
+                        {"type": "text", "text": "owner is jdoe_eng"},
+                        {
+                            "type": "tool_use",
+                            "id": "jdoe_eng",
+                            "name": "jdoe_eng",
+                            "input": {"name": "jdoe_eng"},
+                        },
+                    ],
+                },
                 "jdoe_eng": "jdoe_eng",
             }
         )
@@ -307,13 +317,102 @@ class OsIdentityRedactionTests(unittest.TestCase):
             redacted = agent_exec.redact_sensitive_text(line)
         obj = json.loads(redacted)
         self.assertEqual("assistant", obj["type"])
-        self.assertEqual("jdoe_eng", obj["role"])
-        self.assertEqual("jdoe_eng", obj["model"])
-        self.assertEqual("jdoe_eng", obj["id"])
-        self.assertEqual("jdoe_eng", obj["name"])
+        self.assertEqual("jdoe_eng", obj["uuid"])
+        self.assertEqual("jdoe_eng", obj["message"]["role"])
+        self.assertEqual("jdoe_eng", obj["message"]["model"])
+        self.assertEqual("jdoe_eng", obj["message"]["id"])
         self.assertIn("jdoe_eng", obj)
         self.assertEqual("[USER]", obj["jdoe_eng"])
         self.assertEqual("owner is [USER]", obj["message"]["content"][0]["text"])
+        tool_block = obj["message"]["content"][1]
+        self.assertEqual("jdoe_eng", tool_block["id"])
+        self.assertEqual("jdoe_eng", tool_block["name"])
+        self.assertEqual({"name": "[USER]"}, tool_block["input"])
+
+    def test_protocol_exemptions_apply_only_at_protocol_positions(self) -> None:
+        """Same key names outside the protocol positions are redacted, not exempted."""
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "role": "jdoe_eng",
+                "name": "jdoe_eng",
+                "id": "jdoe_eng",
+                "message": {
+                    "content": [
+                        {"type": "text", "name": "jdoe_eng", "text": "hi"},
+                        {"type": "text", "id": "jdoe_eng", "text": "hi"},
+                        {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "jdoe_eng"}},
+                    ]
+                },
+            }
+        )
+        with _mock_os_context():
+            obj = json.loads(agent_exec.redact_sensitive_text(line))
+        self.assertEqual("[USER]", obj["role"])
+        self.assertEqual("[USER]", obj["name"])
+        self.assertEqual("[USER]", obj["id"])
+        blocks = obj["message"]["content"]
+        self.assertEqual("[USER]", blocks[0]["name"])
+        # Block-level ``id`` is a protocol field on every block type, so it stays intact.
+        self.assertEqual("jdoe_eng", blocks[1]["id"])
+        self.assertEqual("Bash", blocks[2]["name"])
+        self.assertEqual("tu_1", blocks[2]["id"])
+        self.assertEqual({"command": "[USER]"}, blocks[2]["input"])
+
+    def test_tool_use_input_name_is_redacted_while_tool_name_stays(self) -> None:
+        """A tool_use block keeps its tool name but redacts identity values inside its input."""
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu_2",
+                            "name": "Bash",
+                            "input": {"name": "jdoe_eng"},
+                        }
+                    ],
+                },
+            }
+        )
+        with _mock_os_context():
+            obj = json.loads(agent_exec.redact_sensitive_text(line))
+        block = obj["message"]["content"][0]
+        self.assertEqual("Bash", block["name"])
+        self.assertEqual({"name": "[USER]"}, block["input"])
+
+    def test_tool_result_text_list_with_identity_is_redacted(self) -> None:
+        """A tool_result whose nested text block names the user has that text redacted."""
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu_3",
+                            "content": [{"type": "text", "text": "jdoe_eng"}],
+                        }
+                    ],
+                },
+            }
+        )
+        with _mock_os_context():
+            obj = json.loads(agent_exec.redact_sensitive_text(line))
+        self.assertEqual("user", obj["message"]["role"])
+        result_block = obj["message"]["content"][0]
+        self.assertEqual("tool_result", result_block["type"])
+        self.assertEqual("tu_3", result_block["tool_use_id"])
+        self.assertEqual([{"type": "text", "text": "[USER]"}], result_block["content"])
+
+    def test_redact_structure_never_rewrites_dict_keys(self) -> None:
+        """Meta JSON keys named after an OS identity are kept; their string values are redacted."""
+        with _mock_os_context():
+            redacted = agent_exec.redact_structure({"jdoe_eng": "owner jdoe_eng", "nested": {"jdoe_eng": 1}})
+        self.assertEqual({"jdoe_eng": "owner [USER]", "nested": {"jdoe_eng": 1}}, redacted)
 
     def test_devpack_logs_render_keeps_result_event_when_user_and_host_collide(self) -> None:
         """devpack_logs.render keeps protocol fields intact when identities collide with JSON words."""
