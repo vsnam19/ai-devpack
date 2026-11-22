@@ -1945,6 +1945,8 @@ def analyze_run_dir(
     context_window: int | None = None
     prompt_over_context = False
     context_signal_confidence: str | None = None
+    # Per agent step: its engine window and its own largest single request (compared step by step).
+    step_context_infos: list[dict[str, Any]] = []
     timeout_detected = record.outcome.lower() == "timeout"
     quota_net_detected = False
 
@@ -2026,9 +2028,9 @@ def analyze_run_dir(
             continue
 
         # Agent step prompt and metadata
+        step_prompt_est = (len(step.prompt_text) + 3) // 4 if step.prompt_text else 0
         if step.prompt_text:
-            est = (len(step.prompt_text) + 3) // 4
-            prompt_tokens_est = max(prompt_tokens_est, est)
+            prompt_tokens_est = max(prompt_tokens_est, step_prompt_est)
             brief_named_paths.update(_extract_brief_paths_from_prompt(step.prompt_text))
 
         if repo_root is not None and step.prompt_text:
@@ -2050,17 +2052,22 @@ def analyze_run_dir(
                             active_redactor,
                         )
 
-        eng_ctx = _resolve_context_window(step.engine, engines_config)
-        if eng_ctx is not None:
-            context_window = eng_ctx if context_window is None else min(context_window, eng_ctx)
-
         # tokens_in is cumulative over all turns; only the per-request maximum is compared to the window.
         # Prefer per-message usage; when a step has none, fall back to its result/metadata totals.
+        # Each step is checked against the window of the engine that ran it (see the check after the loop).
         step_request_in = int(step.max_request_tokens_in)
         if step_request_in > 0:
             step_request_conf = "high"
         else:
             step_request_in, step_request_conf = _fallback_request_tokens(step)
+        step_info: dict[str, Any] = {
+            "step": step.step_id,
+            "window": _resolve_context_window(step.engine, engines_config),
+            "prompt_est": step_prompt_est,
+            "max_in": step_request_in,
+            "conf": step_request_conf,
+        }
+        step_context_infos.append(step_info)
         if step_request_conf != "none":
             max_step_tokens_in = max(max_step_tokens_in, step_request_in)
             if context_signal_confidence is None or (
@@ -2137,6 +2144,7 @@ def analyze_run_dir(
                     if isinstance(usage, dict):
                         turn_in = int(usage.get("input_tokens", 0) or 0) + int(usage.get("cache_read_input_tokens", 0) or 0) + int(usage.get("cache_creation_input_tokens", 0) or 0)
                         max_step_tokens_in = max(max_step_tokens_in, turn_in)
+                        step_info["max_in"] = max(int(step_info["max_in"]), turn_in)
                     content = msg.get("content")
                     if isinstance(content, list):
                         has_tu = False
@@ -2334,21 +2342,33 @@ def analyze_run_dir(
             active_redactor,
         )
 
-    # Prompt over context window
-    effective_prompt_tokens = max(prompt_tokens_est, max_step_tokens_in)
-    if context_window is not None and effective_prompt_tokens > context_window:
+    # Prompt over context window: each step's largest request (or prompt estimate) against that step's own window.
+    exceeded_weight = 0
+    for info in step_context_infos:
+        step_window = info["window"]
+        if step_window is None:
+            continue
+        if context_window is None:
+            context_window = step_window  # reporting default; replaced by the first step that exceeds
+        effective_tokens = max(int(info["prompt_est"]), int(info["max_in"]))
+        if effective_tokens <= step_window:
+            continue
+        if not prompt_over_context:
+            context_window = step_window
         prompt_over_context = True
         # A low-confidence estimate alone (no prompt-text or per-message evidence) is weaker than exact usage.
-        flag_weight = 2 if context_signal_confidence == "low" and prompt_tokens_est <= context_window else 4
-        scores["TOOL"] += flag_weight
+        flag_weight = 2 if info["conf"] == "low" and int(info["prompt_est"]) <= step_window else 4
+        exceeded_weight = max(exceeded_weight, flag_weight)
         _add_evidence(
             evidence_by_cause["TOOL"],
             seen_ev["TOOL"],
-            record.steps[0].step_id if record.steps else "01",
+            str(info["step"]),
             1,
-            f"Prompt/input tokens ({effective_prompt_tokens}) exceeded engine context window ({context_window})",
+            f"Step {info['step']}: input tokens ({effective_tokens}) exceeded engine context window ({step_window})",
             active_redactor,
         )
+    if exceeded_weight:
+        scores["TOOL"] += exceeded_weight
 
     # Skill not triggered when lint findings occurred
     if lint_findings_count > 0 and not skill_triggers:
@@ -2362,10 +2382,28 @@ def analyze_run_dir(
             active_redactor,
         )
 
+    # Rework rounds: implementer/fixer steps that follow a failed gate or a REQUEST_CHANGES review.
+    # Gate and review records themselves are not rounds.
+    rework_rounds = 0
+    rework_pending = False
+    for step in record.steps:
+        if step.is_gate:
+            if step.status == "fail":
+                rework_pending = True
+            continue
+        role_low = step.role.lower()
+        if role_low in ("implementer", "fixer"):
+            if rework_pending:
+                rework_rounds += 1
+                rework_pending = False
+        elif role_low in ("reviewer", "review"):
+            if "REQUEST_CHANGES" in (step.verdict_line or step.final_result).upper():
+                rework_pending = True
+
     # Determine if run failed or required rework
     outcome_low = record.outcome.lower()
     is_clean_pass = (
-        outcome_low in ("pass", "ok", "approved", "verdict: approve")
+        outcome_low in ("pass", "passed", "ok", "approved", "verdict: approve")
         and not gate_failed
         and not test_lock_failed
         and not scope_violated
@@ -2373,16 +2411,20 @@ def analyze_run_dir(
         and not quota_net_detected
         and not denied_calls
         and not prompt_over_context
-        and len(record.steps) <= 2
+        and rework_rounds == 0
     )
     if not is_clean_pass and all(v == 0 for v in scores.values()):
         scores["MODEL"] = 1
+        if rework_rounds:
+            reason = f"Run outcome '{record.outcome}' needed {rework_rounds} rework round(s) without BRIEF/CONTEXT/SKILL/TOOL/ENV markers"
+        else:
+            reason = f"Run outcome '{record.outcome}' failed without BRIEF/CONTEXT/SKILL/TOOL/ENV markers"
         _add_evidence(
             evidence_by_cause["MODEL"],
             seen_ev["MODEL"],
             record.steps[-1].step_id if record.steps else "run",
             1,
-            f"Run outcome '{record.outcome}' failed without BRIEF/CONTEXT/SKILL/TOOL/ENV markers",
+            reason,
             active_redactor,
         )
     elif not is_clean_pass and (gate_failed or "agent_error" in outcome_low or "fail" in outcome_low or "escalate" in outcome_low):
@@ -2430,6 +2472,7 @@ def analyze_run_dir(
         "missing_symbols": missing_symbols,
         "skill_triggers": skill_triggers,
         "prompt_tokens_est": prompt_tokens_est,
+        "rework_rounds": rework_rounds,
         "max_step_tokens_in": max_step_tokens_in,
         "max_request_tokens_in": max_step_tokens_in,
         "context_signal_confidence": context_signal_confidence or "none",

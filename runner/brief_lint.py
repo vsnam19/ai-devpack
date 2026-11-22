@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
 from pathlib import Path
 import re
@@ -222,9 +221,14 @@ _FORBID_VERB_RE = re.compile(
 _MODIFY_VERB_RE = re.compile(
     r"(?i)\b(?:modify|edit|update|change|alter|delete|remove|rewrite)\b"
 )
+# A path is "created" when the text right before it (same line) says create/add/new/generate, optionally
+# followed by a short article or noun ("Create the new file `x`", "Add generated unit `x`").
 _CREATE_PREFIX_RE = re.compile(
-    r"(?i)\b(?:create|write|output|generate|save|produce|add\s+new)\s+[`'\"]*$"
+    r"(?i)\b(?:create|creates|write|output|generate|save|produce|add|adds|new)\s+"
+    r"(?:(?:a|an|the|new|generated|empty|separate|additional)\s+){0,2}"
+    r"(?:(?:file|unit|module|header|source|helper|test)\s+)?[`'\"]*$"
 )
+_NEGATED_CREATE_RE = re.compile(r"(?i)\b(?:not|never|don't|do\s+not|must\s+not)\b")
 
 
 def estimate_tokens(text: str) -> int:
@@ -352,19 +356,45 @@ def _looks_like_repo_path(token: str, repo_root: Path, top_dirs: frozenset[str])
     return None
 
 
-def _is_declared_new_path(rel_path: str, scope_entries: Sequence[str]) -> bool:
-    """Return True when ``rel_path`` is named by an allowed-files entry (exact, glob or directory prefix)."""
-    for entry in scope_entries:
-        item = entry.strip().strip("`").strip()
-        if not item:
+def _line_path_candidates(line: str) -> list[tuple[str, int]]:
+    """Return ``(token, position)`` pairs from backtick spans and bare path-like tokens on one line."""
+    candidates: list[tuple[str, int]] = []
+    for bm in _BACKTICK_RE.finditer(line):
+        for part in bm.group(1).strip().split():
+            candidates.append((part, bm.start()))
+    for pm in _PATH_TOKEN_RE.finditer(line):
+        # A token cut short by a glob metacharacter (e.g. ``src/gen_*.cpp``) is not a path.
+        if line[pm.end(1):pm.end(1) + 1] in ("*", "?", "[", "{"):
             continue
-        if item.endswith("/"):
-            if rel_path.startswith(item):
-                return True
+        candidates.append((pm.group(1), pm.start()))
+    return candidates
+
+
+def _is_create_context(prefix: str) -> bool:
+    """Return True when the text before a path announces that the path is created (and not negated)."""
+    return bool(_CREATE_PREFIX_RE.search(prefix)) and not _NEGATED_CREATE_RE.search(prefix)
+
+
+def _collect_created_paths(
+    sections: Sequence[dict[str, Any]], repo: Path, top_dirs: frozenset[str]
+) -> set[str]:
+    """Return repo-relative paths that the brief's Expected output says will be created."""
+    created: set[str] = set()
+    for sec in sections:
+        if _match_canonical_section(sec["normalized"]) != "Expected output":
             continue
-        if rel_path == item or fnmatch.fnmatchcase(rel_path, item):
-            return True
-    return False
+        in_fence = False
+        for _, line in sec["body_lines"]:
+            if _FENCE_RE.match(line):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            for raw_tok, pos in _line_path_candidates(line):
+                rel_path = _looks_like_repo_path(raw_tok, repo, top_dirs)
+                if rel_path and _is_create_context(line[:pos]):
+                    created.add(rel_path)
+    return created
 
 
 def _collect_repo_identifiers(repo_root: Path) -> set[str]:
@@ -529,9 +559,9 @@ def lint_brief_text(
     seen_missing_paths: set[tuple[int, str]] = set()
     seen_oob: set[tuple[int, str, int]] = set()
     last_existing_file: Path | None = None
+    created_paths = _collect_created_paths(sections, repo, top_dirs)
 
     for sec in sections:
-        canon = _match_canonical_section(sec["normalized"])
         in_fence = False
         for lineno, line in sec["body_lines"]:
             if _FENCE_RE.match(line):
@@ -562,20 +592,8 @@ def lint_brief_text(
                             )
 
             # Collect candidate paths from backticks and plain path tokens
-            candidates: list[tuple[str, int]] = []
-            for bm in _BACKTICK_RE.finditer(line):
-                span = bm.group(1).strip()
-                # Skip shell invocations with arguments only by tokenizing safely
-                for part in span.split():
-                    candidates.append((part, bm.start()))
-            for pm in _PATH_TOKEN_RE.finditer(line):
-                # A token cut short by a glob metacharacter (e.g. ``src/gen_*.cpp``) is not a path.
-                if line[pm.end(1):pm.end(1) + 1] in ("*", "?", "[", "{"):
-                    continue
-                candidates.append((pm.group(1), pm.start()))
-
             line_files: list[Path] = []
-            for raw_tok, pos in candidates:
+            for raw_tok, _pos in _line_path_candidates(line):
                 rel_path = _looks_like_repo_path(raw_tok, repo, top_dirs)
                 if not rel_path:
                     continue
@@ -587,12 +605,9 @@ def lint_brief_text(
                         line_files.append(resolved)
                         last_existing_file = resolved
                     continue
-                # Allow newly created files: named in the allowed-files list / globs, or introduced
-                # with a creation verb in Expected output. Paths only mentioned in Input stay errors.
-                prefix_ctx = line[:pos]
-                if _is_declared_new_path(rel_path, scope_entries):
-                    continue
-                if canon == "Expected output" and _CREATE_PREFIX_RE.search(prefix_ctx):
+                # Allow newly created files only when Expected output says they are created. Being
+                # listed under Files allowed or only mentioned in Input is not enough (stays an error).
+                if rel_path in created_paths:
                     continue
                 if (lineno, rel_path) not in seen_missing_paths:
                     seen_missing_paths.add((lineno, rel_path))

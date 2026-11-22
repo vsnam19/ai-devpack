@@ -160,7 +160,7 @@ class BriefLintTests(unittest.TestCase):
             text = _valid_brief_text().replace(
                 "- Modify `src/widget.cpp` so `computeValue()` returns 2.\n",
                 "- Modify `src/widget.cpp` so `computeValue()` returns 2.\n"
-                "- Implement helper `src/new.cpp` used by the widget.\n",
+                "- Create helper `src/new.cpp` used by the widget.\n",
             ).replace(
                 "## Files allowed\n- `src/widget.cpp`\n",
                 "## Files allowed\n- `src/widget.cpp`\n- `src/new.cpp`\n",
@@ -182,6 +182,47 @@ class BriefLintTests(unittest.TestCase):
             self.assertEqual(
                 [], [f for f in glob_findings if f["rule"] == "BRIEF-PATH-MISSING"], glob_findings
             )
+
+    def test_rule_brief_path_missing_fix_wording_with_files_allowed_still_errors(self) -> None:
+        """A missing path that Input asks to fix, even when listed under Files allowed, is an error without create wording."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _create_sample_repo(repo)
+            text = _valid_brief_text().replace(
+                "- `src/widget.cpp:7`\n",
+                "- `src/widget.cpp:7`\n- Fix `src/driver.cpp` as well.\n",
+            ).replace(
+                "## Files allowed\n- `src/widget.cpp`\n",
+                "## Files allowed\n- `src/widget.cpp`\n- `src/driver.cpp`\n",
+            )
+            findings = brief_lint.lint_brief_text(text, repo_root=repo)
+            missing = [f for f in findings if f["rule"] == "BRIEF-PATH-MISSING"]
+            self.assertEqual(2, len(missing), findings)
+            self.assertTrue(all("src/driver.cpp" in f["message"] for f in missing))
+            self.assertTrue(all(f["severity"] == "error" for f in missing))
+            self.assertTrue(brief_lint.has_errors(findings))
+
+    def test_rule_brief_path_created_in_expected_output_passes_with_files_allowed(self) -> None:
+        """A missing path that Expected output says to create passes, including when Files allowed lists it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _create_sample_repo(repo)
+            text = _valid_brief_text().replace(
+                "- Modify `src/widget.cpp` so `computeValue()` returns 2.\n",
+                "- Modify `src/widget.cpp` so `computeValue()` returns 2.\n"
+                "- Create `src/new.cpp` with a helper.\n",
+            ).replace(
+                "## Files allowed\n- `src/widget.cpp`\n",
+                "## Files allowed\n- `src/widget.cpp`\n- `src/new.cpp`\n",
+            )
+            findings = brief_lint.lint_brief_text(text, repo_root=repo)
+            self.assertEqual([], [f for f in findings if f["rule"] == "BRIEF-PATH-MISSING"], findings)
+            self.assertFalse(brief_lint.has_errors(findings), findings)
+
+            negated = text.replace("- Create `src/new.cpp` with a helper.\n", "- Do not create `src/new.cpp`.\n")
+            neg_findings = brief_lint.lint_brief_text(negated, repo_root=repo)
+            neg_missing = [f for f in neg_findings if f["rule"] == "BRIEF-PATH-MISSING"]
+            self.assertTrue(any("src/new.cpp" in f["message"] for f in neg_missing), neg_findings)
 
     def test_rule_brief_path_missing_input_only_still_errors(self) -> None:
         """A missing path mentioned only under Input stays a blocking BRIEF-PATH-MISSING error."""

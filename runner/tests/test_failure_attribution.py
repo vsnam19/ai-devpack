@@ -319,5 +319,139 @@ class FailureAttributionTests(unittest.TestCase):
             self.assertEqual(2, rc_same_sec)
 
 
+def _agent_stream(request_inputs: list[int], text: str) -> str:
+    """Return a stream-json transcript with one assistant turn per request input and a closing text block."""
+    events: list[dict[str, object]] = [{"type": "system", "subtype": "init", "cwd": "/tmp/work"}]
+    for n in request_inputs:
+        events.append(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": {"input_tokens": n, "output_tokens": 10},
+                },
+            }
+        )
+    events.append(
+        {"type": "result", "subtype": "success", "is_error": False, "num_turns": len(request_inputs), "result": text}
+    )
+    return "\n".join(json.dumps(e) for e in events) + "\n"
+
+
+class StepwiseContextAndReworkTests(unittest.TestCase):
+    """Per-step context window comparison and rework-based clean-pass rules in analyze."""
+
+    def _write_run(self, base: Path, outcome: str, steps: list[tuple[str, str]]) -> Path:
+        """Create run dir ``base`` (new) with run.json and steps; ``body`` is a stream or gate text."""
+        run_dir = base
+        steps_dir = run_dir / "steps"
+        steps_dir.mkdir(parents=True)
+        run_meta = {
+            "run_id": "20261123T020000Z-t00019",
+            "kind": "dispatch",
+            "started": "2026-11-23T02:00:00Z",
+            "finished": "2026-11-23T02:05:00Z",
+            "engines": {"implementer": "haiku"},
+            "task": "attribution-steps",
+            "outcome": outcome,
+        }
+        (run_dir / "run.json").write_text(json.dumps(run_meta), encoding="utf-8")
+        for stem, body in steps:
+            target = steps_dir / (f"{stem}.txt" if stem.endswith("-gate") else f"{stem}.jsonl")
+            target.write_text(body, encoding="utf-8")
+        return run_dir
+
+    def _analyze(self, run_dir: Path) -> dict[str, object]:
+        """Run analyze with the example engines config and return the parsed attribution.json."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = devpack_logs.main(["analyze", str(run_dir), "--engines", str(ENGINES_EXAMPLE)])
+        self.assertEqual(0, rc)
+        return json.loads((run_dir / "attribution.json").read_text(encoding="utf-8"))
+
+    def test_context_window_is_checked_per_step(self) -> None:
+        """A 50k request on a 200k sonnet step plus 10k on a 32k local step is clean; 33k on the local step is flagged there."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            clean_run = self._write_run(
+                base / "clean",
+                "passed",
+                [
+                    ("01-implementer-sonnet", _agent_stream([50000], "Done A.")),
+                    ("02-implementer-local", _agent_stream([10000], "Done B.")),
+                ],
+            )
+            attr = self._analyze(clean_run)
+            self.assertFalse(attr["signals"]["prompt_over_context"], attr["evidence"])
+            self.assertEqual(50000, attr["signals"]["max_request_tokens_in"])
+
+            over_run = self._write_run(
+                base / "over",
+                "passed",
+                [
+                    ("01-implementer-sonnet", _agent_stream([50000], "Done A.")),
+                    ("02-implementer-local", _agent_stream([33000], "Done B.")),
+                ],
+            )
+            attr_over = self._analyze(over_run)
+            self.assertTrue(attr_over["signals"]["prompt_over_context"])
+            self.assertEqual(32768, attr_over["signals"]["context_window"])
+            self.assertEqual("TOOL", attr_over["suspected_cause"])
+            steps_flagged = [e["step"] for e in attr_over["evidence"] if "exceeded engine context window" in e["text"]]
+            self.assertEqual(["02-implementer-local"], steps_flagged)
+
+    def test_passed_run_with_implementer_review_and_gate_has_no_cause(self) -> None:
+        """A passing three-record run (implementer, review, gate) with no failure signals gets suspected_cause None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_run(
+                Path(tmp),
+                "passed",
+                [
+                    ("01-implementer-haiku", _agent_stream([1000], "Implemented.")),
+                    ("02-reviewer-sonnet", _agent_stream([1000], "VERDICT: APPROVE")),
+                    ("03-gate", "GATE_OK\n"),
+                ],
+            )
+            attr = self._analyze(run_dir)
+            self.assertIsNone(attr["suspected_cause"])
+            self.assertEqual(0, attr["signals"]["rework_rounds"])
+
+    def test_request_changes_review_then_fixer_counts_as_rework(self) -> None:
+        """A REQUEST_CHANGES review followed by a fixer round is one rework round, so a passing run is not 'none'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_run(
+                Path(tmp),
+                "passed",
+                [
+                    ("01-implementer-haiku", _agent_stream([1000], "Implemented.")),
+                    ("02-reviewer-sonnet", _agent_stream([1000], "VERDICT: REQUEST_CHANGES")),
+                    ("03-fixer-haiku", _agent_stream([1000], "Fixed.")),
+                    ("04-gate", "GATE_OK\n"),
+                ],
+            )
+            attr = self._analyze(run_dir)
+            self.assertEqual(1, attr["signals"]["rework_rounds"])
+            self.assertIsNotNone(attr["suspected_cause"])
+
+    def test_two_fixer_rounds_after_failed_gates_are_rework(self) -> None:
+        """Two fixer rounds after failed gates with a final failure count exactly two rework rounds and are not 'none'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_run(
+                Path(tmp),
+                "fail",
+                [
+                    ("01-implementer-haiku", _agent_stream([1000], "Implemented.")),
+                    ("02-gate", "GATE_FAIL\n"),
+                    ("03-fixer-haiku", _agent_stream([1000], "Fix one.")),
+                    ("04-gate", "GATE_FAIL\n"),
+                    ("05-fixer-haiku", _agent_stream([1000], "Fix two.")),
+                    ("06-gate", "GATE_FAIL\n"),
+                ],
+            )
+            attr = self._analyze(run_dir)
+            self.assertEqual(2, attr["signals"]["rework_rounds"])
+            self.assertIsNotNone(attr["suspected_cause"])
+
+
 if __name__ == "__main__":
     unittest.main()
