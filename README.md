@@ -16,11 +16,18 @@ by default; provenance recorded internally.
 |---|---|
 | `policy/` | operating model, ASIL boundaries (company policy, needs safety approval), sandbox, data governance, provenance, failure handling, tool confidence, deviations |
 | `knowledge/` | `lessons.md`, `context_template/AGENTS.md`, skills (MISRA C++:2023 digest, review taxonomy, Doxygen/naming) |
-| `workflow/` | brief/plan/ADR templates, CI pipeline description, GitLab CI and Jenkins examples |
-| `runner/` | `devpack_run.py` local runner, `engines.example.toml` |
-| `enforcement/` | gate, preflight lint, checks, hooks, evidence collector |
-| `eval/` | fixture, tasks and runner to measure pass@1 / pass^k of the agents |
-| `tests/` | repo-level tests (`test_no_project_leaks.py`, `run_all.sh`) |
+| `workflow/templates/` | brief (implement, fix, review), task plan and ADR templates |
+| `workflow/ci/` | `pipeline.md` and examples (`examples/gitlab-ci.yml`, `examples/Jenkinsfile`) |
+| `runner/` | `devpack_run.py` local runner, `engines.example.toml`, unit tests |
+| `enforcement/gate/` | `gate.py` fail-closed gate and `gate.example.toml` (the pack's own gate config) |
+| `enforcement/lint/` | `preflight_lint.py` C/C++ preflight linter and its README |
+| `enforcement/checks/` | secret/PII, scope, trace and test-lock checks |
+| `enforcement/hooks/` | `pre-commit` hook and `install.sh` |
+| `enforcement/evidence/` | `collect.py` evidence collector |
+| `eval/fixture/` | C++17 fixture with `preflight.toml` and the documented lint baseline |
+| `eval/tasks/` | 10 graded tasks and `verify_tasks.sh` |
+| `eval/` | `run_eval.py` runner, `Dockerfile`, unit tests in `eval/tests/` |
+| `tests/` | repo-level tests (`test_no_project_leaks.py`, `test_doc_links.py`) and `run_all.sh` |
 
 ## Install into a project
 
@@ -40,9 +47,28 @@ by default; provenance recorded internally.
 ## Quickstart
 
 ```bash
-bash tests/run_all.sh                                                    # all pack tests
-python3 enforcement/gate/gate.py --config enforcement/gate/gate.example.toml   # expect GATE_OK
+# install the pre-commit hook into a git repository (default: current directory)
+bash enforcement/hooks/install.sh --repo /path/to/project
+
+# run all pack unit tests (fails if a test directory runs 0 tests)
+bash tests/run_all.sh
+
+# run the gate (expect GATE_OK); the receipt is a JSON file
+python3 enforcement/gate/gate.py --config enforcement/gate/gate.example.toml --receipt /tmp/devpack_receipt.json
+
+# run one task through the local runner (implement -> gate -> review -> fix, max 2 rounds)
 python3 runner/devpack_run.py --help
+python3 runner/devpack_run.py --config runner/engines.example.toml --task-id task-001 \
+  --title "Short title" --goal "One-paragraph goal" --allowed-files "src/*.cpp" --dry-run
+
+# evaluation: validate tasks and plan without calling any model
+python3 eval/run_eval.py --dry-run --tasks all --models sonnet,haiku --k 1
+# docker isolation (default); credentials via flag or DEVPACK_CLAUDE_CREDENTIALS
+python3 eval/run_eval.py --isolation docker --credentials /path/to/credentials.json \
+  --tasks all --models sonnet,haiku --k 5
+# local isolation (no container)
+python3 eval/run_eval.py --isolation local --credentials /path/to/credentials.json \
+  --tasks all --models sonnet --k 1
 ```
 
 Write a brief from `workflow/templates/brief_implement.md` (the tech lead approves it), run

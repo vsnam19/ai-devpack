@@ -1,19 +1,66 @@
-# Header: Example fail-closed gate configuration for the ai-devpack repository itself.
-# Runs the enforcement unit test suite and the repository project-leak test (if present).
+# Header: Fail-closed gate configuration for the ai-devpack repository itself.
+# Run from the repository root:
+#   python3 enforcement/gate/gate.py --config enforcement/gate/gate.example.toml
+# Projects copy this file and replace the checks with their own build, test and lint commands.
+# The eval fixture lint run uses eval/fixture/preflight.toml with the documented baseline
+# eval/fixture/lint_baseline.json (see eval/fixture/LINT_BASELINE.md); no rule is disabled.
 
 [[check]]
-name = "enforcement-unit-tests"
-cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "enforcement", "-t", ".", "-p", "test_*.py"]
+name = "project-leak-check"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_no_project_leaks.py"]
 timeout_s = 120
 required = true
 
 [[check]]
-name = "project-leak-check"
+name = "enforcement-unit-tests"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "enforcement", "-t", ".", "-p", "test_*.py"]
+timeout_s = 300
+required = true
+
+[[check]]
+name = "lint-unit-tests"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "enforcement/lint/tests", "-t", ".", "-p", "test_*.py"]
+timeout_s = 600
+required = true
+
+[[check]]
+name = "eval-unit-tests"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "eval", "-p", "test_*.py"]
+timeout_s = 300
+required = true
+
+[[check]]
+name = "runner-unit-tests"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "runner", "-t", ".", "-p", "test_*.py"]
+timeout_s = 300
+required = true
+
+[[check]]
+name = "eval-fixture-build-and-test"
+cmd = ["bash", "eval/fixture/build_and_test.sh"]
+timeout_s = 600
+required = true
+
+[[check]]
+name = "eval-tasks-verify"
+cmd = ["bash", "eval/tasks/verify_tasks.sh"]
+timeout_s = 1800
+required = true
+
+[[check]]
+name = "eval-dry-run"
+cmd = ["python3", "-B", "eval/run_eval.py", "--dry-run", "--tasks", "all", "--models", "sonnet,haiku", "--k", "1"]
+timeout_s = 120
+required = true
+
+[[check]]
+name = "eval-fixture-preflight-lint"
 cmd = [
-  "python3",
-  "-B",
-  "-c",
-  "import os, subprocess, sys; sys.exit(subprocess.call([sys.executable, '-B', '-m', 'unittest', 'tests/test_no_project_leaks.py']) if os.path.isfile('tests/test_no_project_leaks.py') else 0)",
+  "python3", "-B", "enforcement/lint/preflight_lint.py",
+  "--config", "eval/fixture/preflight.toml",
+  "--repo-root", "eval/fixture",
+  "--baseline", "eval/fixture/lint_baseline.json",
+  "eval/fixture",
 ]
-timeout_s = 60
+timeout_s = 600
 required = true

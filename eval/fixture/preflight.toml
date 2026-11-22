@@ -1,0 +1,5 @@
+# Header: Preflight lint configuration for the eval fixture. No rule is disabled.
+# Known false positives are recorded in eval/fixture/lint_baseline.json (see eval/fixture/LINT_BASELINE.md).
+
+[general]
+std = "c++17"
