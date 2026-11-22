@@ -1,0 +1,29 @@
+diff --git a/src/dtc_debouncer.cpp b/src/dtc_debouncer.cpp
+index 99d23a0..dc3cab6 100644
+--- a/src/dtc_debouncer.cpp
++++ b/src/dtc_debouncer.cpp
+@@ -33,6 +33,6 @@ DtcState DtcDebouncer::reportSample(bool isFaultPresent) noexcept {
+         const std::int32_t nextCounter =
+             static_cast<std::int32_t>(m_counter) + static_cast<std::int32_t>(m_config.failStep);
+-        if (nextCounter >= static_cast<std::int32_t>(m_config.confirmThreshold)) {
++        if (nextCounter > static_cast<std::int32_t>(m_config.confirmThreshold)) {
+             m_counter = m_config.confirmThreshold;
+             m_isLatched = true;
+         } else {
+diff --git a/tests/test_dtc_debouncer.cpp b/tests/test_dtc_debouncer.cpp
+index 517f3f8..57bd3f8 100644
+--- a/tests/test_dtc_debouncer.cpp
++++ b/tests/test_dtc_debouncer.cpp
+@@ -68,7 +68,10 @@ void testPendingAndConfirmDebounceThresholds() {
+     CHECK_EQ(debouncer.counter(), static_cast<std::int16_t>(9));
+ 
+-    CHECK_EQ(debouncer.reportSample(true), DtcState::Confirmed);
++    CHECK_EQ(debouncer.reportSample(true), DtcState::Pending);
+     CHECK_EQ(debouncer.counter(), static_cast<std::int16_t>(10));
+-    CHECK(debouncer.isConfirmed());
++    CHECK(!debouncer.isConfirmed());
++
++    CHECK_EQ(debouncer.reportSample(true), DtcState::Confirmed);
++    CHECK(debouncer.isConfirmed());
+ 
+     CHECK_EQ(debouncer.reportSample(false), DtcState::Confirmed);

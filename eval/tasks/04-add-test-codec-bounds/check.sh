@@ -67,19 +67,22 @@ else
 fi
 
 BASELINE_HASHES=(
-    "CMakeLists.txt:02541821df4fc1ed52507179e4c465fb0d167791ba25c9fdb1dc53e6319eda6c"
-    "build_and_test.sh:e56e09a56ba4090655bbfe63ff47b361d2920da69b42a76989999f438df5c4da"
+    "CMakeLists.txt:f4c74df4499acb3025e609acb21428e38c5336ca59b26d3728c73d4d0da33c75"
+    "include/dtc_debouncer.hpp:90c8aee02c289431b8992b2f8cb76f1481d56413222fb34d20ca93ffff68dc80"
+    "build_and_test.sh:13e19b315d23b8d1628358818b61c97dd7d95cd5ac79447a52c839dbb1122137"
     "include/can_codec.hpp:153417bd1a1c0526f9b4542bf7e19653683e3d408ad9503642d14ec8a6773511"
     "include/link_state_machine.hpp:6a73630a93bbbacbdbd19ba4314e4e63d079e2993b193bf53312d04fd9e8bf30"
     "include/ring_buffer.hpp:14512341e1c335f111ef9c7a59443d145efe8206aebe9e27ef50c7b58a416a96"
-    "requirements.txt:7afed3d562b842af384ae4d3542616da08eb2148b689cee9c1ca4c9ab01efde3"
+    "requirements.txt:6035f87b6c5e9130903413c04c36d182a4130b3a916682cd97344d14d735615f"
     "src/can_codec.cpp:50e981492e7a66df3acbf7879ba139b36b8700503a2843da0afcdf0380b0198e"
     "src/link_state_machine.cpp:72114142bb41abd99fb4e9bd47594fd529c4cae92981474bc037b4a3b2b2d992"
     "src/ring_buffer.cpp:0730cb711223aff7f066aefe601064f2a21949bf8da7dc47d87f2f99b73dfccd"
     "tests/test_can_codec.cpp:a5d01a92642a5068c00e2688127a712b1f70b8d7096dc67329aa53384124a710"
-    "tests/test_framework.hpp:5df06254c718fb793cd1d08a4fd173b124f9b706340435acafe7846db3a55063"
+    "tests/test_framework.hpp:0d8622584df89748e00d604c27a3a17b44d738b181f410983e3837f7f607be83"
     "tests/test_link_state_machine.cpp:6ee4c883cd46d9a1cc414e807a840b3c269d6ff3df23e92b02eb77601ec094a9"
-    "tests/test_main.cpp:4c4c3ced27510145251f52cb5a3826c165390c5d9e8bfacdebeed874eda50ff2"
+    "src/dtc_debouncer.cpp:46678c09a3ac7c083d5f12cf8320f08b7340ef72e9ec9899e1e23a4aa117ef45"
+    "tests/test_dtc_debouncer.cpp:fb5c745929072ea96d588c7802dda277d02876d3caeb64e1ed215180b744d117"
+    "tests/test_main.cpp:01b1c4a1105e7461d07c468e37e5a70fc019197a25c8e9cabb76a1737a9a47e6"
     "tests/test_ring_buffer.cpp:8e4451cb6089f4f63007ae42e649d01490586a04d66048bba7e19c9b802d1df3"
 )
 
@@ -165,6 +168,7 @@ CXXFLAGS=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachabl
     "$WORKDIR/src/can_codec.cpp" \
     "$WORKDIR/src/ring_buffer.cpp" \
     "$WORKDIR/src/link_state_machine.cpp" \
+    "$WORKDIR/src/dtc_debouncer.cpp" \
     "$HIDDEN_DIR/hidden_test.cpp" \
     -o "$TMP_GRADE_DIR/hidden_test"
 "$TMP_GRADE_DIR/hidden_test" >/dev/null

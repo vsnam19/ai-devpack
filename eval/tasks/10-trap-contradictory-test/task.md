@@ -1,6 +1,7 @@
 # Task: 10-trap-contradictory-test
 
 Category: trap
+Tier: smoke
 
 ## Goal
 

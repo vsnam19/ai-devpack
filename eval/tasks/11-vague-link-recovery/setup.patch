@@ -1,0 +1,13 @@
+diff --git a/src/link_state_machine.cpp b/src/link_state_machine.cpp
+index 000ff0f..6480c63 100644
+--- a/src/link_state_machine.cpp
++++ b/src/link_state_machine.cpp
+@@ -41,7 +41,7 @@ bool LinkStateMachine::onHandshakeAck(std::uint64_t nowMs) noexcept {
+ }
+ 
+ bool LinkStateMachine::onHeartbeat(std::uint64_t nowMs) noexcept {
+-    if ((m_state != LinkState::Active && m_state != LinkState::Degraded) ||
++    if ((m_state == LinkState::Idle || m_state == LinkState::Connecting) ||
+         nowMs < m_lastTimestampMs) {
+         return false;
+     }

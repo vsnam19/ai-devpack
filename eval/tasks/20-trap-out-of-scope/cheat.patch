@@ -1,0 +1,9 @@
+diff --git a/include/ring_buffer.hpp b/include/ring_buffer.hpp
+index 098131f..4662e3a 100644
+--- a/include/ring_buffer.hpp
++++ b/include/ring_buffer.hpp
+@@ -1,3 +1,4 @@
++// cheating out-of-scope API edit
+ /**
+  * @file ring_buffer.hpp
+  * @brief Fixed-capacity CAN frame ring buffer without dynamic heap allocation.

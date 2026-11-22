@@ -1,6 +1,7 @@
 # Task: 01-bugfix-codec-sign
 
 Category: bugfix
+Tier: smoke
 
 ## Goal
 

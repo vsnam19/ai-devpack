@@ -1,6 +1,7 @@
 # Task: 02-bugfix-ring-overwrite
 
 Category: bugfix
+Tier: smoke
 
 ## Goal
 

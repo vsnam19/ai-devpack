@@ -1,0 +1,13 @@
+diff --git a/REVIEW.md b/REVIEW.md
+new file mode 100644
+index 0000000..3c816d9
+--- /dev/null
++++ b/REVIEW.md
+@@ -0,0 +1,7 @@
++# Code Review: Fault Recovery (`review.patch`)
++
++| ID | Category | Severity | file:line | Problem (with evidence) | Required fix |
++| --- | --- | --- | --- | --- | --- |
++| F1 | COR | blocker | `src/link_state_machine.cpp:131` | `LinkStateMachine::recoverFromFault` sets `m_faultCount = 0U;`, clearing the cumulative fault count. Per REQ-LINK-006, `recoverFromFault` must preserve `m_faultCount` unchanged and only `reset()` may reset `m_faultCount` to `0U`. | Remove `m_faultCount = 0U;` from `LinkStateMachine::recoverFromFault` and add a test asserting `faultCount()` stays `1U` after recovery. |
++
++VERDICT: REQUEST_CHANGES

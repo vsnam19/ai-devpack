@@ -76,9 +76,11 @@ else
         "$FIXTURE_ROOT/src/can_codec.cpp" \
         "$FIXTURE_ROOT/src/ring_buffer.cpp" \
         "$FIXTURE_ROOT/src/link_state_machine.cpp" \
+        "$FIXTURE_ROOT/src/dtc_debouncer.cpp" \
         "$FIXTURE_ROOT/tests/test_can_codec.cpp" \
         "$FIXTURE_ROOT/tests/test_ring_buffer.cpp" \
         "$FIXTURE_ROOT/tests/test_link_state_machine.cpp" \
+        "$FIXTURE_ROOT/tests/test_dtc_debouncer.cpp" \
         "$FIXTURE_ROOT/tests/test_main.cpp" \
         -o "$BUILD_DIR/fixture_tests"
     "$BUILD_DIR/fixture_tests"

@@ -1,9 +1,8 @@
 diff --git a/requirements.txt b/requirements.txt
-index 3d21882..3ee942f 100644
 --- a/requirements.txt
 +++ b/requirements.txt
-@@ -10,3 +10,4 @@ REQ-LINK-001: LinkStateMachine shall transition from Idle to Connecting on start
- REQ-LINK-002: LinkStateMachine in Connecting shall retry up to maxRetries on handshakeTimeoutMs before entering Fault.
- REQ-LINK-003: LinkStateMachine in Active shall enter Degraded on heartbeatTimeoutMs, recover to Active on onHeartbeat, or enter Fault after maxRetries missed heartbeats.
- REQ-LINK-004: LinkStateMachine reset shall return the state machine from any state to Idle with zero retryCount.
+@@ -14,3 +14,4 @@ REQ-DTC-001: DtcDebouncer shall validate positive confirmThreshold, failStep, pa
+ REQ-DTC-002: DtcDebouncer reportSample shall increment counter by failStep up to confirmThreshold, transition through Pending to Confirmed, and decrement by passStep down to clearThreshold.
+ REQ-DTC-003: DtcDebouncer onOperationCycleEnd shall advance healingCounter when latched at clearThreshold, enter Healing, reset healingCounter on any fail sample, and clear to Inactive with counter zero at agingThreshold.
+ REQ-DTC-004: DtcDebouncer reset shall return state to Inactive and clear counter, healingCounter, and confirmed latch status.
 +REQ-LINK-005: LinkStateMachine in Degraded state shall reset retryCount to zero upon receiving onHeartbeat and reject onHeartbeat when in Idle, Connecting, or Fault.

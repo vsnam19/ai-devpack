@@ -1,0 +1,124 @@
+diff --git a/include/dtc_debouncer.hpp b/include/dtc_debouncer.hpp
+index bd617c6..29f1f70 100644
+--- a/include/dtc_debouncer.hpp
++++ b/include/dtc_debouncer.hpp
+@@ -106,12 +106,25 @@ public:
+      */
+     bool isConfirmed() const noexcept;
+ 
++    /**
++     * @brief Enable or disable diagnostic monitor freeze mode.
++     * @param[in] frozen True to freeze counter and state updates, false to resume.
++     */
++    void setFrozen(bool frozen) noexcept;
++
++    /**
++     * @brief Check whether the diagnostic monitor is currently frozen.
++     * @return True if frozen, false otherwise.
++     */
++    bool isFrozen() const noexcept;
++
+ private:
+     DtcConfig m_config;
+     DtcState m_state;
+     std::int16_t m_counter;
+     std::uint8_t m_healingCounter;
+     bool m_isLatched;
++    bool m_isFrozen;
+ };
+ 
+ }  // namespace can_fixture
+diff --git a/src/dtc_debouncer.cpp b/src/dtc_debouncer.cpp
+index ed31f39..fbd665a 100644
+--- a/src/dtc_debouncer.cpp
++++ b/src/dtc_debouncer.cpp
+@@ -12,7 +12,8 @@ DtcDebouncer::DtcDebouncer(const DtcConfig& config) noexcept
+       m_state(DtcState::Inactive),
+       m_counter(0),
+       m_healingCounter(0U),
+-      m_isLatched(false) {
++      m_isLatched(false),
++      m_isFrozen(false) {
+ }
+ 
+ bool DtcDebouncer::isConfigValid() const noexcept {
+@@ -27,7 +28,7 @@ bool DtcDebouncer::isConfigValid() const noexcept {
+ }
+ 
+ DtcState DtcDebouncer::reportSample(bool isFaultPresent) noexcept {
+-    if (!isConfigValid()) {
++    if (!isConfigValid() || m_isFrozen) {
+         return m_state;
+     }
+     if (isFaultPresent) {
+@@ -67,7 +68,7 @@ DtcState DtcDebouncer::reportSample(bool isFaultPresent) noexcept {
+ }
+ 
+ bool DtcDebouncer::onOperationCycleEnd() noexcept {
+-    if (!isConfigValid() || !m_isLatched || m_counter > m_config.clearThreshold) {
++    if (!isConfigValid() || m_isFrozen || !m_isLatched || m_counter > m_config.clearThreshold) {
+         return false;
+     }
+     ++m_healingCounter;
+@@ -87,6 +88,7 @@ void DtcDebouncer::reset() noexcept {
+     m_counter = 0;
+     m_healingCounter = 0U;
+     m_isLatched = false;
++    m_isFrozen = false;
+ }
+ 
+ DtcState DtcDebouncer::state() const noexcept {
+@@ -105,4 +107,12 @@ bool DtcDebouncer::isConfirmed() const noexcept {
+     return m_isLatched;
+ }
+ 
++void DtcDebouncer::setFrozen(bool frozen) noexcept {
++    m_isFrozen = frozen;
++}
++
++bool DtcDebouncer::isFrozen() const noexcept {
++    return m_isFrozen;
++}
++
+ }  // namespace can_fixture
+diff --git a/tests/test_dtc_debouncer.cpp b/tests/test_dtc_debouncer.cpp
+index 517f3f8..21a9c5f 100644
+--- a/tests/test_dtc_debouncer.cpp
++++ b/tests/test_dtc_debouncer.cpp
+@@ -141,6 +141,28 @@ void testResetAndUnconfirmedPassRecovery() {
+     CHECK(!debouncer.isConfirmed());
+ }
+ 
++/**
++ * @brief Verify monitor freeze suspends samples and aging until unfrozen or reset.
++ * @req REQ-DTC-005
++ */
++void testMonitorFreezeControl() {
++    const DtcConfig config{6, -4, 3, 2, 2U};
++    DtcDebouncer debouncer(config);
++    CHECK(!debouncer.isFrozen());
++    debouncer.setFrozen(true);
++    CHECK(debouncer.isFrozen());
++    CHECK_EQ(debouncer.reportSample(true), DtcState::Inactive);
++    CHECK_EQ(debouncer.counter(), static_cast<std::int16_t>(0));
++    CHECK(!debouncer.onOperationCycleEnd());
++    debouncer.setFrozen(false);
++    CHECK_EQ(debouncer.reportSample(true), DtcState::Pending);
++    CHECK_EQ(debouncer.reportSample(true), DtcState::Confirmed);
++    debouncer.setFrozen(true);
++    debouncer.reset();
++    CHECK(!debouncer.isFrozen());
++    CHECK_EQ(debouncer.state(), DtcState::Inactive);
++}
++
+ }  // namespace
+ 
+ void runDtcDebouncerTests() {
+@@ -148,6 +170,7 @@ void runDtcDebouncerTests() {
+     testPendingAndConfirmDebounceThresholds();
+     testOperationCycleAgingAndHealing();
+     testResetAndUnconfirmedPassRecovery();
++    testMonitorFreezeControl();
+ }
+ 
+ }  // namespace can_fixture_test

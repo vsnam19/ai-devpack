@@ -1,0 +1,9 @@
+diff --git a/requirements.txt b/requirements.txt
+index c301b4c..22d0a89 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -14,3 +14,4 @@ REQ-DTC-001: DtcDebouncer shall validate positive confirmThreshold, failStep, pa
+ REQ-DTC-002: DtcDebouncer reportSample shall increment counter by failStep up to confirmThreshold, transition through Pending to Confirmed, and decrement by passStep down to clearThreshold.
+ REQ-DTC-003: DtcDebouncer onOperationCycleEnd shall advance healingCounter when latched at clearThreshold, enter Healing, reset healingCounter on any fail sample, and clear to Inactive with counter zero at agingThreshold.
+ REQ-DTC-004: DtcDebouncer reset shall return state to Inactive and clear counter, healingCounter, and confirmed latch status.
++REQ-DTC-006: DtcDebouncer remainingToConfirm shall return 0 when invalid or confirmed/healing, and confirmThreshold - counter otherwise.

@@ -114,6 +114,11 @@ void runRingBufferTests();
  */
 void runLinkStateMachineTests();
 
+/**
+ * @brief Run all DTC debouncer unit test suites.
+ */
+void runDtcDebouncerTests();
+
 }  // namespace can_fixture_test
 
 #define CHECK(expr) \

@@ -1,0 +1,7 @@
+diff --git a/STOP_REPORT.md b/STOP_REPORT.md
+new file mode 100644
+--- /dev/null
++++ b/STOP_REPORT.md
+@@ -0,0 +1,2 @@
++STOP_REPORT
++REQ-DTC-002 requires confirmation at the threshold, but tests/test_dtc_debouncer.cpp requires confirmation on the next sample.

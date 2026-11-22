@@ -1,0 +1,50 @@
+diff --git a/src/link_state_machine.cpp b/src/link_state_machine.cpp
+index 6480c63..000ff0f 100644
+--- a/src/link_state_machine.cpp
++++ b/src/link_state_machine.cpp
+@@ -41,7 +41,7 @@ bool LinkStateMachine::onHandshakeAck(std::uint64_t nowMs) noexcept {
+ }
+ 
+ bool LinkStateMachine::onHeartbeat(std::uint64_t nowMs) noexcept {
+-    if ((m_state == LinkState::Idle || m_state == LinkState::Connecting) ||
++    if ((m_state != LinkState::Active && m_state != LinkState::Degraded) ||
+         nowMs < m_lastTimestampMs) {
+         return false;
+     }
+diff --git a/tests/test_link_state_machine.cpp b/tests/test_link_state_machine.cpp
+index 199f640..9da711a 100644
+--- a/tests/test_link_state_machine.cpp
++++ b/tests/test_link_state_machine.cpp
+@@ -112,6 +112,24 @@ void testResetFromAnyState() {
+     CHECK_EQ(machine.state(), LinkState::Connecting);
+ }
+ 
++
++/**
++ * @brief Verify onHeartbeat is rejected in Idle, Connecting, Fault, and stale timestamps.
++ * @req REQ-LINK-005
++ */
++void testHeartbeatStateGuards() {
++    const LinkConfig config{50U, 100U, 1U};
++    LinkStateMachine machine(config);
++
++    CHECK(!machine.onHeartbeat(10ULL));
++    CHECK(machine.startConnect(100ULL));
++    CHECK(!machine.onHeartbeat(120ULL));
++    CHECK_EQ(machine.onTick(150ULL), LinkState::Connecting);
++    CHECK_EQ(machine.onTick(200ULL), LinkState::Fault);
++    CHECK(!machine.onHeartbeat(250ULL));
++    CHECK_EQ(machine.state(), LinkState::Fault);
++}
++
+ }  // namespace
+ 
+ void runLinkStateMachineTests() {
+@@ -119,6 +137,7 @@ void runLinkStateMachineTests() {
+     testHandshakeRetryAndFault();
+     testHeartbeatSupervisionAndDegradedEscalation();
+     testResetFromAnyState();
++    testHeartbeatStateGuards();
+ }
+ 
+ }  // namespace can_fixture_test

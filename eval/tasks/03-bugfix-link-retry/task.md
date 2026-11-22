@@ -1,6 +1,7 @@
 # Task: 03-bugfix-link-retry
 
 Category: bugfix
+Tier: smoke
 
 ## Goal
 

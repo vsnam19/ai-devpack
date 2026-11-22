@@ -13,5 +13,6 @@ int main() {
     can_fixture_test::runCanCodecTests();
     can_fixture_test::runRingBufferTests();
     can_fixture_test::runLinkStateMachineTests();
+    can_fixture_test::runDtcDebouncerTests();
     return can_fixture_test::printSummaryAndExitCode<0>();
 }
