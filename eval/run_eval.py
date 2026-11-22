@@ -1113,6 +1113,32 @@ def _run_trial_body(
     )
 
 
+def _implementer_init_info(run_dir: Path, step_logs: Sequence[str]) -> tuple[str, str]:
+    """Return (init_model, init_digest) of the first implementer step that reports an init model.
+
+    Reads the workflow step logs in ``run_dir``, follows each implementer step's
+    ``transcript_path`` and parses its stream ``init`` event. Returns empty strings when
+    no implementer transcript exposes init info; nothing is invented.
+    """
+    for name in step_logs:
+        log_path = run_dir / name
+        if not log_path.is_file():
+            continue
+        try:
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("role") != "implementer":
+            continue
+        transcript = Path(str(payload.get("transcript_path") or ""))
+        if not transcript.is_file():
+            continue
+        parsed = agent_exec.parse_stream(transcript)
+        if parsed.init_model:
+            return parsed.init_model, parsed.init_digest
+    return "", ""
+
+
 def run_runner_trial(
     task: TaskSpec,
     pair_label: str,
@@ -1304,6 +1330,9 @@ def run_runner_trial(
         trial_cost: float | None = None
         if not is_harness_err and not all_local:
             trial_cost = float(summary.get("cost_usd", 0.0) or 0.0)
+        runner_init_model, runner_init_digest = _implementer_init_info(
+            trial_run_dir, summary.get("step_logs", []) or []
+        )
 
         return TrialResult(
             task_id=task.task_id,
@@ -1337,6 +1366,8 @@ def run_runner_trial(
             reviewer_verdict=verdict,
             reviewer_false_approve=false_approve,
             reviewer_false_reject=false_reject,
+            init_model=runner_init_model,
+            init_digest=runner_init_digest,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")

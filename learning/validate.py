@@ -43,9 +43,16 @@ MAX_PROFILE_LINES = 40
 
 
 def _extract_trials_from_payload(payload: Any, engine_name: str = "") -> list[dict[str, Any]]:
-    """Normalize trial records from either a flat trial list or an eval results.json object."""
+    """Normalize trial records from either a flat trial list or an eval results.json object.
+
+    When ``engine_name`` is given, only trials tagged with that engine (``model`` or
+    ``engine`` field) are returned; untagged trials are kept because they cannot be
+    attributed to another engine. If nothing matches, an empty list is returned so the
+    caller can refuse to score another engine's results as this engine.
+    """
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        flat = [item for item in payload if isinstance(item, dict)]
+        return _filter_engine_trials(flat, engine_name)
     if isinstance(payload, dict):
         if isinstance(payload.get("trials"), list):
             trials = [item for item in payload["trials"] if isinstance(item, dict)]
@@ -59,11 +66,20 @@ def _extract_trials_from_payload(payload: Any, engine_name: str = "") -> list[di
                         trials.append(run_item)
         else:
             raise ValueError("Unsupported results JSON structure: missing 'tasks' or 'trials'")
-        if engine_name:
-            filtered = [t for t in trials if str(t.get("model") or t.get("engine") or "") == engine_name]
-            return filtered if filtered else trials
-        return trials
+        return _filter_engine_trials(trials, engine_name)
     raise ValueError("Results JSON must be a dict or list of trial objects")
+
+
+def _filter_engine_trials(trials: list[dict[str, Any]], engine_name: str) -> list[dict[str, Any]]:
+    """Keep trials tagged with ``engine_name`` plus untagged trials; all trials when no engine is given."""
+    if not engine_name:
+        return trials
+    return [
+        t
+        for t in trials
+        if not (t.get("model") or t.get("engine"))
+        or str(t.get("model") or t.get("engine")) == engine_name
+    ]
 
 
 def evaluate_ab_results(
@@ -343,6 +359,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        if not active_trials or not cand_trials:
+            print(
+                f"error: no trials for engine '{args.engine}' in --results-json-pair files "
+                f"(active: {len(active_trials)}, candidate: {len(cand_trials)})",
+                file=sys.stderr,
+            )
+            return 1
 
         decision = evaluate_ab_results(active_trials, cand_trials)
         cmds = promotion_commands(args.engine, candidate_path)
