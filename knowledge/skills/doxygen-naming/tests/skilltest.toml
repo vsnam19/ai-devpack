@@ -18,7 +18,7 @@ expect = false
 name = "header-contract"
 fixture = "fixtures/header-contract/input"
 grader = "graders/header-contract"
-prompt = "Add documentation to this header so it passes our review; preserve its interface."
+prompt = "Add documentation and correct declaration naming so this header passes review; rename declarations and callers as needed while preserving types and runtime behavior."
 check = "bash check.sh"
 [[behaviour]]
 name = "direction-contract"

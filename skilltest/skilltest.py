@@ -30,7 +30,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-from runner.agent_exec import AgentRequest, load_engines, run_agent
+from runner.agent_exec import AgentRequest, load_engines, run_agent, update_run_json
+from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs
 
 
 MAX_DESCRIPTION_LENGTH = 1024
@@ -157,6 +158,17 @@ def lint_skill(skill_dir: Path) -> list[str]:
     if not config_path.is_file() or not config:
         errors.append("missing tests/skilltest.toml")
         return errors
+    for kind in ("trigger", "behaviour"):
+        cases = config.get(kind, [])
+        if not isinstance(cases, list) or any(not isinstance(item, dict) for item in cases):
+            errors.append(f"{kind} must be an array of tables")
+            return errors
+        for index, item in enumerate(cases, 1):
+            for field in ("name", "prompt"):
+                if not isinstance(item.get(field), str) or not item[field].strip():
+                    errors.append(f"{kind} {index}: {field} must be a non-empty string")
+            if kind == "trigger" and not isinstance(item.get("expect"), bool):
+                errors.append(f"trigger {index}: expect must be a boolean")
     triggers = config.get("trigger", [])
     positives = sum(1 for item in triggers if item.get("expect") is True)
     negatives = sum(1 for item in triggers if item.get("expect") is False)
@@ -168,7 +180,8 @@ def lint_skill(skill_dir: Path) -> list[str]:
         errors.append("requires at least one behaviour case")
     fixtures_root = skill_dir / "tests" / "fixtures"
     input_dirs = list(fixtures_root.glob("*/input")) if fixtures_root.is_dir() else []
-    declared_inputs = {item.get("fixture") for item in config.get("behaviour", [])}
+    declared_inputs = {item["fixture"] for item in config.get("behaviour", [])
+                       if isinstance(item.get("fixture"), str)}
     for item in config.get("behaviour", []):
         fixture = item.get("fixture")
         grader = item.get("grader")
@@ -234,32 +247,74 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
                    fixture: Path | None, agent_bin: str, isolation: str,
                    check_command: str | None = None, grader: Path | None = None,
                    expectations: dict[str, Any] | None = None,
-                   engines_config: Path | str = REPOSITORY_ROOT / "runner/engines.example.toml") -> tuple[bool, bool, dict[str, Any]]:
+                   engines_config: Path | str = REPOSITORY_ROOT / "runner/engines.example.toml",
+                   expected_trigger: bool | None = None) -> tuple[bool, bool, dict[str, Any]]:
     """Run one agent trial and return trigger status plus serialized telemetry."""
-    with tempfile.TemporaryDirectory(prefix="skilltest-") as temp:
-        workdir = Path(temp) / "work"
-        workdir.mkdir()
-        if fixture is not None:
-            shutil.copytree(fixture, workdir, dirs_exist_ok=True)
-        if enabled:
-            _copy_skill(skill_dir, workdir, skill_dir.name)
-        result = run_agent(AgentRequest(
-            engine=load_engines(engines_config).get_engine(engine), prompt=prompt, workdir=workdir,
-            run_dir=run_dir, step_name="skilltest", role="skilltest", skills_enabled=enabled,
-            agent_bin=agent_bin, isolation=isolation,
-        ))
-        raw = result.transcript_path.read_text(encoding="utf-8") if result.transcript_path.is_file() else ""
-        passed = False
-        grader_names = {path.name for path in grader.rglob("*") if path.is_file()} if grader else set()
-        contaminated = any(path.name in grader_names for path in workdir.rglob("*") if path.is_file())
-        if check_command is not None and grader is not None and not contaminated:
-            check_env = {**os.environ, "DEVPACK_ROOT": str(REPOSITORY_ROOT)}
-            for key, value in (expectations or {}).items():
-                check_env[f"SKILLTEST_EXPECTED_{key.upper()}"] = str(value)
-            passed = subprocess.run(
-                [*shlex.split(check_command), str(workdir)], cwd=grader, env=check_env, check=False,
-            ).returncode == 0
-        return transcript_triggered(raw, skill_dir.name), passed, asdict(result)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    update_run_json(run_dir, kind="skilltest", engines=[engine], task=prompt, outcome="running")
+    redactor = Redactor()
+    triggered = passed = False
+    telemetry: dict[str, Any] = {}
+    outcome = "error"
+    reason = "Trial did not complete"
+    grader_output = ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="skilltest-") as temp:
+            workdir = Path(temp) / "work"
+            workdir.mkdir()
+            if fixture is not None:
+                shutil.copytree(fixture, workdir, dirs_exist_ok=True)
+            if enabled:
+                _copy_skill(skill_dir, workdir, skill_dir.name)
+            result = run_agent(AgentRequest(
+                engine=load_engines(engines_config).get_engine(engine), prompt=prompt, workdir=workdir,
+                run_dir=run_dir, step_name="skilltest", role="skilltest", skills_enabled=enabled,
+                agent_bin=agent_bin, isolation=isolation,
+            ))
+            telemetry = asdict(result)
+            raw = result.transcript_path.read_text(encoding="utf-8") if result.transcript_path.is_file() else ""
+            triggered = transcript_triggered(raw, skill_dir.name)
+            if result.status != "ok" or result.tool_protocol_errors:
+                reason = f"Agent error: {result.error or result.status}; tool protocol errors={result.tool_protocol_errors}"
+            elif check_command is None:
+                passed = triggered == expected_trigger if expected_trigger is not None else True
+                outcome = "pass" if passed else "fail"
+                reason = "" if passed else f"FAIL: expected triggered={expected_trigger}, observed {triggered}"
+            else:
+                grader_names = {path.name for path in grader.rglob("*") if path.is_file()} if grader else set()
+                contaminated = any(path.name in grader_names for path in workdir.rglob("*") if path.is_file())
+                if contaminated:
+                    outcome = "fail"
+                    reason = "FAIL: grader material found in candidate workspace"
+                elif grader is None:
+                    reason = "Grader directory is missing"
+                else:
+                    check_env = {**os.environ, "DEVPACK_ROOT": str(REPOSITORY_ROOT)}
+                    for key, value in (expectations or {}).items():
+                        check_env[f"SKILLTEST_EXPECTED_{key.upper()}"] = str(value)
+                    check = subprocess.run(
+                        [*shlex.split(check_command), str(workdir)], cwd=grader, env=check_env,
+                        check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    )
+                    grader_output = check.stdout
+                    passed = check.returncode == 0
+                    outcome = "pass" if passed else "fail"
+                    lines = [line.strip() for line in grader_output.splitlines() if line.strip()]
+                    failures = [line for line in lines if re.search(r"FAIL|ERROR|error:|failed", line)]
+                    reason = "" if passed else next(iter(failures or lines), f"Grader exited with code {check.returncode}")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        reason = f"Trial error: {error}"
+    finally:
+        reason = redactor.redact(reason)
+        if check_command is not None:
+            steps = run_dir / "steps"
+            steps.mkdir(exist_ok=True)
+            (steps / "02-grader.txt").write_text(
+                redactor.redact(grader_output) + f"\n{outcome.upper()}: {reason or 'Grader passed'}\n", encoding="utf-8")
+        update_run_json(run_dir, finished=datetime.now(timezone.utc).isoformat(), outcome=outcome)
+        write_rendered_outputs(load_run_dir(run_dir, redactor), run_dir)
+    telemetry.update(reason=reason, outcome=outcome)
+    return triggered, passed, telemetry
 
 
 def run_experiment(args: argparse.Namespace) -> int:
@@ -293,8 +348,8 @@ def run_experiment(args: argparse.Namespace) -> int:
             for _ in range(args.k):
                 serial += 1
                 triggered, _, telemetry = _execute_trial(skill_dir, engine, case["prompt"], True,
-                    _trial_run_dir(output, f"{serial:03d}-trigger-{engine}"), None, args.agent_bin, args.isolation, engines_config=args.engines_config)
-                trials.append({"engine": engine, "arm": "trigger", "case": case["name"], "expected": case["expect"], "triggered": triggered, "telemetry": telemetry})
+                    _trial_run_dir(output, f"{serial:03d}-trigger-{engine}"), None, args.agent_bin, args.isolation, engines_config=args.engines_config, expected_trigger=case["expect"])
+                trials.append({"engine": engine, "arm": "trigger", "case": case["name"], "expected": case["expect"], "triggered": triggered, "reason": telemetry["reason"], "telemetry": telemetry})
         for arm, enabled in (("with_skill", True), ("without_skill", False)):
             for case in config["behaviour"]:
                 fixture = skill_dir / "tests" / case["fixture"]
@@ -305,7 +360,7 @@ def run_experiment(args: argparse.Namespace) -> int:
                         _trial_run_dir(output, f"{serial:03d}-{arm}-{engine}"), fixture, args.agent_bin, args.isolation,
                         case["check"], grader, {key: case[key] for key in ("category", "severity", "verdict") if key in case},
                         engines_config=args.engines_config)
-                    trials.append({"engine": engine, "arm": arm, "case": case["name"], "passed": passed, "telemetry": telemetry})
+                    trials.append({"engine": engine, "arm": arm, "case": case["name"], "passed": passed, "reason": telemetry["reason"], "telemetry": telemetry})
     report = {"skill": skill_dir.name, "trials": trials}
     trigger_report: dict[str, Any] = {}
     for engine in engines:
@@ -333,6 +388,8 @@ def run_experiment(args: argparse.Namespace) -> int:
     lines += [f"- {engine}: precision={item['precision']:.2f}, recall={item['recall']:.2f}, per-case={item['per_case_rate']}" for engine, item in report["trigger"].items()]
     lines += ["", "## Behaviour"]
     lines += [f"- {engine}: with={item['with_skill_rate']:.2f}, without={item['without_skill_rate']:.2f}, delta={item['delta']:.2f}; no measurable benefit={item['no_measurable_benefit']}" for engine, item in report["behaviour"].items()]
+    lines += ["", "## Trials"]
+    lines += [f"- {trial['engine']} {trial['arm']} {trial['case']}: {trial['telemetry']['outcome']}; {trial['reason'] or 'Passed'}" for trial in trials]
     (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(output / "summary.md")
     return 0
