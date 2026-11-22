@@ -1,0 +1,12 @@
+id = "03-distractors-overrecall"
+category = "distractors"
+tier = "v2"
+title = "Retrieve only target entry amid distractors without over-recall"
+ab_compare = true
+
+[step_1]
+role = "implementer"
+prompt_file = "step1.md"
+allowed_files = ["include/ring_buffer.hpp", "src/ring_buffer.cpp"]
+expected_ids = ["mem-ring-target"]
+forbidden_ids = ["mem-dist-01", "mem-dist-02", "mem-dist-03", "mem-dist-04", "mem-dist-05", "mem-dist-06", "mem-dist-07", "mem-dist-08", "mem-dist-09", "mem-dist-10"]

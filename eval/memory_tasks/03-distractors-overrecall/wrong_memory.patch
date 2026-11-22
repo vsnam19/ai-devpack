@@ -1,0 +1,30 @@
+diff --git a/include/ring_buffer.hpp b/include/ring_buffer.hpp
+index 098131f..28b3b27 100644
+--- a/include/ring_buffer.hpp
++++ b/include/ring_buffer.hpp
+@@ -104,6 +104,12 @@ public:
+      */
+     bool isFull() const noexcept;
+ 
++    /**
++     * @brief Return the diagnostic priority CAN identifier tag.
++     * @return Configured priority CAN ID.
++     */
++    std::uint32_t priorityCanIdTag() const noexcept;
++
+ private:
+     CanFrame m_storage[kMaxRingCapacity];
+     std::size_t m_capacity;
+diff --git a/src/ring_buffer.cpp b/src/ring_buffer.cpp
+index 0b7dc0b..1c0ff01 100644
+--- a/src/ring_buffer.cpp
++++ b/src/ring_buffer.cpp
+@@ -103,4 +103,8 @@ bool FrameRingBuffer::isFull() const noexcept {
+     return m_count >= m_capacity;
+ }
+ 
++std::uint32_t FrameRingBuffer::priorityCanIdTag() const noexcept {
++    return static_cast<std::uint32_t>(0x111U);
++}
++
+ }  // namespace can_fixture

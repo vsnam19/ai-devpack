@@ -267,6 +267,46 @@ class TestTestLock(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Deviation: DEV-404", out)
 
+    def test_no_deviation_flag_ignores_head_deviation_trailer(self) -> None:
+        """A removed protected line passes with 'Deviation: <ID>' on HEAD by default, and fails with --no-deviation."""
+        (self.repo_dir / "tests" / "test_codec.cpp").write_text(
+            "void test_decode() {\n"
+            "    ASSERT_EQ(1, 1);\n"
+            "    EXPECT_TRUE(true);\n"
+            "    REQUIRE(2 == 2);\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo_dir),
+                "commit",
+                "-am",
+                "drop closing brace\n\nDeviation: DEV-777",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        protected_args = [
+            "--repo",
+            str(self.repo_dir),
+            "--base",
+            "HEAD~1",
+            "--protected",
+            "tests/**",
+        ]
+
+        code, out, _ = self._run_lock(protected_args)
+        self.assertEqual(code, 0)
+        self.assertIn("Deviation: DEV-777", out)
+
+        code, out, _ = self._run_lock(protected_args + ["--no-deviation"])
+        self.assertEqual(code, 1)
+        self.assertIn("existing non-comment test lines modified or deleted", out)
+        self.assertNotIn("Deviation", out)
+
     def test_custom_assert_regex_is_respected(self) -> None:
         """Custom --assert-regex detects decrease of custom assertion macro tokens."""
         custom_test = self.repo_dir / "tests" / "test_custom.cpp"

@@ -103,7 +103,7 @@ if [[ -z "$BASE_REF" ]]; then
 fi
 
 python3 "$SCOPE_CHECK" --repo "$WORKDIR" --base "$BASE_REF" --allow 'REVIEW.md' 'STOP_REPORT.md' >/dev/null
-python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' >/dev/null
+python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' --no-deviation >/dev/null
 
 
 # Verify review.patch applies and compiles cleanly against the fixture in workdir.

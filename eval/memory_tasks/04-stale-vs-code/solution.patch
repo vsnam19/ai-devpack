@@ -1,0 +1,71 @@
+diff --git a/MEMORY_CONFLICTS.md b/MEMORY_CONFLICTS.md
+new file mode 100644
+index 0000000..d036a83
+--- /dev/null
++++ b/MEMORY_CONFLICTS.md
+@@ -0,0 +1,4 @@
++# Memory Conflict Report
++
++- Entry `mem-codec-stale` conflicts with `docs/spec.md` (`REQ-CODEC-008`).
++- Spec requires unsigned selector with `bitLength <= 16U`; followed spec.
+diff --git a/include/can_codec.hpp b/include/can_codec.hpp
+index ca3e8de..bf57656 100644
+--- a/include/can_codec.hpp
++++ b/include/can_codec.hpp
+@@ -133,6 +133,22 @@ bool decodePhysical(
+     std::size_t frameLength,
+     double* physicalOut) noexcept;
+ 
++/**
++ * @brief Decode a multiplexed physical CAN signal when the selector matches expectedMuxValue.
++ * @param[in] muxSelectorSignal Unsigned selector signal (bitLength <= 16).
++ * @param[in] expectedMuxValue Expected selector raw value.
++ * @param[in] valueSignal Payload value signal to decode.
++ * @param[in] frameBytes 8-byte CAN payload buffer.
++ * @param[out] physicalOut Destination pointer for decoded physical value.
++ * @return True if selector matched and value decoded, false otherwise.
++ */
++bool decodeMultiplexedPhysical(
++    const SignalDef& muxSelectorSignal,
++    std::uint64_t expectedMuxValue,
++    const SignalDef& valueSignal,
++    const std::uint8_t* frameBytes,
++    double* physicalOut) noexcept;
++
+ }  // namespace can_fixture
+ 
+ #endif  // CAN_FIXTURE_CAN_CODEC_HPP
+diff --git a/src/can_codec.cpp b/src/can_codec.cpp
+index c96dd47..eddbae0 100644
+--- a/src/can_codec.cpp
++++ b/src/can_codec.cpp
+@@ -220,4 +220,29 @@ bool decodePhysical(
+     return true;
+ }
+ 
++bool decodeMultiplexedPhysical(
++    const SignalDef& muxSelectorSignal,
++    std::uint64_t expectedMuxValue,
++    const SignalDef& valueSignal,
++    const std::uint8_t* frameBytes,
++    double* physicalOut) noexcept {
++    if (frameBytes == nullptr || physicalOut == nullptr) {
++        return false;
++    }
++    if (!isValidSignal(muxSelectorSignal) || !isValidSignal(valueSignal)) {
++        return false;
++    }
++    if (muxSelectorSignal.isSigned || (muxSelectorSignal.bitLength > 16U)) {
++        return false;
++    }
++    std::uint64_t selectorRaw = 0ULL;
++    if (!unpackRaw(muxSelectorSignal, frameBytes, kMaxFrameBytes, &selectorRaw)) {
++        return false;
++    }
++    if (selectorRaw != expectedMuxValue) {
++        return false;
++    }
++    return decodePhysical(valueSignal, frameBytes, kMaxFrameBytes, physicalOut);
++}
++
+ }  // namespace can_fixture

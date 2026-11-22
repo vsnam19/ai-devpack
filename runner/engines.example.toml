@@ -37,3 +37,10 @@ orchestrator = "sonnet"
 
 [limits]
 max_fix_rounds = 2
+
+[memory]
+enabled = true
+top_k = 5
+budget_tokens = 800
+reviewer_sees_handoffs = false
+

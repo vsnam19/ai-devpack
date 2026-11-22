@@ -1,0 +1,12 @@
+id = "02-superseded-decision"
+category = "superseded"
+tier = "v2"
+title = "Follow superseding decision and ignore superseded entry"
+ab_compare = true
+
+[step_1]
+role = "implementer"
+prompt_file = "step1.md"
+allowed_files = ["include/link_state_machine.hpp", "src/link_state_machine.cpp"]
+expected_ids = ["mem-link-new"]
+forbidden_ids = ["mem-link-old"]

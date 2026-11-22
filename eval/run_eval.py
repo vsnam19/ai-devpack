@@ -33,8 +33,13 @@ import time
 import stat
 import subprocess
 import sys
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import uuid
+
+try:
+    import tomllib  # type: ignore[attr-defined]
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    tomllib = None  # type: ignore[assignment]
 
 EVAL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EVAL_DIR.parent
@@ -53,6 +58,8 @@ from runner.agent_exec import (  # noqa: E402
     AgentRequest,
     EngineConfig,
     EnginesConfig,
+    MemoryConfig,
+    _minimal_toml_loads,
     build_claude_state,
     build_docker_agent_invocation,
     build_invocation,
@@ -61,20 +68,25 @@ from runner.agent_exec import (  # noqa: E402
     build_project_settings,
     check_local_isolation_allowed,
     cleanup_cfg_dir,
+    compute_engine_config_hash,
     detect_harness_error,
     extract_agent_json_object,
     json_string_leaves,
     load_engines,
+    load_qualification_data,
     new_run_dir,
     parse_agent_json_output,
     parse_stream,
     redact_sensitive_text,
     redact_structure,
     resolve_engine,
+    resolve_engine_profile_path,
     run_agent,
+    save_qualification_data,
     update_run_json,
 )
 from runner.devpack_dispatch import run_preflight_lint_on_changed  # noqa: E402
+from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
 from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 
 EXCERPT_MAX_CHARS = 4000
@@ -109,6 +121,36 @@ class OrchestratorGoalSpec:
     goal_dir: Path
     goal_md: Path
     check_sh: Path
+
+
+@dataclass(frozen=True)
+class MemoryStepSpec:
+    """Metadata for a single step inside a multi-step memory evaluation sequence."""
+
+    step_id: str
+    role: str
+    engine: str
+    prompt_file: Path
+    allowed_files: tuple[str, ...]
+    expected_ids: tuple[str, ...] = ()
+    forbidden_ids: tuple[str, ...] = ()
+    expect_proposals: bool = False
+    expect_prior_proposals: bool = False
+
+
+@dataclass(frozen=True)
+class MemorySequenceSpec:
+    """Metadata and filesystem paths for a multi-step memory evaluation sequence."""
+
+    seq_id: str
+    category: str
+    tier: str
+    title: str
+    ab_compare: bool
+    seq_dir: Path
+    seed_memory_dir: Path | None
+    check_sh: Path
+    steps: tuple[MemoryStepSpec, ...]
 
 
 @dataclass
@@ -154,6 +196,14 @@ class TrialResult:
     orchestrator_compliant: bool = True
     disallowed_bash_commands: list[str] = field(default_factory=list)
     denied_tool_calls: dict[str, Any] = field(default_factory=lambda: {"count": 0, "commands": []})
+    init_model: str = ""
+    init_digest: str = ""
+    memory_arm: str = ""
+    memory_recall_rate: float | None = None
+    memory_over_recall_rate: float | None = None
+    memory_injected_tokens: int | None = None
+    memory_injected_ids: list[str] = field(default_factory=list)
+    violation_reason: str = ""
 
 
 @dataclass
@@ -172,6 +222,7 @@ class TaskModelSummary:
     mean_turns: float | None
     mean_duration_s: float
     runs: list[TrialResult] = field(default_factory=list)
+    tier: str = "smoke"
     harness_errors: int = 0
     timeouts: int = 0
     valid_runs: int = 0
@@ -190,6 +241,12 @@ class TaskModelSummary:
     false_reject_count: int = 0
     false_approve_rate: float | None = None
     false_reject_rate: float | None = None
+    memory_recall_rate: float | None = None
+    memory_over_recall_rate: float | None = None
+    mean_injected_tokens: float | None = None
+    pass_with_memory: float | None = None
+    pass_without_memory: float | None = None
+    memory_ab_delta: float | None = None
 
 
 def parse_category(task_md_text: str) -> str:
@@ -330,6 +387,93 @@ def load_and_validate_orchestrator_goals(
     if not goals:
         raise ValueError(f"No orchestrator goals matched in {goals_dir}")
     return goals
+
+
+def load_and_validate_memory_sequences(
+    memory_tasks_dir: Path,
+    selector: str = "all",
+    tier: str = "all",
+) -> list[MemorySequenceSpec]:
+    """Discover and validate multi-step memory evaluation sequences under ``memory_tasks_dir``."""
+    if not memory_tasks_dir.is_dir():
+        raise ValueError(f"Memory tasks directory does not exist: {memory_tasks_dir}")
+
+    if selector.strip().lower() == "all":
+        candidate_dirs = sorted(
+            p for p in memory_tasks_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+        )
+    else:
+        requested = [item.strip() for item in selector.split(",") if item.strip()]
+        if not requested:
+            raise ValueError("No memory sequence IDs provided")
+        candidate_dirs = [memory_tasks_dir / sid for sid in requested]
+
+    sequences: list[MemorySequenceSpec] = []
+    for sdir in candidate_dirs:
+        if not sdir.is_dir():
+            raise ValueError(f"Memory sequence directory not found: {sdir}")
+        seq_toml = sdir / "sequence.toml"
+        check_sh = sdir / "check.sh"
+        if not seq_toml.is_file():
+            raise ValueError(f"Memory sequence '{sdir.name}' is missing 'sequence.toml'")
+        if not check_sh.is_file():
+            raise ValueError(f"Memory sequence '{sdir.name}' is missing 'check.sh'")
+
+        raw_text = seq_toml.read_text(encoding="utf-8")
+        data = tomllib.loads(raw_text) if tomllib is not None else _minimal_toml_loads(raw_text)
+        seq_tier = str(data.get("tier", "v2")).strip().lower() or "v2"
+        if tier.strip().lower() not in ("", "all") and seq_tier != tier.strip().lower():
+            continue
+
+        step_keys = sorted(
+            (k for k in data if k.startswith("step_") and isinstance(data[k], dict)),
+            key=lambda s: int(s.split("_", 1)[1]),
+        )
+        if not step_keys:
+            raise ValueError(f"Memory sequence '{sdir.name}' defines no [step_N] sections")
+
+        steps: list[MemoryStepSpec] = []
+        for skey in step_keys:
+            sdata = data[skey]
+            p_rel = str(sdata.get("prompt_file", "")).strip()
+            if not p_rel:
+                raise ValueError(f"Memory sequence '{sdir.name}' {skey} missing prompt_file")
+            p_path = sdir / p_rel
+            if not p_path.is_file():
+                raise ValueError(f"Memory sequence '{sdir.name}' missing step prompt: {p_path}")
+            if not sdata.get("allowed_files"):
+                raise ValueError(f"Memory sequence '{sdir.name}' {skey} missing allowed_files")
+            steps.append(
+                MemoryStepSpec(
+                    step_id=skey,
+                    role=str(sdata.get("role", "implementer")).strip() or "implementer",
+                    engine=str(sdata.get("engine", "")).strip(),
+                    prompt_file=p_path,
+                    allowed_files=tuple(str(x) for x in sdata.get("allowed_files", [])),
+                    expected_ids=tuple(str(x) for x in sdata.get("expected_ids", [])),
+                    forbidden_ids=tuple(str(x) for x in sdata.get("forbidden_ids", [])),
+                    expect_proposals=bool(sdata.get("expect_proposals", False)),
+                    expect_prior_proposals=bool(sdata.get("expect_prior_proposals", False)),
+                )
+            )
+
+        seed_dir = sdir / "seed_memory"
+        sequences.append(
+            MemorySequenceSpec(
+                seq_id=str(data.get("id", sdir.name)),
+                category=str(data.get("category", "memory")).strip() or "memory",
+                tier=seq_tier,
+                title=str(data.get("title", sdir.name)),
+                ab_compare=bool(data.get("ab_compare", True)),
+                seq_dir=sdir,
+                seed_memory_dir=seed_dir if seed_dir.is_dir() else None,
+                check_sh=check_sh,
+                steps=tuple(steps),
+            )
+        )
+    if not sequences:
+        raise ValueError(f"No memory sequences matched in {memory_tasks_dir}")
+    return sequences
 
 
 def _is_brief_or_runs_path(raw_path: str) -> bool:
@@ -756,6 +900,7 @@ def run_single_trial(
     runs_root: Path | None = None,
     engine_config: EngineConfig | None = None,
     allow_unsandboxed_local: bool = False,
+    profile_overrides: Mapping[str, Path | None] | None = None,
 ) -> TrialResult:
     """Execute one (task, model, run_index) trial in an isolated workspace.
 
@@ -782,6 +927,7 @@ def run_single_trial(
             runs_root=runs_root or (run_root / "runs"),
             engine_config=engine_config,
             allow_unsandboxed_local=allow_unsandboxed_local,
+            profile_overrides=profile_overrides,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")
@@ -804,6 +950,7 @@ def _run_trial_body(
     runs_root: Path | None = None,
     engine_config: EngineConfig | None = None,
     allow_unsandboxed_local: bool = False,
+    profile_overrides: Mapping[str, Path | None] | None = None,
 ) -> TrialResult:
     """Run the agent via agent_exec and execute check.sh for one single-mode trial."""
     if isolation not in ("local", "docker"):
@@ -830,6 +977,11 @@ def _run_trial_body(
         engines=[engine.name],
     )
 
+    if profile_overrides is not None and engine.name in profile_overrides:
+        resolved_profile = profile_overrides[engine.name]
+    else:
+        resolved_profile = resolve_engine_profile_path(engine.name, REPO_ROOT)
+
     request = AgentRequest(
         engine=engine,
         prompt=prompt_text,
@@ -852,6 +1004,7 @@ def _run_trial_body(
         cfg_dir=paths["cfg_dir"],
         tmp_dir=paths["tmp_dir"],
         home_placeholder="$HOME",
+        profile_path=resolved_profile,
     )
     agent_res = run_agent(request)
 
@@ -958,7 +1111,35 @@ def _run_trial_body(
         lint_clean_final=lint_clean_final,
         rounds_to_clean=rounds_to_clean,
         mode="single",
+        init_model=agent_res.init_model,
+        init_digest=agent_res.init_digest,
     )
+
+
+def _implementer_init_info(run_dir: Path, step_logs: Sequence[str]) -> tuple[str, str]:
+    """Return (init_model, init_digest) of the first implementer step that reports an init model.
+
+    Reads the workflow step logs in ``run_dir``, follows each implementer step's
+    ``transcript_path`` and parses its stream ``init`` event. Returns empty strings when
+    no implementer transcript exposes init info; nothing is invented.
+    """
+    for name in step_logs:
+        log_path = run_dir / name
+        if not log_path.is_file():
+            continue
+        try:
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("role") != "implementer":
+            continue
+        transcript = Path(str(payload.get("transcript_path") or ""))
+        if not transcript.is_file():
+            continue
+        parsed = agent_exec.parse_stream(transcript)
+        if parsed.init_model:
+            return parsed.init_model, parsed.init_digest
+    return "", ""
 
 
 def run_runner_trial(
@@ -981,6 +1162,7 @@ def run_runner_trial(
     image_tag: str = DOCKER_IMAGE_TAG,
     runs_root: Path | None = None,
     allow_unsandboxed_local: bool = False,
+    profile_overrides: Mapping[str, Path | None] | None = None,
 ) -> TrialResult:
     """Execute one runner-mode trial (implement -> gate -> review -> fix) and grade it."""
     safe_pair = pair_label.replace(":", "-")
@@ -1097,6 +1279,7 @@ def run_runner_trial(
             extra_secrets=extra_secrets,
             path_replacements=path_replacements,
             home_placeholder="$HOME",
+            profile_overrides=profile_overrides,
         )
 
         task_prompt_in_work = work_dir / "TASK_PROMPT.md"
@@ -1150,6 +1333,9 @@ def run_runner_trial(
         trial_cost: float | None = None
         if not is_harness_err and not all_local:
             trial_cost = float(summary.get("cost_usd", 0.0) or 0.0)
+        runner_init_model, runner_init_digest = _implementer_init_info(
+            trial_run_dir, summary.get("step_logs", []) or []
+        )
 
         return TrialResult(
             task_id=task.task_id,
@@ -1183,6 +1369,8 @@ def run_runner_trial(
             reviewer_verdict=verdict,
             reviewer_false_approve=false_approve,
             reviewer_false_reject=false_reject,
+            init_model=runner_init_model,
+            init_digest=runner_init_digest,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")
@@ -1457,8 +1645,452 @@ def run_orchestrator_trial(
         cleanup_cfg_dir(trial_root / "cfg")
 
 
+MEMORY_PROTECTED_GLOBS: tuple[str, ...] = ("tests/**",)
+MEMORY_STEP_BASELINE_MSG = "chore: memory eval step baseline"
+SCOPE_CHECK_SCRIPT = REPO_ROOT / "enforcement" / "checks" / "scope_check.py"
+TEST_LOCK_SCRIPT = REPO_ROOT / "enforcement" / "checks" / "test_lock.py"
+
+
+def _commit_step_baseline(work_dir: Path, git_env: Mapping[str, str]) -> str:
+    """Commit the worktree as it stands before a step and return that commit SHA.
+
+    The SHA is the base for the step's enforcement checks, so each step is judged only on
+    the edits it made (earlier accepted steps are part of its baseline).
+    """
+    env = dict(git_env)
+    subprocess.run(["git", "add", "-A"], cwd=str(work_dir), env=env, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", MEMORY_STEP_BASELINE_MSG],
+        cwd=str(work_dir),
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(work_dir),
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return head.stdout.strip()
+
+
+def _classify_enforcement_proc(
+    proc: subprocess.CompletedProcess[str],
+    violation_tag: str,
+    violation_kind: str,
+    label: str,
+) -> tuple[str, str]:
+    """Map a check result to ``("", "")`` (clean), ``(violation_kind, detail)`` or ``("harness_error", detail)``."""
+    if proc.returncode == 0:
+        return "", ""
+    violation_lines = [line for line in (proc.stdout or "").splitlines() if violation_tag in line]
+    if proc.returncode == 1 and violation_lines:
+        return violation_kind, "; ".join(violation_lines)
+    tail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-500:]
+    return "harness_error", f"{label} failed (exit {proc.returncode}): {tail}"
+
+
+def _run_step_enforcement(
+    work_dir: Path,
+    base_ref: str,
+    allowed_files: Sequence[str],
+    git_env: Mapping[str, str],
+    timeout_s: int,
+) -> tuple[str, str]:
+    """Run the test lock then the scope check for one step, using the pack-root scripts.
+
+    Returns ``("", "")`` when the step is clean, ``("test_lock_violation" | "scope_violation", detail)``
+    on a violation, or ``("harness_error", detail)`` when a check could not run. A checker that exceeds
+    ``timeout_s`` yields ``("harness_error", "enforcement_timeout: ...")`` instead of raising.
+    """
+    if not allowed_files:
+        return "harness_error", "memory step has no allowed_files; cannot run scope check"
+    env = dict(git_env)
+    try:
+        lock = subprocess.run(
+            [
+                sys.executable,
+                "-B",  # never write __pycache__ into the pack root
+                str(TEST_LOCK_SCRIPT),
+                "--repo",
+                str(work_dir),
+                "--base",
+                base_ref,
+                "--protected",
+                *MEMORY_PROTECTED_GLOBS,
+                "--no-deviation",  # the agent under test may commit its own Deviation trailer
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_s,
+            check=False,
+        )
+        kind, detail = _classify_enforcement_proc(lock, "TEST_LOCK_VIOLATION", "test_lock_violation", "test_lock")
+        if kind:
+            return kind, detail
+        scope = subprocess.run(
+            [
+                sys.executable,
+                "-B",  # never write __pycache__ into the pack root
+                str(SCOPE_CHECK_SCRIPT),
+                "--repo",
+                str(work_dir),
+                "--base",
+                base_ref,
+                "--allow",
+                *allowed_files,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "harness_error", f"enforcement_timeout: checker timed out after {timeout_s}s"
+    return _classify_enforcement_proc(scope, "SCOPE_VIOLATION", "scope_violation", "scope_check")
+
+
+def run_memory_trial(
+    seq: MemorySequenceSpec,
+    model: str,
+    arm: str,
+    run_index: int,
+    run_root: Path,
+    fixture_dir: Path,
+    credentials_path: Path | None,
+    isolation: str,
+    agent_bin: str,
+    timeout_s: int,
+    docker_bin: str | None = None,
+    extra_secrets: Sequence[str] = (),
+    path_replacements: Sequence[tuple[str, str]] = (),
+    image_tag: str = DOCKER_IMAGE_TAG,
+    runs_root: Path | None = None,
+    engine_config: EngineConfig | None = None,
+    allow_unsandboxed_local: bool = False,
+    profile_overrides: Mapping[str, Path | None] | None = None,
+    memory_config: MemoryConfig | None = None,
+) -> TrialResult:
+    """Execute one multi-step memory evaluation trial (fresh agent per step) for ``with_memory`` or ``without_memory``."""
+    trial_name = f"{seq.seq_id}__{model}__{arm}__run{run_index}"
+    trial_root = run_root / trial_name
+    engine = engine_config or resolve_engine(model)
+    mem_enabled = arm == "with_memory"
+    try:
+        if isolation not in ("local", "docker"):
+            raise ValueError(f"Unsupported isolation mode: {isolation}")
+        if isolation == "docker" and not docker_bin:
+            raise RuntimeError("docker_bin is required for docker isolation mode")
+
+        home_dir = trial_root / "home"
+        cfg_dir = trial_root / "cfg"
+        tmp_dir = trial_root / "tmp"
+        work_dir = trial_root / "work"
+        for d in (home_dir, cfg_dir, tmp_dir, work_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        if credentials_path is not None and engine.is_cloud:
+            if not credentials_path.is_file():
+                raise RuntimeError(f"Credentials file not found: {credentials_path}")
+            cred_dest = cfg_dir / ".credentials.json"
+            shutil.copyfile(credentials_path, cred_dest)
+            os.chmod(cred_dest, stat.S_IRUSR | stat.S_IWUSR)
+
+        agent_cwd = DOCKER_TASK_DIR if isolation == "docker" else str(work_dir)
+        (cfg_dir / ".claude.json").write_text(
+            json.dumps(build_claude_state(agent_cwd), indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        shutil.copytree(fixture_dir, work_dir, dirs_exist_ok=True)
+        git_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home_dir),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "LC_ALL": "C.UTF-8",
+        }
+        for args in (
+            ["init", "-q"],
+            ["config", "user.email", "eval@example.invalid"],
+            ["config", "user.name", "Eval Runner"],
+            ["add", "-A"],
+            ["commit", "-q", "-m", "chore: base fixture"],
+        ):
+            subprocess.run(["git", *args], cwd=str(work_dir), env=git_env, check=True, capture_output=True)
+
+        (work_dir / ".claude").mkdir(parents=True, exist_ok=True)
+        (work_dir / ".claude" / "settings.json").write_text(
+            json.dumps(build_project_settings(), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        exclude_file = work_dir / ".git" / "info" / "exclude"
+        if exclude_file.parent.is_dir():
+            existing = exclude_file.read_text(encoding="utf-8") if exclude_file.is_file() else ""
+            exclude_file.write_text(existing + "\n.claude/\n.devpack/\n", encoding="utf-8")
+
+        mem_root = memory_root_for(work_dir)
+        if mem_enabled and seq.seed_memory_dir is not None and seq.seed_memory_dir.is_dir():
+            shutil.copytree(seq.seed_memory_dir, mem_root, dirs_exist_ok=True)
+
+        effective_runs_root = runs_root if runs_root is not None else (trial_root / "runs")
+        trial_run_dir = new_run_dir(
+            effective_runs_root,
+            kind="eval",
+            task=f"{seq.seq_id}:{arm}",
+            engines=[engine.name],
+        )
+
+        if profile_overrides is not None and engine.name in profile_overrides:
+            resolved_profile = profile_overrides[engine.name]
+        else:
+            resolved_profile = resolve_engine_profile_path(engine.name, REPO_ROOT)
+
+        def _redact(text: str) -> str:
+            """Redact sensitive values using trial secrets and path replacements."""
+            return redact_sensitive_text(
+                text,
+                extra_secrets=extra_secrets,
+                path_replacements=path_replacements,
+                home_placeholder="$HOME",
+            )
+
+        total_cost = 0.0
+        total_turns = 0
+        total_duration = 0.0
+        total_tok_in = 0
+        total_tok_out = 0
+        total_proto_errors = 0
+        total_injected_tokens = 0
+        all_injected_ids: list[str] = []
+        prior_proposed_ids: list[str] = []
+        total_expected = 0
+        total_recalled = 0
+        total_over_recall_hits = 0
+        total_over_recall_denom = 0
+        any_timeout = False
+        any_harness_err = False
+        harness_reason = ""
+        last_rc = 0
+        last_error = ""
+        last_excerpt = ""
+        last_stderr = ""
+        last_init_model = ""
+        last_init_digest = ""
+        violation_reason = ""
+        violation_detail = ""
+
+        for step_idx, step in enumerate(seq.steps, start=1):
+            step_prompt = step.prompt_file.read_text(encoding="utf-8")
+            req = AgentRequest(
+                engine=engine,
+                prompt=step_prompt,
+                workdir=work_dir,
+                run_dir=trial_run_dir,
+                step_name=f"{step_idx:02d}-{step.role}-{engine.name}",
+                isolation=isolation,
+                allow_unsandboxed_local=allow_unsandboxed_local,
+                timeout_s=timeout_s,
+                skills_enabled=False,
+                credentials_path=credentials_path if engine.is_cloud else None,
+                agent_bin=agent_bin,
+                docker_bin=docker_bin or "docker",
+                image_tag=image_tag,
+                extra_secrets=extra_secrets,
+                path_replacements=path_replacements,
+                role=step.role,
+                step_index=step_idx,
+                home_dir=home_dir,
+                cfg_dir=cfg_dir,
+                tmp_dir=tmp_dir,
+                home_placeholder="$HOME",
+                profile_path=resolved_profile,
+                memory_enabled=mem_enabled,
+                memory_root=mem_root,
+                memory_config=memory_config,
+            )
+            step_base_ref = _commit_step_baseline(work_dir, git_env)
+            agent_res = run_agent(req)
+            last_rc = agent_res.exit_code
+            last_excerpt = _redact(agent_res.final_text)[:EXCERPT_MAX_CHARS]
+            last_stderr = _redact(agent_res.stderr)[-STDERR_TAIL_MAX_CHARS:]
+            if agent_res.init_model:
+                last_init_model = agent_res.init_model
+                last_init_digest = agent_res.init_digest
+            if not engine.is_local:
+                total_cost += float(agent_res.cost_usd or 0.0)
+            total_turns += int(agent_res.num_turns or 0)
+            total_duration += float(agent_res.duration_s or 0.0)
+            total_tok_in += int(agent_res.tokens_in or 0)
+            total_tok_out += int(agent_res.tokens_out or 0)
+            total_proto_errors += int(agent_res.tool_protocol_errors or 0)
+            total_injected_tokens += int(agent_res.memory_tokens or 0)
+            for mid in agent_res.memory_ids:
+                if mid not in all_injected_ids:
+                    all_injected_ids.append(mid)
+
+            if agent_res.status == "timeout":
+                any_timeout = True
+            if agent_res.status == "harness_error":
+                any_harness_err = True
+                if not harness_reason:
+                    harness_reason = agent_res.error
+            if agent_res.status != "ok" and not last_error:
+                last_error = agent_res.error
+
+            # Recall and over-recall are counted for every step that ran, including a step that
+            # then violates enforcement, so the violating step is reflected in the trial metrics.
+            if mem_enabled:
+                expected_set = set(step.expected_ids)
+                if step.expect_prior_proposals:
+                    expected_set.update(prior_proposed_ids)
+                forbidden_set = set(step.forbidden_ids)
+                injected_set = set(agent_res.memory_ids)
+                total_expected += len(expected_set)
+                total_recalled += len(injected_set & expected_set)
+
+                bad_injected = set(injected_set & forbidden_set)
+                if expected_set:
+                    bad_injected |= (injected_set - expected_set)
+                cited_forbidden = {
+                    fid for fid in forbidden_set if fid and fid in agent_res.final_text
+                }
+                bad_total = bad_injected | cited_forbidden
+                total_over_recall_hits += len(bad_total)
+                total_over_recall_denom += max(1, len(injected_set | cited_forbidden))
+
+            # Enforce scope and the test lock before accepting this step's proposals.
+            enforce_kind, enforce_detail = _run_step_enforcement(
+                work_dir, step_base_ref, step.allowed_files, git_env, timeout_s
+            )
+            if enforce_kind == "harness_error":
+                any_harness_err = True
+                if not harness_reason:
+                    harness_reason = _redact(f"step {step_idx}: {enforce_detail}")
+                break
+            if enforce_kind:
+                violation_reason = enforce_kind
+                violation_detail = _redact(f"step {step_idx}: {enforce_detail}")
+                break
+
+            # Auto-accept deterministic handoff/known-gap proposals after step build gate passes
+            if mem_enabled and agent_res.status == "ok":
+                build_proc = subprocess.run(
+                    ["bash", str(work_dir / "build_and_test.sh"), "--no-cmake"],
+                    cwd=str(work_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                )
+                if build_proc.returncode == 0:
+                    prop_res = process_memory_proposals(
+                        mem_root,
+                        agent_res.final_text,
+                        source=f"run:{trial_run_dir.name}-step{step_idx}",
+                        extra_secrets=extra_secrets,
+                    )
+                    prior_proposed_ids.extend(e.id for e in prop_res.accepted)
+
+            if any_harness_err or any_timeout:
+                break
+
+        check_rc, check_out = _run_check_script(
+            seq.check_sh,
+            work_dir,
+            home_dir,
+            tmp_dir,
+            timeout_s,
+        )
+        if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
+            any_harness_err = True
+            if not harness_reason:
+                harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
+
+        redacted_check_out = _redact(check_out)
+        gate_step_num = len(seq.steps) + 1
+        (trial_run_dir / "steps" / f"{gate_step_num:02d}-gate.txt").write_text(
+            (redacted_check_out + "\n") if redacted_check_out else f"check_rc={check_rc}\n",
+            encoding="utf-8",
+        )
+
+        recall_rate: float | None = None
+        over_recall_rate: float | None = None
+        if mem_enabled:
+            recall_rate = (
+                round(total_recalled / total_expected, 4) if total_expected > 0 else 1.0
+            )
+            over_recall_rate = (
+                round(total_over_recall_hits / total_over_recall_denom, 4)
+                if total_over_recall_denom > 0
+                else 0.0
+            )
+
+        passed = check_rc == 0 and not any_harness_err and not any_timeout and not violation_reason
+        outcome = (
+            "pass"
+            if passed
+            else (
+                "harness_error"
+                if any_harness_err
+                else ("timeout" if any_timeout else (violation_reason or "fail"))
+            )
+        )
+        update_run_json(
+            trial_run_dir,
+            outcome=outcome,
+            timed_out=any_timeout,
+            violation_reason=violation_reason,
+            memory_arm=arm,
+            memory_recall_rate=recall_rate,
+            memory_over_recall_rate=over_recall_rate,
+            memory_injected_tokens=total_injected_tokens,
+            finished=datetime.now(timezone.utc).isoformat(),
+        )
+
+        return TrialResult(
+            task_id=seq.seq_id,
+            category=seq.category,
+            model=model,
+            run_index=run_index,
+            passed=passed,
+            agent_returncode=last_rc,
+            check_returncode=check_rc,
+            cost_usd=None if (any_harness_err or engine.is_local) else round(total_cost, 6),
+            turns=total_turns if not any_harness_err else None,
+            duration_s=round(total_duration, 4),
+            error=_redact(last_error) or violation_detail,
+            check_output=redacted_check_out,
+            harness_error=any_harness_err,
+            harness_error_reason=_redact(harness_reason),
+            agent_result_excerpt=last_excerpt,
+            stderr_tail=last_stderr,
+            tool_protocol_errors=total_proto_errors,
+            run_dir=_redact(str(trial_run_dir)),
+            timed_out=any_timeout,
+            engine_class=engine.engine_class,
+            tokens_in=total_tok_in if not any_harness_err else 0,
+            tokens_out=total_tok_out if not any_harness_err else 0,
+            mode="memory",
+            init_model=last_init_model,
+            init_digest=last_init_digest,
+            memory_arm=arm,
+            memory_recall_rate=recall_rate,
+            memory_over_recall_rate=over_recall_rate,
+            memory_injected_tokens=total_injected_tokens,
+            memory_injected_ids=all_injected_ids,
+            violation_reason=violation_reason,
+        )
+    finally:
+        cleanup_cfg_dir(trial_root / "cfg")
+
+
 def aggregate_results(
-    tasks: Sequence[TaskSpec | OrchestratorGoalSpec],
+    tasks: Sequence[TaskSpec | OrchestratorGoalSpec | MemorySequenceSpec],
     models: Sequence[str],
     k: int,
     trials: Sequence[TrialResult],
@@ -1468,9 +2100,13 @@ def aggregate_results(
     for trial in trials:
         by_task_model.setdefault((trial.task_id, trial.model), []).append(trial)
 
-    def _task_id_of(item: TaskSpec | OrchestratorGoalSpec) -> str:
-        """Return task_id or goal_id for a spec item."""
-        return item.task_id if isinstance(item, TaskSpec) else item.goal_id
+    def _task_id_of(item: TaskSpec | OrchestratorGoalSpec | MemorySequenceSpec) -> str:
+        """Return task_id, goal_id, or seq_id for a spec item."""
+        if isinstance(item, TaskSpec):
+            return item.task_id
+        if isinstance(item, MemorySequenceSpec):
+            return item.seq_id
+        return item.goal_id
 
     task_summaries: list[TaskModelSummary] = []
     for task in tasks:
@@ -1484,9 +2120,13 @@ def aggregate_results(
             timeouts = sum(1 for r in runs if r.timed_out and not r.harness_error)
             protocol_errors = sum(int(r.tool_protocol_errors) for r in runs)
             valid = [r for r in runs if not r.harness_error]
-            has_valid = bool(valid)
-            total = len(valid) if has_valid else 0
-            passes = sum(1 for r in valid if r.passed)
+            memory_runs = [r for r in valid if r.mode == "memory"]
+            with_mem_runs = [r for r in memory_runs if r.memory_arm == "with_memory"]
+            without_mem_runs = [r for r in memory_runs if r.memory_arm == "without_memory"]
+            scored_valid = with_mem_runs if with_mem_runs else valid
+            has_valid = bool(scored_valid)
+            total = len(scored_valid) if has_valid else 0
+            passes = sum(1 for r in scored_valid if r.passed)
             is_local = any(r.engine_class == "local" for r in runs) and all(
                 r.engine_class == "local" for r in runs
             )
@@ -1513,6 +2153,25 @@ def aggregate_results(
             escalations = sum(1 for r in runner_runs if r.escalated)
             false_approves = sum(1 for r in runner_runs if r.reviewer_false_approve)
             false_rejects = sum(1 for r in runner_runs if r.reviewer_false_reject)
+
+            recall_vals = [r.memory_recall_rate for r in with_mem_runs if r.memory_recall_rate is not None]
+            over_recall_vals = [r.memory_over_recall_rate for r in with_mem_runs if r.memory_over_recall_rate is not None]
+            inj_tok_vals = [r.memory_injected_tokens for r in with_mem_runs if r.memory_injected_tokens is not None]
+            pass_with_mem = (
+                round(sum(1 for r in with_mem_runs if r.passed) / len(with_mem_runs), 4)
+                if with_mem_runs
+                else None
+            )
+            pass_without_mem = (
+                round(sum(1 for r in without_mem_runs if r.passed) / len(without_mem_runs), 4)
+                if without_mem_runs
+                else None
+            )
+            mem_ab_delta = (
+                round(pass_with_mem - pass_without_mem, 4)
+                if pass_with_mem is not None and pass_without_mem is not None
+                else None
+            )
 
             task_summaries.append(
                 TaskModelSummary(
@@ -1544,6 +2203,7 @@ def aggregate_results(
                         round(sum(durations) / len(durations), 4) if durations else 0.0
                     ),
                     runs=runs,
+                    tier=getattr(task, "tier", "smoke"),
                     harness_errors=harness_errors,
                     timeouts=timeouts,
                     valid_runs=len(valid),
@@ -1588,6 +2248,20 @@ def aggregate_results(
                     false_reject_rate=(
                         round(false_rejects / len(runner_runs), 4) if runner_runs else None
                     ),
+                    memory_recall_rate=(
+                        round(sum(recall_vals) / len(recall_vals), 4) if recall_vals else None
+                    ),
+                    memory_over_recall_rate=(
+                        round(sum(over_recall_vals) / len(over_recall_vals), 4)
+                        if over_recall_vals
+                        else None
+                    ),
+                    mean_injected_tokens=(
+                        round(sum(inj_tok_vals) / len(inj_tok_vals), 1) if inj_tok_vals else None
+                    ),
+                    pass_with_memory=pass_with_mem,
+                    pass_without_memory=pass_without_mem,
+                    memory_ab_delta=mem_ab_delta,
                 )
             )
 
@@ -1682,6 +2356,12 @@ def aggregate_results(
                     "false_reject_count": sum(s.false_reject_count for s in matching),
                     "false_approve_rate": _mean(cat_false_app),
                     "false_reject_rate": _mean(cat_false_rej),
+                    "memory_recall_rate": _mean([s.memory_recall_rate for s in matching if s.memory_recall_rate is not None]),
+                    "memory_over_recall_rate": _mean([s.memory_over_recall_rate for s in matching if s.memory_over_recall_rate is not None]),
+                    "mean_injected_tokens": _mean([s.mean_injected_tokens for s in matching if s.mean_injected_tokens is not None]),
+                    "pass_with_memory": _mean([s.pass_with_memory for s in matching if s.pass_with_memory is not None]),
+                    "pass_without_memory": _mean([s.pass_without_memory for s in matching if s.pass_without_memory is not None]),
+                    "memory_ab_delta": _mean([s.memory_ab_delta for s in matching if s.memory_ab_delta is not None]),
                 }
             )
 
@@ -1782,6 +2462,23 @@ def render_summary_markdown(
                 f"{_fmt(ts.mean_local_tokens)} | {_fmt(ts.mean_local_wall_s)} |"
             )
 
+    if mode == "memory" or any(r.mode == "memory" for ts in task_summaries for r in ts.runs):
+        lines.extend(
+            [
+                "",
+                "## Memory Metrics",
+                "",
+                "| Sequence | Category | Engine | Pass (With Mem) | Pass (No Mem) | A/B Delta | Recall Rate | Over-Recall Rate | Injected Tokens |",
+                "|---|---|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for ts in task_summaries:
+            lines.append(
+                f"| {ts.task_id} | {ts.category} | {ts.model} | "
+                f"{_fmt(ts.pass_with_memory)} | {_fmt(ts.pass_without_memory)} | {_fmt(ts.memory_ab_delta)} | "
+                f"{_fmt(ts.memory_recall_rate)} | {_fmt(ts.memory_over_recall_rate)} | {_fmt(ts.mean_injected_tokens)} |"
+            )
+
     lines.extend(
         [
             "",
@@ -1835,9 +2532,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("single", "runner", "orchestrator"),
+        choices=("single", "runner", "orchestrator", "memory"),
         default="single",
-        help="Evaluation topology mode: single, runner, or orchestrator (default: single)",
+        help="Evaluation topology mode: single, runner, orchestrator, or memory (default: single)",
     )
     parser.add_argument(
         "--engines",
@@ -1884,6 +2581,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--goals-dir",
         default=str(default_eval_dir / "orchestrator_goals"),
         help="Path to orchestrator goals directory for --mode orchestrator",
+    )
+    parser.add_argument(
+        "--memory-tasks-dir",
+        default=str(default_eval_dir / "memory_tasks"),
+        help="Path to memory sequences directory for --mode memory",
+    )
+    parser.add_argument(
+        "--no-memory-ab",
+        action="store_true",
+        help="Run only the with_memory arm in --mode memory (skip without_memory A/B arm)",
     )
     parser.add_argument(
         "--max-fix-rounds",
@@ -1977,7 +2684,150 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit 0 even when some runs were harness errors (default: exit 1)",
     )
+    parser.add_argument(
+        "--record-qualification",
+        action="store_true",
+        help="Evaluate SPEC 5.3 criteria and write .devpack/qualification.json when met",
+    )
+    parser.add_argument(
+        "--qualification-file",
+        default="",
+        help="Path to qualification.json (default: <repo_root>/.devpack/qualification.json)",
+    )
+    parser.add_argument(
+        "--profile-override",
+        action="append",
+        default=[],
+        metavar="ENGINE=PATH",
+        help="Override engine profile path for an engine during evaluation (repeatable)",
+    )
     return parser
+
+
+def _parse_profile_overrides(raw_items: Sequence[str]) -> dict[str, Path | None]:
+    """Parse ``ENGINE=PATH`` CLI flags into a mapping of engine name to profile Path."""
+    overrides: dict[str, Path | None] = {}
+    for item in raw_items:
+        if "=" not in item:
+            raise ValueError(f"Invalid --profile-override '{item}': expected ENGINE=PATH")
+        eng_name, raw_path = item.split("=", 1)
+        eng_name = eng_name.strip()
+        raw_path = raw_path.strip()
+        if not eng_name:
+            raise ValueError(f"Invalid --profile-override '{item}': empty engine name")
+        overrides[eng_name] = Path(raw_path).resolve() if raw_path else None
+    return overrides
+
+
+def evaluate_and_record_qualification(
+    *,
+    tier: str,
+    mode: str,
+    unit_labels: Sequence[str],
+    engine_map: Mapping[str, EngineConfig],
+    task_summaries: Sequence[TaskModelSummary],
+    qualification_file: Path,
+    eval_summary_path: Path,
+    repo_root: Path,
+) -> tuple[bool, list[str]]:
+    """Check SPEC 5.3 qualification criteria and write ``qualification.json`` when met.
+
+    Returns ``(all_qualified, messages)``.
+    """
+    if tier not in ("smoke", "all"):
+        return False, [f"Qualification requires --tier smoke or --tier all (got '{tier}')."]
+    if mode not in ("single", "runner"):
+        return False, [f"Qualification requires --mode single or --mode runner (got '{mode}')."]
+
+    try:
+        summary_rel = str(eval_summary_path.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        summary_rel = redact_sensitive_text(str(eval_summary_path), home_placeholder="$HOME")
+
+    qual_data = load_qualification_data(qualification_file) if qualification_file.is_file() else {"version": 1, "engines": {}}
+    all_ok = True
+    messages: list[str] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    changed_existing = False
+
+    for label in unit_labels:
+        eng_name = label.split(":", 1)[0] if mode == "runner" else label
+        engine_cfg = engine_map.get(eng_name)
+        if engine_cfg is None:
+            all_ok = False
+            messages.append(f"{eng_name}: engine configuration not found")
+            continue
+
+        smoke_sums = [
+            ts for ts in task_summaries if ts.model == label and ts.tier == "smoke"
+        ]
+        if not smoke_sums:
+            all_ok = False
+            messages.append(f"{eng_name}: no smoke-tier tasks evaluated")
+            continue
+
+        pow3_values = [
+            compute_pass_pow_k(ts.passes, ts.valid_runs, k=3) if ts.valid_runs > 0 else 0.0
+            for ts in smoke_sums
+        ]
+        mean_pass_pow_3 = sum(pow3_values) / len(pow3_values)
+        total_proto_errors = sum(ts.tool_protocol_errors for ts in smoke_sums)
+        passing_trials = [
+            r for ts in smoke_sums for r in ts.runs if not r.harness_error and r.passed
+        ]
+        lint_clean_rate = (
+            sum(1 for r in passing_trials if r.lint_clean_final is True) / len(passing_trials)
+            if passing_trials
+            else 0.0
+        )
+
+        failures: list[str] = []
+        if mean_pass_pow_3 < 0.8:
+            failures.append(f"smoke pass^3={mean_pass_pow_3:.4f} < 0.8")
+        if total_proto_errors != 0:
+            failures.append(f"tool_protocol_errors={total_proto_errors} != 0")
+        if not passing_trials:
+            failures.append("no passing smoke trials for lint_clean_final check")
+        elif lint_clean_rate < 0.9:
+            failures.append(f"lint_clean_final_rate={lint_clean_rate:.4f} < 0.9")
+
+        if failures:
+            all_ok = False
+            reason = "; ".join(failures)
+            messages.append(f"{eng_name}: unqualified ({reason})")
+            if eng_name in qual_data["engines"] and isinstance(qual_data["engines"][eng_name], dict):
+                qual_data["engines"][eng_name]["status"] = "unqualified"
+                qual_data["engines"][eng_name]["unqualified_reason"] = reason
+                qual_data["engines"][eng_name]["updated"] = now_iso
+                changed_existing = True
+            continue
+
+        all_trials = [r for ts in smoke_sums for r in ts.runs]
+        init_model = next((r.init_model for r in all_trials if r.init_model), "") or engine_cfg.model
+        init_digest = next((r.init_digest for r in all_trials if r.init_digest), "")
+        qual_data["engines"][eng_name] = {
+            "engine": eng_name,
+            "status": "qualified",
+            "model_id": init_model,
+            "model_digest": init_digest,
+            "config_hash": compute_engine_config_hash(engine_cfg),
+            "date": now_iso,
+            "eval_summary_path": summary_rel,
+            "metrics": {
+                "pass_pow_3": round(mean_pass_pow_3, 4),
+                "tool_protocol_errors": total_proto_errors,
+                "lint_clean_final_rate": round(lint_clean_rate, 4),
+            },
+        }
+        changed_existing = True
+        messages.append(
+            f"{eng_name}: qualified (model_id={init_model}, pass^3={mean_pass_pow_3:.4f}, "
+            f"lint_clean={lint_clean_rate:.4f})"
+        )
+
+    if changed_existing:
+        save_qualification_data(qualification_file, qual_data)
+    return all_ok, messages
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1998,6 +2848,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     fixture_dir = Path(args.fixture_dir).resolve()
     tasks_dir = Path(args.tasks_dir).resolve()
     goals_dir = Path(args.goals_dir).resolve()
+    memory_tasks_dir = Path(args.memory_tasks_dir).resolve()
     dockerfile_path = Path(args.dockerfile).resolve()
     repo_root = Path(__file__).resolve().parent.parent
 
@@ -2022,9 +2873,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         validate_fixture_dir(fixture_dir)
-        if mode == "orchestrator":
+        if mode == "memory":
+            sequences = load_and_validate_memory_sequences(memory_tasks_dir, args.tasks, args.tier)
+            eval_units: list[TaskSpec | OrchestratorGoalSpec | MemorySequenceSpec] = list(sequences)
+            raw_engines = getattr(args, "engines", None) or args.models
+            unit_labels = [m.strip() for m in raw_engines.split(",") if m.strip()]
+            if not unit_labels:
+                raise ValueError("--engines/--models must specify at least one engine")
+            engine_names_for_creds = list(unit_labels)
+        elif mode == "orchestrator":
             goals = load_and_validate_orchestrator_goals(goals_dir, args.tasks, args.tier)
-            eval_units: list[TaskSpec | OrchestratorGoalSpec] = list(goals)
+            eval_units = list(goals)
             orch_name = args.orchestrator.strip()
             workers_list = [w.strip() for w in args.workers.split(",") if w.strip()]
             if not orch_name or not workers_list:
@@ -2057,7 +2916,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         name: resolve_engine(name, loaded_engines) for name in dict.fromkeys(engine_names_for_creds)
     }
 
+    try:
+        profile_overrides = _parse_profile_overrides(args.profile_override)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     if args.dry_run:
+        if mode == "memory":
+            arms = ("with_memory",) if args.no_memory_ab else ("with_memory", "without_memory")
+            plan_mem = [
+                (seq, lbl, arm, run_idx)
+                for seq in eval_units
+                for lbl in unit_labels
+                for arm in arms
+                for run_idx in range(1, args.k + 1)
+            ]
+            print(f"DRY-RUN memory plan ({len(plan_mem)} total trials):")
+            print("  mode: memory")
+            print(f"  isolation: {args.isolation}")
+            print(f"  engines: {', '.join(unit_labels)}")
+            print(f"  arms: {', '.join(arms)}")
+            print(f"  tier: {args.tier}")
+            print(f"  k: {args.k}")
+            print(f"  sequences ({len(eval_units)}): {', '.join(s.seq_id for s in eval_units)}")  # type: ignore[union-attr]
+            for idx, (seq, lbl, arm, run_idx) in enumerate(plan_mem, start=1):
+                print(
+                    f"  [{idx:03d}/{len(plan_mem):03d}] "
+                    f"seq={seq.seq_id} category={seq.category} engine={lbl} arm={arm} run={run_idx}/{args.k}"  # type: ignore[union-attr]
+                )
+            return 0
         if mode == "orchestrator":
             plan_orch = [
                 (g, lbl, run_idx)
@@ -2170,7 +3058,71 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     trials: list[TrialResult] = []
     try:
-        if mode == "orchestrator":
+        if mode == "memory":
+            arms = ("with_memory",) if args.no_memory_ab else ("with_memory", "without_memory")
+            mem_cfg = loaded_engines.memory if loaded_engines is not None else MemoryConfig()
+            mem_jobs = [
+                (seq, model, arm, run_idx)
+                for seq in eval_units
+                for model in unit_labels
+                for arm in arms
+                for run_idx in range(1, args.k + 1)
+            ]
+            if args.max_parallel == 1:
+                for seq, model, arm, run_idx in mem_jobs:
+                    trials.append(
+                        run_memory_trial(
+                            seq=seq,  # type: ignore[arg-type]
+                            model=model,
+                            arm=arm,
+                            run_index=run_idx,
+                            run_root=run_root,
+                            fixture_dir=fixture_dir,
+                            credentials_path=credentials_path,
+                            isolation=args.isolation,
+                            agent_bin=args.agent_bin,
+                            timeout_s=args.timeout_s,
+                            docker_bin=docker_bin,
+                            extra_secrets=extra_secrets,
+                            path_replacements=path_replacements,
+                            image_tag=image_tag,
+                            runs_root=runs_root,
+                            engine_config=engine_map[model],
+                            allow_unsandboxed_local=args.allow_unsandboxed_local,
+                            profile_overrides=profile_overrides,
+                            memory_config=mem_cfg,
+                        )
+                    )
+            else:
+                with ThreadPoolExecutor(max_workers=args.max_parallel) as pool:
+                    futures = [
+                        pool.submit(
+                            run_memory_trial,
+                            seq,  # type: ignore[arg-type]
+                            model,
+                            arm,
+                            run_idx,
+                            run_root,
+                            fixture_dir,
+                            credentials_path,
+                            args.isolation,
+                            args.agent_bin,
+                            args.timeout_s,
+                            docker_bin,
+                            extra_secrets,
+                            path_replacements,
+                            image_tag,
+                            runs_root,
+                            engine_map[model],
+                            args.allow_unsandboxed_local,
+                            profile_overrides,
+                            mem_cfg,
+                        )
+                        for seq, model, arm, run_idx in mem_jobs
+                    ]
+                    for fut in as_completed(futures):
+                        trials.append(fut.result())
+        elif mode == "orchestrator":
             orch_name = args.orchestrator.strip()
             orch_eng = engine_map[orch_name]
             orch_lbl = unit_labels[0]
@@ -2262,6 +3214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             image_tag=image_tag,
                             runs_root=runs_root,
                             allow_unsandboxed_local=args.allow_unsandboxed_local,
+                            profile_overrides=profile_overrides,
                         )
                     )
             else:
@@ -2288,6 +3241,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             image_tag,
                             runs_root,
                             args.allow_unsandboxed_local,
+                            profile_overrides,
                         )
                         for t, lbl, imp_e, rev_e, fix_e, run_idx in runner_jobs
                     ]
@@ -2320,6 +3274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             runs_root=runs_root,
                             engine_config=engine_map[model],
                             allow_unsandboxed_local=args.allow_unsandboxed_local,
+                            profile_overrides=profile_overrides,
                         )
                     )
             else:
@@ -2343,6 +3298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             runs_root,
                             engine_map[model],
                             args.allow_unsandboxed_local,
+                            profile_overrides,
                         )
                         for task, model, run_idx in plan_items
                     ]
@@ -2415,6 +3371,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         if not args.allow_harness_errors:
+            return 1
+
+    if args.record_qualification:
+        qual_path = (
+            Path(args.qualification_file).resolve()
+            if args.qualification_file
+            else (repo_root / ".devpack" / "qualification.json")
+        )
+        qual_ok, qual_messages = evaluate_and_record_qualification(
+            tier=args.tier,
+            mode=mode,
+            unit_labels=unit_labels,
+            engine_map=engine_map,
+            task_summaries=task_summaries,
+            qualification_file=qual_path,
+            eval_summary_path=dated_dir / "summary.md",
+            repo_root=repo_root,
+        )
+        for msg in qual_messages:
+            stream = sys.stdout if qual_ok else sys.stderr
+            print(msg, file=stream)
+        if not qual_ok:
             return 1
     return 0
 

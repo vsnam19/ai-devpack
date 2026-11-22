@@ -423,6 +423,129 @@ class DevpackDispatchTests(unittest.TestCase):
         checklist_lines = (REPO_ROOT / "runner" / "quality_checklist.md").read_text(encoding="utf-8").splitlines()
         self.assertLessEqual(len(checklist_lines), 25)
 
+    def test_qualification_model_change_refusal_and_deviation_override(self) -> None:
+        """Verify unqualified/model-changed engines refuse fail-closed and --allow-unqualified requires --deviation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_repo(wt)
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nUpdate oneValue.\n", encoding="utf-8")
+            marker = base / "agent_invoked.txt"
+            model_file = base / "served_model.txt"
+            model_file.write_text("qwen3-v1", encoding="utf-8")
+            fake_agent = _write_fake_agent(
+                base / "fake_claude.py",
+                f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+                f"model_id = pathlib.Path({str(model_file)!r}).read_text(encoding='utf-8').strip()\n"
+                "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': model_id}))\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 1, 'result': 'done'}))\n",
+            )
+            qual_path = wt / ".devpack" / "qualification.json"
+            qual_path.parent.mkdir(parents=True, exist_ok=True)
+            eng_cfg = devpack_dispatch.resolve_engine("local")
+            cfg_hash = devpack_dispatch.compute_engine_config_hash(eng_cfg)
+            qual_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "engines": {
+                            "local": {
+                                "engine": "local",
+                                "status": "qualified",
+                                "model_id": "qwen3-v1",
+                                "model_digest": "",
+                                "config_hash": cfg_hash,
+                                "date": "2026-11-23T00:00:00+00:00",
+                                "eval_summary_path": "eval/results/summary.md",
+                            }
+                        },
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            env_local = {
+                "DEVPACK_LOCAL_BASE_URL": "http://127.0.0.1:11434",
+                "DEVPACK_LOCAL_AUTH_TOKEN": "LOCAL_TOK",
+            }
+            runs_root = base / "runs"
+
+            # 1. --allow-unqualified without --deviation -> exit 2
+            rc_bad_cli, _, err_bad_cli = self._run_dispatch(
+                [
+                    "--engine", "local", "--brief", str(brief), "--workdir", str(wt),
+                    "--allow-unqualified", "--runs-root", str(runs_root),
+                ],
+                env_extra=env_local,
+            )
+            self.assertEqual(2, rc_bad_cli)
+            self.assertIn("--deviation", err_bad_cli)
+
+            # 2. Matching init model passes
+            rc_ok, out_ok, _ = self._run_dispatch(
+                [
+                    "--engine", "local", "--brief", str(brief), "--workdir", str(wt),
+                    "--gate-cmd", "true", "--runs-root", str(runs_root),
+                    "--agent-bin", str(fake_agent), "--isolation", "local", "--allow-unsandboxed-local",
+                ],
+                env_extra=env_local,
+            )
+            self.assertEqual(0, rc_ok)
+            self.assertEqual("qwen3-v1", json.loads(out_ok.strip())["served_model_id"])
+
+            # 3. Served model changes in init event -> marks unqualified and refuses!
+            model_file.write_text("qwen3-v2", encoding="utf-8")
+            rc_chg, out_chg, err_chg = self._run_dispatch(
+                [
+                    "--engine", "local", "--brief", str(brief), "--workdir", str(wt),
+                    "--gate-cmd", "true", "--runs-root", str(runs_root),
+                    "--agent-bin", str(fake_agent), "--isolation", "local", "--allow-unsandboxed-local",
+                ],
+                env_extra=env_local,
+            )
+            self.assertEqual(1, rc_chg)
+            self.assertIn("served model changed", err_chg)
+            chg_data = json.loads(out_chg.strip())
+            self.assertEqual("refused", chg_data["status"])
+            self.assertTrue(chg_data["model_changed"])
+            qual_after = json.loads(qual_path.read_text(encoding="utf-8"))
+            self.assertEqual("unqualified", qual_after["engines"]["local"]["status"])
+
+            # 4. Subsequent dispatch refuses BEFORE launching agent
+            marker.unlink(missing_ok=True)
+            rc_ref, out_ref, err_ref = self._run_dispatch(
+                [
+                    "--engine", "local", "--brief", str(brief), "--workdir", str(wt),
+                    "--gate-cmd", "true", "--runs-root", str(runs_root),
+                    "--agent-bin", str(fake_agent), "--isolation", "local", "--allow-unsandboxed-local",
+                ],
+                env_extra=env_local,
+            )
+            self.assertEqual(1, rc_ref)
+            self.assertFalse(marker.exists())
+            self.assertIn("unqualified", err_ref)
+            self.assertEqual("refused", json.loads(out_ref.strip())["status"])
+
+            # 5. --allow-unqualified --deviation DEV-007 overrides and logs deviation
+            rc_dev, out_dev, err_dev = self._run_dispatch(
+                [
+                    "--engine", "local", "--brief", str(brief), "--workdir", str(wt),
+                    "--gate-cmd", "true", "--runs-root", str(runs_root),
+                    "--agent-bin", str(fake_agent), "--isolation", "local", "--allow-unsandboxed-local",
+                    "--allow-unqualified", "--deviation", "DEV-007",
+                ],
+                env_extra=env_local,
+            )
+            self.assertEqual(0, rc_dev)
+            self.assertTrue(marker.exists())
+            self.assertIn("DEV-007", err_dev)
+            dev_data = json.loads(out_dev.strip())
+            self.assertEqual("DEV-007", dev_data["deviation_id"])
+            self.assertTrue(dev_data["allow_unqualified"])
+            run_meta = json.loads((Path(dev_data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("DEV-007", run_meta["deviation_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Header: Protected test lock and assertion-weakening check.
 # Fails if protected files lose existing non-comment, non-blank code lines,
-# are deleted/renamed, or lose assertions, unless HEAD has "Deviation: <ID>".
+# are deleted/renamed, or lose assertions, unless HEAD has "Deviation: <ID>"
+# (ignored when --no-deviation is given).
 # Insertions and C/C++ comment edits are allowed.
 # Exit codes: 0 intact or authorized; 1 violation or git/config error; 2 bad CLI.
 """Enforce test lock on protected test files across changes."""
@@ -185,6 +186,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ASSERT_REGEX,
         help=f"Regular expression for assertion tokens (default: {DEFAULT_ASSERT_REGEX!r}).",
     )
+    parser.add_argument(
+        "--no-deviation",
+        action="store_true",
+        default=False,
+        help=(
+            "Ignore 'Deviation: <ID>' trailers on HEAD. Use when the checked code may commit its own "
+            "exemption (eval runs); default off keeps the product gate behaviour."
+        ),
+    )
     return parser
 
 
@@ -258,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     if violations:
-        deviation_id = get_head_deviation(repo_root)
+        deviation_id = None if args.no_deviation else get_head_deviation(repo_root)
         if deviation_id:
             print(f"TEST_LOCK_OK: {len(violations)} change(s) authorized by Deviation: {deviation_id}")
             return 0

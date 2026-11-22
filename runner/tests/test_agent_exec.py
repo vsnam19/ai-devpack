@@ -566,6 +566,100 @@ class AgentExecUnitTests(unittest.TestCase):
             rj_proj = json.loads((run_proj / "run.json").read_text(encoding="utf-8"))
             self.assertIn("WARNING:", rj_proj["sandbox_warning"])
 
+    def test_profile_injection_meta_hash_and_hot_reload_from_disk(self) -> None:
+        """Verify profile_path injects under '## Known mistakes for this engine', records sha256+version in meta, and reloads per call."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workdir = base / "work"
+            workdir.mkdir()
+            profile = base / "local.md"
+            profile.write_text(
+                "# Engine Profile: local\nVersion: 1\n"
+                "- [DOXYGEN-PARAM-DIR] (4 occurrences): Missing [in] -> Always write @param[in].\n",
+                encoding="utf-8",
+            )
+            fake_claude = _write_executable(
+                base / "fake_claude.py",
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'qwen3-30b'}))\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 1, 'result': 'ok'}))\n",
+            )
+            eng = EngineConfig(name="haiku", model="haiku", engine_class="cloud")
+            run_dir = new_run_dir(base / "runs", kind="task", task="t-prof", engines=["haiku"])
+
+            res1 = run_agent(
+                AgentRequest(
+                    engine=eng,
+                    prompt="Implement feature A.",
+                    workdir=workdir,
+                    run_dir=run_dir,
+                    step_name="01-implementer-haiku",
+                    isolation="local",
+                    allow_unsandboxed_local=True,
+                    agent_bin=str(fake_claude),
+                    profile_path=profile,
+                )
+            )
+            self.assertEqual("ok", res1.status)
+            self.assertEqual("qwen3-30b", res1.init_model)
+            self.assertEqual(1, res1.profile_version)
+            self.assertEqual(64, len(res1.profile_sha256))
+            prompt1 = (run_dir / "steps" / "01-implementer-haiku.prompt.md").read_text(encoding="utf-8")
+            self.assertIn("## Known mistakes for this engine", prompt1)
+            self.assertIn("DOXYGEN-PARAM-DIR", prompt1)
+            meta1 = json.loads((run_dir / "steps" / "01-implementer-haiku.meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(res1.profile_sha256, meta1["profile_sha256"])
+            self.assertEqual(1, meta1["profile_version"])
+
+            # Edit profile on disk between calls -> next call must reload new content, version, and hash
+            profile.write_text(
+                "# Engine Profile: local\nVersion: 2\n"
+                "- [NO-IMPL-IN-HEADER] (6 occurrences): inline in header -> Define in .cpp only.\n",
+                encoding="utf-8",
+            )
+            res2 = run_agent(
+                AgentRequest(
+                    engine=eng,
+                    prompt="Implement feature B.",
+                    workdir=workdir,
+                    run_dir=run_dir,
+                    step_name="02-implementer-haiku",
+                    isolation="local",
+                    allow_unsandboxed_local=True,
+                    agent_bin=str(fake_claude),
+                    profile_path=profile,
+                )
+            )
+            self.assertEqual(2, res2.profile_version)
+            self.assertNotEqual(res1.profile_sha256, res2.profile_sha256)
+            prompt2 = (run_dir / "steps" / "02-implementer-haiku.prompt.md").read_text(encoding="utf-8")
+            self.assertIn("NO-IMPL-IN-HEADER", prompt2)
+            self.assertNotIn("DOXYGEN-PARAM-DIR", prompt2)
+            meta2 = json.loads((run_dir / "steps" / "02-implementer-haiku.meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(res2.profile_sha256, meta2["profile_sha256"])
+            self.assertEqual(2, meta2["profile_version"])
+
+            # Empty Version 0 stub records sha256 + version=0 without injecting empty section
+            stub = REPO_ROOT / "knowledge" / "engine_profiles" / "local.md"
+            res3 = run_agent(
+                AgentRequest(
+                    engine=eng,
+                    prompt="Implement feature C.",
+                    workdir=workdir,
+                    run_dir=run_dir,
+                    step_name="03-implementer-haiku",
+                    isolation="local",
+                    allow_unsandboxed_local=True,
+                    agent_bin=str(fake_claude),
+                    profile_path=stub,
+                )
+            )
+            self.assertEqual(0, res3.profile_version)
+            self.assertEqual(64, len(res3.profile_sha256))
+            prompt3 = (run_dir / "steps" / "03-implementer-haiku.prompt.md").read_text(encoding="utf-8")
+            self.assertNotIn("## Known mistakes for this engine", prompt3)
+
 
 if __name__ == "__main__":
     unittest.main()

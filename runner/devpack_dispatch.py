@@ -6,19 +6,24 @@
 #       [--allow GLOB ...] [--protected GLOB ...] [--base REF] [--gate-cmd CMD]
 #       [--no-gate] [--runs-root DIR] [--engines FILE] [--project-config FILE]
 #       [--isolation docker|local] [--allow-unsandboxed-local] [--credentials PATH]
-#       [--agent-bin PATH] [--role worker] [--no-checklist] [--dry-run] [--help]
+#       [--agent-bin PATH] [--role worker] [--no-checklist] [--profile FILE]
+#       [--qualification-file FILE] [--require-qualification]
+#       [--allow-unqualified --deviation ID] [--dry-run] [--help]
 #
 # Runs ONE isolated agent job via runner/agent_exec.py, then runs deterministic
 # enforcement checks: scope_check.py against --allow, test_lock.py against
 # --protected, preflight_lint.py on changed C/C++ files, and the configured gate
 # command. Enforces .devpack/project.toml data-class bounds (missing file =
-# "internal") and container-by-default sandbox policy before launching an agent.
+# "internal"), container-by-default sandbox policy, and qualification / served
+# model-change detection (.devpack/qualification.json) before and after running.
 # Writes a v0.2 run directory and prints ONE compact JSON line to stdout.
 #
 # Exit codes:
 #   0 - Agent status ok, gate ok, and scope ok (or --dry-run validated)
-#   1 - Agent error/timeout, gate/lint/test-lock fail, scope violation, or policy refusal
-#   2 - Invalid arguments, missing brief/config, or non-git workdir
+#   1 - Agent error/timeout, gate/lint/test-lock fail, scope violation, policy
+#       refusal, or unqualified engine / model-change refusal
+#   2 - Invalid arguments (including --allow-unqualified without --deviation),
+#       missing brief/config, or non-git workdir
 """Single-job deterministic worker dispatcher for ai-devpack."""
 
 from __future__ import annotations
@@ -59,20 +64,26 @@ from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 from runner import agent_exec  # noqa: E402
 from runner.agent_exec import (  # noqa: E402
     AgentRequest,
+    AgentResult,
     EngineConfig,
     EnginesConfig,
     check_data_class_allowed,
     check_local_isolation_allowed,
+    compute_engine_config_hash,
     load_engines,
     load_project_config,
+    load_qualification_data,
     load_quality_checklist,
     new_run_dir,
     redact_sensitive_text,
     resolve_engine,
+    resolve_engine_profile_path,
     run_agent,
+    save_qualification_data,
     update_run_json,
 )
 from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs  # noqa: E402
+from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
 
 CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
 _LINT_SUMMARY_RE = re.compile(r"Summary:\s+\d+\s+file\(s\)\s+checked,\s+(\d+)\s+finding\(s\)\.")
@@ -235,6 +246,95 @@ def _control_snapshot(workdir: Path) -> dict[str, str]:
     return result
 
 
+def check_qualification_pre_run(
+    engine: EngineConfig,
+    qual_path: Path,
+    *,
+    enforce_if_missing: bool = False,
+) -> tuple[bool, str]:
+    """Verify engine qualification status and config hash before launching an agent."""
+    if not qual_path.is_file():
+        if enforce_if_missing:
+            return (
+                False,
+                f"Refused: engine '{engine.name}' is unqualified "
+                f"(missing {qual_path.name}; run eval/run_eval.py --record-qualification "
+                "or pass --allow-unqualified --deviation <ID>).",
+            )
+        return True, ""
+
+    qual_data = load_qualification_data(qual_path)
+    entry = qual_data.get("engines", {}).get(engine.name)
+    if not isinstance(entry, dict):
+        return (
+            False,
+            f"Refused: engine '{engine.name}' is unqualified "
+            f"(not recorded in {qual_path.name}; run eval/run_eval.py --record-qualification "
+            "or pass --allow-unqualified --deviation <ID>).",
+        )
+    status = str(entry.get("status", "")).strip().lower()
+    if status != "qualified":
+        reason = str(entry.get("unqualified_reason") or f"status='{status or 'unknown'}'")
+        return (
+            False,
+            f"Refused: engine '{engine.name}' is unqualified ({reason}).",
+        )
+
+    current_hash = compute_engine_config_hash(engine)
+    recorded_hash = str(entry.get("config_hash") or "")
+    if recorded_hash and recorded_hash != current_hash:
+        entry["status"] = "unqualified"
+        entry["unqualified_reason"] = "engine config hash changed"
+        entry["updated"] = datetime.now(timezone.utc).isoformat()
+        save_qualification_data(qual_path, qual_data)
+        return (
+            False,
+            f"Refused: engine '{engine.name}' config changed since qualification (marked unqualified).",
+        )
+    return True, ""
+
+
+def check_model_change_post_run(
+    engine: EngineConfig,
+    agent_res: AgentResult,
+    qual_path: Path,
+) -> tuple[bool, str]:
+    """Compare served stream init model ID/digest against qualification.json."""
+    observed_model = str(agent_res.init_model or "").strip()
+    observed_digest = str(agent_res.init_digest or "").strip()
+    if not qual_path.is_file() or not observed_model:
+        return True, ""
+
+    qual_data = load_qualification_data(qual_path)
+    entry = qual_data.get("engines", {}).get(engine.name)
+    if not isinstance(entry, dict) or str(entry.get("status", "")).lower() != "qualified":
+        return True, ""
+
+    expected_model = str(entry.get("model_id") or "").strip()
+    expected_digest = str(entry.get("model_digest") or "").strip()
+    model_diff = bool(expected_model and observed_model != expected_model)
+    digest_diff = bool(expected_digest and observed_digest and observed_digest != expected_digest)
+    if not model_diff and not digest_diff:
+        return True, ""
+
+    reason = (
+        f"served model changed from '{expected_model}' to '{observed_model}'"
+        if model_diff
+        else f"served model digest changed from '{expected_digest}' to '{observed_digest}'"
+    )
+    entry["status"] = "unqualified"
+    entry["unqualified_reason"] = reason
+    entry["detected_model_id"] = observed_model
+    if observed_digest:
+        entry["detected_model_digest"] = observed_digest
+    entry["updated"] = datetime.now(timezone.utc).isoformat()
+    save_qualification_data(qual_path, qual_data)
+    return (
+        False,
+        f"Refused: engine '{engine.name}' {reason} (marked unqualified; re-run qualification).",
+    )
+
+
 def dispatch_job(
     *,
     engine_name: str,
@@ -254,15 +354,28 @@ def dispatch_job(
     agent_bin: str = "claude",
     role: str = "worker",
     no_checklist: bool = False,
+    profile_path: Path | None = None,
+    qualification_file: Path | None = None,
+    allow_unqualified: bool = False,
+    deviation_id: str = "",
+    require_qualification: bool = False,
     dry_run: bool = False,
     docker_bin: str = "docker",
     image_tag: str = agent_exec.DOCKER_IMAGE_TAG,
     pack_root: Path = PACK_ROOT,
+    memory_root: Path | None = None,
+    memory_enabled: bool | None = None,
+    memory_top_k: int | None = None,
+    memory_budget_tokens: int | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
     Returns ``(exit_code, result_payload)``.
     """
+    cleaned_deviation = deviation_id.strip()
+    if allow_unqualified and not cleaned_deviation:
+        raise ValueError("--allow-unqualified requires --deviation <ID>")
+
     project_cfg = load_project_config(workdir, project_config_path)
 
     effective_engines_path = engines_config_path
@@ -289,8 +402,16 @@ def dispatch_job(
 
     brief_raw = brief_path.read_text(encoding="utf-8")
     prompt_text = brief_raw if no_checklist else _inject_quality_checklist(brief_raw, pack_root)
+    resolved_profile = (
+        profile_path
+        if profile_path is not None
+        else resolve_engine_profile_path(engine.name, workdir, pack_root)
+    )
+    qual_path = qualification_file or (workdir / ".devpack" / "qualification.json")
+    enforce_qual = require_qualification or bool(project_cfg.get("require_qualification", False))
+    engine_cfg_hash = compute_engine_config_hash(engine)
 
-    # Check data-class and sandbox policy before launching any agent
+    # Check data-class, sandbox, and qualification policy before launching any agent
     data_ok, data_reason = check_data_class_allowed(engine, str(project_cfg["data_class"]))
     iso_ok, iso_msg = check_local_isolation_allowed(
         isolation,
@@ -298,6 +419,17 @@ def dispatch_job(
         workdir=workdir,
         project_config=project_cfg,
     )
+    qual_ok, qual_reason = check_qualification_pre_run(
+        engine,
+        qual_path,
+        enforce_if_missing=enforce_qual,
+    )
+    qual_deviation_logged = False
+    if not qual_ok and allow_unqualified:
+        qual_deviation_logged = True
+        sys.stderr.write(
+            f"WARNING: deviation {cleaned_deviation}: allowing unqualified engine '{engine.name}': {qual_reason}\n"
+        )
 
     if dry_run:
         if not data_ok:
@@ -324,18 +456,35 @@ def dispatch_job(
                 "cost_usd": None if engine.is_local else 0.0,
                 "error": iso_msg,
             }
+        if not qual_ok and not allow_unqualified:
+            sys.stderr.write(qual_reason + "\n")
+            return 1, {
+                "run_dir": "",
+                "status": "refused",
+                "gate": "skipped",
+                "scope": "ok",
+                "changed_files": [],
+                "final_text_tail": "",
+                "cost_usd": None if engine.is_local else 0.0,
+                "error": qual_reason,
+            }
         plan = {
             "mode": "dry-run",
             "engine": engine.name,
             "engine_class": engine.engine_class,
+            "engine_config_hash": engine_cfg_hash,
             "data_class": project_cfg["data_class"],
             "isolation": isolation,
+            "qualification": "deviation" if qual_deviation_logged else "ok",
             "workdir": str(workdir),
             "base_ref": effective_base,
             "allow": list(allow_globs),
             "protected": list(protected_globs),
             "brief": str(brief_path),
+            "profile_path": str(resolved_profile) if resolved_profile else "",
         }
+        if qual_deviation_logged:
+            plan["deviation_id"] = cleaned_deviation
         _emit_json_line(plan)
         return 0, plan
 
@@ -395,6 +544,40 @@ def dispatch_job(
         _emit_json_line(payload)
         return 1, payload
 
+    if not qual_ok and not allow_unqualified:
+        sys.stderr.write(qual_reason + "\n")
+        update_run_json(
+            run_dir,
+            outcome="refused",
+            qualification_status="unqualified",
+            engine_config_hash=engine_cfg_hash,
+            refusal_reason=qual_reason,
+            finished=datetime.now(timezone.utc).isoformat(),
+        )
+        payload = {
+            "run_dir": str(run_dir),
+            "status": "refused",
+            "gate": "skipped",
+            "scope": "ok",
+            "changed_files": [],
+            "final_text_tail": "",
+            "cost_usd": None if engine.is_local else 0.0,
+            "error": qual_reason,
+            "qualification": "unqualified",
+        }
+        _render_run_dir_quietly(run_dir)
+        _emit_json_line(payload)
+        return 1, payload
+
+    if qual_deviation_logged:
+        update_run_json(
+            run_dir,
+            allow_unqualified=True,
+            deviation_id=cleaned_deviation,
+            qualification_warning=qual_reason,
+            engine_config_hash=engine_cfg_hash,
+        )
+
     req = AgentRequest(
         engine=engine,
         prompt=prompt_text,
@@ -410,9 +593,60 @@ def dispatch_job(
         image_tag=image_tag,
         role=role,
         step_index=1,
+        profile_path=resolved_profile,
+        memory_enabled=memory_enabled,
+        memory_root=memory_root,
+        memory_top_k=memory_top_k,
+        memory_budget_tokens=memory_budget_tokens,
+        memory_config=engines_cfg.memory if engines_cfg is not None else None,
+        memory_task_text=brief_raw,
     )
     control_before = _control_snapshot(workdir)
     agent_res = run_agent(req)
+
+    model_ok, model_reason = check_model_change_post_run(engine, agent_res, qual_path)
+    if not model_ok:
+        if allow_unqualified:
+            qual_deviation_logged = True
+            sys.stderr.write(
+                f"WARNING: deviation {cleaned_deviation}: model changed on '{engine.name}': {model_reason}\n"
+            )
+            update_run_json(
+                run_dir,
+                allow_unqualified=True,
+                deviation_id=cleaned_deviation,
+                model_changed=True,
+                served_model_id=agent_res.init_model,
+                engine_config_hash=engine_cfg_hash,
+            )
+        else:
+            sys.stderr.write(model_reason + "\n")
+            update_run_json(
+                run_dir,
+                outcome="refused",
+                qualification_status="unqualified",
+                model_changed=True,
+                served_model_id=agent_res.init_model,
+                engine_config_hash=engine_cfg_hash,
+                refusal_reason=model_reason,
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+            payload = {
+                "run_dir": str(run_dir),
+                "status": "refused",
+                "gate": "skipped",
+                "scope": "ok",
+                "changed_files": [],
+                "final_text_tail": agent_res.final_text[-800:],
+                "cost_usd": None if engine.is_local else round(float(agent_res.cost_usd or 0.0), 6),
+                "error": model_reason,
+                "qualification": "unqualified",
+                "model_changed": True,
+                "served_model_id": agent_res.init_model,
+            }
+            _render_run_dir_quietly(run_dir)
+            _emit_json_line(payload)
+            return 1, payload
     control_after = _control_snapshot(workdir)
     control_changes = sorted(name for name in control_before.keys() | control_after.keys()
                              if control_before.get(name) != control_after.get(name))
@@ -513,15 +747,38 @@ def dispatch_job(
             (steps_dir / "02-gate.txt").write_text(redacted_gate + "\n", encoding="utf-8")
 
     passed = agent_res.status == "ok" and gate_status == "ok" and scope_status == "ok"
+
+    mem_proposal_summary: dict[str, Any] = {"accepted": [], "pending": [], "rejected": []}
+    if agent_res.status == "ok" and gate_status == "ok" and scope_status == "ok":
+        effective_mem_root = memory_root if memory_root is not None else memory_root_for(workdir)
+        stop_report_path = workdir / "STOP_REPORT.md"
+        stop_report_text = (
+            stop_report_path.read_text(encoding="utf-8", errors="replace")
+            if stop_report_path.is_file()
+            else ""
+        )
+        prop_res = process_memory_proposals(
+            effective_mem_root,
+            agent_res.final_text,
+            source=f"run:{run_dir.name}",
+            stop_report_text=stop_report_text,
+        )
+        mem_proposal_summary = prop_res.to_dict()
+
     outcome = "pass" if passed else ("timeout" if agent_res.status == "timeout" else "fail")
     update_run_json(
         run_dir,
+        task=brief_path.stem,
         outcome=outcome,
         gate=gate_status,
         scope=scope_status,
         test_lock=test_lock_status,
         lint_findings=lint_findings,
         data_class=project_cfg["data_class"],
+        memory_ids=list(agent_res.memory_ids),
+        memory_hashes=dict(agent_res.memory_hashes),
+        memory_tokens=int(agent_res.memory_tokens),
+        memory_proposals=mem_proposal_summary,
         finished=datetime.now(timezone.utc).isoformat(),
     )
     _render_run_dir_quietly(run_dir)
@@ -541,11 +798,24 @@ def dispatch_job(
         "tool_protocol_errors": agent_res.tool_protocol_errors,
         "test_lock": test_lock_status,
         "lint_findings": lint_findings,
+        "memory_ids": list(agent_res.memory_ids),
+        "memory_hashes": dict(agent_res.memory_hashes),
+        "memory_tokens": int(agent_res.memory_tokens),
     }
+    if any(mem_proposal_summary.values()):
+        payload["memory_proposals"] = mem_proposal_summary
     if agent_res.error:
         payload["error"] = agent_res.error
     if scope_out and scope_status != "ok":
         payload["scope_detail"] = scope_out
+    if agent_res.profile_sha256:
+        payload["profile_sha256"] = agent_res.profile_sha256
+        payload["profile_version"] = agent_res.profile_version
+    if agent_res.init_model:
+        payload["served_model_id"] = agent_res.init_model
+    if qual_deviation_logged:
+        payload["deviation_id"] = cleaned_deviation
+        payload["allow_unqualified"] = True
 
     _emit_json_line(payload)
     return (0 if passed else 1), payload
@@ -655,9 +925,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Do not inject runner/quality_checklist.md into the worker prompt",
     )
     parser.add_argument(
+        "--profile",
+        default="",
+        help="Optional engine profile markdown path (default: knowledge/engine_profiles/<engine>.md)",
+    )
+    parser.add_argument(
+        "--qualification-file",
+        default="",
+        help="Optional qualification JSON path (default: <workdir>/.devpack/qualification.json)",
+    )
+    parser.add_argument(
+        "--require-qualification",
+        action="store_true",
+        help="Refuse engines without a valid qualified entry even if qualification.json is absent",
+    )
+    parser.add_argument(
+        "--allow-unqualified",
+        action="store_true",
+        help="Permit running an unqualified engine (requires --deviation <ID>)",
+    )
+    parser.add_argument(
+        "--deviation",
+        default="",
+        help="Deviation ID (e.g. DEV-001) authorizing --allow-unqualified",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate configuration, data-class, and sandbox policy without running an agent",
+    )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Disable project memory retrieval and injection for this dispatch",
     )
     return parser
 
@@ -692,6 +992,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     runs_root = Path(args.runs_root).resolve() if args.runs_root else None
     credentials_path = Path(args.credentials).resolve() if args.credentials else None
+    profile_path = Path(args.profile).resolve() if args.profile else None
+    if profile_path is not None and not profile_path.is_file():
+        print(f"error: profile file not found: {profile_path}", file=sys.stderr)
+        return 2
+    qual_file = Path(args.qualification_file).resolve() if args.qualification_file else None
 
     try:
         rc, _payload = dispatch_job(
@@ -712,7 +1017,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent_bin=args.agent_bin,
             role=args.role,
             no_checklist=args.no_checklist,
+            profile_path=profile_path,
+            qualification_file=qual_file,
+            allow_unqualified=args.allow_unqualified,
+            deviation_id=args.deviation,
+            require_qualification=args.require_qualification,
             dry_run=args.dry_run,
+            memory_enabled=False if args.no_memory else None,
         )
         return rc
     except ValueError as exc:
