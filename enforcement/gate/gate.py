@@ -5,8 +5,9 @@
 # prints GATE_OK or GATE_FAIL <first failing check>.
 #
 # Exit codes:
-#   0 - All configured checks passed (or were skipped with an explicit deviation ID): GATE_OK.
-#   1 - Configuration invalid/missing, zero checks, or one or more checks failed: GATE_FAIL.
+#   0 - All required checks passed (or were skipped with an explicit deviation ID): GATE_OK.
+#       Failing checks with required = false are reported as WARN and do not fail the gate.
+#   1 - Configuration invalid/missing, zero checks, zero required checks, or a required check failed: GATE_FAIL.
 """Fail-closed deterministic gate runner.
 
 Reads an ordered list of checks from a TOML file, executes each command inside
@@ -134,6 +135,9 @@ def parse_checks_config(config_path: pathlib.Path) -> tuple[list[dict[str, Any]]
                 "required": required,
             }
         )
+
+    if not any(item["required"] for item in validated):
+        return None, "config", "zero required checks configured"
 
     return validated, None, None
 
@@ -354,6 +358,10 @@ def main(argv: list[str] | None = None) -> int:
         results.append(result)
         if result["status"] == "PASS":
             print(f"PASS {name}")
+        elif not result.get("required", True):
+            reason = result.get("reason", "check failed")
+            result["status"] = "WARN"
+            print(f"WARN {name}: {reason}")
         else:
             reason = result.get("reason", "check failed")
             print(f"FAIL {name}: {reason}")

@@ -389,5 +389,73 @@ required = true
         self.assertEqual(receipt["checks"][1]["status"], "PASS")
 
 
+    def test_non_required_failure_warns_and_gate_ok(self) -> None:
+        """A failing required=false check prints WARN, is recorded as WARN, and the gate stays OK."""
+        self.config_path.write_text(
+            """
+[[check]]
+name = "good"
+cmd = ["python3", "-c", "pass"]
+required = true
+
+[[check]]
+name = "optional-bad"
+cmd = ["python3", "-c", "import sys; sys.exit(3)"]
+required = false
+""",
+            encoding="utf-8",
+        )
+        code, out = self._run_gate(
+            ["--config", str(self.config_path), "--repo", str(self.repo_dir), "--receipt", str(self.receipt_path)]
+        )
+        lines = out.strip().splitlines()
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[-1], "GATE_OK")
+        self.assertTrue(any(line.startswith("WARN optional-bad: ") for line in lines))
+        receipt = json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["gate_status"], "GATE_OK")
+        statuses = {c["name"]: c["status"] for c in receipt["checks"]}
+        self.assertEqual(statuses, {"good": "PASS", "optional-bad": "WARN"})
+
+    def test_required_failure_still_fails_alongside_warn(self) -> None:
+        """A failing required check fails the gate even when a non-required check also fails."""
+        self.config_path.write_text(
+            """
+[[check]]
+name = "optional-bad"
+cmd = ["python3", "-c", "import sys; sys.exit(1)"]
+required = false
+
+[[check]]
+name = "req-bad"
+cmd = ["python3", "-c", "import sys; sys.exit(1)"]
+required = true
+""",
+            encoding="utf-8",
+        )
+        code, out = self._run_gate(
+            ["--config", str(self.config_path), "--repo", str(self.repo_dir), "--receipt", str(self.receipt_path)]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out.strip().splitlines()[-1], "GATE_FAIL req-bad")
+
+    def test_zero_required_checks_fails_closed(self) -> None:
+        """A config whose checks are all required=false fails closed."""
+        self.config_path.write_text(
+            """
+[[check]]
+name = "only-optional"
+cmd = ["python3", "-c", "pass"]
+required = false
+""",
+            encoding="utf-8",
+        )
+        code, out = self._run_gate(
+            ["--config", str(self.config_path), "--repo", str(self.repo_dir), "--receipt", str(self.receipt_path)]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out.strip().splitlines()[-1], "GATE_FAIL config")
+
+
 if __name__ == "__main__":
     unittest.main()

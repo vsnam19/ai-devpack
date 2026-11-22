@@ -60,7 +60,7 @@ def matches_any_glob(rel_posix_path: str, compiled_globs: list[re.Pattern[str]])
 
 
 def get_changed_files(repo_root: pathlib.Path, base_ref: str) -> tuple[list[str] | None, str | None]:
-    """Return sorted list of files changed since ``base_ref`` (committed, staged, or working tree)."""
+    """Return sorted list of files changed since ``base_ref`` (committed, staged, working tree, or untracked)."""
     verify = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{base_ref}^{{commit}}"],
         stdout=subprocess.PIPE,
@@ -77,6 +77,7 @@ def get_changed_files(repo_root: pathlib.Path, base_ref: str) -> tuple[list[str]
         ["git", "-C", str(repo_root), "diff", "--name-only", base_ref],
         ["git", "-C", str(repo_root), "diff", "--name-only", f"{base_ref}..HEAD"],
         ["git", "-C", str(repo_root), "diff", "--cached", "--name-only"],
+        ["git", "-C", str(repo_root), "ls-files", "--others", "--exclude-standard"],
     ]
     for cmd in diff_cmds:
         proc = subprocess.run(

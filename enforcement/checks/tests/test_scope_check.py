@@ -148,5 +148,24 @@ class TestScopeCheck(unittest.TestCase):
         self.assertIn("SCOPE_ERROR", err)
 
 
+    def test_untracked_out_of_scope_file_fails(self) -> None:
+        """An untracked (not ignored) file outside --allow globs is reported as a violation."""
+        (self.repo_dir / "stray.txt").write_text("x\n", encoding="utf-8")
+        code, out, _ = self._run_scope(
+            ["--repo", str(self.repo_dir), "--base", "HEAD", "--allow", "src/**"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("SCOPE_VIOLATION: stray.txt", out)
+
+    def test_untracked_in_scope_file_passes(self) -> None:
+        """An untracked file inside the allowed globs passes."""
+        (self.repo_dir / "src" / "new_file.txt").write_text("x\n", encoding="utf-8")
+        code, out, _ = self._run_scope(
+            ["--repo", str(self.repo_dir), "--base", "HEAD", "--allow", "src/**"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("SCOPE_OK", out)
+
+
 if __name__ == "__main__":
     unittest.main()

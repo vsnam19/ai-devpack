@@ -147,5 +147,36 @@ class TestSecretPiiCheck(unittest.TestCase):
         self.assertNotIn(forbidden_token, out)
 
 
+    def _git(self, *args: str) -> None:
+        """Run a git command inside the temporary repository."""
+        subprocess.run(
+            ["git", "-C", str(self.repo_dir), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_staged_secret_detected_after_working_tree_removal(self) -> None:
+        """A secret staged then deleted from the working tree is still detected with --staged."""
+        target = self.repo_dir / "conf.txt"
+        target.write_text("line\npassword = \"hunter2hunter2\"\n", encoding="utf-8")
+        self._git("add", "conf.txt")
+        target.unlink()
+        code, out, _ = self._run_scanner(["--repo", str(self.repo_dir), "--staged"])
+        self.assertEqual(code, 1)
+        self.assertIn("conf.txt:2:", out)
+        self.assertNotIn("hunter2hunter2", out)
+
+    def test_staged_ignores_working_tree_only_secret(self) -> None:
+        """A secret added only to the working tree is not reported in --staged mode."""
+        target = self.repo_dir / "conf.txt"
+        target.write_text("clean = 1\n", encoding="utf-8")
+        self._git("add", "conf.txt")
+        target.write_text("clean = 1\npassword = \"hunter2hunter2\"\n", encoding="utf-8")
+        code, out, _ = self._run_scanner(["--repo", str(self.repo_dir), "--staged"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "")
+
+
 if __name__ == "__main__":
     unittest.main()
