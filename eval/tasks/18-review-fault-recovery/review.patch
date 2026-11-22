@@ -1,5 +1,17 @@
 diff --git a/src/link_state_machine.cpp b/src/link_state_machine.cpp
+index 000ff0f..745f634 100644
 --- a/src/link_state_machine.cpp
 +++ b/src/link_state_machine.cpp
-@@
-+/* Seeded review defect: recoverFromFault resets accumulated fault count. */
+@@ -120,0 +121,12 @@ std::uint64_t LinkStateMachine::lastTimestampMs() const noexcept {
++
++/* Seeded review defect: recoverFromFault clears m_faultCount. */
++bool LinkStateMachine::recoverFromFault(std::uint64_t nowMs) noexcept {
++    if (m_state != LinkState::Fault || !isConfigValid() || nowMs < m_lastTimestampMs) {
++        return false;
++    }
++    m_state = LinkState::Connecting;
++    m_retryCount = 0U;
++    m_lastTimestampMs = nowMs;
++    m_faultCount = 0U;
++    return true;
++}

@@ -12,5 +12,4 @@ new file mode 100644
 +| Category | Severity | Evidence |
 +| --- | --- | --- |
 +| Functional | High | `recoverFromFault` incorrectly clears fault accounting. |
-+
 +VERDICT: REQUEST_CHANGES

@@ -9,7 +9,7 @@ After a bus-off recovery, the link sometimes reports active work while subsequen
 ## Files allowed
 - `include/link_state_machine.hpp`
 - `src/link_state_machine.cpp`
-- `tests/test_link_state_machine.cpp`
+- tests/test_link_state_machine.cpp
 
 ## Commands
 - `bash build_and_test.sh`

@@ -8,7 +8,7 @@ Under sustained traffic, the newest frame is retained but the receiver sees an u
 
 ## Files allowed
 - `src/ring_buffer.cpp`
-- `tests/test_ring_buffer.cpp`
+- tests/test_ring_buffer.cpp
 
 ## Commands
 - `bash build_and_test.sh`

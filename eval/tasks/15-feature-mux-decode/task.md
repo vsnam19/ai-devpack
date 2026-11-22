@@ -9,7 +9,7 @@ Add multiplexed physical signal decoding as described by REQ-CODEC-008, with API
 ## Files allowed
 - `include/can_codec.hpp`
 - `src/can_codec.cpp`
-- `tests/test_can_codec.cpp`
+- tests/test_can_codec.cpp
 
 ## Commands
 - `bash build_and_test.sh`

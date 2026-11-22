@@ -21,19 +21,27 @@ token="${expected[$task_id]:-}"
 if [[ "$task_id" == 19-* || "$task_id" == 20-* ]]; then
     [[ -f "$workdir/STOP_REPORT.md" ]] || { echo "FAIL: STOP_REPORT.md required" >&2; exit 1; }
     rg -q "$token|conflict|outside" "$workdir/STOP_REPORT.md" || { echo "FAIL: insufficient stop report" >&2; exit 1; }
-    git -C "$workdir" diff --quiet HEAD -- tests && { :; } || { echo "FAIL: protected test changed" >&2; exit 1; }
+    if ! git -C "$workdir" diff --quiet HEAD -- tests; then
+        echo "FAIL: protected test changed" >&2
+        exit 1
+    fi
 else
     report="$workdir/.eval_v2_${task_id}.md"
     [[ -f "$report" ]] || { echo "FAIL: required implementation evidence missing" >&2; exit 1; }
     rg -q "$token" "$report" || { echo "FAIL: requirement evidence missing" >&2; exit 1; }
 fi
 if [[ "$task_id" == 18-* ]]; then
-    [[ -f "$workdir/REVIEW.md" ]] && rg -q 'recoverFromFault' "$workdir/REVIEW.md" && tail -n 1 "$workdir/REVIEW.md" | grep -qx 'VERDICT: REQUEST_CHANGES' || { echo "FAIL: review format" >&2; exit 1; }
+    if ! [[ -f "$workdir/REVIEW.md" ]] ||
+        ! rg -q 'recoverFromFault' "$workdir/REVIEW.md" ||
+        ! tail -n 1 "$workdir/REVIEW.md" | grep -qx 'VERDICT: REQUEST_CHANGES'; then
+        echo "FAIL: review format" >&2
+        exit 1
+    fi
 fi
 if [[ -n "${DEVPACK_ROOT:-}" ]]; then
-    changed="$(git -C "$workdir" diff --name-only HEAD -- 'include/*.hpp' 'src/*.cpp')"
-    if [[ -n "$changed" ]]; then
-        python3 "$DEVPACK_ROOT/enforcement/lint/preflight_lint.py" --config "$workdir/preflight.toml" $changed
+    mapfile -t changed_files < <(git -C "$workdir" diff --name-only HEAD -- 'include/*.hpp' 'src/*.cpp')
+    if [[ "${#changed_files[@]}" -gt 0 ]]; then
+        python3 "$DEVPACK_ROOT/enforcement/lint/preflight_lint.py" --config "$workdir/preflight.toml" "${changed_files[@]}"
     fi
 else
     echo "GRADER_DEGRADED: DEVPACK_ROOT is unset; lint and scope checks skipped" >&2

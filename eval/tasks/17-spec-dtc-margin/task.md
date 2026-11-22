@@ -9,7 +9,7 @@ Implement REQ-DTC-006 and add trace-tagged boundary tests (`@req REQ-DTC-006`) f
 ## Files allowed
 - `include/dtc_debouncer.hpp`
 - `src/dtc_debouncer.cpp`
-- `tests/test_dtc_debouncer.cpp`
+- tests/test_dtc_debouncer.cpp
 
 ## Commands
 - `bash build_and_test.sh`

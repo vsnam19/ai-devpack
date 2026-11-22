@@ -9,7 +9,7 @@ A diagnostic may remain pending after enough clean operation cycles. Determine t
 ## Files allowed
 - `include/dtc_debouncer.hpp`
 - `src/dtc_debouncer.cpp`
-- `tests/test_dtc_debouncer.cpp`
+- tests/test_dtc_debouncer.cpp
 
 ## Commands
 - `bash build_and_test.sh`

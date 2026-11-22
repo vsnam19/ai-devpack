@@ -9,7 +9,7 @@ Implement REQ-RING-005. Add tests carrying `@req REQ-RING-005` trace tags for no
 ## Files allowed
 - `include/ring_buffer.hpp`
 - `src/ring_buffer.cpp`
-- `tests/test_ring_buffer.cpp`
+- tests/test_ring_buffer.cpp
 
 ## Commands
 - `bash build_and_test.sh`
