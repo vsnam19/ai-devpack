@@ -95,6 +95,53 @@ class RuleSnippetTests(unittest.TestCase):
             )
             return report.findings
 
+    def test_direction_and_file_block_regression(self) -> None:
+        """Catch ordinary file comments and output directions on value parameters."""
+        code = ("// @file speed.hpp\n// @brief Speed utility.\n"
+                "/** @brief Clamp speed.\n * @param[in] speed Current speed.\n"
+                " * @param[in,out] limit Maximum speed.\n */\n"
+                "unsigned clampVehicleSpeed(unsigned speed, unsigned limit) noexcept;\n")
+        findings = self._lint_snippet("speed.hpp", code)
+        selected = [f for f in findings if f.rule in {
+            "DOXYGEN-FILE-BLOCK", "DOXYGEN-PARAM-DIR-MISMATCH"}]
+        self.assertEqual(2, len(selected))
+        self.assertEqual({"error"}, {f.severity for f in selected})
+        mismatch = next(f for f in selected if f.rule.endswith("MISMATCH"))
+        self.assertIn("limit", mismatch.message)
+        self.assertIn("unsigned", mismatch.message)
+
+    def test_direction_types_and_configuration(self) -> None:
+        """Check const placement, mutable warnings, and rule disabling."""
+        for type_name, direction, severity in (
+            ("int", "out", "error"), ("const int&", "out", "error"),
+            ("int const*", "in,out", "error"),
+            ("int* const", "in", "warning"), ("int&", "in", "warning"),
+            ("int*", "out", None), ("const int*", "in", None),
+            ("int const&", "in", None), ("int", "in", None),
+        ):
+            with self.subTest(type_name=type_name, direction=direction):
+                code = ("/** @file sample.hpp\n * @brief Sample.\n */\n"
+                        f"/** @brief Process.\n * @param[{direction}] reading Value.\n */\n"
+                        f"void processReading({type_name} reading);\n")
+                findings = self._lint_snippet("sample.hpp", code)
+                selected = [f for f in findings if f.rule == "DOXYGEN-PARAM-DIR-MISMATCH"]
+                self.assertEqual([severity] if severity else [], [f.severity for f in selected])
+                cfg = preflight_lint.LintConfig(disabled_rules={"DOXYGEN-PARAM-DIR-MISMATCH"})
+                self.assertFalse(any(f.rule == "DOXYGEN-PARAM-DIR-MISMATCH"
+                                     for f in self._lint_snippet("sample.hpp", code, config=cfg)))
+
+    def test_file_comment_forms(self) -> None:
+        """Accept all Doxygen comment forms and ignore tags in string literals."""
+        for header in ("/** @file sample.hpp */", "/*! @file sample.hpp */",
+                       "/// @file sample.hpp", "//! @file sample.hpp",
+                       "/* @file sample.hpp */", "// @file sample.hpp"):
+            with self.subTest(header=header):
+                findings = self._lint_snippet("sample.hpp", header + "\n/// @brief Sample.\n")
+                self.assertEqual(int(header.startswith(("/* @", "// @"))),
+                                 sum(f.rule == "DOXYGEN-FILE-BLOCK" for f in findings))
+        findings = self._lint_snippet("sample.hpp", 'constexpr auto kText = "// @file fake";\n')
+        self.assertFalse(any(f.rule == "DOXYGEN-FILE-BLOCK" for f in findings))
+
     def test_no_c_style_cast_positive_and_negative(self) -> None:
         """Verify MISRA-8.2.2 flags C-style casts and allows static_cast and (void) casts."""
         bad_code = (

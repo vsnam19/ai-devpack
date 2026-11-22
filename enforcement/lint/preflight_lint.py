@@ -934,6 +934,54 @@ def _record_comment_context(
     contexts[id(finding)] = FingerprintContext(comment_text=normalized_comment)
 
 
+def check_param_direction_types(
+    node: dict[str, Any], raw_text: str, target_file: str,
+    findings: list[Finding],
+) -> None:
+    """Compare attached Doxygen directions with resolved AST parameter types."""
+    start = node.get("range", {}).get("begin", {}).get("offset")
+    if not isinstance(start, int):
+        return
+    prefix = raw_text[:start]
+    comments = [m for m in CPP_TOKEN_PATTERN.finditer(prefix)
+                if m.group().startswith(("/**", "/*!", "///", "//!"))]
+    if not comments:
+        return
+    last = comments[-1]
+    if prefix[last.end():].strip():
+        return
+    first = len(comments) - 1
+    if last.group().startswith(("///", "//!")):
+        while first > 0 and not prefix[comments[first - 1].end():comments[first].start()].strip():
+            first -= 1
+    documentation = prefix[comments[first].start():last.end()]
+    directions = dict((m.group(2), m.group(1).replace(" ", "")) for m in
+                      re.finditer(r"[@\\]param\s*\[\s*(in\s*,\s*out|in|out)\s*\]\s+(\w+)", documentation))
+    for param in node.get("inner", []):
+        if param.get("kind") != "ParmVarDecl":
+            continue
+        name = param.get("name", "")
+        direction = directions.get(name)
+        if direction is None:
+            continue
+        types = param.get("type", {})
+        spelling = types.get("qualType", "")
+        resolved = types.get("desugaredQualType", spelling)
+        # Top-level pointer constness does not make its pointee immutable.
+        indirect = re.search(r"[*&]", resolved)
+        readonly = indirect is None
+        if indirect:
+            pointee = re.split(r"[*&]", resolved)[-2]
+            readonly = bool(re.search(r"\bconst\b", pointee))
+        severity = "error" if readonly and direction != "in" else (
+            "warning" if not readonly and direction == "in" else None)
+        if severity:
+            findings.append(Finding(target_file, raw_text.count("\n", 0, start) + 1,
+                                    "DOXYGEN-PARAM-DIR-MISMATCH", severity,
+                                    f"Parameter '{name}' of type '{spelling}' documented as [{direction}] "
+                                    + ("cannot provide output" if readonly else "may provide output")))
+
+
 def check_comments_and_doxygen(
     raw_text: str,
     target_file: str,
@@ -944,6 +992,17 @@ def check_comments_and_doxygen(
 ) -> None:
     """Check commented-out code / empty comments and Doxygen @param[in|out|in,out] directions."""
     disabled = disabled_rules or set()
+    if "DOXYGEN-FILE-BLOCK" not in disabled:
+        for token in CPP_TOKEN_PATTERN.finditer(raw_text):
+            comment = token.group()
+            if not comment.startswith(("//", "/*")) or comment.startswith(("/**", "/*!", "///", "//!")):
+                continue
+            for tag in re.finditer(r"[@\\]file\b", comment):
+                finding = Finding(target_file, raw_text.count("\n", 0, token.start() + tag.start()) + 1,
+                                  "DOXYGEN-FILE-BLOCK", "error",
+                                  "@file must be inside a Doxygen comment")
+                findings.append(finding)
+                _record_comment_context(contexts, finding, comment)
     lines = raw_text.splitlines()
     for idx, line in enumerate(lines, start=1):
         stripped_line = line.strip()
@@ -1654,6 +1713,10 @@ def walk_ast_for_misra(
                 next_access = "private" if node.get("tagUsed") == "class" else "public"
 
         if in_target:
+            if (kind in ("FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl")
+                    and cfg.require_param_direction
+                    and "DOXYGEN-PARAM-DIR-MISMATCH" not in disabled):
+                check_param_direction_types(node, raw_text, target_file, findings)
             if kind == "GotoStmt":
                 rule = "MISRA-C-15.1" if is_c else "MISRA-9.6.1"
                 if rule not in disabled:
@@ -3811,7 +3874,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="preflight_lint.py",
         description=(
             "Generic C/C++ preflight linter (MISRA-style lexical/AST rules, Doxygen, "
-            "configurable naming regexes, parameter limits, optional clang-tidy, and baseline fingerprints)."
+            "configurable naming regexes, parameter limits, optional clang-tidy, and baseline fingerprints). "
+            "DOXYGEN-FILE-BLOCK requires @file in Doxygen comments; "
+            "DOXYGEN-PARAM-DIR-MISMATCH checks parameter types against directions."
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
