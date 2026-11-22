@@ -34,9 +34,9 @@ if str(REPO_ROOT) not in sys.path:
 from enforcement.checks import secret_pii_check  # noqa: E402
 
 try:
-    from runner.agent_exec import collect_os_identities, redact_os_identities_line  # noqa: E402
+    from runner.agent_exec import collect_os_identities, redact_os_identities, redact_value  # noqa: E402
 except ModuleNotFoundError:  # pragma: no cover - direct runner/ invocation
-    from agent_exec import collect_os_identities, redact_os_identities_line  # type: ignore[no-redef]  # noqa: E402
+    from agent_exec import collect_os_identities, redact_os_identities, redact_value  # type: ignore[no-redef]  # noqa: E402
 
 TRUNCATE_LIMIT_BYTES = 4096
 
@@ -253,9 +253,13 @@ class Redactor:
         if self.current_home and self.current_home in out:
             out = out.replace(self.current_home, "~")
         out = _HOME_PATH_RE.sub("~", out)
-        out = redact_os_identities_line(out, self._os_identities)
+        out = redact_os_identities(out, self._os_identities)
 
         return out
+
+    def redact_value(self, value: Any) -> Any:
+        """Recursively redact strings and dict keys in ``value`` with no exemptions."""
+        return redact_value(value, _text_fn=self.redact)
 
 
 def _extract_credential_file_secrets(raw_text: str) -> list[str]:
@@ -489,7 +493,7 @@ def parse_stream_jsonl(
                         saw_tool_use = True
                         t_name = redactor.redact(str(block.get("name", "unknown_tool")))
                         t_id = redactor.redact(str(block.get("id", "")))
-                        t_input = block.get("input", {})
+                        t_input = redactor.redact_value(block.get("input", {}))
                         try:
                             pretty_in = json.dumps(t_input, indent=2, ensure_ascii=False)
                         except (TypeError, ValueError):
@@ -529,7 +533,9 @@ def parse_stream_jsonl(
                     if b_type == "tool_result":
                         t_id = redactor.redact(str(block.get("tool_use_id", "")))
                         t_name = tool_id_to_name.get(t_id, "")
-                        raw_res = _normalize_tool_result_content(block.get("content"))
+                        raw_res = _normalize_tool_result_content(
+                            redactor.redact_value(block.get("content"))
+                        )
                         redacted_res = redactor.redact(raw_res)
                         is_err = bool(block.get("is_error", False))
                         step.items.append(

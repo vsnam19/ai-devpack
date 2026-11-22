@@ -38,7 +38,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 import uuid
 
 try:
@@ -1777,106 +1777,95 @@ def redact_os_identities(
     return out
 
 
-# Stream-json protocol fields whose values must never be rewritten by OS identity redaction:
-# rewriting them (e.g. ``"type":"result"`` when the host is named ``result``) breaks stream
-# parsing. An exemption applies only at its exact position in one stdout event (one JSON line):
+# Stream-json protocol fields whose scalar values are exempt from OS-identity redaction
+# inside raw agent-CLI stdout lines: rewriting them (e.g. ``"type":"result"`` when the
+# host is named ``result``) breaks stream parsing. Exemptions apply ONLY in
+# :func:`redact_stream_line` at exact protocol positions:
 #   event top level:              type, subtype, session_id, uuid, model, stop_reason
 #   event.message:                role, model, id, stop_reason, type
 #   event.message.content[]:      type, id, tool_use_id, and name only when type == "tool_use"
-# The same key name anywhere else (tool input, tool result text, nested objects) is redacted.
+# Everything else (including block ``input``, ``content``, and non-protocol keys) goes
+# through full redaction via :func:`redact_value`.
 _EVENT_PROTOCOL_KEYS = frozenset({"type", "subtype", "session_id", "uuid", "model", "stop_reason"})
+_EVENT_ENVELOPE_KEYS = _EVENT_PROTOCOL_KEYS | frozenset(
+    {
+        "message",
+        "result",
+        "is_error",
+        "num_turns",
+        "turns",
+        "duration_ms",
+        "duration_s",
+        "total_cost_usd",
+        "cost_usd",
+        "cost",
+        "usage",
+        "modelUsage",
+        "permission_denials",
+        "cwd",
+        "tools",
+        "model_digest",
+        "digest",
+    }
+)
 _MESSAGE_PROTOCOL_KEYS = frozenset({"role", "model", "id", "stop_reason", "type"})
+_MESSAGE_ENVELOPE_KEYS = _MESSAGE_PROTOCOL_KEYS | frozenset({"content", "usage"})
 _CONTENT_BLOCK_PROTOCOL_KEYS = frozenset({"type", "id", "tool_use_id"})
-
-
-def _redact_identities_in_json_value(
-    value: Any,
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
-) -> Any:
-    """Return ``value`` with OS identities redacted in every string value; dict keys are kept."""
-    if isinstance(value, str):
-        return redact_os_identities(value, identities)
-    if isinstance(value, list):
-        return [_redact_identities_in_json_value(item, identities) for item in value]
-    if isinstance(value, dict):
-        return {key: _redact_identities_in_json_value(item, identities) for key, item in value.items()}
-    return value
+_CONTENT_BLOCK_ENVELOPE_KEYS = _CONTENT_BLOCK_PROTOCOL_KEYS | frozenset(
+    {"name", "input", "text", "thinking", "content", "is_error"}
+)
 
 
 def _redact_content_block(
     block: Any,
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
+    text_fn: Callable[[str], str],
 ) -> Any:
     """Redact one ``message.content[]`` block, exempting only its protocol positions."""
     if not isinstance(block, dict):
-        return _redact_identities_in_json_value(block, identities)
+        return redact_value(block, _text_fn=text_fn)
     is_tool_use = block.get("type") == "tool_use"
     out: dict[str, Any] = {}
     for key, item in block.items():
-        exempt = key in _CONTENT_BLOCK_PROTOCOL_KEYS or (key == "name" and is_tool_use)
-        out[key] = item if exempt else _redact_identities_in_json_value(item, identities)
+        exempt = (
+            key in _CONTENT_BLOCK_PROTOCOL_KEYS or (key == "name" and is_tool_use)
+        ) and not isinstance(item, (dict, list))
+        out_key = key if key in _CONTENT_BLOCK_ENVELOPE_KEYS else text_fn(str(key))
+        out[out_key] = item if exempt else redact_value(item, _text_fn=text_fn)
     return out
 
 
 def _redact_message(
     message: dict[str, Any],
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
+    text_fn: Callable[[str], str],
 ) -> dict[str, Any]:
     """Redact ``event.message``, exempting its protocol fields and redacting each content block."""
     out: dict[str, Any] = {}
     for key, item in message.items():
-        if key in _MESSAGE_PROTOCOL_KEYS:
+        if key in _MESSAGE_PROTOCOL_KEYS and not isinstance(item, (dict, list)):
             out[key] = item
         elif key == "content" and isinstance(item, list):
-            out[key] = [_redact_content_block(block, identities) for block in item]
+            out[key] = [_redact_content_block(block, text_fn) for block in item]
         else:
-            out[key] = _redact_identities_in_json_value(item, identities)
+            out_key = key if key in _MESSAGE_ENVELOPE_KEYS else text_fn(str(key))
+            out[out_key] = redact_value(item, _text_fn=text_fn)
     return out
 
 
 def _redact_stream_event(
     event: dict[str, Any],
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
+    text_fn: Callable[[str], str],
 ) -> dict[str, Any]:
     """Redact one stream-json event object, exempting protocol fields only at their positions."""
     out: dict[str, Any] = {}
     for key, item in event.items():
-        if key in _EVENT_PROTOCOL_KEYS:
+        if key in _EVENT_PROTOCOL_KEYS and not isinstance(item, (dict, list)):
             out[key] = item
         elif key == "message" and isinstance(item, dict):
-            out[key] = _redact_message(item, identities)
+            out[key] = _redact_message(item, text_fn)
         else:
-            out[key] = _redact_identities_in_json_value(item, identities)
+            out_key = key if key in _EVENT_ENVELOPE_KEYS else text_fn(str(key))
+            out[out_key] = redact_value(item, _text_fn=text_fn)
     return out
-
-
-def redact_os_identities_line(
-    text: str,
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
-) -> str:
-    """Redact OS identities in one log line, structurally when it is a JSON object.
-
-    A line that parses as a JSON object is re-serialized with identities redacted only inside
-    string values. Keys are never rewritten, and protocol fields (``type``, ``role``, ...) are
-    exempt only at their stream-json positions (see :func:`_redact_stream_event`). Any other
-    text gets the plain whole-word text redaction of :func:`redact_os_identities`. A trailing
-    line ending is preserved.
-    """
-    if not text:
-        return text
-    ids = identities if identities is not None else collect_os_identities()
-    body = text.rstrip("\r\n")
-    ending = text[len(body):]
-    stripped = body.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        try:
-            parsed = json.loads(stripped)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, dict):
-            redacted_obj = _redact_stream_event(parsed, ids)
-            return json.dumps(redacted_obj, ensure_ascii=False, separators=(",", ":")) + ending
-    return redact_os_identities(text, ids)
 
 
 def redact_sensitive_text(
@@ -1884,6 +1873,7 @@ def redact_sensitive_text(
     extra_secrets: Sequence[str] = (),
     path_replacements: Sequence[tuple[str, str]] = (),
     home_placeholder: str = "~",
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
 ) -> str:
     """Redact credentials, auth env values, secret/PII patterns, host home paths, and OS IDs."""
     if not text:
@@ -1923,8 +1913,51 @@ def redact_sensitive_text(
         pass
 
     result = _HOST_HOME_RE.sub(home_placeholder, result)
-    result = redact_os_identities_line(result)
+    result = redact_os_identities(result, identities)
     return result
+
+
+def redact_value(
+    value: Any,
+    extra_secrets: Sequence[str] = (),
+    path_replacements: Sequence[tuple[str, str]] = (),
+    home_placeholder: str = "~",
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
+    *,
+    _text_fn: Callable[[str], str] | None = None,
+) -> Any:
+    """Recursively redact sensitive strings and dict keys in a JSON-serializable structure.
+
+    Applies full text redaction (secrets, paths, and OS identities) with no stream-protocol
+    exemptions. Both dict keys and values are redacted.
+    """
+    if _text_fn is None:
+        ids = identities if identities is not None else collect_os_identities()
+
+        def _redact_leaf(text: str) -> str:
+            """Redact one scalar string or dict key using pre-collected OS identities."""
+            return redact_sensitive_text(
+                text,
+                extra_secrets=extra_secrets,
+                path_replacements=path_replacements,
+                home_placeholder=home_placeholder,
+                identities=ids,
+            )
+
+        _text_fn = _redact_leaf
+
+    if isinstance(value, str):
+        return _text_fn(value)
+    if isinstance(value, list):
+        return [redact_value(item, _text_fn=_text_fn) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_value(item, _text_fn=_text_fn) for item in value)
+    if isinstance(value, dict):
+        return {
+            (_text_fn(k) if isinstance(k, str) else k): redact_value(v, _text_fn=_text_fn)
+            for k, v in value.items()
+        }
+    return value
 
 
 def redact_structure(
@@ -1932,24 +1965,58 @@ def redact_structure(
     extra_secrets: Sequence[str] = (),
     path_replacements: Sequence[tuple[str, str]] = (),
     home_placeholder: str = "~",
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
 ) -> Any:
-    """Recursively redact sensitive string values in a JSON-serializable structure.
+    """Alias for :func:`redact_value` preserving existing callers."""
+    return redact_value(
+        value,
+        extra_secrets=extra_secrets,
+        path_replacements=path_replacements,
+        home_placeholder=home_placeholder,
+        identities=identities,
+    )
 
-    Dict keys are never rewritten; only string values are redacted.
+
+def redact_stream_line(
+    line: str,
+    extra_secrets: Sequence[str] = (),
+    path_replacements: Sequence[tuple[str, str]] = (),
+    home_placeholder: str = "~",
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
+) -> str:
+    """Redact one raw agent-CLI stdout line, exempting stream-json protocol fields only.
+
+    Intended solely for raw agent-CLI stdout in ``_read_stdout``. JSON object lines keep
+    scalar values at stream-json protocol positions intact while running full redaction
+    (secrets, paths, OS identities) on all other keys and values (including block ``input``
+    and ``content``). Non-JSON lines receive full text redaction.
     """
-    if isinstance(value, str):
-        return redact_sensitive_text(value, extra_secrets, path_replacements, home_placeholder)
-    if isinstance(value, list):
-        return [
-            redact_structure(item, extra_secrets, path_replacements, home_placeholder)
-            for item in value
-        ]
-    if isinstance(value, dict):
-        return {
-            k: redact_structure(v, extra_secrets, path_replacements, home_placeholder)
-            for k, v in value.items()
-        }
-    return value
+    if not line:
+        return line
+    ids = identities if identities is not None else collect_os_identities()
+
+    def _redact_leaf(text: str) -> str:
+        """Redact secrets, paths, and OS identities in one non-protocol string."""
+        return redact_sensitive_text(
+            text,
+            extra_secrets=extra_secrets,
+            path_replacements=path_replacements,
+            home_placeholder=home_placeholder,
+            identities=ids,
+        )
+
+    body = line.rstrip("\r\n")
+    ending = line[len(body):]
+    stripped = body.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            redacted_obj = _redact_stream_event(parsed, _redact_leaf)
+            return json.dumps(redacted_obj, ensure_ascii=False, separators=(",", ":")) + ending
+    return _redact_leaf(line)
 
 
 def cleanup_cfg_dir(cfg_dir: Path) -> None:
@@ -2478,13 +2545,16 @@ def run_agent(request: AgentRequest) -> AgentResult:
         except OSError:
             pass
 
+    os_identities = collect_os_identities()
+
     def _redact(text: str) -> str:
-        """Redact secrets and home paths using request settings."""
+        """Redact secrets, home paths, and OS identities using request settings."""
         return redact_sensitive_text(
             text,
             extra_secrets=secrets_list,
             path_replacements=request.path_replacements,
             home_placeholder=request.home_placeholder,
+            identities=os_identities,
         )
 
     prompt_path.write_text(_redact(effective_prompt), encoding="utf-8")
@@ -2507,17 +2577,19 @@ def run_agent(request: AgentRequest) -> AgentResult:
         res.final_text = _redact(res.final_text)
         res.error = _redact(res.error)
         res.stderr = _redact(res.stderr)
-        res.permission_denials = redact_structure(
+        res.permission_denials = redact_value(
             res.permission_denials,
             extra_secrets=secrets_list,
             path_replacements=request.path_replacements,
             home_placeholder=request.home_placeholder,
+            identities=os_identities,
         )
-        meta_payload = redact_structure(
+        meta_payload = redact_value(
             res.to_dict(),
             extra_secrets=secrets_list,
             path_replacements=request.path_replacements,
             home_placeholder=request.home_placeholder,
+            identities=os_identities,
         )
         meta_path.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
         return res
@@ -2643,7 +2715,13 @@ def run_agent(request: AgentRequest) -> AgentResult:
                     """Read subprocess stdout line-by-line, redact, and flush to jsonl_fh."""
                     assert proc.stdout is not None
                     for raw_line in proc.stdout:
-                        redacted_line = _redact(raw_line)
+                        redacted_line = redact_stream_line(
+                            raw_line,
+                            extra_secrets=secrets_list,
+                            path_replacements=request.path_replacements,
+                            home_placeholder=request.home_placeholder,
+                            identities=os_identities,
+                        )
                         stdout_lines.append(redacted_line)
                         jsonl_fh.write(redacted_line)
                         if not redacted_line.endswith("\n"):

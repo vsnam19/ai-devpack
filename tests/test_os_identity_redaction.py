@@ -268,7 +268,7 @@ class OsIdentityRedactionTests(unittest.TestCase):
         }
         raw_lines = [json.dumps(tool_result_event), json.dumps(result_event)]
         with _mock_os_context(user="user", primary_group="user", hostname="result"):
-            redacted_lines = [agent_exec.redact_sensitive_text(line) for line in raw_lines]
+            redacted_lines = [agent_exec.redact_stream_line(line) for line in raw_lines]
             with tempfile.TemporaryDirectory() as tmp:
                 jsonl_path = Path(tmp) / "stream.jsonl"
                 jsonl_path.write_text("\n".join(redacted_lines) + "\n", encoding="utf-8")
@@ -290,8 +290,8 @@ class OsIdentityRedactionTests(unittest.TestCase):
         self.assertEqual("result", result_obj["type"])
         self.assertEqual("success", result_obj["subtype"])
 
-    def test_identity_redaction_never_touches_json_keys_or_protocol_values(self) -> None:
-        """Keys and protocol values at protocol positions are preserved; free text is redacted."""
+    def test_stream_line_preserves_protocol_positions_and_redacts_rest(self) -> None:
+        """Protocol values at stream-json positions are preserved; all other keys/values are redacted."""
         line = json.dumps(
             {
                 "type": "assistant",
@@ -314,15 +314,15 @@ class OsIdentityRedactionTests(unittest.TestCase):
             }
         )
         with _mock_os_context():
-            redacted = agent_exec.redact_sensitive_text(line)
+            redacted = agent_exec.redact_stream_line(line)
         obj = json.loads(redacted)
         self.assertEqual("assistant", obj["type"])
         self.assertEqual("jdoe_eng", obj["uuid"])
         self.assertEqual("jdoe_eng", obj["message"]["role"])
         self.assertEqual("jdoe_eng", obj["message"]["model"])
         self.assertEqual("jdoe_eng", obj["message"]["id"])
-        self.assertIn("jdoe_eng", obj)
-        self.assertEqual("[USER]", obj["jdoe_eng"])
+        self.assertNotIn("jdoe_eng", obj)
+        self.assertEqual("[USER]", obj["[USER]"])
         self.assertEqual("owner is [USER]", obj["message"]["content"][0]["text"])
         tool_block = obj["message"]["content"][1]
         self.assertEqual("jdoe_eng", tool_block["id"])
@@ -347,7 +347,7 @@ class OsIdentityRedactionTests(unittest.TestCase):
             }
         )
         with _mock_os_context():
-            obj = json.loads(agent_exec.redact_sensitive_text(line))
+            obj = json.loads(agent_exec.redact_stream_line(line))
         self.assertEqual("[USER]", obj["role"])
         self.assertEqual("[USER]", obj["name"])
         self.assertEqual("[USER]", obj["id"])
@@ -378,7 +378,7 @@ class OsIdentityRedactionTests(unittest.TestCase):
             }
         )
         with _mock_os_context():
-            obj = json.loads(agent_exec.redact_sensitive_text(line))
+            obj = json.loads(agent_exec.redact_stream_line(line))
         block = obj["message"]["content"][0]
         self.assertEqual("Bash", block["name"])
         self.assertEqual({"name": "[USER]"}, block["input"])
@@ -401,18 +401,167 @@ class OsIdentityRedactionTests(unittest.TestCase):
             }
         )
         with _mock_os_context():
-            obj = json.loads(agent_exec.redact_sensitive_text(line))
+            obj = json.loads(agent_exec.redact_stream_line(line))
         self.assertEqual("user", obj["message"]["role"])
         result_block = obj["message"]["content"][0]
         self.assertEqual("tool_result", result_block["type"])
         self.assertEqual("tu_3", result_block["tool_use_id"])
         self.assertEqual([{"type": "text", "text": "[USER]"}], result_block["content"])
 
-    def test_redact_structure_never_rewrites_dict_keys(self) -> None:
-        """Meta JSON keys named after an OS identity are kept; their string values are redacted."""
+    def test_redact_stream_line_non_json_gets_full_redaction(self) -> None:
+        """Non-JSON stdout lines passed to redact_stream_line undergo full text redaction."""
+        fake_home = "/" + "ho" + "me/jdoe_eng"
+        fake_secret = "FAKE_STREAM_SECRET_998877"
+        raw = f"plain error user=jdoe_eng host=workstation-42 path={fake_home}/app secret={fake_secret}\n"
         with _mock_os_context():
-            redacted = agent_exec.redact_structure({"jdoe_eng": "owner jdoe_eng", "nested": {"jdoe_eng": 1}})
-        self.assertEqual({"jdoe_eng": "owner [USER]", "nested": {"jdoe_eng": 1}}, redacted)
+            redacted = agent_exec.redact_stream_line(raw, extra_secrets=[fake_secret])
+        self.assertNotIn("jdoe_eng", redacted)
+        self.assertNotIn("workstation-42", redacted)
+        self.assertNotIn(fake_secret, redacted)
+        self.assertIn("~/app", redacted)
+        self.assertIn("[USER]", redacted)
+        self.assertIn("[HOST]", redacted)
+        self.assertIn("<REDACTED_CREDENTIALS>", redacted)
+        self.assertTrue(redacted.endswith("\n"))
+
+    def test_redact_value_and_structure_redact_keys_and_have_no_exemptions(self) -> None:
+        """redact_value/redact_structure redact dict keys (secrets, paths, OS IDs) with no exemptions."""
+        fake_home = "/" + "ho" + "me/jdoe_eng"
+        fake_aws_key = "AKIAIOSFODNN7EXAMPLE"
+        fake_secret = "FAKE_KEY_SECRET_VAL_7788"
+        payload = {
+            f"{fake_home}/{fake_aws_key}/{fake_secret}": "jdoe_eng on workstation-42",
+            "model": "workstation-42",
+            "type": "workstation-42",
+            "role": "jdoe_eng",
+            "nested": {"jdoe_eng": 1},
+        }
+        with _mock_os_context():
+            redacted_val = agent_exec.redact_value(payload, extra_secrets=[fake_secret])
+            redacted_struct = agent_exec.redact_structure(payload, extra_secrets=[fake_secret])
+
+        for out in (redacted_val, redacted_struct):
+            serialized = json.dumps(out)
+            self.assertNotIn(fake_home, serialized)
+            self.assertNotIn(fake_aws_key, serialized)
+            self.assertNotIn(fake_secret, serialized)
+            self.assertNotIn("jdoe_eng", serialized)
+            self.assertNotIn("workstation-42", serialized)
+            self.assertEqual("[HOST]", out["model"])
+            self.assertEqual("[HOST]", out["type"])
+            self.assertEqual("[USER]", out["role"])
+            self.assertEqual({"[USER]": 1}, out["nested"])
+            expected_key = "~/<REDACTED:aws-access-key-id>/<REDACTED_CREDENTIALS>"
+            self.assertIn(expected_key, out)
+            self.assertEqual("[USER] on [HOST]", out[expected_key])
+
+    def test_permission_denial_meta_redacts_secret_and_home_path_in_keys(self) -> None:
+        """Permission-denial tool_input keys with a secret token and home path are redacted in .meta.json."""
+        fake_home = "/" + "ho" + "me/jdoe_eng"
+        fake_cred_secret = "FAKE_OAUTH_DENIAL_TOKEN_5566"
+        fake_aws_key = "AKIAIOSFODNN7EXAMPLE"
+        denial_key = f"{fake_home}/secrets/{fake_cred_secret}/{fake_aws_key}"
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workdir = base / "work"
+            workdir.mkdir()
+            cred_file = base / "creds.json"
+            cred_file.write_text(
+                json.dumps({"claudeAiOauth": {"accessToken": fake_cred_secret}}),
+                encoding="utf-8",
+            )
+            fake_claude = base / "fake_claude.py"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                f"denials = [{{'tool_name': 'Write', 'tool_input': {{{denial_key!r}: 'workstation-42'}}}}]\n"
+                "print(json.dumps({\n"
+                "    'type': 'result',\n"
+                "    'subtype': 'success',\n"
+                "    'is_error': False,\n"
+                "    'num_turns': 1,\n"
+                "    'duration_ms': 10,\n"
+                "    'total_cost_usd': 0.001,\n"
+                "    'usage': {'input_tokens': 5, 'output_tokens': 2},\n"
+                "    'permission_denials': denials,\n"
+                "    'result': 'done',\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            run_dir = agent_exec.new_run_dir(base / "runs", kind="task", task="t-denial", engines=["haiku"])
+            with _mock_os_context():
+                res = agent_exec.run_agent(
+                    agent_exec.AgentRequest(
+                        engine=agent_exec.EngineConfig(name="haiku", model="haiku", engine_class="cloud"),
+                        prompt="test denial",
+                        workdir=workdir,
+                        run_dir=run_dir,
+                        step_name="01-implementer-haiku",
+                        isolation="local",
+                        allow_unsandboxed_local=True,
+                        credentials_path=cred_file,
+                        agent_bin=str(fake_claude),
+                    )
+                )
+
+            self.assertEqual("ok", res.status, msg=res.error)
+            meta_path = run_dir / "steps" / "01-implementer-haiku.meta.json"
+            jsonl_path = run_dir / "steps" / "01-implementer-haiku.jsonl"
+            for artifact in (meta_path, jsonl_path):
+                raw_text = artifact.read_text(encoding="utf-8")
+                self.assertNotIn(fake_cred_secret, raw_text)
+                self.assertNotIn(fake_aws_key, raw_text)
+                self.assertNotIn(fake_home, raw_text)
+                self.assertNotIn("jdoe_eng", raw_text)
+                self.assertNotIn("workstation-42", raw_text)
+
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            denial_input = meta["permission_denials"][0]["tool_input"]
+            self.assertEqual(
+                {"~/secrets/<REDACTED_CREDENTIALS>/<REDACTED:aws-access-key-id>": "[HOST]"},
+                denial_input,
+            )
+
+    def test_run_agent_stream_result_and_role_preserved_on_identity_collision(self) -> None:
+        """run_agent parses stream result event when host='result' and preserves role='user'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workdir = base / "work"
+            workdir.mkdir()
+            fake_claude = base / "fake_claude.py"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "print(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'tu_1', 'content': '-rw-r--r-- 1 user user 10 f'}]}}))\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 1, 'duration_ms': 25, 'total_cost_usd': 0.001, 'usage': {'input_tokens': 4, 'output_tokens': 2}, 'result': 'result host done'}))\n",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            run_dir = agent_exec.new_run_dir(base / "runs", kind="task", task="t-collide", engines=["haiku"])
+            with _mock_os_context(user="user", primary_group="user", hostname="result"):
+                res = agent_exec.run_agent(
+                    agent_exec.AgentRequest(
+                        engine=agent_exec.EngineConfig(name="haiku", model="haiku", engine_class="cloud"),
+                        prompt="test collision",
+                        workdir=workdir,
+                        run_dir=run_dir,
+                        step_name="01-implementer-haiku",
+                        isolation="local",
+                        allow_unsandboxed_local=True,
+                        agent_bin=str(fake_claude),
+                    )
+                )
+
+            self.assertEqual("ok", res.status, msg=res.error)
+            self.assertEqual("[HOST] host done", res.final_text)
+            lines = [
+                json.loads(line)
+                for line in (run_dir / "steps" / "01-implementer-haiku.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual("user", lines[0]["message"]["role"])
+            self.assertEqual("result", lines[1]["type"])
 
     def test_devpack_logs_render_keeps_result_event_when_user_and_host_collide(self) -> None:
         """devpack_logs.render keeps protocol fields intact when identities collide with JSON words."""
@@ -486,24 +635,85 @@ class OsIdentityRedactionTests(unittest.TestCase):
         self.assertNotIn("no result event", transcript)
 
 
-    def test_devpack_logs_redactor_keeps_json_protocol_fields_on_whole_lines(self) -> None:
-        """Redactor.redact on a raw stream-json line keeps keys and protocol values intact."""
-        line = json.dumps(
-            {
-                "type": "result",
-                "subtype": "success",
-                "role": "user",
-                "result": "listed result files",
-            }
-        )
-        with _mock_os_context(user="jdoe_eng", primary_group="eng_team", hostname="result"):
+    def test_devpack_logs_redacts_tool_input_model_hostname_and_has_no_stream_exemptions(self) -> None:
+        """devpack_logs and redact_sensitive_text apply no stream exemptions to tool input JSON."""
+        tool_input_json = json.dumps({"model": "workstation-42"})
+        with _mock_os_context():
             redactor = devpack_logs.Redactor()
-            redacted = redactor.redact(line)
-        obj = json.loads(redacted)
-        self.assertEqual("result", obj["type"])
-        self.assertEqual("success", obj["subtype"])
-        self.assertEqual("user", obj["role"])
-        self.assertEqual("listed [HOST] files", obj["result"])
+            redacted_log = redactor.redact(tool_input_json)
+            redacted_text = agent_exec.redact_sensitive_text(tool_input_json)
+        self.assertEqual({"model": "[HOST]"}, json.loads(redacted_log))
+        self.assertEqual({"model": "[HOST]"}, json.loads(redacted_text))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "20261122T120000Z-112233"
+            steps_dir = run_dir / "steps"
+            steps_dir.mkdir(parents=True)
+            (run_dir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_dir.name,
+                        "kind": "task",
+                        "started": "2026-11-22T12:00:00Z",
+                        "finished": "2026-11-22T12:00:05Z",
+                        "engines": {"implementer": "haiku"},
+                        "task": "check-tool-input",
+                        "outcome": "ok",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-haiku-5-5",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu_1",
+                                "name": "Bash",
+                                "input": {"model": "workstation-42"},
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "num_turns": 1,
+                    "duration_ms": 10,
+                    "total_cost_usd": 0.001,
+                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                    "result": "ok",
+                },
+            ]
+            (steps_dir / "01-implementer-haiku.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in events) + "\n",
+                encoding="utf-8",
+            )
+            (steps_dir / "01-implementer-haiku.meta.json").write_text(
+                json.dumps(
+                    {
+                        "role": "implementer",
+                        "engine": "haiku",
+                        "status": "ok",
+                        "prompt_sha256": "0" * 64,
+                        "prompt_file": "01-implementer-haiku.prompt.md",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with _mock_os_context():
+                rc = devpack_logs.main(["render", str(run_dir)])
+            self.assertEqual(0, rc)
+            for fname in ("transcript.md", "index.html"):
+                rendered = (run_dir / fname).read_text(encoding="utf-8")
+                self.assertNotIn("workstation-42", rendered)
+                self.assertIn("[HOST]", rendered)
 
 
 if __name__ == "__main__":
