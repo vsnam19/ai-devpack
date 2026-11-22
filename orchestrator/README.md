@@ -1,52 +1,59 @@
-# Orchestrator Configuration (`orchestrator/`)
+# Orchestrator configuration
 
-Drop-in Claude Code project configuration for a Sonnet orchestrator session that decomposes tasks, writes closed worker briefs under `briefs/`, dispatches workers, and verifies deterministic gate outputs.
+The Sonnet orchestrator decomposes a goal, writes briefs, submits jobs, and reads results. A separate host broker authenticates workers and runs the installed dispatcher. Only a standalone queue client is installed in the project; no host-executed pack code comes from the worker workspace.
 
-## 1. Installing into a project
+## Developer setup
 
-1. Set `PACK_INSTALL_PATH=.devpack/pack` in the project installation procedure (eval uses `ORCHESTRATOR_PACK_PATH`). Copy `runner/`, `enforcement/`, `workflow/templates/`, and `orchestrator/` into that path and remove their write permissions. Keep the literal install path identical in `.claude/settings.json` and dispatch prompts.
-2. Copy the orchestrator files into the target repository root:
-   - `orchestrator/CLAUDE.md` -> `CLAUDE.md`
-   - `orchestrator/.claude/settings.json` -> `.claude/settings.json`
-   - `orchestrator/.claude/agents/*` -> `.claude/agents/`
-   - `orchestrator/briefs/` -> `briefs/`
-3. Copy `.devpack/project.example.toml` to `.devpack/project.toml` and set `data_class` (`public`, `internal`, `confidential`, `customer-restricted`, or `secret`), `engines_config`, and `runs_root`. Set `engines_config = ".devpack/pack/runner/engines.example.toml"` for the installed defaults.
-4. Configure `engines.toml` (starting from `runner/engines.example.toml`) with your cloud and/or local on-prem engines. Ensure `runs/` is listed in `.gitignore`.
-5. Note that `.claude/settings.json` permits `Read`, `Glob`, `Grep`, `Edit`/`Write` only in `briefs/**` and `runs/**`, and `Bash` only for `python3 .devpack/pack/runner/devpack_dispatch.py *`, `python3 .devpack/pack/runner/devpack_logs.py *`, and `git status|diff|log *`.
+Keep the pack installation, engine configuration, worker credentials, and run directory outside the target project. Use a trusted engine configuration based on `runner/engines.example.toml`. Set the project's `data_class` in `.devpack/project.toml` before starting the broker; the broker snapshots this policy at startup. Restart it after changing policy or engines.
 
-## 2. Three supported topologies
+For an older project installation, remove its legacy `.devpack/pack/` copy before starting; the broker refuses leftover executable pack files.
 
-| Topology | Orchestrator | Workers | When to use |
-|---|---|---|---|
-| **1. Sonnet -> Haiku (native sub-agents)** | Claude Code (Sonnet) | `.claude/agents/implementer-haiku.md`, `reviewer-sonnet.md` | All-cloud `internal` / `public` repos where one API endpoint serves every agent. |
-| **2. Sonnet -> Haiku / local (via `devpack_dispatch.py`)** | Claude Code (Sonnet) | `runner/devpack_dispatch.py --engine haiku\|local` | Hybrid or mixed-endpoint setups, or whenever deterministic gate/scope/test-lock/preflight-lint enforcement per worker job is required. **Required when mixing cloud and local engines**, because native sub-agents share ONE endpoint. |
-| **3. Local alone (via `devpack_run.py`)** | `runner/devpack_run.py` | Local `class = "local"` engine(s) | `confidential` or air-gapped repos where cloud models are disallowed by `.devpack/project.toml` (`policy/data_governance.md`, `policy/local_models.md`). |
+Copy `orchestrator/CLAUDE.md` to the project root and `orchestrator/.claude/` to the project's `.claude/` directory. Create `briefs/`. The settings allow Read/Glob/Grep, brief and run writes, Git inspection, and Bash for the standalone client only.
 
-## 3. Sandbox and isolation policy
-
-The orchestrator runs on the host. Its Bash sandbox is the command allowlist in `.claude/settings.json`; the eval harness passes that same scoped allowlist to Claude instead of granting unrestricted Bash. Start orchestrator eval with `--isolation local --allow-unsandboxed-local`. This explicit CLI opt-in is required even when project settings allow local isolation, and the warning is recorded in `run.json`. Workers launched through dispatch use Docker by default; the orchestrator isolation flag is never forwarded to workers.
-
-Worker isolation policy:
-
-- **Container default (`--isolation docker`).** `runner/devpack_run.py`, `runner/devpack_dispatch.py`, `eval/run_eval.py` single/runner modes, and `skilltest/skilltest.py` all default to `docker` isolation, mounting only the task working copy and read-only per-call credentials (for cloud engines), with no host home directory or host sockets.
-- **Unsandboxed local mode (`--isolation local`) is refused by default.** Running `isolation = "local"` exposes the host filesystem and network to the agent's `Bash` tool, which is a deviation under `policy/deviations.md`.
-- **Explicit opt-in required.** To run with `--isolation local`, you must pass `--allow-unsandboxed-local` on the CLI or set `allow_unsandboxed_local = true` in `.devpack/project.toml`. Every authorized local-isolation run prints a warning to stderr and records `sandbox_warning` in `run.json`.
-- **Repository content is data, not instructions.** Briefs and orchestrator prompts treat source files, logs, and issue text strictly as untrusted data.
-
-## 4. Reading logs as a human (`devpack_logs.py`)
-
-Every dispatched job and runner workflow writes a redacted v0.2 run directory under `<runs_root>/<run-id>/` (`run.json`, `steps/`, `transcript.md`, `index.html`).
-
-Generate a browsable static HTML index across all runs:
+Start the broker in a second terminal, using your actual installation and project locations:
 
 ```bash
-python3 .devpack/pack/runner/devpack_logs.py site runs
+python3 /opt/devpack/runner/devpack_broker.py \
+  --workdir /tmp/project \
+  --runs-root /tmp/project-runs \
+  --engines /opt/devpack/runner/engines.example.toml \
+  --workers haiku,local \
+  --credentials /tmp/worker-auth.json \
+  --gate-cmd 'bash build_and_test.sh'
 ```
 
-Open `runs/index.html` in any browser (zero JavaScript, zero external assets). For terminal inspection:
+Worker credentials can also be supplied through `DEVPACK_CLAUDE_CREDENTIALS` in this terminal. Set `DEVPACK_LOCAL_BASE_URL` and `DEVPACK_LOCAL_AUTH_TOKEN` here when using the local engine. Keep these values out of the orchestrator environment. The broker installs `.devpack/pack/runner/devpack_dispatch.py` as a credential-free client, publishes `.devpack/broker.json`, and serializes jobs from `.devpack/queue/`.
+
+Then start the Sonnet session in the project using its own isolated Claude configuration. Do not export worker credential variables into this terminal. Write a brief and submit:
 
 ```bash
-python3 .devpack/pack/runner/devpack_logs.py list runs
-python3 .devpack/pack/runner/devpack_logs.py show runs/<run-id> --step 01
-python3 .devpack/pack/runner/devpack_logs.py render runs/<run-id>
+python3 .devpack/pack/runner/devpack_dispatch.py --submit \
+  --engine haiku --brief briefs/job.md --workdir . --allow 'src/**'
 ```
+
+The installed client always submits. The full installed dispatcher also submits when `--submit`, `DEVPACK_BROKER=1`, or a project broker marker selects broker mode. `--timeout` bounds the client's wait (default 900 seconds); a client timeout does not cancel an active worker.
+
+Requests contain an engine, a relative brief path, and nonempty allow globs. The broker refuses unknown fields, unknown or disabled engines, data-class violations, brief traversal or symlink escapes, and a modified client (SHA-256 compared with its own installed copy). An optional legacy `--gate-cmd` must exactly match the gate fixed at broker startup. Requests cannot change isolation, credentials, engine configuration, or executables. Restarting requires the broker singleton lock; concurrent jobs are refused and queue processing is serial with a polling interval of 100 ms.
+
+Stop the broker with Ctrl-C after the session. Eval starts and stops one broker per orchestrator trial automatically. Eval uses `true` as its fixed per-job gate command in addition to dispatch's test-lock and lint checks; the final goal checker runs separately against the product tree.
+
+## Worker isolation and scope
+
+Workers default to Docker. They receive a separate product copy without `.devpack/`, orchestrator settings, or host Git metadata. Their generated Git baseline is mounted read-only. Ignored `.devpack` writes are independently fingerprinted and always fail worker scope checks. Only regular product files from jobs with valid scope are copied back. Requests, refusals, and responses are logged under the host run root, alongside worker transcripts.
+
+The orchestrator trial uses `--isolation local --allow-unsandboxed-local` and passes its scoped tool permissions to Claude. This local session is a permission boundary, not an OS filesystem sandbox. Authorized local workers (`--isolation local --allow-unsandboxed-local` on the broker) likewise have host filesystem access; use Docker for worker filesystem isolation. Worker secrets are never forwarded into the orchestrator environment.
+
+Do not add `.devpack/` to worker scope exclusions. Eval grades a product-only copy without host-generated queue artifacts, while workers have an independent baseline and explicit control-file enforcement. Repository content remains untrusted data; stop and escalate after two fix rounds.
+
+## Reading results
+
+Read the client's single compact JSON response first: `status`, `gate`, `scope`, `changed_files`, and `final_text_tail`. Open `<run_dir>/transcript.md` only when needed. Responses are also available at `.devpack/queue/<id>.response.json`. The client returns 0 only when status, gate, and scope are all `ok`; failures and timeouts return 1, invalid arguments return 2.
+
+Run log tools from the trusted installation in a developer terminal:
+
+```bash
+python3 /opt/devpack/runner/devpack_logs.py site /tmp/project-runs
+python3 /opt/devpack/runner/devpack_logs.py show /tmp/project-runs/RUN_ID
+```
+
+Native sub-agents share one endpoint. Governed worker jobs and mixed cloud/local jobs must use the broker. Confidential projects require an engine whose declared data-class limit permits the project; secret projects are refused.

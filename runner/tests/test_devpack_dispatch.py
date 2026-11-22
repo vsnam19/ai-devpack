@@ -21,6 +21,8 @@ for _p in (str(REPO_ROOT), str(RUNNER_DIR)):
 
 import devpack_dispatch  # noqa: E402
 from skilltest import skilltest  # noqa: E402
+from eval.run_eval import ORCHESTRATOR_PACK_PATH  # noqa: E402
+from runner.devpack_broker import Broker, CLIENT_RELATIVE, CLIENT_SOURCE  # noqa: E402
 
 
 def _init_git_repo(workdir: Path) -> None:
@@ -315,6 +317,40 @@ class DevpackDispatchTests(unittest.TestCase):
         self.assertEqual(0, proc.returncode)
         self.assertIn("--allow-unsandboxed-local", proc.stdout)
 
+    def test_broker_response_contains_rendered_transcript(self) -> None:
+        """The allowed path submits to the broker and returns readable worker logs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workdir = base / "work"
+            _init_git_repo(workdir)
+            (workdir / "briefs").mkdir()
+            (workdir / "briefs/job.md").write_text("Inspect the project.\n", encoding="utf-8")
+            worker = _write_fake_agent(
+                base / "worker.py",
+                "print(json.dumps({'type': 'result', 'is_error': False, 'result': 'broker worker done'}))\n",
+            )
+            broker = Broker(
+                workdir, base / "runs", isolation="local", allow_unsandboxed_local=True,
+                agent_bin=str(worker), gate_cmd="true",
+            )
+            try:
+                self.assertEqual(CLIENT_SOURCE.read_bytes(), broker.client_path.read_bytes())
+                self.assertEqual([broker.client_path], [
+                    path for path in (workdir / ORCHESTRATOR_PACK_PATH).rglob("*") if path.is_file()
+                ])
+                request_id = "a" * 32
+                request = {"engine": "haiku", "brief": "briefs/job.md", "allow": ["src/**"]}
+                (broker.queue / f"{request_id}.request.json").write_text(json.dumps(request), encoding="utf-8")
+                broker.poll()
+                response = json.loads((broker.queue / f"{request_id}.response.json").read_text(encoding="utf-8"))
+                self.assertEqual("ok", response["status"], response)
+                self.assertIn("run_dir", response)
+                transcript = Path(response["run_dir"]) / "transcript.md"
+                self.assertTrue(transcript.is_file())
+                self.assertIn("broker worker done", transcript.read_text(encoding="utf-8"))
+            finally:
+                broker.close()
+
     def test_orchestrator_settings_and_checklist_constraints(self) -> None:
         """Verify orchestrator settings.json is valid JSON denying product edits, CLAUDE.md <= 80 lines, checklist <= 25 lines."""
         settings_path = REPO_ROOT / "orchestrator" / ".claude" / "settings.json"
@@ -330,8 +366,16 @@ class DevpackDispatchTests(unittest.TestCase):
         self.assertIn("Write(briefs/**)", allow)
         self.assertIn("Edit(runs/**)", allow)
         self.assertIn("Write(runs/**)", allow)
-        self.assertIn("Bash(python3 .devpack/pack/runner/devpack_dispatch.py *)", allow)
-        self.assertIn("Bash(python3 .devpack/pack/runner/devpack_logs.py *)", allow)
+        client_path = ORCHESTRATOR_PACK_PATH / "runner/devpack_dispatch.py"
+        client_command = f"python3 {client_path}"
+        self.assertEqual(client_path, CLIENT_RELATIVE)
+        self.assertIn(f"Bash({client_command} *)", allow)
+        for permission in allow:
+            self.assertNotIn("devpack_logs.py", permission)
+            if permission.startswith("Bash(") and "devpack_dispatch.py" in permission:
+                self.assertEqual(f"Bash({client_command} *)", permission)
+        for host_script in ("devpack_dispatch.py", "devpack_logs.py"):
+            self.assertNotIn(f"Bash(python3 runner/{host_script} *)", allow)
 
         for disallowed in ("Edit", "Write"):
             self.assertNotIn(disallowed, allow)
@@ -341,6 +385,7 @@ class DevpackDispatchTests(unittest.TestCase):
 
         claude_lines = (REPO_ROOT / "orchestrator" / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
         self.assertLessEqual(len(claude_lines), 80)
+        self.assertIn(client_command, "\n".join(claude_lines))
 
         checklist_lines = (REPO_ROOT / "runner" / "quality_checklist.md").read_text(encoding="utf-8").splitlines()
         self.assertLessEqual(len(checklist_lines), 25)

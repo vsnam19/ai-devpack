@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -34,6 +35,19 @@ import subprocess
 import sys
 import time
 from typing import Any, Sequence
+
+def _submission_requested(argv: Sequence[str]) -> bool:
+    """Select queue mode before importing host execution and credential code."""
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--workdir", default=".")
+    options, _ = probe.parse_known_args(argv)
+    return ("--submit" in argv or os.environ.get("DEVPACK_BROKER") == "1"
+            or (Path(options.workdir) / ".devpack/broker.json").exists())
+
+
+if __name__ == "__main__" and _submission_requested(sys.argv[1:]):
+    from devpack_submit import main as _submit_main
+    raise SystemExit(_submit_main())
 
 RUNNER_DIR = Path(__file__).resolve().parent
 PACK_ROOT = RUNNER_DIR.parent
@@ -202,6 +216,25 @@ def _emit_json_line(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, separators=(",", ":")))
 
 
+def _control_snapshot(workdir: Path) -> dict[str, str]:
+    """Fingerprint control files independently of Git ignore and allowed glob rules."""
+    root = workdir / ".devpack"
+    result = {}
+    if root.is_symlink():
+        return {".devpack": "symlink:" + os.readlink(root)}
+    if root.exists():
+        result[".devpack"] = "directory"
+        for path in root.rglob("*"):
+            name = path.relative_to(workdir).as_posix()
+            if path.is_symlink():
+                result[name] = "symlink:" + os.readlink(path)
+            elif path.is_file():
+                result[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            else:
+                result[name] = "directory"
+    return result
+
+
 def dispatch_job(
     *,
     engine_name: str,
@@ -222,6 +255,8 @@ def dispatch_job(
     role: str = "worker",
     no_checklist: bool = False,
     dry_run: bool = False,
+    docker_bin: str = "docker",
+    image_tag: str = agent_exec.DOCKER_IMAGE_TAG,
     pack_root: Path = PACK_ROOT,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
@@ -371,14 +406,22 @@ def dispatch_job(
         timeout_s=engine.timeout_s,
         credentials_path=credentials_path,
         agent_bin=agent_bin,
+        docker_bin=docker_bin,
+        image_tag=image_tag,
         role=role,
         step_index=1,
     )
+    control_before = _control_snapshot(workdir)
     agent_res = run_agent(req)
+    control_after = _control_snapshot(workdir)
+    control_changes = sorted(name for name in control_before.keys() | control_after.keys()
+                             if control_before.get(name) != control_after.get(name))
 
     changed_files, changed_err = get_changed_files(workdir, effective_base)
     if changed_files is None:
         changed_files = []
+
+    changed_files = sorted(set(changed_files) | set(control_changes))
 
     # Scope check
     scope_status = "ok"
@@ -396,6 +439,10 @@ def dispatch_job(
         scope_out = (s_out + "\n" + s_err).strip()
         if s_rc != 0:
             scope_status = "violation"
+
+    if control_changes:
+        scope_status = "violation"
+        scope_out = "\n".join(f"SCOPE_VIOLATION: {name} is broker control data" for name in control_changes)
 
     # Gate + test_lock + preflight_lint
     gate_status = "skipped"
@@ -514,6 +561,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "and test_lock."
         ),
     )
+    parser.add_argument("--submit", action="store_true", help="Submit through the host broker")
     parser.add_argument(
         "--engine",
         required=True,
@@ -616,8 +664,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for ``runner/devpack_dispatch.py``."""
+    effective_argv = list(argv) if argv is not None else sys.argv[1:]
+    if _submission_requested(effective_argv):
+        from runner.devpack_submit import main as submit_main
+        return submit_main(effective_argv)
     parser = build_arg_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_args(effective_argv)
 
     brief_path = Path(args.brief).resolve()
     workdir = Path(args.workdir).resolve()

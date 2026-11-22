@@ -9,7 +9,6 @@
       "Edit(runs/**)",
       "Write(runs/**)",
       "Bash(python3 .devpack/pack/runner/devpack_dispatch.py *)",
-      "Bash(python3 .devpack/pack/runner/devpack_logs.py *)",
       "Bash(git status)",
       "Bash(git status *)",
       "Bash(git diff)",

@@ -28,6 +28,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import time
 import stat
 import subprocess
 import sys
@@ -1211,19 +1213,10 @@ def run_orchestrator_trial(
             if proc.returncode != 0:
                 raise RuntimeError(f"git {' '.join(args_git)} failed: {proc.stderr.strip()}")
 
-        pack_dir = work_dir / ORCHESTRATOR_PACK_PATH
-        for relative in ("runner", "enforcement", "workflow/templates", "orchestrator"):
-            shutil.copytree(
-                REPO_ROOT / relative, pack_dir / relative,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-            )
-        for installed in pack_dir.rglob("*"):
-            installed.chmod(installed.stat().st_mode & ~0o222)
-        pack_dir.chmod(pack_dir.stat().st_mode & ~0o222)
+        # The broker installs only a credential-free client under this path.
+        (work_dir / ".devpack").mkdir(exist_ok=True)
         (work_dir / ".devpack/project.toml").write_text(
-            'data_class = "internal"\n'
-            f'engines_config = "{ORCHESTRATOR_PACK_PATH}/runner/engines.example.toml"\n'
-            'runs_root = "runs"\n', encoding="utf-8",
+            'data_class = "internal"\n', encoding="utf-8",
         )
         orch_src = REPO_ROOT / "orchestrator"
         if (orch_src / "CLAUDE.md").is_file():
@@ -1236,7 +1229,7 @@ def run_orchestrator_trial(
         if exclude_file.parent.is_dir():
             existing = exclude_file.read_text(encoding="utf-8") if exclude_file.is_file() else ""
             exclude_file.write_text(
-                existing + "\n.claude/\n.devpack/\nCLAUDE.md\nbriefs/\nruns/\n",
+                existing + "\n.claude/\nCLAUDE.md\nbriefs/\nruns/\n",
                 encoding="utf-8",
             )
 
@@ -1247,7 +1240,7 @@ def run_orchestrator_trial(
             f"## Dispatch Environment\n"
             f"- Worker engine(s): `{worker_engines_str}`\n"
             f"- Dispatch command: `python3 {dispatch_script} --engine <worker> --brief briefs/<file>.md "
-            "--workdir . --allow ... --gate-cmd <check-command>`\n"
+            "--submit --workdir . --allow ...`\n"
             "- Never use Edit or Write on files outside `briefs/**` and `runs/**`.\n"
         )
 
@@ -1287,7 +1280,35 @@ def run_orchestrator_trial(
             tmp_dir=tmp_dir,
             home_placeholder="$HOME",
         )
-        agent_res = run_agent(request)
+        broker_command = [
+            sys.executable, str(REPO_ROOT / "runner/devpack_broker.py"),
+            "--workdir", str(work_dir), "--runs-root", str(trial_run_dir / "workers"),
+            "--workers", worker_engines_str, "--gate-cmd", "true",
+            "--docker-bin", docker_bin or "docker", "--image-tag", image_tag,
+        ]
+        if credentials_path is not None:
+            broker_command.extend(["--credentials", str(credentials_path)])
+        broker_log = (trial_run_dir / "broker.txt").open("w", encoding="utf-8")
+        broker = subprocess.Popen(broker_command, stdout=broker_log, stderr=broker_log,
+                                  start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            marker = work_dir / ".devpack/broker.json"
+            while not marker.is_file():
+                if broker.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("broker failed to start; see broker.txt")
+                time.sleep(0.05)
+            agent_res = run_agent(request)
+        finally:
+            if broker.poll() is None:
+                os.killpg(broker.pid, signal.SIGTERM)
+                try:
+                    broker.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(broker.pid, signal.SIGKILL)
+                    broker.wait(timeout=5)
+            broker_log.close()
+            (work_dir / ".devpack/broker.json").unlink(missing_ok=True)
 
         def _redact(text: str) -> str:
             """Redact secrets and paths from text."""
@@ -1305,9 +1326,14 @@ def run_orchestrator_trial(
 
         analysis = analyze_orchestrator_transcript(agent_res.transcript_path)
 
+        # Grade the same product tree without host-generated queue/client artifacts.
+        # Workers have their own clean Git baseline and an explicit control-file check.
+        grading_work = trial_root / "grading-work"
+        shutil.copytree(work_dir, grading_work, symlinks=True,
+                        ignore=shutil.ignore_patterns(".devpack"))
         check_rc, check_out = _run_check_script(
             goal.check_sh,
-            work_dir,
+            grading_work,
             home_dir,
             tmp_dir,
             timeout_s,

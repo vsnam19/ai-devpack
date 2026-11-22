@@ -91,18 +91,23 @@ class DispatchReviewTests(unittest.TestCase):
             check.write_text('#!/bin/bash\nset -euo pipefail\ntest "$(cat "$2/result.txt")" = after\n')
             goal = run_eval.OrchestratorGoalSpec("mini", "feature", "smoke", root, goal_md, check)
             worker = root / "worker"
-            worker.write_text("#!/usr/bin/env python3\nimport json,pathlib\npathlib.Path('result.txt').write_text('after')\nprint(json.dumps({'type':'result','result':'done'}))\n")
+            worker.write_text("#!/usr/bin/env python3\nimport json,os,pathlib\nassert not pathlib.Path('.devpack').exists()\nassert 'broker-auth-token' in (pathlib.Path(os.environ['CLAUDE_CONFIG_DIR']) / '.credentials.json').read_text()\npathlib.Path('result.txt').write_text('after')\nprint(json.dumps({'type':'result','result':'done'}))\n")
             worker.chmod(0o755)
             docker = root / "docker"
             docker.write_text(
                 "#!/usr/bin/env python3\nimport os,sys\na=sys.argv\nassert a[1]=='run'\n"
                 "mount=a[a.index('-v')+1].split(':')[0]\nos.chdir(mount)\n"
+                "mounts=[a[i+1] for i,x in enumerate(a) if x=='-v']\n"
+                "cfg=next(x.split(':')[0] for x in mounts if ':/workspace/cfg:' in x)\n"
+                "assert any(':/workspace/task/.git:ro' in x for x in mounts)\n"
+                "os.environ['CLAUDE_CONFIG_DIR']=cfg\n"
                 f"os.execv({str(worker)!r}, [{str(worker)!r}])\n"
             )
             docker.chmod(0o755)
             orchestrator = root / "claude"
             orchestrator.write_text(
-                "#!/usr/bin/env python3\nimport fnmatch,json,pathlib,subprocess,sys\n"
+                "#!/usr/bin/env python3\nimport fnmatch,json,os,pathlib,subprocess,sys\n"
+                "assert not any(k=='DEVPACK_CLAUDE_CREDENTIALS' or k.startswith('DEVPACK_LOCAL_') for k in os.environ)\n"
                 "p=pathlib.Path\ns=json.loads(p('.claude/settings.json').read_text())\n"
                 "cmd='python3 .devpack/pack/runner/devpack_dispatch.py --engine haiku --brief briefs/job.md --workdir . --allow result.txt --gate-cmd true'\n"
                 "assert any(fnmatch.fnmatchcase(cmd,x[5:-1]) for x in s['permissions']['allow'] if x.startswith('Bash('))\n"
@@ -116,11 +121,15 @@ class DispatchReviewTests(unittest.TestCase):
                 "print(json.dumps({'type':'result','result':'done'}))\n"
             )
             orchestrator.chmod(0o755)
-            with mock.patch.dict(os.environ, {"PATH": str(root) + os.pathsep + os.environ["PATH"]}):
+            credentials = root / "credentials.json"
+            credentials.write_text('{"accessToken":"broker-auth-token"}')
+            with mock.patch.dict(os.environ, {"PATH": str(root) + os.pathsep + os.environ["PATH"],
+                                             "DEVPACK_CLAUDE_CREDENTIALS": str(credentials),
+                                             "DEVPACK_LOCAL_AUTH_TOKEN": "broker-local-token"}):
                 result = run_eval.run_orchestrator_trial(
                     goal=goal, orch_engine=agent_exec.resolve_engine("sonnet"), orch_label="sonnet->haiku",
                     worker_engines_str="haiku", run_index=1, run_root=root / "trials",
-                    fixture_dir=fixture, credentials_path=None, isolation="local",
+                    fixture_dir=fixture, credentials_path=credentials, isolation="local",
                     agent_bin=str(orchestrator), timeout_s=30, allow_unsandboxed_local=True,
                 )
             self.assertTrue(result.passed, (result.error, result.stderr_tail, result.check_output))
@@ -132,6 +141,11 @@ class DispatchReviewTests(unittest.TestCase):
             work = root / "trials/mini__sonnet->haiku__run1/work"
             self.assertEqual("after", (work / "result.txt").read_text())
             self.assertEqual(0, (work / '.devpack/pack/runner/devpack_dispatch.py').stat().st_mode & 0o222)
+            self.assertEqual(["runner/devpack_dispatch.py"], sorted(
+                p.relative_to(work / '.devpack/pack').as_posix()
+                for p in (work / '.devpack/pack').rglob('*') if p.is_file()))
+            self.assertFalse((work / '.devpack/broker.json').exists())
+            self.assertTrue(list((work / '.devpack/queue').glob('*.response.json')))
             runs = [json.loads(p.read_text()) for p in (root / 'trials').rglob('run.json')]
             self.assertTrue(any(r.get('sandbox_warning') for r in runs))
             self.assertTrue(any(r.get('isolation') == 'docker' for r in runs))

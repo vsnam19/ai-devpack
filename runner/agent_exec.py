@@ -1246,6 +1246,8 @@ def build_invocation(
         f"{resolved_workdir}:{DOCKER_TASK_DIR}:rw",
         "-v",
         f"{resolved_cfg}:/workspace/cfg:ro",
+        *(["-v", f"{resolved_workdir / '.git'}:{DOCKER_TASK_DIR}/.git:ro"]
+          if isinstance(request_or_engine, AgentRequest) and request_or_engine.role == "broker-worker" else []),
         image_tag,
         *_build_claude_tail(agent_bin_in_container),
     ]
