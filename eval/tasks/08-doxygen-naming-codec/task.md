@@ -1,6 +1,7 @@
 # Task: 08-doxygen-naming-codec
 
 Category: doxygen/naming
+Tier: smoke
 
 ## Goal
 

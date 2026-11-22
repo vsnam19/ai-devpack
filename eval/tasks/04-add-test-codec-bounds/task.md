@@ -1,6 +1,7 @@
 # Task: 04-add-test-codec-bounds
 
 Category: add-test
+Tier: smoke
 
 ## Goal
 

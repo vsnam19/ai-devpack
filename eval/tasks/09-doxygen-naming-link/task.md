@@ -1,6 +1,7 @@
 # Task: 09-doxygen-naming-link
 
 Category: doxygen/naming
+Tier: smoke
 
 ## Goal
 

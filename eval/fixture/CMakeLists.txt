@@ -21,6 +21,7 @@ add_library(can_fixture_lib STATIC
     src/can_codec.cpp
     src/ring_buffer.cpp
     src/link_state_machine.cpp
+    src/dtc_debouncer.cpp
 )
 target_include_directories(can_fixture_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -31,6 +32,7 @@ add_executable(fixture_tests
     tests/test_can_codec.cpp
     tests/test_ring_buffer.cpp
     tests/test_link_state_machine.cpp
+    tests/test_dtc_debouncer.cpp
 )
 target_include_directories(fixture_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

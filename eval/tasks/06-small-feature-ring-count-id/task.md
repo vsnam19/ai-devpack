@@ -1,6 +1,7 @@
 # Task: 06-small-feature-ring-count-id
 
 Category: small-feature
+Tier: smoke
 
 ## Goal
 

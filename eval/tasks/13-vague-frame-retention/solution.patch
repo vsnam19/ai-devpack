@@ -1,0 +1,6 @@
+diff --git a/.eval_v2_13-vague-frame-retention.md b/.eval_v2_13-vague-frame-retention.md
+new file mode 100644
+--- /dev/null
++++ b/.eval_v2_13-vague-frame-retention.md
+@@ -0,0 +1 @@
++REQ-RING-002: overwrite advances the oldest frame exactly once.

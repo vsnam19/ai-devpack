@@ -1,0 +1,5 @@
+diff --git a/src/link_state_machine.cpp b/src/link_state_machine.cpp
+--- a/src/link_state_machine.cpp
++++ b/src/link_state_machine.cpp
+@@
++/* Seeded review defect: recoverFromFault resets accumulated fault count. */

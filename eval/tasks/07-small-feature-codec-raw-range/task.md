@@ -1,6 +1,7 @@
 # Task: 07-small-feature-codec-raw-range
 
 Category: small-feature
+Tier: smoke
 
 ## Goal
 

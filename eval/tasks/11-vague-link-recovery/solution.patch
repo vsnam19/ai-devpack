@@ -1,0 +1,6 @@
+diff --git a/.eval_v2_11-vague-link-recovery.md b/.eval_v2_11-vague-link-recovery.md
+new file mode 100644
+--- /dev/null
++++ b/.eval_v2_11-vague-link-recovery.md
+@@ -0,0 +1 @@
++REQ-LINK-006: recovery preserves fault accounting and returns to Connecting.

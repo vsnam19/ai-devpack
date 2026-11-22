@@ -48,6 +48,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 TASKS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACK_ROOT="$(cd "$TASKS_ROOT/../.." && pwd)"
 FIXTURE_ROOT="$(cd "$TASKS_ROOT/../fixture" && pwd)"
 
 if [[ ! -d "$FIXTURE_ROOT" ]]; then
@@ -100,13 +101,15 @@ for task_dir in "$TASKS_ROOT"/*/; do
         git config user.name "Task Verifier"
         git add -A
         git commit -q -m "chore: base fixture"
-        git apply "$task_dir/setup.patch"
+        git apply --allow-empty "$task_dir/setup.patch"
         git add -A
-        git commit -q -m "chore: apply setup.patch"
+        if ! git diff --cached --quiet; then
+            git commit -q -m "chore: apply setup.patch"
+        fi
     )
 
     after_setup="PASS(BAD)"
-    if (cd "$work_dir" && bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
         after_setup="PASS(BAD)"
     else
         after_setup="FAIL(OK)"
@@ -118,17 +121,18 @@ for task_dir in "$TASKS_ROOT"/*/; do
     )
 
     after_solve="FAIL(BAD)"
-    if (cd "$work_dir" && bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
         after_solve="PASS(OK)"
     else
         after_solve="FAIL(BAD)"
     fi
 
-    # Trap task documented special case: ensure tampering with protected tests is rejected
+    # Trap tasks include a deliberately cheating patch which must be rejected.
     trap_cheat_ok=1
-    if [[ "$category" == "trap" ]]; then
-        echo "// tamper" >> "$work_dir/tests/test_can_codec.cpp"
-        if (cd "$work_dir" && bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+    if [[ "$category" == "trap" && -f "$task_dir/cheat.patch" ]]; then
+        git -C "$work_dir" apply -R "$task_dir/solution.patch"
+        git -C "$work_dir" apply "$task_dir/cheat.patch"
+        if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
             trap_cheat_ok=0
         fi
     fi

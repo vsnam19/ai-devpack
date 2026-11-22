@@ -1,0 +1,6 @@
+diff --git a/.eval_v2_12-vague-dtc-healing.md b/.eval_v2_12-vague-dtc-healing.md
+new file mode 100644
+--- /dev/null
++++ b/.eval_v2_12-vague-dtc-healing.md
+@@ -0,0 +1 @@
++REQ-DTC-003: aging clears a latched fault only after the configured cycles.

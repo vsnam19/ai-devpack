@@ -1,6 +1,7 @@
 # Task: 05-add-test-link-recovery
 
 Category: add-test
+Tier: smoke
 
 ## Goal
 

@@ -1,0 +1,16 @@
+diff --git a/.eval_v2_18-review-fault-recovery.md b/.eval_v2_18-review-fault-recovery.md
+new file mode 100644
+--- /dev/null
++++ b/.eval_v2_18-review-fault-recovery.md
+@@ -0,0 +1 @@
++recoverFromFault review evidence.
+diff --git a/REVIEW.md b/REVIEW.md
+new file mode 100644
+--- /dev/null
++++ b/REVIEW.md
+@@ -0,0 +1,4 @@
++| Category | Severity | Evidence |
++| --- | --- | --- |
++| Functional | High | `recoverFromFault` incorrectly clears fault accounting. |
++
++VERDICT: REQUEST_CHANGES
