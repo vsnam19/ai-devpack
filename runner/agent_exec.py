@@ -1777,15 +1777,16 @@ def redact_os_identities(
     return out
 
 
-# Stream-json protocol fields whose scalar values are exempt from OS-identity redaction
-# inside raw agent-CLI stdout lines: rewriting them (e.g. ``"type":"result"`` when the
-# host is named ``result``) breaks stream parsing. Exemptions apply ONLY in
-# :func:`redact_stream_line` at exact protocol positions:
+# Stream-json protocol fields whose scalar values skip OS-identity replacement inside raw
+# agent-CLI stdout lines: rewriting them (e.g. ``"type":"result"`` when the host is named
+# ``result``) breaks stream parsing. Protocol-position values still receive secret, PII,
+# and home-path redaction (see :func:`redact_sensitive_text` with no identities). Exemptions
+# apply ONLY in :func:`redact_stream_line` at exact protocol positions:
 #   event top level:              type, subtype, session_id, uuid, model, stop_reason
 #   event.message:                role, model, id, stop_reason, type
 #   event.message.content[]:      type, id, tool_use_id, and name only when type == "tool_use"
 # Everything else (including block ``input``, ``content``, and non-protocol keys) goes
-# through full redaction via :func:`redact_value`.
+# through full redaction (secrets, paths, and OS identities) via the full text function.
 _EVENT_PROTOCOL_KEYS = frozenset({"type", "subtype", "session_id", "uuid", "model", "stop_reason"})
 _EVENT_ENVELOPE_KEYS = _EVENT_PROTOCOL_KEYS | frozenset(
     {
@@ -1814,37 +1815,50 @@ _CONTENT_BLOCK_PROTOCOL_KEYS = frozenset({"type", "id", "tool_use_id"})
 _CONTENT_BLOCK_ENVELOPE_KEYS = _CONTENT_BLOCK_PROTOCOL_KEYS | frozenset(
     {"name", "input", "text", "thinking", "content", "is_error"}
 )
+# Identity set with no users, groups, or hosts: applying it skips OS-identity replacement.
+_NO_OS_IDENTITIES: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] = (
+    frozenset(),
+    frozenset(),
+    (),
+)
+
+
+def _protocol_scalar(item: Any, protocol_fn: Callable[[str], str]) -> Any:
+    """Return a protocol-position scalar with secret/PII/path redaction but no OS-identity replacement."""
+    return protocol_fn(item) if isinstance(item, str) else item
 
 
 def _redact_content_block(
     block: Any,
     text_fn: Callable[[str], str],
+    protocol_fn: Callable[[str], str],
 ) -> Any:
-    """Redact one ``message.content[]`` block, exempting only its protocol positions."""
+    """Redact one ``message.content[]`` block; protocol positions skip OS-identity replacement only."""
     if not isinstance(block, dict):
         return redact_value(block, _text_fn=text_fn)
     is_tool_use = block.get("type") == "tool_use"
     out: dict[str, Any] = {}
     for key, item in block.items():
-        exempt = (
+        protocol = (
             key in _CONTENT_BLOCK_PROTOCOL_KEYS or (key == "name" and is_tool_use)
         ) and not isinstance(item, (dict, list))
         out_key = key if key in _CONTENT_BLOCK_ENVELOPE_KEYS else text_fn(str(key))
-        out[out_key] = item if exempt else redact_value(item, _text_fn=text_fn)
+        out[out_key] = _protocol_scalar(item, protocol_fn) if protocol else redact_value(item, _text_fn=text_fn)
     return out
 
 
 def _redact_message(
     message: dict[str, Any],
     text_fn: Callable[[str], str],
+    protocol_fn: Callable[[str], str],
 ) -> dict[str, Any]:
-    """Redact ``event.message``, exempting its protocol fields and redacting each content block."""
+    """Redact ``event.message``; protocol fields skip OS-identity replacement, blocks are redacted."""
     out: dict[str, Any] = {}
     for key, item in message.items():
         if key in _MESSAGE_PROTOCOL_KEYS and not isinstance(item, (dict, list)):
-            out[key] = item
+            out[key] = _protocol_scalar(item, protocol_fn)
         elif key == "content" and isinstance(item, list):
-            out[key] = [_redact_content_block(block, text_fn) for block in item]
+            out[key] = [_redact_content_block(block, text_fn, protocol_fn) for block in item]
         else:
             out_key = key if key in _MESSAGE_ENVELOPE_KEYS else text_fn(str(key))
             out[out_key] = redact_value(item, _text_fn=text_fn)
@@ -1854,14 +1868,19 @@ def _redact_message(
 def _redact_stream_event(
     event: dict[str, Any],
     text_fn: Callable[[str], str],
+    protocol_fn: Callable[[str], str],
 ) -> dict[str, Any]:
-    """Redact one stream-json event object, exempting protocol fields only at their positions."""
+    """Redact one stream-json event; protocol fields skip OS-identity replacement only at their positions.
+
+    ``text_fn`` applies full redaction (secrets, paths, OS identities). ``protocol_fn``
+    applies secret, PII, and path redaction without OS-identity replacement.
+    """
     out: dict[str, Any] = {}
     for key, item in event.items():
         if key in _EVENT_PROTOCOL_KEYS and not isinstance(item, (dict, list)):
-            out[key] = item
+            out[key] = _protocol_scalar(item, protocol_fn)
         elif key == "message" and isinstance(item, dict):
-            out[key] = _redact_message(item, text_fn)
+            out[key] = _redact_message(item, text_fn, protocol_fn)
         else:
             out_key = key if key in _EVENT_ENVELOPE_KEYS else text_fn(str(key))
             out[out_key] = redact_value(item, _text_fn=text_fn)
@@ -1987,9 +2006,9 @@ def redact_stream_line(
     """Redact one raw agent-CLI stdout line, exempting stream-json protocol fields only.
 
     Intended solely for raw agent-CLI stdout in ``_read_stdout``. JSON object lines keep
-    scalar values at stream-json protocol positions intact while running full redaction
-    (secrets, paths, OS identities) on all other keys and values (including block ``input``
-    and ``content``). Non-JSON lines receive full text redaction.
+    scalar values at stream-json protocol positions skip OS-identity replacement but still get
+    secret, PII, and home-path redaction, while all other keys and values (including block
+    ``input`` and ``content``) get full redaction. Non-JSON lines receive full text redaction.
     """
     if not line:
         return line
@@ -2005,6 +2024,16 @@ def redact_stream_line(
             identities=ids,
         )
 
+    def _redact_protocol(text: str) -> str:
+        """Redact secrets and paths in one protocol-position string, skipping OS-identity replacement."""
+        return redact_sensitive_text(
+            text,
+            extra_secrets=extra_secrets,
+            path_replacements=path_replacements,
+            home_placeholder=home_placeholder,
+            identities=_NO_OS_IDENTITIES,
+        )
+
     body = line.rstrip("\r\n")
     ending = line[len(body):]
     stripped = body.strip()
@@ -2014,7 +2043,7 @@ def redact_stream_line(
         except ValueError:
             parsed = None
         if isinstance(parsed, dict):
-            redacted_obj = _redact_stream_event(parsed, _redact_leaf)
+            redacted_obj = _redact_stream_event(parsed, _redact_leaf, _redact_protocol)
             return json.dumps(redacted_obj, ensure_ascii=False, separators=(",", ":")) + ending
     return _redact_leaf(line)
 

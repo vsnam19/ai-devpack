@@ -359,6 +359,42 @@ class OsIdentityRedactionTests(unittest.TestCase):
         self.assertEqual("tu_1", blocks[2]["id"])
         self.assertEqual({"command": "[USER]"}, blocks[2]["input"])
 
+    def test_protocol_position_home_path_is_redacted_without_identity_exemption(self) -> None:
+        """A home path in a protocol scalar (``model``) is redacted like a path elsewhere."""
+        fake_path = "/" + "ho" + "me/alice/models/custom"
+        line = json.dumps({"type": "system", "model": fake_path})
+        with _mock_os_context():
+            obj = json.loads(agent_exec.redact_stream_line(line))
+            elsewhere = agent_exec.redact_stream_line(
+                json.dumps({"type": "system", "note": fake_path})
+            )
+        self.assertEqual("system", obj["type"])
+        self.assertEqual("~/models/custom", obj["model"])
+        self.assertNotIn("/" + "ho" + "me/alice", json.dumps(obj))
+        self.assertEqual("~/models/custom", json.loads(elsewhere)["note"])
+
+    def test_protocol_position_secret_in_message_id_is_redacted(self) -> None:
+        """A secret token at a protocol position (``message.id``) is still redacted."""
+        fake_token = "FAKE_PROTOCOL_TOKEN_556677"
+        line = json.dumps(
+            {"type": "assistant", "message": {"role": "assistant", "id": fake_token, "content": []}}
+        )
+        with _mock_os_context():
+            redacted = agent_exec.redact_stream_line(line, extra_secrets=[fake_token])
+        self.assertNotIn(fake_token, redacted)
+        obj = json.loads(redacted)
+        self.assertEqual("<REDACTED_CREDENTIALS>", obj["message"]["id"])
+        self.assertEqual("assistant", obj["message"]["role"])
+
+    def test_result_event_parses_when_host_is_named_result(self) -> None:
+        """With the host named ``result``, ``{"type":"result"}`` still parses as a result event."""
+        line = '{"type":"result"}\n'
+        with _mock_os_context(hostname="result"):
+            redacted = agent_exec.redact_stream_line(line)
+        self.assertTrue(redacted.endswith("\n"))
+        obj = json.loads(redacted)
+        self.assertEqual("result", obj["type"])
+
     def test_tool_use_input_name_is_redacted_while_tool_name_stays(self) -> None:
         """A tool_use block keeps its tool name but redacts identity values inside its input."""
         line = json.dumps(
