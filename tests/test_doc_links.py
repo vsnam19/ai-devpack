@@ -8,17 +8,24 @@ import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PREFIXES = ("enforcement", "eval", "runner", "workflow", "policy", "knowledge")
+PREFIXES = ("enforcement", "eval", "runner", "workflow", "policy", "knowledge", "tests")
 PATH_RE = re.compile(r"(?<![\w./-])((?:%s)/[A-Za-z0-9_./-]*)" % "|".join(PREFIXES))
 SPAN_RE = re.compile(r"`([^`\n]+)`")
 DOC_ROOTS = ("policy", "knowledge", "workflow")
 
 
 def doc_files() -> list[pathlib.Path]:
-    """Return README.md and every markdown/yaml/Jenkinsfile doc under the doc directories."""
-    files = [ROOT / "README.md"]
+    """Return README.md, CHANGELOG.md, every doc under the doc directories and every eval markdown file.
+
+    eval/results/ is excluded because it holds generated run output, not maintained docs.
+    """
+    files = [ROOT / "README.md", ROOT / "CHANGELOG.md"]
     for name in DOC_ROOTS:
         files.extend(p for p in sorted((ROOT / name).rglob("*")) if p.is_file())
+    results_dir = ROOT / "eval" / "results"
+    files.extend(
+        p for p in sorted((ROOT / "eval").rglob("*.md")) if results_dir not in p.parents
+    )
     return files
 
 

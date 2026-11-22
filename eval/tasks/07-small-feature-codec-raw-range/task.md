@@ -23,13 +23,13 @@ Specifically:
    - If `signal.isSigned` (signed two's-complement signal):
      - If `signal.bitLength >= 64U`, return `true` (all `std::int64_t` values fit in 64 signed bits).
      - Otherwise, compute `minSigned = -(1LL << (signal.bitLength - 1U))` and `maxSigned = (1LL << (signal.bitLength - 1U)) - 1LL`, and return `candidateValue >= minSigned && candidateValue <= maxSigned`.
-3. In `tests/test_can_codec.cpp`, add a unit test tagged `@req REQ-CODEC-007` and call it from `runCanCodecTests()`.
+3. In `test_can_codec.cpp` (in `tests/`), add a unit test tagged `@req REQ-CODEC-007` and call it from `runCanCodecTests()`.
 
 ## Files allowed
 
 - `include/can_codec.hpp`
 - `src/can_codec.cpp`
-- `tests/test_can_codec.cpp`
+- `test_can_codec.cpp` (in `tests/`)
 
 ## Commands to run
 
@@ -37,7 +37,7 @@ Specifically:
 
 ## STOP rule
 
-- Only edit `include/can_codec.hpp`, `src/can_codec.cpp`, and `tests/test_can_codec.cpp`.
+- Only edit `include/can_codec.hpp`, `src/can_codec.cpp`, and `test_can_codec.cpp` (in `tests/`).
 - Follow all Doxygen (`@param[in]`) and naming rules (no non-meaningful names such as `tmp`, `val`, `buf`).
 - Never delete or weaken existing tests or assertions.
 - Maximum 2 fix attempts per distinct error; if still failing, stop and report the exact failure.

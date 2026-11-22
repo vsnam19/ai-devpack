@@ -8,7 +8,7 @@ Fix a defect in `src/can_codec.cpp` where signed CAN signals (`SignalDef::isSign
 
 Specifically:
 - `can_fixture::signExtend(rawValue, bitLength)` must treat bit `bitLength - 1` (0-indexed) as the sign bit for any `bitLength` in `[1, 63]` and fill upper bits `[bitLength, 63]` with `1` when that sign bit is set.
-- `REQ-CODEC-004` unit tests in `tests/test_can_codec.cpp` must pass.
+- `REQ-CODEC-004` unit tests in `test_can_codec.cpp` (in `tests/`) must pass.
 
 ## Files allowed
 

@@ -51,7 +51,7 @@ python3 eval/run_eval.py \
   --k 5 \
   --tasks all \
   --credentials "$DEVPACK_CLAUDE_CREDENTIALS" \
-  --out eval/results
+  --out /tmp/devpack-eval-results
 ```
 
 In Docker mode:
@@ -77,7 +77,7 @@ python3 eval/run_eval.py \
   --k 3 \
   --tasks 01-bugfix-codec-sign \
   --credentials "$DEVPACK_CLAUDE_CREDENTIALS" \
-  --out eval/results
+  --out /tmp/devpack-eval-results
 ```
 
 In local mode:

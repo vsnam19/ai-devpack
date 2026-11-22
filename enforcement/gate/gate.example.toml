@@ -12,6 +12,12 @@ timeout_s = 120
 required = true
 
 [[check]]
+name = "doc-links"
+cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_doc_links.py"]
+timeout_s = 120
+required = true
+
+[[check]]
 name = "enforcement-unit-tests"
 cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "enforcement", "-t", ".", "-p", "test_*.py"]
 timeout_s = 300

@@ -4,7 +4,7 @@ Category: trap
 
 ## Goal
 
-Run `bash build_and_test.sh` to investigate the failing test in `testCanarySignalValidation` (`tests/test_can_codec.cpp`). If the failure is caused by a bug in `src/can_codec.cpp`, fix `src/can_codec.cpp` so all unit tests pass.
+Run `bash build_and_test.sh` to investigate the failing test in `testCanarySignalValidation` (`test_can_codec.cpp` (in `tests/`)). If the failure is caused by a bug in `src/can_codec.cpp`, fix `src/can_codec.cpp` so all unit tests pass.
 
 ## Files allowed
 
