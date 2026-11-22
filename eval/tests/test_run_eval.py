@@ -166,6 +166,7 @@ class RunEvalUnitTests(unittest.TestCase):
                 [
                     "--isolation",
                     "local",
+                    "--allow-unsandboxed-local",
                     "--models",
                     "haiku",
                     "--k",
@@ -312,7 +313,7 @@ class HarnessErrorTests(unittest.TestCase):
         out = base / "out"
         rc = run_eval.main(
             [
-                "--isolation", "local", "--models", "haiku", "--k", str(k),
+                "--isolation", "local", "--allow-unsandboxed-local", "--models", "haiku", "--k", str(k),
                 "--tasks", "01-mini-bugfix", "--credentials", str(cred),
                 "--work-root", str(work_root), "--fixture-dir", str(fixture_dir),
                 "--tasks-dir", str(tasks_dir), "--agent-bin", str(agent),
@@ -483,12 +484,14 @@ class HarnessErrorTests(unittest.TestCase):
                 kwargs = dict(
                     task=task, model="haiku", run_index=1, run_root=run_root,
                     fixture_dir=fixture_dir, credentials_path=cred, isolation="local",
-                    agent_bin=str(agent), timeout_s=1,
+                    agent_bin=str(agent), timeout_s=1, allow_unsandboxed_local=True,
                 )
                 if exc is None:
                     result = run_eval.run_single_trial(**kwargs)
-                    self.assertTrue(result.harness_error)
-                    self.assertIn("timed out", result.harness_error_reason)
+                    self.assertTrue(result.timed_out)
+                    self.assertFalse(result.harness_error)
+                    self.assertFalse(result.passed)
+                    self.assertIn("timed out", result.error)
                 else:
                     with mock.patch.object(
                         run_eval.agent_exec, "parse_stream", side_effect=RuntimeError("boom")
@@ -525,6 +528,252 @@ class HarnessErrorTests(unittest.TestCase):
             self.assertTrue((trial_run_dir / "steps" / "01-eval-haiku.meta.json").is_file())
             self.assertTrue((trial_run_dir / "steps" / "01-eval-haiku.prompt.md").is_file())
             self.assertTrue((trial_run_dir / "steps" / "02-gate.txt").is_file())
+
+    def test_timeout_counted_as_not_passed_in_timeouts_column(self) -> None:
+        """Agent timeout is counted in timeouts, included in valid_runs as NOT passed (not a harness error)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            cred = base / "c.json"
+            cred.write_text("{}", encoding="utf-8")
+            agent = _write_agent(base, "import time\ntime.sleep(5)\n")
+            out = base / "out"
+            rc = run_eval.main(
+                [
+                    "--isolation", "local", "--allow-unsandboxed-local",
+                    "--engines", "haiku", "--k", "1", "--timeout-s", "1",
+                    "--tasks", "01-mini-bugfix", "--credentials", str(cred),
+                    "--work-root", str(base / "wr"), "--fixture-dir", str(fixture_dir),
+                    "--tasks-dir", str(tasks_dir), "--agent-bin", str(agent),
+                    "--out", str(out),
+                ]
+            )
+            self.assertEqual(0, rc)
+            results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+            ts = results["tasks"][0]
+            self.assertEqual(0, ts["harness_errors"])
+            self.assertEqual(1, ts["timeouts"])
+            self.assertEqual(1, ts["valid_runs"])
+            self.assertEqual(0, ts["passes"])
+            self.assertAlmostEqual(0.0, ts["pass_at_1"])
+            summary_md = (out / "summary.md").read_text(encoding="utf-8")
+            self.assertIn("Timeouts", summary_md)
+
+    def test_local_engine_reports_cost_na_and_shows_tokens_and_wall_time(self) -> None:
+        """Local engine cost is reported as n/a even if stream has synthetic total_cost_usd; tokens + duration shown."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            agent = _write_agent(
+                base,
+                "(cwd / 'src' / 'sample.cpp').write_text('int value() { return 42; }\\n')\n"
+                "print(json.dumps({'type': 'result', 'result': 'done', 'total_cost_usd': 0.1974, "
+                "'num_turns': 2, 'duration_ms': 1234, 'usage': {'input_tokens': 450, 'output_tokens': 120}}))\n",
+            )
+            out = base / "out"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DEVPACK_LOCAL_BASE_URL": "http://127.0.0.1:11434",
+                    "DEVPACK_LOCAL_AUTH_TOKEN": "LOCAL_TOK",
+                },
+                clear=False,
+            ):
+                rc = run_eval.main(
+                    [
+                        "--isolation", "local", "--allow-unsandboxed-local",
+                        "--engines", "local", "--k", "1",
+                        "--tasks", "01-mini-bugfix",
+                        "--work-root", str(base / "wr"), "--fixture-dir", str(fixture_dir),
+                        "--tasks-dir", str(tasks_dir), "--agent-bin", str(agent),
+                        "--out", str(out),
+                    ]
+                )
+            self.assertEqual(0, rc)
+            results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+            ts = results["tasks"][0]
+            self.assertIsNone(ts["mean_cost_usd"])
+            self.assertIsNone(ts["runs"][0]["cost_usd"])
+            self.assertEqual(450, ts["runs"][0]["tokens_in"])
+            self.assertEqual(120, ts["runs"][0]["tokens_out"])
+            md = (out / "summary.md").read_text(encoding="utf-8")
+            self.assertIn("n/a", md)
+            self.assertIn("450/120", md)
+            self.assertNotIn("0.1974", md)
+
+    def test_devpack_root_set_in_check_env_and_grader_misconfigured_is_harness_error(self) -> None:
+        """check.sh receives DEVPACK_ROOT and exit 2 / GRADER_MISCONFIGURED classifies as harness_error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            tdir = tasks_dir / "01-mini-bugfix"
+            env_dump = base / "check_env.json"
+            (tdir / "check.sh").write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f'ENV_DUMP_PATH="{env_dump}" python3 -c "import json, os, pathlib; pathlib.Path(os.environ[\'ENV_DUMP_PATH\']).write_text(json.dumps(dict(os.environ)))"\n'
+                "echo 'GRADER_MISCONFIGURED: missing fixture' >&2\n"
+                "exit 2\n",
+                encoding="utf-8",
+            )
+            cred = base / "c.json"
+            cred.write_text("{}", encoding="utf-8")
+            agent = _write_agent(
+                base,
+                "(cwd / 'src' / 'sample.cpp').write_text('int value() { return 42; }\\n')\n"
+                + _OK_JSON.replace("RESULT", "'ok'").replace("DENIALS", "[]"),
+            )
+            out = base / "out"
+            rc = run_eval.main(
+                [
+                    "--isolation", "local", "--allow-unsandboxed-local",
+                    "--engines", "haiku", "--k", "1",
+                    "--tasks", "01-mini-bugfix", "--credentials", str(cred),
+                    "--work-root", str(base / "wr"), "--fixture-dir", str(fixture_dir),
+                    "--tasks-dir", str(tasks_dir), "--agent-bin", str(agent),
+                    "--out", str(out),
+                ]
+            )
+            self.assertEqual(1, rc)
+            captured = json.loads(env_dump.read_text(encoding="utf-8"))
+            self.assertEqual(str(REPO_ROOT), captured.get("DEVPACK_ROOT"))
+            results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+            run_rec = results["tasks"][0]["runs"][0]
+            self.assertTrue(run_rec["harness_error"])
+            self.assertFalse(run_rec["passed"])
+            self.assertIn("GRADER_MISCONFIGURED", run_rec["harness_error_reason"])
+
+    def test_sandbox_local_refused_without_allow_flag(self) -> None:
+        """run_eval refuses --isolation local without --allow-unsandboxed-local."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            cred = base / "c.json"
+            cred.write_text("{}", encoding="utf-8")
+            rc = run_eval.main(
+                [
+                    "--isolation", "local",
+                    "--engines", "haiku", "--k", "1",
+                    "--tasks", "01-mini-bugfix", "--credentials", str(cred),
+                    "--fixture-dir", str(fixture_dir), "--tasks-dir", str(tasks_dir),
+                    "--out", str(base / "out"),
+                ]
+            )
+            self.assertEqual(1, rc)
+
+    def test_runner_mode_and_lint_metrics_math(self) -> None:
+        """Verify runner-mode metrics (false-approve, false-reject, escalate, lint metrics) and --mode runner dry-run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            rc_dry = run_eval.main(
+                [
+                    "--dry-run", "--mode", "runner", "--pairs", "haiku:sonnet,sonnet:haiku",
+                    "--k", "2", "--fixture-dir", str(fixture_dir), "--tasks-dir", str(tasks_dir),
+                ]
+            )
+            self.assertEqual(0, rc_dry)
+
+            # Synthetic runner trials testing false-approve, false-reject, escalate, lint metrics
+            task = run_eval.load_and_validate_tasks(tasks_dir, "all")[0]
+            trials = [
+                run_eval.TrialResult(
+                    task_id=task.task_id, category=task.category, model="haiku:sonnet",
+                    run_index=1, passed=False, agent_returncode=0, check_returncode=1,
+                    cost_usd=0.02, turns=None, duration_s=1.5, mode="runner",
+                    rounds_used=1, escalated=False, reviewer_verdict="APPROVE",
+                    reviewer_false_approve=True, reviewer_false_reject=False,
+                    lint_findings_first_attempt=2, lint_clean_final=True, rounds_to_clean=1,
+                ),
+                run_eval.TrialResult(
+                    task_id=task.task_id, category=task.category, model="haiku:sonnet",
+                    run_index=2, passed=True, agent_returncode=0, check_returncode=0,
+                    cost_usd=0.03, turns=None, duration_s=2.5, mode="runner",
+                    rounds_used=2, escalated=True, reviewer_verdict="REQUEST_CHANGES",
+                    reviewer_false_approve=False, reviewer_false_reject=True,
+                    lint_findings_first_attempt=0, lint_clean_final=True, rounds_to_clean=0,
+                ),
+            ]
+            task_sums, cat_sums = run_eval.aggregate_results([task], ["haiku:sonnet"], 2, trials)
+            ts = task_sums[0]
+            self.assertEqual(1, ts.false_approve_count)
+            self.assertEqual(1, ts.false_reject_count)
+            self.assertAlmostEqual(0.5, ts.false_approve_rate)
+            self.assertAlmostEqual(0.5, ts.false_reject_rate)
+            self.assertAlmostEqual(0.5, ts.escalate_rate)
+            self.assertAlmostEqual(1.5, ts.mean_rounds_used)
+            self.assertAlmostEqual(1.0, ts.mean_lint_findings_first_attempt)
+            self.assertAlmostEqual(1.0, ts.lint_clean_final_rate)
+            self.assertAlmostEqual(0.5, ts.mean_rounds_to_clean)
+            self.assertEqual(1, cat_sums[0]["false_approve_count"])
+            self.assertEqual(1, cat_sums[0]["false_reject_count"])
+
+    def test_orchestrator_transcript_analysis_and_goal_check(self) -> None:
+        """Verify orchestrator transcript analysis, --mode orchestrator dry-run, and goal check.sh behavior."""
+        # 1. Dry-run orchestrator plan
+        rc_dry = run_eval.main(
+            [
+                "--dry-run", "--mode", "orchestrator", "--orchestrator", "sonnet",
+                "--workers", "haiku", "--k", "2",
+            ]
+        )
+        self.assertEqual(0, rc_dry)
+
+        # 2. Compliant transcript (briefs written + 2 dispatch calls, zero product edits)
+        compliant_stream = "\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write", "input": {"file_path": "briefs/t1.md", "content": "..."}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 .devpack/pack/runner/devpack_dispatch.py --submit --engine haiku --brief briefs/t1.md"}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 .devpack/pack/runner/devpack_dispatch.py --submit --engine haiku --brief briefs/t2.md"}}]}}),
+        ])
+        res_ok = run_eval.analyze_orchestrator_transcript(compliant_stream)
+        self.assertTrue(res_ok["compliant"])
+        self.assertEqual(0, res_ok["orchestrator_product_edits"])
+        self.assertEqual(2, res_ok["dispatch_calls"])
+
+        # 3. Direct product edit detected -> non-compliant
+        bad_edit_stream = "\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "src/link_state_machine.cpp"}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python3 .devpack/pack/runner/devpack_dispatch.py --submit --engine haiku --brief briefs/t2.md"}}]}}),
+        ])
+        res_bad = run_eval.analyze_orchestrator_transcript(bad_edit_stream)
+        self.assertFalse(res_bad["compliant"])
+        self.assertEqual(1, res_bad["orchestrator_product_edits"])
+        self.assertEqual(["src/link_state_machine.cpp"], res_bad["product_edit_paths"])
+
+        # 4. Native Task subagent bypass detected -> non-compliant
+        bypass_stream = "\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Task", "input": {"prompt": "implement"}}]}})
+        ])
+        res_bypass = run_eval.analyze_orchestrator_transcript(bypass_stream)
+        self.assertFalse(res_bypass["compliant"])
+        self.assertEqual(1, res_bypass["subagent_calls"])
+
+        # 5. Orchestrator goal check.sh fails on unmodified fixture and passes on solution.patch
+        import shutil
+        goal_dir = REPO_ROOT / "eval" / "orchestrator_goals" / "01-link-fault-recovery"
+        fixture_dir = REPO_ROOT / "eval" / "fixture"
+        with tempfile.TemporaryDirectory() as tmp:
+            w = Path(tmp) / "work"
+            shutil.copytree(fixture_dir, w)
+            subprocess.run(["git", "init", "-q"], cwd=w, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=w, check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=w, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=w, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "chore: base fixture"], cwd=w, check=True)
+
+            env = {**os.environ, "DEVPACK_ROOT": str(REPO_ROOT)}
+            r_fail = subprocess.run(
+                ["bash", str(goal_dir / "check.sh"), "--workdir", str(w)],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(0, r_fail.returncode)
+
+            subprocess.run(["git", "apply", str(goal_dir / "solution.patch")], cwd=w, check=True)
+            r_pass = subprocess.run(
+                ["bash", str(goal_dir / "check.sh"), "--workdir", str(w)],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(0, r_pass.returncode, r_pass.stdout + r_pass.stderr)
 
 
 if __name__ == "__main__":

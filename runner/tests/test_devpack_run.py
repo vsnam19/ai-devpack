@@ -199,6 +199,9 @@ class DevpackRunUnitTests(unittest.TestCase):
                     str(log_dir),
                     "--task-id",
                     "task-converge",
+                    "--isolation",
+                    "local",
+                    "--allow-unsandboxed-local",
                 ]
             )
             self.assertEqual(0, rc)
@@ -251,6 +254,9 @@ class DevpackRunUnitTests(unittest.TestCase):
                     str(log_dir),
                     "--task-id",
                     "task-escalate",
+                    "--isolation",
+                    "local",
+                    "--allow-unsandboxed-local",
                 ]
             )
             self.assertEqual(1, rc)
@@ -334,6 +340,9 @@ class DevpackRunUnitTests(unittest.TestCase):
                     str(fake_claude),
                     "--task-id",
                     "v2-task-01",
+                    "--isolation",
+                    "local",
+                    "--allow-unsandboxed-local",
                 ]
             )
             self.assertEqual(0, rc)
@@ -367,6 +376,121 @@ class DevpackRunUnitTests(unittest.TestCase):
                     (steps_dir / expected_step).is_file(),
                     f"Missing expected step artifact: {expected_step}",
                 )
+
+    def test_preflight_lint_failure_populates_fix_brief_verbatim_and_tracks_metrics(self) -> None:
+        """Verify preflight lint findings fail the gate, paste verbatim into fix brief, and record lint metrics."""
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "worktree"
+            (wt / "src").mkdir(parents=True)
+            (wt / "preflight.toml").write_text('[general]\nstd = "c++17"\n', encoding="utf-8")
+            (wt / "src" / "calc.cpp").write_text(
+                "/**\n * @file calc.cpp\n * @brief Calc.\n */\n"
+                "/**\n * @brief Add one.\n * @param[in] value Input.\n * @return Output.\n */\n"
+                "int addOne(int value) { return value + 1; }\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=wt, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=wt, check=True)
+
+            # Fake claude: 1st call (implementer) writes C-style cast + missing doxygen;
+            # 2nd call (fixer) writes clean C++; 3rd call (reviewer) approves.
+            state_path = base / "lint_state.json"
+            state_path.write_text(json.dumps({"step": 0}), encoding="utf-8")
+            fake_claude = base / "fake_claude.py"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"sf = pathlib.Path({str(state_path)!r})\n"
+                "st = json.loads(sf.read_text(encoding='utf-8'))\n"
+                "st['step'] += 1\n"
+                "n = st['step']\n"
+                "sf.write_text(json.dumps(st), encoding='utf-8')\n"
+                "target = pathlib.Path('src/calc.cpp')\n"
+                "if n == 1:\n"
+                "    target.write_text('int addOne(int tmp) { return (int)tmp + 1; }\\n', encoding='utf-8')\n"
+                "    res = 'Implemented'\n"
+                "elif n == 2:\n"
+                "    target.write_text('/**\\n * @file calc.cpp\\n * @brief Calc.\\n */\\n/**\\n * @brief Add one.\\n * @param[in] inputValue Input.\\n * @return Incremented value.\\n */\\nint addOne(int inputValue) { return inputValue + 1; }\\n', encoding='utf-8')\n"
+                "    res = 'Fixed lint'\n"
+                "else:\n"
+                "    res = 'Clean\\nVERDICT: APPROVE'\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'total_cost_usd': 0.01, 'num_turns': 1, 'duration_ms': 50, 'result': res}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_claude, stat.S_IRWXU)
+
+            fake_gate = base / "fake_gate.py"
+            fake_gate.write_text("#!/usr/bin/env python3\nprint('BUILD_OK')\n", encoding="utf-8")
+            os.chmod(fake_gate, stat.S_IRWXU)
+
+            config_path = base / "engines.toml"
+            config_path.write_text(
+                "version = 2\n"
+                f'gate_cmd = ["python3", "{fake_gate}"]\n'
+                "[engines.haiku]\n"
+                'model = "haiku"\n'
+                'class = "cloud"\n'
+                "[roles]\n"
+                'implementer = "haiku"\n'
+                'reviewer = "haiku"\n'
+                'fixer = "haiku"\n',
+                encoding="utf-8",
+            )
+
+            runs_root = base / "runs"
+            rc = devpack_run.main(
+                [
+                    "--config", str(config_path),
+                    "--worktree", str(wt),
+                    "--runs-root", str(runs_root),
+                    "--agent-bin", str(fake_claude),
+                    "--task-id", "lint-loop",
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(0, rc)
+            rdir = next(runs_root.iterdir())
+            summary = json.loads((rdir / "run_summary.json").read_text(encoding="utf-8"))
+            self.assertGreater(summary["lint_findings_first_attempt"], 0)
+            self.assertTrue(summary["lint_clean_final"])
+            self.assertEqual(1, summary["rounds_to_clean"])
+
+            impl_prompt = (rdir / "steps" / "01-implementer-haiku.prompt.md").read_text(encoding="utf-8")
+            self.assertIn("Code Quality Checklist", impl_prompt)
+
+            fix_prompt = (rdir / "steps" / "03-fixer-haiku.prompt.md").read_text(encoding="utf-8")
+            self.assertIn("MISRA-8.2.2", fix_prompt)
+            self.assertIn("DOXYGEN-FILE", fix_prompt)
+
+    def test_local_isolation_refused_without_allow_flag(self) -> None:
+        """Verify devpack_run defaults to docker and refuses --isolation local without explicit allow."""
+        args = devpack_run.build_arg_parser().parse_args([])
+        self.assertEqual("docker", args.isolation)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            script_path = base / "fake.py"
+            state_path = base / "state.json"
+            state_path.write_text(json.dumps({}), encoding="utf-8")
+            _write_fake_driver_script(script_path, state_path)
+            cfg_path = base / "engines.toml"
+            _write_test_toml(cfg_path, script_path)
+            rc = devpack_run.main(
+                [
+                    "--config", str(cfg_path),
+                    "--worktree", str(base),
+                    "--runs-root", str(base / "runs"),
+                    "--isolation", "local",
+                ]
+            )
+            self.assertEqual(1, rc)
+            self.assertEqual([], json.loads(state_path.read_text()).get("calls", []))
 
 
 if __name__ == "__main__":
