@@ -388,7 +388,8 @@ def parse_stream_jsonl(
 ) -> None:
     """Parse a stream-json or session ``.jsonl`` file into ``step`` with redaction applied."""
     try:
-        raw_lines = jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        # Split on "\n" only: splitlines() would also break on U+2028, U+0085 and similar characters.
+        raw_lines = jsonl_path.read_text(encoding="utf-8", errors="replace").split("\n")
     except OSError:
         step.status = "harness_error"
         return

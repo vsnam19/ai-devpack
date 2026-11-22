@@ -751,6 +751,45 @@ class OsIdentityRedactionTests(unittest.TestCase):
                 self.assertNotIn("workstation-42", rendered)
                 self.assertIn("[HOST]", rendered)
 
+    def test_redacted_result_with_line_separator_stays_one_jsonl_line(self) -> None:
+        """A result holding a Unicode line separator stays on one JSONL line and still parses as the result."""
+        source = json.dumps({"type": "result", "subtype": "success", "result": "a b"}) + "\n"
+        with _mock_os_context():
+            redacted = agent_exec.redact_stream_line(source)
+        self.assertNotIn(" ", redacted)
+        self.assertEqual(1, len(redacted.strip().splitlines()))
+        parsed = agent_exec.parse_stream(redacted)
+        self.assertEqual("a b", parsed.final_text)
+
+    def test_parse_stream_splits_only_on_newline(self) -> None:
+        """parse_stream keeps a result whose JSON string holds raw U+2028, U+2029 or U+0085 characters.
+
+        These are legal unescaped JSON string content but are str.splitlines() line breaks.
+        """
+        for separator in (" ", " ", "\x85"):
+            with self.subTest(separator=hex(ord(separator))):
+                raw = '{"type":"result","subtype":"success","result":"a' + separator + 'b"}\n'
+                parsed = agent_exec.parse_stream(raw)
+                self.assertEqual("a" + separator + "b", parsed.final_text)
+
+    def test_devpack_logs_reader_sees_result_with_line_separator_as_one_event(self) -> None:
+        """parse_stream_jsonl reads a raw U+2028 result as exactly one event with no unparsed fragments."""
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl_path = Path(tmp) / "01-implementer-haiku.jsonl"
+            jsonl_path.write_text(
+                '{"type":"result","subtype":"success","result":"a b"}\n',
+                encoding="utf-8",
+            )
+            step = devpack_logs.StepRecord(
+                step_num="01",
+                step_id="01-implementer-haiku",
+                role="implementer",
+                engine="haiku",
+            )
+            devpack_logs.parse_stream_jsonl(jsonl_path, devpack_logs.Redactor(), step)
+        self.assertEqual(0, step.unknown_events)
+        self.assertEqual("a b", step.final_result)
+
 
 if __name__ == "__main__":
     unittest.main()

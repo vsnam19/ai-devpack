@@ -2044,7 +2044,9 @@ def redact_stream_line(
             parsed = None
         if isinstance(parsed, dict):
             redacted_obj = _redact_stream_event(parsed, _redact_leaf, _redact_protocol)
-            return json.dumps(redacted_obj, ensure_ascii=False, separators=(",", ":")) + ending
+            # ensure_ascii=True keeps U+2028/U+2029/U+0085 and other control characters escaped,
+            # so the redacted stream line stays one JSONL line under splitlines() readers.
+            return json.dumps(redacted_obj, ensure_ascii=True, separators=(",", ":")) + ending
     return _redact_leaf(line)
 
 
@@ -2129,7 +2131,9 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
 
     result_event: dict[str, Any] | None = None
 
-    for raw_line in raw_text.splitlines():
+    # Split on "\n" only: str.splitlines() also breaks on U+2028, U+0085 and other separators
+    # that may appear unescaped inside JSON strings.
+    for raw_line in raw_text.split("\n"):
         line = raw_line.strip()
         if not line or not (line.startswith("{") and line.endswith("}")):
             continue
