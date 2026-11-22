@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Header: Git pre-commit hook invoking secret_pii_check.py on staged changes.
+#
+# Usage:
+#   enforcement/hooks/pre-commit [--help] [extra secret_pii_check args...]
+#
+# Exit codes:
+#   0 - Staged files passed secret and PII checks.
+#   1 - Forbidden secret/PII detected in staged files, or scanner missing.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: pre-commit [--help] [--patterns FILE]
+
+Git pre-commit hook that scans staged changes for secrets and PII using
+enforcement/checks/secret_pii_check.py --staged.
+
+Exit codes:
+  0  No secrets or PII detected in staged files.
+  1  Secret/PII violation detected or hook configuration error.
+EOF
+}
+
+for arg in "$@"; do
+  case "${arg}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+done
+
+REAL_SCRIPT="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${REAL_SCRIPT}")" && pwd)"
+
+if REPO_TOP="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  REPO_ROOT="${REPO_TOP}"
+else
+  REPO_ROOT="$(pwd)"
+fi
+
+if [ -f "${REPO_ROOT}/enforcement/checks/secret_pii_check.py" ]; then
+  CHECK_SCRIPT="${REPO_ROOT}/enforcement/checks/secret_pii_check.py"
+elif [ -f "${SCRIPT_DIR}/../checks/secret_pii_check.py" ]; then
+  CHECK_SCRIPT="${SCRIPT_DIR}/../checks/secret_pii_check.py"
+else
+  echo "PRE_COMMIT_ERROR: secret_pii_check.py not found" >&2
+  exit 1
+fi
+
+exec python3 "${CHECK_SCRIPT}" --repo "${REPO_ROOT}" --staged "$@"
