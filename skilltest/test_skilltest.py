@@ -186,6 +186,7 @@ class SkilltestCliTests(unittest.TestCase):
             results = root / "results"
             result = self.run_cli(
                 "run", "knowledge/skills/doxygen-naming", "--engines", "haiku", "--k", "1",
+                "--isolation", "local", "--allow-unsandboxed-local",
                 "--agent-bin", str(fake), "--results-root", str(results)
             )
             self.assertEqual(result.returncode, 0, result.stderr)

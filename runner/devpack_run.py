@@ -590,6 +590,8 @@ def run_task_workflow(
     step_index = 0
     step_logs: list[str] = []
     total_cost_usd = 0.0
+    local_tokens = 0
+    local_wall_s = 0.0
     total_tokens_in = 0
     total_tokens_out = 0
     total_duration_s = 0.0
@@ -603,6 +605,7 @@ def run_task_workflow(
 
     def _invoke_role(role_name: str, engine: EngineConfig, prompt_text: str) -> agent_exec.AgentResult:
         """Run a role via agent_exec.run_agent and accumulate telemetry."""
+        nonlocal local_tokens, local_wall_s
         nonlocal total_cost_usd, total_tokens_in, total_tokens_out, total_duration_s
         nonlocal total_tool_protocol_errors, any_timeout, any_harness_error, first_harness_error
         step_stem = f"{step_index:02d}-{role_name}-{engine.name}"
@@ -629,7 +632,11 @@ def run_task_workflow(
             step_index=step_index,
         )
         res = run_agent(req)
-        total_cost_usd += float(res.cost_usd or 0.0)
+        if engine.is_cloud:
+            total_cost_usd += float(res.cost_usd or 0.0)
+        else:
+            local_tokens += int(res.tokens_in or 0) + int(res.tokens_out or 0)
+            local_wall_s += float(res.duration_s or 0.0)
         total_tokens_in += int(res.tokens_in or 0)
         total_tokens_out += int(res.tokens_out or 0)
         total_duration_s += float(res.duration_s or 0.0)
@@ -904,6 +911,8 @@ def run_task_workflow(
         "max_fix_rounds": max_fix_rounds,
         "escalation_reason": escalation_reason,
         "cost_usd": round(total_cost_usd, 6),
+        "local_tokens": local_tokens,
+        "local_wall_s": round(local_wall_s, 4),
         "tokens_in": total_tokens_in,
         "tokens_out": total_tokens_out,
         "duration_s": round(total_duration_s, 4),

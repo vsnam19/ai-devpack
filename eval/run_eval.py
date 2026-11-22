@@ -77,6 +77,8 @@ from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 
 EXCERPT_MAX_CHARS = 4000
 STDERR_TAIL_MAX_CHARS = 2000
+ORCHESTRATOR_PACK_PATH = Path(".devpack/pack")
+
 REQUIRED_TASK_FILES = ("task.md", "check.sh", "setup.patch", "solution.patch")
 
 
@@ -134,6 +136,8 @@ class TrialResult:
     engine_class: str = "cloud"
     tokens_in: int = 0
     tokens_out: int = 0
+    local_tokens: int = 0
+    local_wall_s: float = 0.0
     lint_findings_first_attempt: int | None = None
     lint_clean_final: bool | None = None
     rounds_to_clean: int | None = None
@@ -174,6 +178,8 @@ class TaskModelSummary:
     mean_lint_findings_first_attempt: float | None = None
     lint_clean_final_rate: float | None = None
     mean_rounds_to_clean: float | None = None
+    mean_local_tokens: float | None = None
+    mean_local_wall_s: float | None = None
     mean_rounds_used: float | None = None
     escalate_rate: float | None = None
     false_approve_count: int = 0
@@ -1119,6 +1125,8 @@ def run_runner_trial(
             lint_findings_first_attempt=summary.get("lint_findings_first_attempt"),
             lint_clean_final=summary.get("lint_clean_final"),
             rounds_to_clean=summary.get("rounds_to_clean"),
+            local_tokens=int(summary.get("local_tokens", 0) or 0),
+            local_wall_s=float(summary.get("local_wall_s", 0.0) or 0.0),
             mode="runner",
             rounds_used=int(summary.get("fix_rounds_used", 0) or 0),
             escalated=escalated,
@@ -1154,10 +1162,11 @@ def run_orchestrator_trial(
     trial_name = f"{goal.goal_id}__{safe_label}__run{run_index}"
     trial_root = run_root / trial_name
     try:
-        if isolation not in ("local", "docker"):
-            raise ValueError(f"Unsupported isolation mode: {isolation}")
-        if isolation == "docker" and not docker_bin:
-            raise RuntimeError("docker_bin is required for docker isolation mode")
+        if isolation != "local" or not allow_unsandboxed_local:
+            raise ValueError(
+                "Orchestrator sessions require --isolation local --allow-unsandboxed-local; "
+                "dispatched workers use Docker by default"
+            )
 
         home_dir = trial_root / "home"
         cfg_dir = trial_root / "cfg"
@@ -1202,6 +1211,20 @@ def run_orchestrator_trial(
             if proc.returncode != 0:
                 raise RuntimeError(f"git {' '.join(args_git)} failed: {proc.stderr.strip()}")
 
+        pack_dir = work_dir / ORCHESTRATOR_PACK_PATH
+        for relative in ("runner", "enforcement", "workflow/templates", "orchestrator"):
+            shutil.copytree(
+                REPO_ROOT / relative, pack_dir / relative,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+        for installed in pack_dir.rglob("*"):
+            installed.chmod(installed.stat().st_mode & ~0o222)
+        pack_dir.chmod(pack_dir.stat().st_mode & ~0o222)
+        (work_dir / ".devpack/project.toml").write_text(
+            'data_class = "internal"\n'
+            f'engines_config = "{ORCHESTRATOR_PACK_PATH}/runner/engines.example.toml"\n'
+            'runs_root = "runs"\n', encoding="utf-8",
+        )
         orch_src = REPO_ROOT / "orchestrator"
         if (orch_src / "CLAUDE.md").is_file():
             shutil.copyfile(orch_src / "CLAUDE.md", work_dir / "CLAUDE.md")
@@ -1213,18 +1236,18 @@ def run_orchestrator_trial(
         if exclude_file.parent.is_dir():
             existing = exclude_file.read_text(encoding="utf-8") if exclude_file.is_file() else ""
             exclude_file.write_text(
-                existing + "\n.claude/\nCLAUDE.md\nbriefs/\nruns/\n",
+                existing + "\n.claude/\n.devpack/\nCLAUDE.md\nbriefs/\nruns/\n",
                 encoding="utf-8",
             )
 
         goal_text = goal.goal_md.read_text(encoding="utf-8")
-        dispatch_script = str(REPO_ROOT / "runner" / "devpack_dispatch.py")
+        dispatch_script = str(ORCHESTRATOR_PACK_PATH / "runner/devpack_dispatch.py")
         prompt_text = (
             f"{goal_text.strip()}\n\n"
             f"## Dispatch Environment\n"
             f"- Worker engine(s): `{worker_engines_str}`\n"
             f"- Dispatch command: `python3 {dispatch_script} --engine <worker> --brief briefs/<file>.md "
-            f"--workdir {work_dir} --allow ... --isolation {isolation}`\n"
+            "--workdir . --allow ... --gate-cmd <check-command>`\n"
             "- Never use Edit or Write on files outside `briefs/**` and `runs/**`.\n"
         )
 
@@ -1236,13 +1259,18 @@ def run_orchestrator_trial(
             engines=[orch_engine.name],
         )
 
+        permissions = json.loads(
+            (work_dir / ".claude/settings.json").read_text(encoding="utf-8")
+        )["permissions"]
         request = AgentRequest(
             engine=orch_engine,
             prompt=prompt_text,
             workdir=work_dir,
             run_dir=trial_run_dir,
             step_name=f"01-orchestrator-{orch_engine.name}",
-            isolation=isolation,
+            isolation="local",
+            allowed_tools=permissions["allow"],
+            disallowed_tools=permissions["deny"],
             allow_unsandboxed_local=allow_unsandboxed_local,
             timeout_s=timeout_s,
             skills_enabled=False,
@@ -1463,6 +1491,8 @@ def aggregate_results(
                     mean_rounds_to_clean=(
                         round(sum(lint_rounds) / len(lint_rounds), 4) if lint_rounds else None
                     ),
+                    mean_local_tokens=(sum(r.local_tokens for r in valid) / len(valid) if valid else None),
+                    mean_local_wall_s=(sum(r.local_wall_s for r in valid) / len(valid) if valid else None),
                     mean_rounds_used=(
                         round(sum(rounds_used_list) / len(rounds_used_list), 4)
                         if rounds_used_list
@@ -1555,6 +1585,8 @@ def aggregate_results(
                         if cat_costs
                         else None
                     ),
+                    "mean_local_tokens": _mean([s.mean_local_tokens for s in matching if s.mean_local_tokens is not None]),
+                    "mean_local_wall_s": _mean([s.mean_local_wall_s for s in matching if s.mean_local_wall_s is not None]),
                     "mean_tokens_in": _mean(cat_tokens_in),
                     "mean_tokens_out": _mean(cat_tokens_out),
                     "mean_duration_s": (
@@ -1659,15 +1691,16 @@ def render_summary_markdown(
                 "",
                 "## Runner Metrics",
                 "",
-                "| Task | Pair | Mean Rounds | Escalate Rate | False-Approve | False-Reject |",
-                "|---|---|---:|---:|---:|---:|",
+                "| Task | Pair | Mean Rounds | Escalate Rate | False-Approve | False-Reject | Local Tokens | Local Wall (s) |",
+                "|---|---|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for ts in task_summaries:
             lines.append(
                 f"| {ts.task_id} | {ts.model} | {_fmt(ts.mean_rounds_used)} | "
                 f"{_fmt(ts.escalate_rate)} | {ts.false_approve_count} ({_fmt(ts.false_approve_rate)}) | "
-                f"{ts.false_reject_count} ({_fmt(ts.false_reject_rate)}) |"
+                f"{ts.false_reject_count} ({_fmt(ts.false_reject_rate)}) | "
+                f"{_fmt(ts.mean_local_tokens)} | {_fmt(ts.mean_local_wall_s)} |"
             )
 
     lines.extend(
@@ -1984,6 +2017,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"task={task.task_id} category={task.category} {kind_label}={lbl} run={run_idx}/{args.k}"
             )
         return 0
+
+    if mode == "orchestrator" and (args.isolation != "local" or not args.allow_unsandboxed_local):
+        print("error: orchestrator requires --isolation local --allow-unsandboxed-local", file=sys.stderr)
+        return 1
 
     iso_ok, iso_msg = check_local_isolation_allowed(
         args.isolation,

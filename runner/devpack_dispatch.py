@@ -312,6 +312,8 @@ def dispatch_job(
         outcome="running",
     )
 
+    update_run_json(run_dir, isolation=isolation)
+
     if not data_ok:
         sys.stderr.write(data_reason + "\n")
         update_run_json(

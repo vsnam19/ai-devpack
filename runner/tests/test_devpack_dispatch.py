@@ -330,8 +330,8 @@ class DevpackDispatchTests(unittest.TestCase):
         self.assertIn("Write(briefs/**)", allow)
         self.assertIn("Edit(runs/**)", allow)
         self.assertIn("Write(runs/**)", allow)
-        self.assertIn("Bash(python3 runner/devpack_dispatch.py *)", allow)
-        self.assertIn("Bash(python3 runner/devpack_logs.py *)", allow)
+        self.assertIn("Bash(python3 .devpack/pack/runner/devpack_dispatch.py *)", allow)
+        self.assertIn("Bash(python3 .devpack/pack/runner/devpack_logs.py *)", allow)
 
         for disallowed in ("Edit", "Write"):
             self.assertNotIn(disallowed, allow)
