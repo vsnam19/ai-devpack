@@ -1,0 +1,23 @@
+{
+  "gate_status": "GATE_OK",
+  "status": "GATE_OK",
+  "first_failed_check": null,
+  "git_head": "971d041ecd4ec14679fcd5f9dea3201f2b4981d4",
+  "timestamp_utc": "2026-11-22T12:25:37Z",
+  "checks": [
+    {
+      "name": "enforcement-unit-tests",
+      "status": "PASS",
+      "exit_code": 0,
+      "duration_s": 0.887752,
+      "required": true
+    },
+    {
+      "name": "project-leak-check",
+      "status": "PASS",
+      "exit_code": 0,
+      "duration_s": 0.014264,
+      "required": true
+    }
+  ]
+}
