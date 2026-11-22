@@ -1,0 +1,3 @@
+Running gate checks...
+PASS project-leak-check
+GATE_OK

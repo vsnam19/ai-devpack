@@ -2,9 +2,9 @@
 # run_all.sh - run every unit test of the pack and shellcheck on shell scripts.
 #
 # Usage: bash tests/run_all.sh [--help]
-# Runs `python3 -m unittest discover` for tests, enforcement, eval and runner when those
-# directories exist. Runs shellcheck on *.sh if installed, else prints
-# "SKIP shellcheck: not installed".
+# Runs `python3 -m unittest discover` for tests, enforcement, eval, runner,
+# skilltest and learning when those directories exist. Runs shellcheck on *.sh if
+# installed, else prints "SKIP shellcheck: not installed".
 # Fails when a directory containing test_*.py files reports "Ran 0 tests".
 # Exit codes: 0 all steps passed; 1 at least one step failed; 2 bad usage.
 set -euo pipefail
@@ -22,11 +22,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 status=0
 
-for dir in tests enforcement eval runner; do
+for dir in tests enforcement eval runner skilltest learning; do
   if [[ -d "$dir" ]]; then
     echo "== unittest: $dir"
     log="$(mktemp)"
-    if ! python3 -m unittest discover -s "$dir" -p 'test_*.py' 2>&1 | tee "$log"; then
+    discover_args=(-s "$dir" -p 'test_*.py')
+    if [[ -f "$dir/__init__.py" ]]; then
+      discover_args=(-s "$dir" -t . -p 'test_*.py')
+    fi
+    if ! python3 -m unittest discover "${discover_args[@]}" 2>&1 | tee "$log"; then
       echo "FAIL unittest: $dir" >&2
       status=1
     elif [[ -n "$(find "$dir" -name 'test_*.py' -not -path '*/.git/*' -print -quit)" ]] \

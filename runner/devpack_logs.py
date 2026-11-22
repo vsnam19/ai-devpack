@@ -33,6 +33,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from enforcement.checks import secret_pii_check  # noqa: E402
 
+try:
+    from runner.agent_exec import collect_os_identities, redact_os_identities  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - direct runner/ invocation
+    from agent_exec import collect_os_identities, redact_os_identities  # type: ignore[no-redef]  # noqa: E402
+
 TRUNCATE_LIMIT_BYTES = 4096
 
 # Construct home prefix dynamically so literal forbidden pattern never appears in source.
@@ -222,9 +227,10 @@ class Redactor:
             if current_home and current_home not in ("~", "/")
             else None
         )
+        self._os_identities = collect_os_identities()
 
     def redact(self, text: str) -> str:
-        """Return a redacted copy of ``text`` with secrets and home paths scrubbed."""
+        """Return a redacted copy of ``text`` with secrets, home paths, and OS IDs scrubbed."""
         if not text:
             return text
 
@@ -247,6 +253,7 @@ class Redactor:
         if self.current_home and self.current_home in out:
             out = out.replace(self.current_home, "~")
         out = _HOME_PATH_RE.sub("~", out)
+        out = redact_os_identities(out, self._os_identities)
 
         return out
 

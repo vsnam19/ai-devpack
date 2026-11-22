@@ -108,3 +108,31 @@ discipline and needs a mechanism later. Mechanism paths are relative to the pack
 - **Rule:** Independent review (a different session, with the taxonomy) before a human reads agent-written documents; external claims carry a URL and the mark "external, verify".
 - **Enforced by:** `workflow/templates/brief_review.md`; `tests/test_no_project_leaks.py` covers only privacy, not facts
 - **Status:** prompt-only
+
+## LSN-016 Local server default context truncated the agent prompt
+- **ID:** LSN-016
+- **Incident:** A local inference server with a small default context window silently truncated the system prompt and tool schemas, causing the model to print JSON tool calls as plain assistant text instead of emitting structured `tool_use` blocks.
+- **Rule:** Configure local servers with context `>= 32,768` tokens (`min_context_tokens = 32768`), qualify every local engine on the `smoke` tier before enabling it, and reject runs with `tool_protocol_errors > 0`.
+- **Enforced by:** `policy/local_models.md`, `runner/agent_exec.py` (`tool_protocol_errors` detection), `eval/run_eval.py --record-qualification`
+- **Status:** enforced
+
+## LSN-017 Saturated eval tasks hid real capability differences
+- **ID:** LSN-017
+- **Incident:** v0.1 tasks named the exact bug and file, saturating scores across weaker and stronger models and hiding multi-file, spec-driven, and review capability limits.
+- **Rule:** Partition evaluation tasks into calibrated tiers (`smoke` for qualification/regression and `v2` for vague, multi-file, spec-driven, review, and trap tasks) with explicit calibration targets.
+- **Enforced by:** `eval/tasks/` (`Tier: smoke|v2`), `eval/run_eval.py --tier`
+- **Status:** enforced
+
+## LSN-018 Weak task graders allowed a builder agent to pass with fake checks
+- **ID:** LSN-018
+- **Incident:** A builder agent made the task-verification gate pass using empty seeded defects, no hidden tests, and a marker file as the pass condition while the director read only task goals; an independent review caught the gap.
+- **Rule:** Task verification must enforce structural meta-checks on graders and patches, and the human/director must inspect `check.sh` and `solution.patch` directly with cross-model review.
+- **Enforced by:** `eval/tasks/verify_tasks.sh` structural meta-checks (hidden test compile-probe, `src/`/`include/` change checks, `nosrc` failure check, negative review patches, `cheat.patch`) plus independent review
+- **Status:** enforced
+
+## LSN-019 Eval graders must not honour self-authored exemptions
+- **ID:** LSN-019
+- **Incident:** An agent under evaluation could commit its own `Deviation:` trailer to bypass `enforcement/checks/test_lock.py` during grading.
+- **Rule:** Evaluation callers and task graders must invoke `test_lock.py` with `--no-deviation` so an agent under test cannot self-exempt protected test files.
+- **Enforced by:** `enforcement/checks/test_lock.py` (`--no-deviation`), `eval/run_eval.py`, `eval/tasks/v2_check.sh`, `eval/tasks/18-review-fault-recovery/check.sh`, `eval/orchestrator_goals/01-link-fault-recovery/check.sh`
+- **Status:** enforced

@@ -1979,14 +1979,22 @@ def run_memory_trial(
 
             # Auto-accept deterministic handoff/known-gap proposals after step build gate passes
             if mem_enabled and agent_res.status == "ok":
-                build_proc = subprocess.run(
-                    ["bash", str(work_dir / "build_and_test.sh"), "--no-cmake"],
-                    cwd=str(work_dir),
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_s,
-                    check=False,
-                )
+                try:
+                    build_proc = subprocess.run(
+                        ["bash", str(work_dir / "build_and_test.sh"), "--no-cmake"],
+                        cwd=str(work_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_s,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    any_harness_err = True
+                    if not harness_reason:
+                        harness_reason = _redact(
+                            f"step {step_idx}: build_timeout: build_and_test.sh timed out after {timeout_s}s"
+                        )
+                    break
                 if build_proc.returncode == 0:
                     prop_res = process_memory_proposals(
                         mem_root,

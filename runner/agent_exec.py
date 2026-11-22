@@ -22,13 +22,16 @@ import argparse
 import copy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import getpass
 import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -37,6 +40,16 @@ import threading
 import time
 from typing import Any, Iterator, Mapping, Sequence
 import uuid
+
+try:
+    import grp  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - non-POSIX
+    grp = None  # type: ignore[assignment]
+
+try:
+    import pwd  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - non-POSIX
+    pwd = None  # type: ignore[assignment]
 
 try:
     import tomllib  # type: ignore[attr-defined]
@@ -1591,13 +1604,186 @@ def _collect_env_auth_secrets() -> list[str]:
     return secrets
 
 
+_GENERIC_OS_USERS = frozenset(
+    {"root", "nobody", "daemon", "bin", "sys", "sync", "user", "admin", "runner", "test"}
+)
+_GENERIC_OS_GROUPS = frozenset(
+    {
+        "root",
+        "nobody",
+        "nogroup",
+        "daemon",
+        "bin",
+        "sys",
+        "sync",
+        "users",
+        "staff",
+        "wheel",
+        "docker",
+        "sudo",
+        "adm",
+        "mail",
+        "tty",
+        "disk",
+        "audio",
+        "video",
+        "render",
+        "kvm",
+        "input",
+        "cdrom",
+        "plugdev",
+        "dip",
+        "lpadmin",
+        "netdev",
+        "dialout",
+        "lp",
+        "scanner",
+        "utmp",
+        "shadow",
+        "crontab",
+        "ssh",
+        "systemd-journal",
+        "runner",
+    }
+)
+_GENERIC_OS_HOSTS = frozenset(
+    {
+        "localhost",
+        "localhost.localdomain",
+        "ip6-localhost",
+        "ip6-loopback",
+        "host",
+        "runner",
+        "dev",
+        "tmp",
+        "var",
+        "opt",
+        "etc",
+        "usr",
+        "lib",
+        "bin",
+        "sys",
+        "proc",
+        "run",
+        "mnt",
+        "home",
+        "root",
+    }
+)
+_LS_LONG_LINE_RE = re.compile(
+    r"(^|\n|\\n)([dlcbps-][rwxstST-]{9}[+.@]?\s+\d+\s+)(\S+)(\s+)(\S+)(\s+\d+\b)"
+)
+
+
+def collect_os_identities() -> tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]]:
+    """Collect current OS user, group, and host names for log redaction."""
+    all_users: set[str] = set()
+    if pwd is not None:
+        try:
+            pw_name = pwd.getpwuid(os.getuid()).pw_name.strip()
+            if pw_name and not pw_name.isdigit():
+                all_users.add(pw_name)
+        except (KeyError, OSError):
+            pass
+    try:
+        gu = getpass.getuser().strip()
+        if gu and not gu.isdigit():
+            all_users.add(gu)
+    except Exception:
+        pass
+    for env_key in ("USER", "LOGNAME"):
+        val = os.environ.get(env_key, "").strip()
+        if val and not val.isdigit():
+            all_users.add(val)
+
+    all_groups: set[str] = set()
+    general_groups: set[str] = set()
+    if grp is not None:
+        primary_gid: int | None = None
+        try:
+            primary_gid = os.getgid()
+            gname = grp.getgrgid(primary_gid).gr_name.strip()
+            if gname and not gname.isdigit():
+                all_groups.add(gname)
+                general_groups.add(gname)
+        except (KeyError, OSError):
+            pass
+        try:
+            for gid in os.getgroups():
+                try:
+                    gname = grp.getgrgid(gid).gr_name.strip()
+                except KeyError:
+                    continue
+                if gname and not gname.isdigit():
+                    all_groups.add(gname)
+                    if gid == primary_gid or gid >= 1000:
+                        general_groups.add(gname)
+        except OSError:
+            pass
+
+    raw_hosts: set[str] = set()
+    for getter in (socket.gethostname, platform.node):
+        try:
+            h = getter().strip()
+        except OSError:
+            h = ""
+        if h and not h.isdigit():
+            raw_hosts.add(h)
+            if "." in h:
+                short = h.split(".", 1)[0].strip()
+                if short and not short.isdigit():
+                    raw_hosts.add(short)
+
+    replacements: list[tuple[str, str]] = []
+    for u in all_users:
+        if len(u) >= 2 and u.lower() not in _GENERIC_OS_USERS:
+            replacements.append((u, "[USER]"))
+    for g in general_groups:
+        if len(g) >= 2 and g.lower() not in _GENERIC_OS_GROUPS and g not in all_users:
+            replacements.append((g, "[GROUP]"))
+    for h in raw_hosts:
+        if len(h) >= 3 and h.lower() not in _GENERIC_OS_HOSTS:
+            replacements.append((h, "[HOST]"))
+    replacements.sort(key=lambda item: len(item[0]), reverse=True)
+    return frozenset(all_users), frozenset(all_groups), tuple(replacements)
+
+
+def redact_os_identities(
+    text: str,
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
+) -> str:
+    """Replace current OS user, group, and host names in ``text`` with placeholders."""
+    if not text:
+        return text
+    all_users, all_groups, replacements = (
+        identities if identities is not None else collect_os_identities()
+    )
+
+    def _replace_ls_line(match: re.Match[str]) -> str:
+        """Replace owner and group columns in ``ls -l`` lines when matching current OS IDs."""
+        prefix_nl, perms_links, owner, ws, group, size_tail = match.groups()
+        new_owner = "[USER]" if owner in all_users else owner
+        new_group = "[GROUP]" if group in all_groups else group
+        return f"{prefix_nl}{perms_links}{new_owner}{ws}{new_group}{size_tail}"
+
+    out = _LS_LONG_LINE_RE.sub(_replace_ls_line, text)
+    for token, placeholder in replacements:
+        pattern = re.compile(
+            r"(?:(?<![A-Za-z0-9_])|(?<=\\n)|(?<=\\t)|(?<=\\r))"
+            + re.escape(token)
+            + r"(?![A-Za-z0-9_])"
+        )
+        out = pattern.sub(placeholder, out)
+    return out
+
+
 def redact_sensitive_text(
     text: str,
     extra_secrets: Sequence[str] = (),
     path_replacements: Sequence[tuple[str, str]] = (),
     home_placeholder: str = "~",
 ) -> str:
-    """Redact credentials, auth env values, secret/PII patterns, and host home paths from ``text``."""
+    """Redact credentials, auth env values, secret/PII patterns, host home paths, and OS IDs."""
     if not text:
         return text
     result = text
@@ -1635,6 +1821,7 @@ def redact_sensitive_text(
         pass
 
     result = _HOST_HOME_RE.sub(home_placeholder, result)
+    result = redact_os_identities(result)
     return result
 
 

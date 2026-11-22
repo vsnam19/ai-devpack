@@ -8,7 +8,7 @@ import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PREFIXES = ("enforcement", "eval", "runner", "workflow", "policy", "knowledge", "tests")
+PREFIXES = ("enforcement", "eval", "runner", "workflow", "policy", "knowledge", "tests", "learning", "orchestrator", "skilltest")
 PATH_RE = re.compile(r"(?<![\w./-])((?:%s)/[A-Za-z0-9_./-]*)" % "|".join(PREFIXES))
 SPAN_RE = re.compile(r"`([^`\n]+)`")
 DOC_ROOTS = ("policy", "knowledge", "workflow")
