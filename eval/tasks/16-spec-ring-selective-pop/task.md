@@ -10,9 +10,10 @@ Implement REQ-RING-005. Add tests carrying `@req REQ-RING-005` trace tags for no
 - `include/ring_buffer.hpp`
 - `src/ring_buffer.cpp`
 - tests/test_ring_buffer.cpp
+- `STOP_REPORT.md`
 
 ## Commands
 - `bash build_and_test.sh`
 
 ## STOP rule
-- Preserve FIFO order and do not alter unrelated tests.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never edit tests.

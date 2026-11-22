@@ -9,9 +9,10 @@ Under sustained traffic, the newest frame is retained but the receiver sees an u
 ## Files allowed
 - `src/ring_buffer.cpp`
 - tests/test_ring_buffer.cpp
+- `STOP_REPORT.md`
 
 ## Commands
 - `bash build_and_test.sh`
 
 ## STOP rule
-- Do not change public interfaces or protected tests.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never edit tests.

@@ -10,9 +10,10 @@ Add multiplexed physical signal decoding as described by REQ-CODEC-008, with API
 - `include/can_codec.hpp`
 - `src/can_codec.cpp`
 - tests/test_can_codec.cpp
+- `STOP_REPORT.md`
 
 ## Commands
 - `bash build_and_test.sh`
 
 ## STOP rule
-- Preserve existing codec behavior.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never edit tests.

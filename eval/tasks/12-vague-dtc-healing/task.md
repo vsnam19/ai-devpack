@@ -10,9 +10,10 @@ A diagnostic may remain pending after enough clean operation cycles. Determine t
 - `include/dtc_debouncer.hpp`
 - `src/dtc_debouncer.cpp`
 - tests/test_dtc_debouncer.cpp
+- `STOP_REPORT.md`
 
 ## Commands
 - `bash build_and_test.sh`
 
 ## STOP rule
-- Do not weaken tests or change files outside scope.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never edit tests.

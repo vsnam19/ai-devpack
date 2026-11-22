@@ -4,4 +4,4 @@ new file mode 100644
 +++ b/STOP_REPORT.md
 @@ -0,0 +1,2 @@
 +STOP_REPORT
-+REQ-DTC-002 conflicts with the protected diagnostic assertion; no safe code change is allowed.
++REQ-DTC-002 requires confirmation at the threshold, but tests/test_dtc_debouncer.cpp requires confirmation on the next sample.

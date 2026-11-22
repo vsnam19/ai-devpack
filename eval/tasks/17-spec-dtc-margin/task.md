@@ -10,9 +10,10 @@ Implement REQ-DTC-006 and add trace-tagged boundary tests (`@req REQ-DTC-006`) f
 - `include/dtc_debouncer.hpp`
 - `src/dtc_debouncer.cpp`
 - tests/test_dtc_debouncer.cpp
+- `STOP_REPORT.md`
 
 ## Commands
 - `bash build_and_test.sh`
 
 ## STOP rule
-- Do not modify the specification.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never edit tests.

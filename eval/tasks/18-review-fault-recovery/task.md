@@ -8,9 +8,10 @@ Review `review.patch` against REQ-LINK-006. Write `REVIEW.md` with a review-taxo
 
 ## Files allowed
 - `REVIEW.md`
+- `STOP_REPORT.md`
 
 ## Commands
 - `git apply --check review.patch`
 
 ## STOP rule
-- This is a review-only task: do not apply or edit production files.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never edit tests.
