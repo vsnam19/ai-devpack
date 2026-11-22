@@ -16,13 +16,15 @@ All notable changes to ai-devpack are recorded here. Versioning follows
   secret/PII, scope, trace and test-lock checks, git hooks, evidence collector.
 - `runner/`: `devpack_run.py` local runner (implement, gate, review, fix, escalate) and
   `engines.example.toml`.
-- `eval/`: C++17 fixture with preflight config and lint baseline, 10 graded tasks with
+- `eval/`: C++17 fixture with preflight config, 10 graded tasks with
   `verify_tasks.sh`, `run_eval.py` (docker/local isolation), `Dockerfile`.
 - `tests/test_no_project_leaks.py`, `tests/test_doc_links.py` and `tests/run_all.sh`.
 - One gate config covering leak test, all unit tests, fixture build, task verification,
   eval dry run and fixture lint.
 
 ### Fixed
+- MISRA-15.1.3 false positive on out-of-class constructor definitions fixed; the fixture
+  lint baseline that hid it is removed.
 - `tests/run_all.sh` now fails when a directory with `test_*.py` files runs 0 tests.
 - Brief template STOP section now requires removing runtime resources the task installed
   (matches LSN-007).

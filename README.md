@@ -24,7 +24,7 @@ by default; provenance recorded internally.
 | `enforcement/checks/` | secret/PII, scope, trace and test-lock checks |
 | `enforcement/hooks/` | `pre-commit` hook and `install.sh` |
 | `enforcement/evidence/` | `collect.py` evidence collector |
-| `eval/fixture/` | C++17 fixture with `preflight.toml` and the documented lint baseline |
+| `eval/fixture/` | C++17 fixture with `preflight.toml` (lint runs without a baseline) |
 | `eval/tasks/` | 10 graded tasks and `verify_tasks.sh` |
 | `eval/` | `run_eval.py` runner, `Dockerfile`, unit tests in `eval/tests/` |
 | `tests/` | repo-level tests (`test_no_project_leaks.py`, `test_doc_links.py`) and `run_all.sh` |
