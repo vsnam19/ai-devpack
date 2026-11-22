@@ -368,6 +368,7 @@ class HarnessErrorTests(unittest.TestCase):
             calls: list[list[str]] = []
 
             def fake_run(argv, **_kw):
+                """Record docker build invocation and return exit code 0."""
                 calls.append(list(argv))
                 return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -490,13 +491,40 @@ class HarnessErrorTests(unittest.TestCase):
                     self.assertIn("timed out", result.harness_error_reason)
                 else:
                     with mock.patch.object(
-                        run_eval, "parse_agent_json_output", side_effect=RuntimeError("boom")
+                        run_eval.agent_exec, "parse_stream", side_effect=RuntimeError("boom")
                     ):
                         with self.assertRaises(RuntimeError):
                             run_eval.run_single_trial(**kwargs)
                 cfg = run_root / "01-mini-bugfix__haiku__run1" / "cfg"
                 self.assertTrue(cfg.is_dir())
                 self.assertEqual([], list(cfg.iterdir()))
+
+    def test_engines_flag_and_runs_root_trial_artifacts(self) -> None:
+        """--engines alias and --runs-root write per-trial run dirs, cost_usd, and tool_protocol_errors."""
+        body = (
+            self._FIX
+            + "print(json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '```json\\n{\"name\": \"Bash\", \"arguments\": {\"cmd\": \"ls\"}}\\n```'}]}}))\n"
+            + _OK_JSON.replace("RESULT", "'done'").replace("DENIALS", "[]")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            runs_root = base / "custom_runs"
+            rc, results, _, _ = self._run(
+                body,
+                extra_args=["--engines", "haiku", "--runs-root", str(runs_root)],
+                k=1,
+            )
+            self.assertEqual(0, rc)
+            run_rec = results["tasks"][0]["runs"][0]
+            self.assertAlmostEqual(0.01, run_rec["cost_usd"])
+            self.assertEqual(1, run_rec["tool_protocol_errors"])
+            self.assertTrue(run_rec["run_dir"])
+            trial_run_dir = Path(run_rec["run_dir"])
+            self.assertTrue((trial_run_dir / "run.json").is_file())
+            self.assertTrue((trial_run_dir / "steps" / "01-eval-haiku.jsonl").is_file())
+            self.assertTrue((trial_run_dir / "steps" / "01-eval-haiku.meta.json").is_file())
+            self.assertTrue((trial_run_dir / "steps" / "01-eval-haiku.prompt.md").is_file())
+            self.assertTrue((trial_run_dir / "steps" / "02-gate.txt").is_file())
 
 
 if __name__ == "__main__":

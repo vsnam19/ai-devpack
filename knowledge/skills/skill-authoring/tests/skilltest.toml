@@ -1,0 +1,28 @@
+[[trigger]]
+name = "create a skill"
+prompt = "Create a skill for release notes."
+expect = true
+[[trigger]]
+name = "test a skill"
+prompt = "Write skilltest cases for this agent skill."
+expect = true
+[[trigger]]
+name = "fix source"
+prompt = "Fix this C++ source file."
+expect = false
+[[trigger]]
+name = "calculate result"
+prompt = "Calculate this result."
+expect = false
+[[behaviour]]
+name = "frontmatter-draft"
+fixture = "fixtures/frontmatter-draft/input"
+grader = "graders/frontmatter-draft"
+prompt = "Turn this draft directory into a reusable agent skill and add its test plan."
+check = "bash check.sh"
+[[behaviour]]
+name = "test-matrix"
+fixture = "fixtures/test-matrix/input"
+grader = "graders/test-matrix"
+prompt = "Finish this draft agent skill so it is ready for skilltest lint."
+check = "bash check.sh"

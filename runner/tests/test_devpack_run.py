@@ -259,6 +259,115 @@ class DevpackRunUnitTests(unittest.TestCase):
             self.assertEqual(2, summary["fix_rounds_used"])
             self.assertTrue(any("escalate" in name for name in summary["step_logs"]))
 
+    def test_v2_engines_workflow_writes_shared_run_dir_steps(self) -> None:
+        """Verify devpack_run with v2 engines.toml runs roles via agent_exec into one run dir (kind: task)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            state_path = base / "v2_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "calls": [],
+                        "responses": [
+                            "Implemented feature",
+                            "Minor issue\nVERDICT: REQUEST_CHANGES",
+                            "Fixed issue",
+                            "All checks pass\nVERDICT: APPROVE",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_claude = base / "fake_claude.py"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"sf = pathlib.Path({str(state_path)!r})\n"
+                "st = json.loads(sf.read_text(encoding='utf-8'))\n"
+                "st['calls'].append(sys.argv[1:])\n"
+                "resp = st['responses'].pop(0)\n"
+                "sf.write_text(json.dumps(st), encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'total_cost_usd': 0.005, 'num_turns': 2, 'duration_ms': 100, 'usage': {'input_tokens': 20, 'output_tokens': 10}, 'result': resp}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_claude, stat.S_IRWXU)
+
+            fake_gate = base / "fake_gate.py"
+            fake_gate.write_text(
+                "#!/usr/bin/env python3\nprint('GATE_OK')\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_gate, stat.S_IRWXU)
+
+            config_path = base / "engines_v2.toml"
+            config_path.write_text(
+                "version = 2\n"
+                f'gate_cmd = ["python3", "{fake_gate}"]\n'
+                "gate_timeout_s = 30\n\n"
+                "[engines.haiku]\n"
+                'model = "haiku"\n'
+                'class = "cloud"\n'
+                'max_data_class = "internal"\n\n'
+                "[engines.sonnet]\n"
+                'model = "sonnet"\n'
+                'class = "cloud"\n'
+                'max_data_class = "internal"\n\n'
+                "[roles]\n"
+                'implementer = "haiku"\n'
+                'reviewer = "sonnet"\n'
+                'fixer = "haiku"\n\n'
+                "[limits]\n"
+                "max_fix_rounds = 2\n",
+                encoding="utf-8",
+            )
+
+            runs_root = base / "runs"
+            rc = devpack_run.main(
+                [
+                    "--config",
+                    str(config_path),
+                    "--worktree",
+                    str(base),
+                    "--runs-root",
+                    str(runs_root),
+                    "--agent-bin",
+                    str(fake_claude),
+                    "--task-id",
+                    "v2-task-01",
+                ]
+            )
+            self.assertEqual(0, rc)
+            run_dirs = [p for p in runs_root.iterdir() if p.is_dir()]
+            self.assertEqual(1, len(run_dirs))
+            rdir = run_dirs[0]
+            run_json = json.loads((rdir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("task", run_json["kind"])
+            self.assertEqual("v2-task-01", run_json["task"])
+            self.assertEqual("APPROVED", run_json["outcome"])
+            self.assertIsNotNone(run_json["finished"])
+
+            steps_dir = rdir / "steps"
+            for expected_step in (
+                "01-implementer-haiku.jsonl",
+                "01-implementer-haiku.meta.json",
+                "01-implementer-haiku.prompt.md",
+                "02-gate.txt",
+                "03-reviewer-sonnet.jsonl",
+                "03-reviewer-sonnet.meta.json",
+                "03-reviewer-sonnet.prompt.md",
+                "04-fixer-haiku.jsonl",
+                "04-fixer-haiku.meta.json",
+                "04-fixer-haiku.prompt.md",
+                "05-gate.txt",
+                "06-reviewer-sonnet.jsonl",
+                "06-reviewer-sonnet.meta.json",
+                "06-reviewer-sonnet.prompt.md",
+            ):
+                self.assertTrue(
+                    (steps_dir / expected_step).is_file(),
+                    f"Missing expected step artifact: {expected_step}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

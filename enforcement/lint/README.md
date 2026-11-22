@@ -53,6 +53,8 @@ python3 enforcement/lint/preflight_lint.py --json src/
 | `NO-IMPL-IN-HEADER` | AST (Headers) | `error` | Non-template, non-constexpr function or method definitions with bodies `{ ... }` are forbidden in header files (`.h`, `.hh`, `.hpp`) when `no_impl_in_header = true` (default). |
 | `DOXYGEN-FILE` | Doxygen | `error` | Every source and header file must contain a Doxygen file block with `@file` and `@brief` (or `\file` and `\brief`). |
 | `DOXYGEN-PARAM-DIR` | Doxygen | `error` | Every `@param` tag must include an explicit direction: `@param[in]`, `@param[out]`, or `@param[in,out]`. |
+| `DOXYGEN-FILE-BLOCK` | Doxygen | `error` | A file tag in an ordinary comment must use `/**`, `/*!`, `///`, or `//!`. Missing tags retain `DOXYGEN-FILE` behavior. |
+| `DOXYGEN-PARAM-DIR-MISMATCH` | Doxygen / AST | `error` / `warning` | Value and const referent parameters cannot be `[out]` or `[in,out]` (error). Mutable references and pointers documented as `[in]` produce a warning. Messages name the parameter and type. |
 | `NAMING-MEANINGFUL` | Naming | `error` | Disallows single-character variable and parameter names (except configured loop indices `i`, `j`, `k`) and generic placeholder names (`tmp`, `temp`, `val`, `var`, `foo`, `bar`, `baz`, `obj`, `dat`, `buf`, `ptr`). |
 | `NAMING-CONVENTION` | Naming | `error` | Validates identifier names (classes/structs/enums/type aliases, functions/methods, variables, parameters, member fields, constants, namespaces) against configurable regex patterns. |
 | `HIS-PAR` | Complexity | `error` | Functions, methods, and constructors may take at most `max_params` parameters (default `5`). |
@@ -236,3 +238,8 @@ def check_ast_node(
 | `0` | Clean run: no findings (or all findings are within baseline allowances, or only `TOOL-MISSING` with `--allow-missing-tools`). |
 | `1` | Lint check failed: one or more active findings (including `TOOL-MISSING` in default fail-closed mode) or baseline regression (`BASELINE_NEW` / `BASELINE_EXCESS`). |
 | `2` | Usage, configuration, or execution error: invalid CLI flags, malformed `preflight.toml`, missing target files, baseline `schema_version` / `fingerprint_policy_version` mismatch, or subprocess crash. |
+
+Both rules support `--disable-rule ID` and `disabled_rules` in `[general]`.
+Direction mismatch checks also follow `require_param_direction = false` in `[doxygen]`.
+Warnings remain findings and fail the gate like existing warnings. Type checks require the AST;
+aliases use resolved types when available.
