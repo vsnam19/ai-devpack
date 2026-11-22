@@ -1,21 +1,26 @@
 [[trigger]]
-name = "document declarations"
-prompt = "Add Doxygen comments to these C++ declarations."
+name = "cpp-header-review"
+prompt = "Add documentation to this C++ header so it passes our review."
 expect = true
 [[trigger]]
-name = "rename C++ identifiers"
-prompt = "Fix naming in this C++ header."
+name = "cpp-api-review"
+prompt = "Review these C++ declarations for naming and interface documentation."
 expect = true
 [[trigger]]
-name = "unrelated arithmetic"
-prompt = "Calculate the checksum."
+name = "python-docstring"
+prompt = "Add Python docstrings to this module."
 expect = false
 [[trigger]]
-name = "unrelated review"
-prompt = "Summarize this meeting."
+name = "markdown-guide"
+prompt = "Write a Markdown contributor guide for this repository."
 expect = false
 [[behaviour]]
-name = "documentation marker"
-fixture = "fixtures/missing-docs"
-prompt = "Repair output.txt with the required Doxygen marker."
+name = "header-contract"
+fixture = "fixtures/header-contract"
+prompt = "Add documentation to this header so it passes our review; preserve its interface."
+check = "bash check.sh ."
+[[behaviour]]
+name = "direction-contract"
+fixture = "fixtures/direction-contract"
+prompt = "Document this signal update API for review and correct any declaration naming issues."
 check = "bash check.sh ."

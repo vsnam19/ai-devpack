@@ -15,7 +15,12 @@ name = "format JSON"
 prompt = "Format this JSON document."
 expect = false
 [[behaviour]]
-name = "no dynamic allocation"
-fixture = "fixtures/dynamic-allocation"
-prompt = "Replace dynamic allocation in output.txt."
+name = "runtime-counter"
+fixture = "fixtures/runtime-counter"
+prompt = "Make this runtime counter suitable for an embedded C++17 build."
+check = "bash check.sh ."
+[[behaviour]]
+name = "constructor-contract"
+fixture = "fixtures/constructor-contract"
+prompt = "Bring this small C++ value type up to our embedded coding standard."
 check = "bash check.sh ."

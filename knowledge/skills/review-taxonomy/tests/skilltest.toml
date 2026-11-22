@@ -15,7 +15,12 @@ name = "rename variable"
 prompt = "Rename this variable."
 expect = false
 [[behaviour]]
-name = "review verdict"
-fixture = "fixtures/no-verdict"
-prompt = "Add a taxonomy table and final review verdict to output.txt."
+name = "bounds-review"
+fixture = "fixtures/bounds-review"
+prompt = "Review this diff and write REVIEW.md with all merge-blocking findings."
+check = "bash check.sh ."
+[[behaviour]]
+name = "gate-review"
+fixture = "fixtures/gate-review"
+prompt = "Review this submitted change and write the merge decision in REVIEW.md."
 check = "bash check.sh ."

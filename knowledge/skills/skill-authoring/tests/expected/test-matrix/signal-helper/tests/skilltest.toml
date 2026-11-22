@@ -1,0 +1,21 @@
+[[trigger]]
+name = "signal"
+prompt = "signal report"
+expect = true
+[[trigger]]
+name = "summary"
+prompt = "summarize a signal"
+expect = true
+[[trigger]]
+name = "review"
+prompt = "review this patch"
+expect = false
+[[trigger]]
+name = "parser"
+prompt = "fix this parser"
+expect = false
+[[behaviour]]
+name = "summary"
+fixture = "fixtures/input"
+prompt = "report the supplied signal"
+check = "test -f SUMMARY.md"

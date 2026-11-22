@@ -11,6 +11,7 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -172,7 +173,8 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
         raw = result.transcript_path.read_text(encoding="utf-8") if result.transcript_path.is_file() else ""
         passed = False
         if check_command is not None:
-            passed = subprocess.run(check_command, shell=True, cwd=workdir, check=False).returncode == 0
+            check_env = {**os.environ, "DEVPACK_ROOT": str(REPOSITORY_ROOT)}
+            passed = subprocess.run(check_command, shell=True, cwd=workdir, env=check_env, check=False).returncode == 0
         return transcript_triggered(raw, skill_dir.name), passed, asdict(result)
 
 

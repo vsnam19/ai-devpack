@@ -1,8 +1,10 @@
 """Tests for the deterministic skill test harness."""
 
 import json
+import os
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -58,19 +60,19 @@ class SkilltestCliTests(unittest.TestCase):
         self.assertTrue(report["no_measurable_benefit"])
 
     def test_behaviour_checks_distinguish_fixture_from_expected(self) -> None:
-        """Every behaviour check rejects its input and accepts its reference output."""
-        for name, fixture in (
-            ("doxygen-naming", "missing-docs"),
-            ("misra-cpp-2023", "dynamic-allocation"),
-            ("review-taxonomy", "no-verdict"),
-            ("skill-authoring", "missing-test-case"),
-        ):
+        """Every declared check rejects its input and accepts its reference output."""
+        for name in ("doxygen-naming", "misra-cpp-2023", "review-taxonomy", "skill-authoring"):
             tests = ROOT / "knowledge" / "skills" / name / "tests"
-            check = tests / "fixtures" / fixture / "check.sh"
-            failing = subprocess.run(["bash", str(check), str(tests / "fixtures" / fixture)], check=False)
-            passing = subprocess.run(["bash", str(check), str(tests / "expected" / fixture)], check=False)
-            self.assertNotEqual(failing.returncode, 0, name)
-            self.assertEqual(passing.returncode, 0, name)
+            config = tomllib.loads((tests / "skilltest.toml").read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(config["behaviour"]), 2, name)
+            for case in config["behaviour"]:
+                fixture = case["fixture"].split("/")[-1]
+                check = tests / "fixtures" / fixture / "check.sh"
+                env = {**os.environ, "DEVPACK_ROOT": str(ROOT)}
+                failing = subprocess.run(["bash", str(check), str(tests / "fixtures" / fixture)], check=False, env=env)
+                passing = subprocess.run(["bash", str(check), str(tests / "expected" / fixture)], check=False, env=env)
+                self.assertNotEqual(failing.returncode, 0, f"{name}/{fixture}")
+                self.assertEqual(passing.returncode, 0, f"{name}/{fixture}")
 
     def test_dry_run_prints_plan(self) -> None:
         """Dry-run displays every trial without requiring an agent binary."""

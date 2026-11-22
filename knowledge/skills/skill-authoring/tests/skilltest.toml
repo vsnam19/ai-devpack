@@ -15,7 +15,12 @@ name = "calculate result"
 prompt = "Calculate this result."
 expect = false
 [[behaviour]]
-name = "test configuration"
-fixture = "fixtures/missing-test-case"
-prompt = "Add a behaviour test case to output.txt."
+name = "frontmatter-draft"
+fixture = "fixtures/frontmatter-draft"
+prompt = "Turn this draft directory into a reusable agent skill and add its test plan."
+check = "bash check.sh ."
+[[behaviour]]
+name = "test-matrix"
+fixture = "fixtures/test-matrix"
+prompt = "Finish this draft agent skill so it is ready for skilltest lint."
 check = "bash check.sh ."
