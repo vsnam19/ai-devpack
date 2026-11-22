@@ -4,23 +4,25 @@
 # Usage:
 #   python3 runner/devpack_run.py [--help] [--config runner/engines.example.toml]
 #       [--task-file PATH] [--task-id ID] [--title TITLE] [--goal GOAL]
-#       [--worktree DIR] [--log-dir DIR] [--max-fix-rounds 2] [--dry-run]
+#       [--worktree DIR] [--log-dir DIR] [--runs-root DIR] [--max-fix-rounds 2]
+#       [--isolation local|docker] [--credentials PATH] [--agent-bin claude] [--dry-run]
 #
 # Drives a single closed task through:
 #   1. Render workflow/templates/brief_implement.md (or built-in fallback) with task data
-#   2. Run implementer in the task worktree
-#   3. Run deterministic gate command from config; if gate fails -> fix round
-#   4. Run reviewer with git diff; parse last line VERDICT: APPROVE | REQUEST_CHANGES
+#   2. Run implementer role via runner/agent_exec.py in the task worktree
+#   3. Run deterministic gate command from config; write steps/NN-gate.txt; if gate fails -> fix round
+#   4. Run reviewer role via runner/agent_exec.py with git diff; parse last line VERDICT: APPROVE | REQUEST_CHANGES
 #   5. If REQUEST_CHANGES -> fix round (re-running gate and review)
 #   6. After max_fix_rounds (default 2), stop with ESCALATE_TO_HUMAN
 #
-# Writes a JSON log per step into --log-dir.
+# Writes a v0.2 run directory (run.json, steps/NN-<role>-<engine>.{jsonl,meta.json,prompt.md},
+# steps/NN-gate.txt) as well as run_summary.json.
 #
 # Exit codes:
 #   0 - Task passed gate and received VERDICT: APPROVE (or --dry-run completed)
 #   1 - Task stopped with ESCALATE_TO_HUMAN or execution failure
 #   2 - Invalid command-line arguments or configuration error
-"""Local task runner driving implement -> gate -> review -> fix with bounded retries."""
+"""Local task runner driving implement -> gate -> review -> fix via agent_exec."""
 
 from __future__ import annotations
 
@@ -36,10 +38,24 @@ import sys
 import time
 from typing import Any, Sequence
 
-try:
-    import tomllib  # type: ignore[attr-defined]
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
-    tomllib = None  # type: ignore[assignment]
+RUNNER_DIR = Path(__file__).resolve().parent
+REPO_ROOT = RUNNER_DIR.parent
+for _p in (str(REPO_ROOT), str(RUNNER_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import agent_exec  # noqa: E402
+from agent_exec import (  # noqa: E402
+    AgentRequest,
+    EngineConfig,
+    EnginesConfig,
+    format_command,
+    load_engines,
+    new_run_dir,
+    redact_sensitive_text,
+    run_agent,
+    update_run_json,
+)
 
 ESCALATE_TO_HUMAN = "ESCALATE_TO_HUMAN"
 VERDICT_APPROVE = "APPROVE"
@@ -107,82 +123,14 @@ Never weaken, delete, or skip a test or check.
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Z0-9_]+)\s*\}\}")
 
 
-def _minimal_toml_loads(text: str) -> dict[str, Any]:
-    """Parse a minimal subset of TOML (key=value, arrays, and [section.subsection]) for Python 3.10."""
-    root: dict[str, Any] = {}
-    current = root
-    lines = text.splitlines()
-    idx = 0
-    while idx < len(lines):
-        raw = lines[idx].strip()
-        idx += 1
-        if not raw or raw.startswith("#"):
-            continue
-        if raw.startswith("[") and raw.endswith("]"):
-            section_path = raw[1:-1].strip().split(".")
-            current = root
-            for part in section_path:
-                current = current.setdefault(part, {})
-            continue
-        if "=" not in raw:
-            continue
-        key, val_str = raw.split("=", 1)
-        key = key.strip()
-        val_str = val_str.strip()
-        if val_str.startswith("[") and not val_str.endswith("]"):
-            buf = [val_str]
-            while idx < len(lines):
-                nxt = lines[idx].strip()
-                idx += 1
-                if nxt.startswith("#"):
-                    continue
-                buf.append(nxt)
-                if nxt.endswith("]"):
-                    break
-            val_str = " ".join(buf)
-        if val_str.startswith("[") and val_str.endswith("]"):
-            inner = val_str[1:-1].strip()
-            if not inner:
-                current[key] = []
-            else:
-                items = [
-                    item.strip().strip('"').strip("'")
-                    for item in inner.split(",")
-                    if item.strip()
-                ]
-                current[key] = items
-        elif val_str.startswith(('"', "'")) and val_str.endswith(('"', "'")):
-            current[key] = val_str[1:-1]
-        elif val_str.lower() in ("true", "false"):
-            current[key] = val_str.lower() == "true"
-        else:
-            try:
-                current[key] = int(val_str)
-            except ValueError:
-                current[key] = val_str
-    return root
-
-
-def load_engine_config(config_path: Path) -> dict[str, Any]:
-    """Load engine and gate settings from a TOML configuration file."""
-    if not config_path.is_file():
-        raise ValueError(f"Config file not found: {config_path}")
-    text = config_path.read_text(encoding="utf-8")
-    if tomllib is not None:
-        data = tomllib.loads(text)
-    else:  # pragma: no cover
-        data = _minimal_toml_loads(text)
-
-    if not isinstance(data, dict):
-        raise ValueError("Invalid configuration format")
-
-    roles = data.get("roles", {})
-    if not isinstance(roles, dict) or "implementer" not in roles or "reviewer" not in roles:
-        raise ValueError("Config must define [roles.implementer] and [roles.reviewer]")
-    if "gate_cmd" not in data:
-        raise ValueError("Config must define gate_cmd")
-
-    return data
+def load_engine_config(config_path: Path) -> EnginesConfig:
+    """Load v2 or v0.1 engine and gate settings from a TOML configuration file."""
+    cfg = load_engines(config_path)
+    if "implementer" not in cfg.roles and "implementer" not in cfg.role_engines:
+        raise ValueError("Config must define implementer role")
+    if "reviewer" not in cfg.roles and "reviewer" not in cfg.role_engines:
+        raise ValueError("Config must define reviewer role")
+    return cfg
 
 
 def load_task_data(
@@ -362,38 +310,6 @@ def parse_review_verdict(review_output: str) -> str:
     return "INVALID_VERDICT"
 
 
-def format_command(
-    cmd_template: str | Sequence[str],
-    prompt: str,
-    prompt_file: Path,
-    role_model: str = "",
-) -> list[str]:
-    """Expand ``{prompt}``, ``{prompt_file}``, and ``{model}`` in a command template."""
-    if isinstance(cmd_template, str):
-        tokens = shlex.split(cmd_template)
-    else:
-        tokens = [str(item) for item in cmd_template]
-
-    if not tokens:
-        raise ValueError("Empty command template")
-
-    has_prompt_placeholder = any(
-        "{prompt}" in tok or "{prompt_file}" in tok for tok in tokens
-    )
-    expanded: list[str] = []
-    for tok in tokens:
-        replaced = (
-            tok.replace("{prompt}", prompt)
-            .replace("{prompt_file}", str(prompt_file))
-            .replace("{model}", role_model)
-        )
-        expanded.append(replaced)
-
-    if not has_prompt_placeholder:
-        expanded.append(prompt)
-    return expanded
-
-
 def compute_worktree_diff(worktree: Path) -> str:
     """Collect the current git diff in ``worktree`` (or empty string if not a git repo)."""
     for args in (["git", "diff", "HEAD"], ["git", "diff"]):
@@ -421,6 +337,18 @@ def write_step_log(log_dir: Path, step_index: int, step_name: str, payload: dict
     return log_path
 
 
+def write_gate_step_file(run_dir: Path, step_index: int, gate_text: str) -> Path:
+    """Write ``steps/NN-gate.txt`` inside ``run_dir`` with redacted gate output."""
+    steps_dir = run_dir / "steps"
+    steps_dir.mkdir(parents=True, exist_ok=True)
+    gate_path = steps_dir / f"{step_index:02d}-gate.txt"
+    redacted = redact_sensitive_text(gate_text)
+    if redacted and not redacted.endswith("\n"):
+        redacted += "\n"
+    gate_path.write_text(redacted, encoding="utf-8")
+    return gate_path
+
+
 def execute_command(
     cmd: Sequence[str],
     cwd: Path,
@@ -432,6 +360,7 @@ def execute_command(
         proc = subprocess.run(
             list(cmd),
             cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -446,35 +375,90 @@ def execute_command(
         return 127, "", f"OS error running command: {exc}", round(time.monotonic() - start, 4)
 
 
+def _coerce_role_engine(config: EnginesConfig | dict[str, Any], role: str, fallback_role: str = "") -> EngineConfig:
+    """Extract an EngineConfig for ``role`` from either an EnginesConfig or legacy dict."""
+    if isinstance(config, EnginesConfig):
+        try:
+            return config.engine_for_role(role)
+        except KeyError:
+            if fallback_role:
+                return config.engine_for_role(fallback_role)
+            raise
+
+    roles = config.get("roles", {})
+    engines = config.get("engines", {})
+    raw = roles.get(role)
+    if raw is None and fallback_role:
+        raw = roles.get(fallback_role)
+    if isinstance(raw, EngineConfig):
+        return raw
+    if isinstance(raw, str):
+        if raw in engines:
+            e = engines[raw]
+            if isinstance(e, EngineConfig):
+                return e
+            if isinstance(e, dict):
+                return EngineConfig(name=raw, **e)
+        return EngineConfig(name=raw, model=raw, engine_class="cloud")
+    if isinstance(raw, dict):
+        model = str(raw.get("model", "sonnet"))
+        cmd = raw.get("cmd")
+        cmd_list = [str(x) for x in cmd] if isinstance(cmd, list) else None
+        return EngineConfig(
+            name=model,
+            model=model,
+            engine_class=str(raw.get("class", "cloud")),
+            timeout_s=int(raw.get("timeout_s", 900)),
+            cmd=cmd_list,
+        )
+    raise ValueError(f"Cannot resolve engine for role '{role}'")
+
+
 def run_task_workflow(
-    config: dict[str, Any],
+    config: EnginesConfig | dict[str, Any],
     context: dict[str, str],
     worktree: Path,
     log_dir: Path,
     repo_root: Path,
     max_fix_rounds_override: int | None = None,
     dry_run: bool = False,
+    *,
+    run_dir: Path | None = None,
+    isolation: str = "local",
+    credentials_path: Path | None = None,
+    agent_bin: str = "claude",
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
+    Executes all agent roles (``implementer``, ``reviewer``, ``fixer``) via
+    ``agent_exec.run_agent`` and writes all step transcripts and gate logs into
+    one shared v0.2 run directory (``kind: task``).
     Returns ``(exit_code, summary_dict)``.
     """
+    if isinstance(config, EnginesConfig):
+        default_max_rounds = config.max_fix_rounds
+        gate_cmd = list(config.gate_cmd)
+        gate_timeout_s = config.gate_timeout_s
+    else:
+        limits = config.get("limits", {}) if isinstance(config.get("limits"), dict) else {}
+        default_max_rounds = int(limits.get("max_fix_rounds", config.get("max_fix_rounds", 2)))
+        gate_cmd_raw = config.get("gate_cmd", list(agent_exec.DEFAULT_GATE_CMD))
+        gate_cmd = (
+            shlex.split(gate_cmd_raw)
+            if isinstance(gate_cmd_raw, str)
+            else [str(x) for x in gate_cmd_raw]
+        )
+        gate_timeout_s = int(config.get("gate_timeout_s", 300))
+
     max_fix_rounds = (
         max_fix_rounds_override
         if max_fix_rounds_override is not None
-        else int(config.get("max_fix_rounds", 2))
+        else default_max_rounds
     )
-    roles = config["roles"]
-    impl_cfg = roles["implementer"]
-    rev_cfg = roles["reviewer"]
-    fix_cfg = roles.get("fixer", impl_cfg)
 
-    gate_cmd_raw = config["gate_cmd"]
-    if isinstance(gate_cmd_raw, str):
-        gate_cmd = shlex.split(gate_cmd_raw)
-    else:
-        gate_cmd = [str(x) for x in gate_cmd_raw]
-    gate_timeout_s = int(config.get("gate_timeout_s", 300))
+    impl_engine = _coerce_role_engine(config, "implementer")
+    rev_engine = _coerce_role_engine(config, "reviewer")
+    fix_engine = _coerce_role_engine(config, "fixer", fallback_role="implementer")
 
     impl_brief, impl_tpl_src = render_implement_brief(repo_root, context)
 
@@ -486,11 +470,16 @@ def run_task_workflow(
             "worktree": str(worktree),
             "implement_template": impl_tpl_src,
             "max_fix_rounds": max_fix_rounds,
+            "roles": {
+                "implementer": impl_engine.name,
+                "reviewer": rev_engine.name,
+                "fixer": fix_engine.name,
+            },
             "steps": [
-                "1. implement: render brief and run roles.implementer in worktree",
+                f"1. implement: render brief and run role implementer ({impl_engine.name}) in worktree",
                 f"2. gate: run {' '.join(gate_cmd)} (on failure -> fix round)",
-                "3. review: run roles.reviewer with git diff and parse final VERDICT line",
-                f"4. fix: on gate failure or VERDICT: REQUEST_CHANGES, run fixer (up to {max_fix_rounds} rounds, then {ESCALATE_TO_HUMAN})",
+                f"3. review: run role reviewer ({rev_engine.name}) with git diff and parse final VERDICT line",
+                f"4. fix: on gate failure or VERDICT: REQUEST_CHANGES, run fixer ({fix_engine.name}) (up to {max_fix_rounds} rounds, then {ESCALATE_TO_HUMAN})",
             ],
         }
         print(f"DRY-RUN step plan for task '{context['TASK_ID']}' ({context['TASK_TITLE']}):")
@@ -502,24 +491,51 @@ def run_task_workflow(
         return 0, plan
 
     log_dir.mkdir(parents=True, exist_ok=True)
+    active_run_dir = run_dir if run_dir is not None else log_dir
+    (active_run_dir / "steps").mkdir(parents=True, exist_ok=True)
+    role_engine_map = {
+        "implementer": impl_engine.name,
+        "reviewer": rev_engine.name,
+        "fixer": fix_engine.name,
+    }
+    if not (active_run_dir / "run.json").is_file():
+        update_run_json(
+            active_run_dir,
+            run_id=active_run_dir.name,
+            kind="task",
+            task=context["TASK_ID"],
+            engines=role_engine_map,
+            outcome="running",
+        )
+
     step_index = 0
     step_logs: list[str] = []
+    total_cost_usd = 0.0
+
+    def _invoke_role(role_name: str, engine: EngineConfig, prompt_text: str) -> agent_exec.AgentResult:
+        """Run a role via agent_exec.run_agent and accumulate cost."""
+        nonlocal total_cost_usd
+        step_stem = f"{step_index:02d}-{role_name}-{engine.name}"
+        req = AgentRequest(
+            engine=engine,
+            prompt=prompt_text,
+            workdir=worktree,
+            run_dir=active_run_dir,
+            step_name=step_stem,
+            isolation=isolation,
+            timeout_s=engine.timeout_s,
+            credentials_path=credentials_path,
+            agent_bin=agent_bin,
+            role=role_name,
+            step_index=step_index,
+        )
+        res = run_agent(req)
+        total_cost_usd += float(res.cost_usd or 0.0)
+        return res
 
     # Step 1: Implement
     step_index += 1
-    impl_prompt_file = log_dir / f"prompt_{step_index:02d}_implement.md"
-    impl_prompt_file.write_text(impl_brief, encoding="utf-8")
-    impl_cmd = format_command(
-        impl_cfg["cmd"],
-        prompt=impl_brief,
-        prompt_file=impl_prompt_file,
-        role_model=str(impl_cfg.get("model", "sonnet")),
-    )
-    impl_rc, impl_out, impl_err, impl_dur = execute_command(
-        impl_cmd,
-        cwd=worktree,
-        timeout_s=int(impl_cfg.get("timeout_s", 900)),
-    )
+    impl_res = _invoke_role("implementer", impl_engine, impl_brief)
     log_file = write_step_log(
         log_dir,
         step_index,
@@ -527,13 +543,17 @@ def run_task_workflow(
         {
             "step_index": step_index,
             "step": "implement",
+            "role": "implementer",
+            "engine": impl_engine.name,
             "round": 0,
             "template": impl_tpl_src,
-            "command": impl_cmd,
-            "returncode": impl_rc,
-            "stdout": impl_out,
-            "stderr": impl_err,
-            "duration_s": impl_dur,
+            "status": impl_res.status,
+            "returncode": impl_res.exit_code,
+            "stdout": impl_res.final_text,
+            "stderr": impl_res.stderr,
+            "duration_s": impl_res.duration_s,
+            "cost_usd": impl_res.cost_usd,
+            "transcript_path": str(impl_res.transcript_path),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -553,6 +573,12 @@ def run_task_workflow(
             timeout_s=gate_timeout_s,
         )
         gate_passed = gate_rc == 0
+        combined_gate_output = (gate_out + ("\n" + gate_err if gate_err else "")).strip()
+        write_gate_step_file(
+            active_run_dir,
+            step_index,
+            combined_gate_output or f"Gate exited with {gate_rc}",
+        )
         log_file = write_step_log(
             log_dir,
             step_index,
@@ -583,7 +609,7 @@ def run_task_workflow(
 
             fix_rounds_used += 1
             step_index += 1
-            failure_details = (gate_out + "\n" + gate_err).strip() or f"Gate exited with {gate_rc}"
+            failure_details = combined_gate_output or f"Gate exited with {gate_rc}"
             fix_brief, fix_tpl_src = render_fix_brief(
                 repo_root=repo_root,
                 context=context,
@@ -592,19 +618,7 @@ def run_task_workflow(
                 failure_source="gate",
                 failure_details=failure_details,
             )
-            fix_prompt_file = log_dir / f"prompt_{step_index:02d}_fix.md"
-            fix_prompt_file.write_text(fix_brief, encoding="utf-8")
-            fix_cmd = format_command(
-                fix_cfg["cmd"],
-                prompt=fix_brief,
-                prompt_file=fix_prompt_file,
-                role_model=str(fix_cfg.get("model", "sonnet")),
-            )
-            fix_rc, fix_out, fix_err, fix_dur = execute_command(
-                fix_cmd,
-                cwd=worktree,
-                timeout_s=int(fix_cfg.get("timeout_s", 900)),
-            )
+            fix_res = _invoke_role("fixer", fix_engine, fix_brief)
             log_file = write_step_log(
                 log_dir,
                 step_index,
@@ -612,14 +626,18 @@ def run_task_workflow(
                 {
                     "step_index": step_index,
                     "step": "fix",
+                    "role": "fixer",
+                    "engine": fix_engine.name,
                     "round": fix_rounds_used,
                     "trigger": "gate",
                     "template": fix_tpl_src,
-                    "command": fix_cmd,
-                    "returncode": fix_rc,
-                    "stdout": fix_out,
-                    "stderr": fix_err,
-                    "duration_s": fix_dur,
+                    "status": fix_res.status,
+                    "returncode": fix_res.exit_code,
+                    "stdout": fix_res.final_text,
+                    "stderr": fix_res.stderr,
+                    "duration_s": fix_res.duration_s,
+                    "cost_usd": fix_res.cost_usd,
+                    "transcript_path": str(fix_res.transcript_path),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
@@ -634,20 +652,12 @@ def run_task_workflow(
             context=context,
             git_diff=diff_text,
         )
-        rev_prompt_file = log_dir / f"prompt_{step_index:02d}_review.md"
-        rev_prompt_file.write_text(rev_brief, encoding="utf-8")
-        rev_cmd = format_command(
-            rev_cfg["cmd"],
-            prompt=rev_brief,
-            prompt_file=rev_prompt_file,
-            role_model=str(rev_cfg.get("model", "sonnet")),
+        rev_res = _invoke_role("reviewer", rev_engine, rev_brief)
+        verdict = (
+            parse_review_verdict(rev_res.final_text)
+            if rev_res.exit_code == 0 and rev_res.status == "ok"
+            else "INVALID_VERDICT"
         )
-        rev_rc, rev_out, rev_err, rev_dur = execute_command(
-            rev_cmd,
-            cwd=worktree,
-            timeout_s=int(rev_cfg.get("timeout_s", 600)),
-        )
-        verdict = parse_review_verdict(rev_out) if rev_rc == 0 else "INVALID_VERDICT"
         final_verdict = verdict
         log_file = write_step_log(
             log_dir,
@@ -656,14 +666,18 @@ def run_task_workflow(
             {
                 "step_index": step_index,
                 "step": "review",
+                "role": "reviewer",
+                "engine": rev_engine.name,
                 "round": fix_rounds_used,
                 "template": rev_tpl_src,
-                "command": rev_cmd,
-                "returncode": rev_rc,
+                "status": rev_res.status,
+                "returncode": rev_res.exit_code,
                 "verdict": verdict,
-                "stdout": rev_out,
-                "stderr": rev_err,
-                "duration_s": rev_dur,
+                "stdout": rev_res.final_text,
+                "stderr": rev_res.stderr,
+                "duration_s": rev_res.duration_s,
+                "cost_usd": rev_res.cost_usd,
+                "transcript_path": str(rev_res.transcript_path),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -683,7 +697,11 @@ def run_task_workflow(
 
         fix_rounds_used += 1
         step_index += 1
-        failure_details = rev_out.strip() or rev_err.strip() or f"Reviewer verdict: {verdict}"
+        failure_details = (
+            rev_res.final_text.strip()
+            or rev_res.stderr.strip()
+            or f"Reviewer verdict: {verdict}"
+        )
         fix_brief, fix_tpl_src = render_fix_brief(
             repo_root=repo_root,
             context=context,
@@ -692,19 +710,7 @@ def run_task_workflow(
             failure_source=f"review ({verdict})",
             failure_details=failure_details,
         )
-        fix_prompt_file = log_dir / f"prompt_{step_index:02d}_fix.md"
-        fix_prompt_file.write_text(fix_brief, encoding="utf-8")
-        fix_cmd = format_command(
-            fix_cfg["cmd"],
-            prompt=fix_brief,
-            prompt_file=fix_prompt_file,
-            role_model=str(fix_cfg.get("model", "sonnet")),
-        )
-        fix_rc, fix_out, fix_err, fix_dur = execute_command(
-            fix_cmd,
-            cwd=worktree,
-            timeout_s=int(fix_cfg.get("timeout_s", 900)),
-        )
+        fix_res = _invoke_role("fixer", fix_engine, fix_brief)
         log_file = write_step_log(
             log_dir,
             step_index,
@@ -712,14 +718,18 @@ def run_task_workflow(
             {
                 "step_index": step_index,
                 "step": "fix",
+                "role": "fixer",
+                "engine": fix_engine.name,
                 "round": fix_rounds_used,
                 "trigger": "review",
                 "template": fix_tpl_src,
-                "command": fix_cmd,
-                "returncode": fix_rc,
-                "stdout": fix_out,
-                "stderr": fix_err,
-                "duration_s": fix_dur,
+                "status": fix_res.status,
+                "returncode": fix_res.exit_code,
+                "stdout": fix_res.final_text,
+                "stderr": fix_res.stderr,
+                "duration_s": fix_res.duration_s,
+                "cost_usd": fix_res.cost_usd,
+                "transcript_path": str(fix_res.transcript_path),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -743,6 +753,14 @@ def run_task_workflow(
         )
         step_logs.append(esc_log.name)
 
+    update_run_json(
+        active_run_dir,
+        task=context["TASK_ID"],
+        engines=role_engine_map,
+        outcome=final_status,
+        finished=datetime.now(timezone.utc).isoformat(),
+    )
+
     summary = {
         "task_id": context["TASK_ID"],
         "task_title": context["TASK_TITLE"],
@@ -751,12 +769,19 @@ def run_task_workflow(
         "fix_rounds_used": fix_rounds_used,
         "max_fix_rounds": max_fix_rounds,
         "escalation_reason": escalation_reason,
+        "cost_usd": round(total_cost_usd, 6),
+        "run_dir": str(active_run_dir),
         "step_logs": step_logs,
     }
     (log_dir / "run_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n",
         encoding="utf-8",
     )
+    if active_run_dir != log_dir:
+        (active_run_dir / "run_summary.json").write_text(
+            json.dumps(summary, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     if final_status == "APPROVED":
         print("VERDICT: APPROVE")
@@ -816,7 +841,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-dir",
         default="",
-        help="Directory to write per-step JSON logs (default: /tmp/devpack-run/<task-id>)",
+        help="Directory to write per-step logs and run artifacts",
+    )
+    parser.add_argument(
+        "--runs-root",
+        default="",
+        help="Root directory for creating a timestamped runs/<run-id>/ directory",
     )
     parser.add_argument(
         "--repo-root",
@@ -828,6 +858,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override max_fix_rounds from config (default: from config, typically 2)",
+    )
+    parser.add_argument(
+        "--isolation",
+        choices=("local", "docker"),
+        default="local",
+        help="Agent isolation mode (default: local)",
+    )
+    parser.add_argument(
+        "--credentials",
+        default=os.environ.get("DEVPACK_CLAUDE_CREDENTIALS", ""),
+        help="Optional path to Claude credentials file for cloud engines",
+    )
+    parser.add_argument(
+        "--agent-bin",
+        default=os.environ.get("DEVPACK_AGENT_BIN", "claude"),
+        help="Agent CLI executable name or path (default: claude)",
     )
     parser.add_argument(
         "--dry-run",
@@ -846,6 +892,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     worktree = Path(args.worktree).resolve()
     repo_root = Path(args.repo_root).resolve()
     task_file = Path(args.task_file).resolve() if args.task_file else None
+    credentials_path = Path(args.credentials).resolve() if args.credentials else None
 
     if not worktree.is_dir():
         print(f"error: worktree directory not found: {worktree}", file=sys.stderr)
@@ -864,10 +911,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    run_dir: Path | None = None
+    if args.runs_root and not args.dry_run:
+        run_dir = new_run_dir(
+            Path(args.runs_root).resolve(),
+            kind="task",
+            task=context["TASK_ID"],
+        )
+
     if args.log_dir:
         log_dir = Path(args.log_dir).resolve()
-    else:
+        if run_dir is None:
+            run_dir = log_dir
+    elif run_dir is not None:
+        log_dir = run_dir
+    elif args.dry_run:
         log_dir = Path("/tmp/devpack-run") / args.task_id
+    else:
+        run_dir = new_run_dir(
+            Path("/tmp/devpack-run/runs"),
+            kind="task",
+            task=context["TASK_ID"],
+        )
+        log_dir = run_dir
 
     rc, _summary = run_task_workflow(
         config=config,
@@ -877,6 +943,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo_root=repo_root,
         max_fix_rounds_override=args.max_fix_rounds,
         dry_run=args.dry_run,
+        run_dir=run_dir,
+        isolation=args.isolation,
+        credentials_path=credentials_path,
+        agent_bin=args.agent_bin,
     )
     return rc
 

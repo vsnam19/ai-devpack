@@ -1,57 +1,39 @@
-# engines.example.toml - Example engine and gate configuration for runner/devpack_run.py.
+# engines.example.toml - Example v2 engine, role, and limit configuration for ai-devpack.
 #
-# Configures the maximum fix rounds (capped at 2 before ESCALATE_TO_HUMAN),
-# the deterministic gate command, and role command templates for implementer,
-# reviewer, and fixer using Claude Sonnet / Haiku.
+# Defines cloud and local engines (with data classification bounds and environment
+# variable names for local endpoints), maps workflow roles to engine names, and
+# configures retry limits and deterministic gate execution for runner/devpack_run.py.
 
-max_fix_rounds = 2
+version = 2
 gate_cmd = ["python3", "enforcement/gate/gate.py", "--config", "enforcement/gate/gate.example.toml"]
 gate_timeout_s = 300
 
-[roles.implementer]
+[engines.sonnet]
 model = "sonnet"
-cmd = [
-  "claude",
-  "-p",
-  "--model",
-  "sonnet",
-  "--setting-sources",
-  "project",
-  "--strict-mcp-config",
-  "--no-session-persistence",
-  "--disable-slash-commands",
-  "{prompt}",
-]
+class = "cloud"             # cloud | local
+max_data_class = "internal" # highest confidentiality class this engine may see (policy/data_governance.md)
 timeout_s = 900
 
-[roles.reviewer]
-model = "sonnet"
-cmd = [
-  "claude",
-  "-p",
-  "--model",
-  "sonnet",
-  "--setting-sources",
-  "project",
-  "--strict-mcp-config",
-  "--no-session-persistence",
-  "--disable-slash-commands",
-  "{prompt}",
-]
-timeout_s = 600
-
-[roles.fixer]
-model = "sonnet"
-cmd = [
-  "claude",
-  "-p",
-  "--model",
-  "sonnet",
-  "--setting-sources",
-  "project",
-  "--strict-mcp-config",
-  "--no-session-persistence",
-  "--disable-slash-commands",
-  "{prompt}",
-]
+[engines.haiku]
+model = "haiku"
+class = "cloud"
+max_data_class = "internal"
 timeout_s = 900
+
+[engines.local]
+model = "local-coder"       # model name exposed by the on-prem server
+class = "local"
+max_data_class = "confidential"
+base_url_env = "DEVPACK_LOCAL_BASE_URL"      # env var NAME holding the URL; never the URL itself in repo
+auth_token_env = "DEVPACK_LOCAL_AUTH_TOKEN"  # env var NAME; value never logged
+min_context_tokens = 32768
+timeout_s = 900
+
+[roles]
+implementer = "haiku"
+reviewer = "sonnet"
+fixer = "haiku"
+orchestrator = "sonnet"
+
+[limits]
+max_fix_rounds = 2

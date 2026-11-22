@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# run_eval.py - Isolated evaluation runner for ai-devpack tasks and models.
+# run_eval.py - Isolated evaluation runner for ai-devpack tasks and engines.
 #
 # Usage:
-#   python3 eval/run_eval.py [--help] [--models sonnet,haiku] [--k 5]
-#       [--tasks all|id,...] [--isolation docker|local] [--out eval/results]
+#   python3 eval/run_eval.py [--help] [--engines sonnet,haiku] [--models sonnet,haiku]
+#       [--k 5] [--tasks all|id,...] [--isolation docker|local] [--out eval/results]
+#       [--runs-root eval/results/<date>/runs] [--engines-config runner/engines.example.toml]
 #       [--dry-run] [--timeout-s 900] [--max-parallel 1] [--credentials PATH]
 #       [--work-root PATH] [--claude-version 2.1.330] [--allow-harness-errors]
 #
@@ -23,29 +24,53 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
 import subprocess
 import sys
-import time
 from typing import Any, Callable, Sequence
 import uuid
 
-DEFAULT_CLAUDE_VERSION = "2.1.330"
-DOCKER_IMAGE_TAG = f"devpack-eval:{DEFAULT_CLAUDE_VERSION}"
-DOCKER_TASK_DIR = "/workspace/task"
-ALLOWED_TOOLS = ("Read", "Edit", "Write", "Bash", "Glob", "Grep")
-DISALLOWED_TOOLS = ("WebFetch", "WebSearch")
+EVAL_DIR = Path(__file__).resolve().parent
+REPO_ROOT = EVAL_DIR.parent
+for _p in (str(REPO_ROOT), str(REPO_ROOT / "runner")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from runner import agent_exec  # noqa: E402
+from runner.agent_exec import (  # noqa: E402
+    ALLOWED_TOOLS,
+    DEFAULT_CLAUDE_VERSION,
+    DISALLOWED_TOOLS,
+    DOCKER_IMAGE_TAG,
+    DOCKER_TASK_DIR,
+    AgentRequest,
+    EngineConfig,
+    EnginesConfig,
+    build_claude_state,
+    build_docker_agent_invocation,
+    build_invocation,
+    build_local_agent_invocation,
+    build_permission_args,
+    build_project_settings,
+    cleanup_cfg_dir,
+    detect_harness_error,
+    extract_agent_json_object,
+    json_string_leaves,
+    load_engines,
+    new_run_dir,
+    parse_agent_json_output,
+    parse_stream,
+    redact_sensitive_text,
+    redact_structure,
+    resolve_engine,
+    run_agent,
+    update_run_json,
+)
+
 EXCERPT_MAX_CHARS = 4000
 STDERR_TAIL_MAX_CHARS = 2000
 REQUIRED_TASK_FILES = ("task.md", "check.sh", "setup.patch", "solution.patch")
-
-# Assemble host-home regex from fragments so forbidden literal substrings never appear.
-_HOME_PREFIX = "/" + "ho" + "me/"
-_HOST_HOME_RE = re.compile(
-    r"(?:" + re.escape(_HOME_PREFIX) + r"[A-Za-z0-9_.-]+|/Users/[A-Za-z0-9_.-]+)"
-)
 
 
 @dataclass(frozen=True)
@@ -83,6 +108,8 @@ class TrialResult:
     agent_result_excerpt: str = ""
     permission_denials: list[Any] = field(default_factory=list)
     stderr_tail: str = ""
+    tool_protocol_errors: int = 0
+    run_dir: str = ""
 
 
 @dataclass
@@ -103,6 +130,7 @@ class TaskModelSummary:
     runs: list[TrialResult] = field(default_factory=list)
     harness_errors: int = 0
     valid_runs: int = 0
+    tool_protocol_errors: int = 0
 
 
 def parse_category(task_md_text: str) -> str:
@@ -116,17 +144,17 @@ def parse_category(task_md_text: str) -> str:
     return "uncategorized"
 
 
-def load_and_validate_tasks(tasks_dir: Path, task_Selector: str) -> list[TaskSpec]:
+def load_and_validate_tasks(tasks_dir: Path, task_selector: str) -> list[TaskSpec]:
     """Discover and validate requested tasks under ``tasks_dir``."""
     if not tasks_dir.is_dir():
         raise ValueError(f"Tasks directory does not exist: {tasks_dir}")
 
-    if task_Selector.strip().lower() == "all":
+    if task_selector.strip().lower() == "all":
         candidate_dirs = sorted(
             p for p in tasks_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
         )
     else:
-        requested_ids = [item.strip() for item in task_Selector.split(",") if item.strip()]
+        requested_ids = [item.strip() for item in task_selector.split(",") if item.strip()]
         if not requested_ids:
             raise ValueError("No task IDs provided in --tasks")
         candidate_dirs = [tasks_dir / tid for tid in requested_ids]
@@ -177,53 +205,20 @@ def docker_image_tag(claude_version: str) -> str:
     return f"devpack-eval:{claude_version}"
 
 
-def build_permission_args() -> list[str]:
-    """Return command-line permission flags that make workspace trust irrelevant."""
-    return [
-        "--allowedTools",
-        *ALLOWED_TOOLS,
-        "--disallowedTools",
-        *DISALLOWED_TOOLS,
-    ]
-
-
-def build_claude_state(agent_cwd: str) -> dict[str, Any]:
-    """Return ``.claude.json`` content marking ``agent_cwd`` as a trusted project."""
-    return {"projects": {agent_cwd: {"hasTrustDialogAccepted": True}}}
-
-
-def build_project_settings() -> dict[str, Any]:
-    """Return the Claude project settings JSON enforcing tool permissions in cwd."""
-    return {
-        "permissions": {
-            "allow": [
-                "Read",
-                "Edit",
-                "Write",
-                "Bash",
-            ],
-            "deny": [
-                "WebFetch",
-                "WebSearch",
-            ],
-        }
-    }
-
-
 def prepare_isolated_trial_dir(
     trial_root: Path,
     fixture_dir: Path,
     task: TaskSpec,
-    credentials_path: Path,
+    credentials_path: Path | None,
     agent_cwd: str | None = None,
 ) -> dict[str, Path]:
     """Create an isolated trial directory with home, cfg, and git-initialized task workdir.
 
-    Copies only the credentials file into ``<trial_root>/cfg/.credentials.json``,
-    initializes git on a fresh copy of ``fixture_dir``, applies ``setup.patch``,
-    commits the setup state, and writes the task prompt and ``.claude/settings.json``.
-    Also pre-writes ``<cfg>/.claude.json`` trusting ``agent_cwd`` (the working
-    directory as seen by the agent; defaults to the host task dir).
+    Copies only the credentials file into ``<trial_root>/cfg/.credentials.json``
+    (when ``credentials_path`` is provided), initializes git on a fresh copy of
+    ``fixture_dir``, applies ``setup.patch``, commits the setup state, and writes
+    the task prompt and ``.claude/settings.json``. Also pre-writes
+    ``<cfg>/.claude.json`` trusting ``agent_cwd``.
     """
     home_dir = trial_root / "home"
     cfg_dir = trial_root / "cfg"
@@ -235,12 +230,12 @@ def prepare_isolated_trial_dir(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    if not credentials_path.is_file():
-        raise RuntimeError(f"Credentials file not found: {credentials_path}")
-
     cred_dest = cfg_dir / ".credentials.json"
-    shutil.copyfile(credentials_path, cred_dest)
-    os.chmod(cred_dest, stat.S_IRUSR | stat.S_IWUSR)
+    if credentials_path is not None:
+        if not credentials_path.is_file():
+            raise RuntimeError(f"Credentials file not found: {credentials_path}")
+        shutil.copyfile(credentials_path, cred_dest)
+        os.chmod(cred_dest, stat.S_IRUSR | stat.S_IWUSR)
 
     state_path = cfg_dir / ".claude.json"
     state_path.write_text(
@@ -316,91 +311,6 @@ def prepare_isolated_trial_dir(
     }
 
 
-def build_local_agent_invocation(
-    agent_bin: str,
-    model: str,
-    prompt_text: str,
-    paths: dict[str, Path],
-) -> tuple[list[str], dict[str, str], Path]:
-    """Construct the command, isolated environment dict, and cwd for local mode."""
-    cmd = [
-        agent_bin,
-        "-p",
-        *build_permission_args(),
-        "--model",
-        model,
-        "--setting-sources",
-        "project",
-        "--strict-mcp-config",
-        "--no-session-persistence",
-        "--disable-slash-commands",
-        "--output-format",
-        "json",
-        prompt_text,
-    ]
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(paths["home_dir"]),
-        "CLAUDE_CONFIG_DIR": str(paths["cfg_dir"]),
-        "TMPDIR": str(paths["tmp_dir"]),
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-    }
-    return cmd, env, paths["work_dir"]
-
-
-def build_docker_agent_invocation(
-    docker_bin: str,
-    image_tag: str,
-    model: str,
-    prompt_text: str,
-    paths: dict[str, Path],
-    agent_bin_in_container: str = "claude",
-) -> tuple[list[str], dict[str, str], Path]:
-    """Construct the docker run command, environment dict, and cwd for docker mode."""
-    cmd = [
-        docker_bin,
-        "run",
-        "--rm",
-        "--network",
-        "default",
-        "--user",
-        "1000:1000",
-        "--workdir",
-        DOCKER_TASK_DIR,
-        "-e",
-        "HOME=/workspace/home",
-        "-e",
-        "CLAUDE_CONFIG_DIR=/workspace/cfg",
-        "-v",
-        f"{paths['work_dir']}:{DOCKER_TASK_DIR}:rw",
-        "-v",
-        f"{paths['cfg_dir']}:/workspace/cfg:ro",
-        image_tag,
-        agent_bin_in_container,
-        "-p",
-        *build_permission_args(),
-        "--model",
-        model,
-        "--setting-sources",
-        "project",
-        "--strict-mcp-config",
-        "--no-session-persistence",
-        "--disable-slash-commands",
-        "--output-format",
-        "json",
-        prompt_text,
-    ]
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(paths["home_dir"]),
-        "TMPDIR": str(paths["tmp_dir"]),
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-    }
-    return cmd, env, paths["work_dir"]
-
-
 def ensure_docker_image(
     dockerfile_path: Path,
     image_tag: str = DOCKER_IMAGE_TAG,
@@ -441,89 +351,6 @@ def ensure_docker_image(
     return docker_bin
 
 
-def extract_agent_json_object(stdout_text: str) -> dict[str, Any] | None:
-    """Return the JSON object printed by the agent, or None when unparsable."""
-    stripped = stdout_text.strip()
-    if not stripped:
-        return None
-
-    candidates = [stripped]
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    if len(lines) > 1:
-        candidates.extend(reversed(lines))
-
-    parsed: dict[str, Any] | None = None
-    for candidate in candidates:
-        if not (candidate.startswith("{") and candidate.endswith("}")):
-            continue
-        try:
-            obj = json.loads(candidate)
-            if isinstance(obj, dict):
-                parsed = obj
-                break
-        except json.JSONDecodeError:
-            continue
-
-    return parsed
-
-
-def parse_agent_json_output(stdout_text: str) -> dict[str, Any]:
-    """Parse cost, turns, and duration telemetry from agent JSON output if present."""
-    metrics: dict[str, Any] = {
-        "cost_usd": None,
-        "turns": None,
-        "duration_s": None,
-    }
-    parsed = extract_agent_json_object(stdout_text)
-    if not parsed:
-        return metrics
-
-    for cost_key in ("total_cost_usd", "cost_usd", "cost"):
-        val = parsed.get(cost_key)
-        if isinstance(val, (int, float)):
-            metrics["cost_usd"] = float(val)
-            break
-
-    for turns_key in ("num_turns", "turns"):
-        val = parsed.get(turns_key)
-        if isinstance(val, int):
-            metrics["turns"] = val
-            break
-
-    if isinstance(parsed.get("duration_s"), (int, float)):
-        metrics["duration_s"] = float(parsed["duration_s"])
-    elif isinstance(parsed.get("duration_ms"), (int, float)):
-        metrics["duration_s"] = float(parsed["duration_ms"]) / 1000.0
-
-    return metrics
-
-
-def detect_harness_error(
-    agent_rc: int,
-    stdout_text: str,
-    stderr_text: str,
-    timeout_error: str = "",
-) -> str:
-    """Return a reason string when the run is a harness error, else an empty string.
-
-    A harness error means the agent could not work under valid conditions
-    (untrusted workspace, ignored permissions, crash, unparsable output).
-    """
-    if timeout_error:
-        return timeout_error
-    combined = f"{stdout_text}\n{stderr_text}"
-    lowered = combined.lower()
-    if "not been trusted" in lowered:
-        return "workspace not trusted: agent ignored project permissions"
-    if "ignoring" in lowered and "permissions" in lowered:
-        return "agent ignored permissions entries"
-    if agent_rc != 0:
-        return f"agent exited with non-zero status {agent_rc}"
-    if extract_agent_json_object(stdout_text) is None:
-        return "agent output JSON is missing or unparsable"
-    return ""
-
-
 def compute_pass_at_1(passes: int, total: int) -> float:
     """Compute empirical pass@1 (c / n) for a task or category."""
     if total < 1:
@@ -554,97 +381,13 @@ def compute_pass_pow_k(passes: int, total: int, k: int | None = None) -> float:
     return (passes / total) ** exponent
 
 
-def redact_sensitive_text(
-    text: str,
-    extra_secrets: Sequence[str] = (),
-    path_replacements: Sequence[tuple[str, str]] = (),
-) -> str:
-    """Redact credentials, secret tokens, and host home paths from output text."""
-    if not text:
-        return text
-    result = text
-    for secret in extra_secrets:
-        cleaned = secret.strip()
-        if cleaned:
-            result = result.replace(cleaned, "<REDACTED_CREDENTIALS>")
-
-    for raw_path, placeholder in path_replacements:
-        if raw_path:
-            result = result.replace(raw_path, placeholder)
-
-    env_home = os.environ.get("HOME", "").strip()
-    if env_home and env_home != "/":
-        result = result.replace(env_home, "$HOME")
-
-    try:
-        resolved_home = str(Path.home())
-        if resolved_home and resolved_home != "/":
-            result = result.replace(resolved_home, "$HOME")
-    except RuntimeError:
-        pass
-
-    result = _HOST_HOME_RE.sub("$HOME", result)
-    return result
-
-
-def redact_structure(
-    value: Any,
-    extra_secrets: Sequence[str] = (),
-    path_replacements: Sequence[tuple[str, str]] = (),
-) -> Any:
-    """Recursively redact sensitive strings in a JSON-serializable structure."""
-    if isinstance(value, str):
-        return redact_sensitive_text(value, extra_secrets, path_replacements)
-    if isinstance(value, list):
-        return [
-            redact_structure(item, extra_secrets, path_replacements) for item in value
-        ]
-    if isinstance(value, dict):
-        return {
-            redact_sensitive_text(str(k), extra_secrets, path_replacements): redact_structure(
-                v, extra_secrets, path_replacements
-            )
-            for k, v in value.items()
-        }
-    return value
-
-
-def _json_string_leaves(value: Any, min_len: int = 8) -> list[str]:
-    """Return every string value (length >= ``min_len``) found inside a JSON structure."""
-    if isinstance(value, str):
-        return [value] if len(value) >= min_len else []
-    if isinstance(value, list):
-        return [leaf for item in value for leaf in _json_string_leaves(item, min_len)]
-    if isinstance(value, dict):
-        return [leaf for item in value.values() for leaf in _json_string_leaves(item, min_len)]
-    return []
-
-
-def cleanup_cfg_dir(cfg_dir: Path) -> None:
-    """Delete the credentials copy and every other entry inside ``cfg_dir``."""
-    try:
-        (cfg_dir / ".credentials.json").unlink(missing_ok=True)
-    except OSError:
-        pass
-    if not cfg_dir.is_dir():
-        return
-    for entry in cfg_dir.iterdir():
-        try:
-            if entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
-                entry.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
 def run_single_trial(
     task: TaskSpec,
     model: str,
     run_index: int,
     run_root: Path,
     fixture_dir: Path,
-    credentials_path: Path,
+    credentials_path: Path | None,
     isolation: str,
     agent_bin: str,
     timeout_s: int,
@@ -652,6 +395,8 @@ def run_single_trial(
     extra_secrets: Sequence[str] = (),
     path_replacements: Sequence[tuple[str, str]] = (),
     image_tag: str = DOCKER_IMAGE_TAG,
+    runs_root: Path | None = None,
+    engine_config: EngineConfig | None = None,
 ) -> TrialResult:
     """Execute one (task, model, run_index) trial in an isolated workspace.
 
@@ -662,9 +407,21 @@ def run_single_trial(
     trial_root = run_root / trial_name
     try:
         return _run_trial_body(
-            task, model, run_index, trial_root, fixture_dir, credentials_path,
-            isolation, agent_bin, timeout_s, docker_bin, extra_secrets,
-            path_replacements, image_tag,
+            task=task,
+            model=model,
+            run_index=run_index,
+            trial_root=trial_root,
+            fixture_dir=fixture_dir,
+            credentials_path=credentials_path,
+            isolation=isolation,
+            agent_bin=agent_bin,
+            timeout_s=timeout_s,
+            docker_bin=docker_bin,
+            extra_secrets=extra_secrets,
+            path_replacements=path_replacements,
+            image_tag=image_tag,
+            runs_root=runs_root or (run_root / "runs"),
+            engine_config=engine_config,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")
@@ -676,7 +433,7 @@ def _run_trial_body(
     run_index: int,
     trial_root: Path,
     fixture_dir: Path,
-    credentials_path: Path,
+    credentials_path: Path | None,
     isolation: str,
     agent_bin: str,
     timeout_s: int,
@@ -684,102 +441,78 @@ def _run_trial_body(
     extra_secrets: Sequence[str],
     path_replacements: Sequence[tuple[str, str]],
     image_tag: str,
+    runs_root: Path | None = None,
+    engine_config: EngineConfig | None = None,
 ) -> TrialResult:
-    """Run the agent and the check for one trial (cleanup is done by the caller)."""
+    """Run the agent via agent_exec and execute check.sh for one trial."""
     if isolation not in ("local", "docker"):
         raise ValueError(f"Unsupported isolation mode: {isolation}")
+    if isolation == "docker" and not docker_bin:
+        raise RuntimeError("docker_bin is required for docker isolation mode")
+
+    engine = engine_config or resolve_engine(model)
     paths = prepare_isolated_trial_dir(
         trial_root=trial_root,
         fixture_dir=fixture_dir,
         task=task,
-        credentials_path=credentials_path,
+        credentials_path=credentials_path if engine.is_cloud else None,
         agent_cwd=DOCKER_TASK_DIR if isolation == "docker" else None,
     )
     prompt_text = paths["prompt_file"].read_text(encoding="utf-8")
     work_dir = paths["work_dir"]
 
-    if isolation == "local":
-        cmd, env, cwd = build_local_agent_invocation(
-            agent_bin=agent_bin,
-            model=model,
-            prompt_text=prompt_text,
-            paths=paths,
-        )
-    else:
-        if not docker_bin:
-            raise RuntimeError("docker_bin is required for docker isolation mode")
-        cmd, env, cwd = build_docker_agent_invocation(
-            docker_bin=docker_bin,
-            image_tag=image_tag,
-            model=model,
-            prompt_text=prompt_text,
-            paths=paths,
-        )
-
-    start_ts = time.monotonic()
-    agent_rc = -1
-    agent_stdout = ""
-    agent_stderr = ""
-    error_msg = ""
-    timeout_error = ""
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-        agent_rc = proc.returncode
-        agent_stdout = proc.stdout or ""
-        agent_stderr = proc.stderr or ""
-        if proc.returncode != 0 and agent_stderr.strip():
-            error_msg = agent_stderr.strip()
-    except subprocess.TimeoutExpired as exc:
-        agent_rc = 124
-        error_msg = f"Agent timed out after {timeout_s}s"
-        timeout_error = error_msg
-        for attr in ("stdout", "stderr"):
-            raw = getattr(exc, attr, None)
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="replace")
-            if attr == "stdout":
-                agent_stdout = raw or ""
-            else:
-                agent_stderr = raw or ""
-    except OSError as exc:
-        agent_rc = 127
-        error_msg = f"Failed to execute agent command: {exc}"
-        timeout_error = error_msg
-
-    elapsed_s = time.monotonic() - start_ts
-    parsed_metrics = parse_agent_json_output(agent_stdout)
-    parsed_obj = extract_agent_json_object(agent_stdout) or {}
-    duration_s = (
-        parsed_metrics["duration_s"]
-        if parsed_metrics["duration_s"] is not None
-        else round(elapsed_s, 4)
+    effective_runs_root = runs_root if runs_root is not None else (trial_root / "runs")
+    trial_run_dir = new_run_dir(
+        effective_runs_root,
+        kind="eval",
+        task=task.task_id,
+        engines=[engine.name],
     )
-    harness_reason = detect_harness_error(
-        agent_rc, agent_stdout, agent_stderr, timeout_error
+
+    request = AgentRequest(
+        engine=engine,
+        prompt=prompt_text,
+        workdir=work_dir,
+        run_dir=trial_run_dir,
+        step_name=f"01-eval-{engine.name}",
+        isolation=isolation,
+        timeout_s=timeout_s,
+        skills_enabled=False,
+        credentials_path=credentials_path if engine.is_cloud else None,
+        agent_bin=agent_bin,
+        docker_bin=docker_bin or "docker",
+        image_tag=image_tag,
+        extra_secrets=extra_secrets,
+        path_replacements=path_replacements,
+        role="eval",
+        step_index=1,
+        home_dir=paths["home_dir"],
+        cfg_dir=paths["cfg_dir"],
+        tmp_dir=paths["tmp_dir"],
+        home_placeholder="$HOME",
     )
+    agent_res = run_agent(request)
 
     def _redact(text: str) -> str:
         """Redact a string using this run's secrets and path replacements."""
-        return redact_sensitive_text(text, extra_secrets, path_replacements)
+        return redact_sensitive_text(
+            text,
+            extra_secrets=extra_secrets,
+            path_replacements=path_replacements,
+            home_placeholder="$HOME",
+        )
 
-    result_text = parsed_obj.get("result")
-    excerpt = _redact(result_text)[:EXCERPT_MAX_CHARS] if isinstance(result_text, str) else ""
-    denials = parsed_obj.get("permission_denials")
-    denials_out = (
-        redact_structure(denials, extra_secrets, path_replacements)
-        if isinstance(denials, list)
-        else []
+    excerpt = _redact(agent_res.final_text)[:EXCERPT_MAX_CHARS]
+    denials_out = redact_structure(
+        agent_res.permission_denials,
+        extra_secrets=extra_secrets,
+        path_replacements=path_replacements,
+        home_placeholder="$HOME",
     )
-    stderr_tail = _redact(agent_stderr)[-STDERR_TAIL_MAX_CHARS:]
+    stderr_tail = _redact(agent_res.stderr)[-STDERR_TAIL_MAX_CHARS:]
+    is_harness_err = agent_res.status in ("harness_error", "timeout")
+    harness_reason = agent_res.error if is_harness_err else ""
+    error_msg = agent_res.error if agent_res.status != "ok" else ""
 
     task_prompt_in_work = work_dir / "TASK_PROMPT.md"
     if task_prompt_in_work.exists():
@@ -808,25 +541,41 @@ def _run_trial_body(
         check_rc = 124
         check_out = f"check.sh timed out after {timeout_s}s"
 
-    passed = check_rc == 0 and not harness_reason
+    redacted_check_out = _redact(check_out)
+    gate_step_path = trial_run_dir / "steps" / "02-gate.txt"
+    gate_step_path.write_text(
+        (redacted_check_out + "\n") if redacted_check_out else f"check_rc={check_rc}\n",
+        encoding="utf-8",
+    )
+
+    passed = check_rc == 0 and not is_harness_err
+    outcome = "pass" if passed else ("harness_error" if is_harness_err else "fail")
+    update_run_json(
+        trial_run_dir,
+        outcome=outcome,
+        finished=datetime.now(timezone.utc).isoformat(),
+    )
+
     return TrialResult(
         task_id=task.task_id,
         category=task.category,
         model=model,
         run_index=run_index,
         passed=passed,
-        agent_returncode=agent_rc,
+        agent_returncode=agent_res.exit_code,
         check_returncode=check_rc,
-        cost_usd=parsed_metrics["cost_usd"],
-        turns=parsed_metrics["turns"],
-        duration_s=float(duration_s),
+        cost_usd=agent_res.cost_usd if not is_harness_err else None,
+        turns=agent_res.num_turns if not is_harness_err else None,
+        duration_s=float(agent_res.duration_s),
         error=_redact(error_msg),
-        check_output=_redact(check_out),
-        harness_error=bool(harness_reason),
+        check_output=redacted_check_out,
+        harness_error=is_harness_err,
         harness_error_reason=_redact(harness_reason),
         agent_result_excerpt=excerpt,
-        permission_denials=denials_out,
+        permission_denials=denials_out if isinstance(denials_out, list) else [],
         stderr_tail=stderr_tail,
+        tool_protocol_errors=int(agent_res.tool_protocol_errors),
+        run_dir=_redact(str(trial_run_dir)),
     )
 
 
@@ -849,6 +598,7 @@ def aggregate_results(
                 key=lambda r: r.run_index,
             )
             harness_errors = sum(1 for r in runs if r.harness_error)
+            protocol_errors = sum(int(r.tool_protocol_errors) for r in runs)
             valid = [r for r in runs if not r.harness_error]
             has_valid = bool(valid)
             total = len(valid) if has_valid else 0
@@ -889,6 +639,7 @@ def aggregate_results(
                     runs=runs,
                     harness_errors=harness_errors,
                     valid_runs=len(valid),
+                    tool_protocol_errors=protocol_errors,
                 )
             )
 
@@ -910,9 +661,9 @@ def aggregate_results(
                 """Average ``values`` rounded to 4 places, or None when empty."""
                 return round(sum(values) / len(values), 4) if values else None
 
-            mean_pass_at_1 = _mean([s.pass_at_1 for s in scored])
-            mean_pass_hat_k = _mean([s.pass_hat_k for s in scored])
-            mean_pass_pow_k = _mean([s.pass_pow_k for s in scored])
+            mean_pass_at_1 = _mean([s.pass_at_1 for s in scored if s.pass_at_1 is not None])
+            mean_pass_hat_k = _mean([s.pass_hat_k for s in scored if s.pass_hat_k is not None])
+            mean_pass_pow_k = _mean([s.pass_pow_k for s in scored if s.pass_pow_k is not None])
             cat_costs = [
                 s.mean_cost_usd for s in matching if s.mean_cost_usd is not None
             ]
@@ -927,6 +678,7 @@ def aggregate_results(
                     "pass_hat_k": mean_pass_hat_k,
                     "pass_pow_k": mean_pass_pow_k,
                     "harness_errors": sum(s.harness_errors for s in matching),
+                    "tool_protocol_errors": sum(s.tool_protocol_errors for s in matching),
                     "mean_cost_usd": (
                         round(sum(cat_costs) / len(cat_costs), 6)
                         if cat_costs
@@ -963,15 +715,15 @@ def render_summary_markdown(
         "",
         f"- **Date**: {date_str}",
         f"- **Isolation**: `{isolation}`",
-        f"- **Models**: `{', '.join(models)}`",
+        f"- **Engines**: `{', '.join(models)}`",
         f"- **k**: `{k}`",
         "",
         "## Per-Category Summary",
         "",
         "Pass metrics are computed over valid runs only (harness errors excluded).",
         "",
-        "| Category | Model | Tasks | Harness errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Duration (s) |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Category | Engine | Tasks | Harness errors | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Duration (s) |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for cat in category_summaries:
         cost_str = (
@@ -981,7 +733,7 @@ def render_summary_markdown(
         )
         lines.append(
             f"| {cat['category']} | {cat['model']} | {cat['tasks_count']} | "
-            f"{cat['harness_errors']} | "
+            f"{cat['harness_errors']} | {cat.get('tool_protocol_errors', 0)} | "
             f"{_fmt(cat['pass_at_1'])} | {_fmt(cat['pass_hat_k'])} | "
             f"{_fmt(cat['pass_pow_k'])} | {cost_str} | {cat['mean_duration_s']:.2f} |"
         )
@@ -991,8 +743,8 @@ def render_summary_markdown(
             "",
             "## Per-Task Summary",
             "",
-            "| Task | Category | Model | Passes (c/valid) | Harness errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Duration (s) |",
-            "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+            "| Task | Category | Engine | Passes (c/valid) | Harness errors | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Duration (s) |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for ts in task_summaries:
@@ -1001,37 +753,75 @@ def render_summary_markdown(
         )
         lines.append(
             f"| {ts.task_id} | {ts.category} | {ts.model} | "
-            f"{ts.passes}/{ts.valid_runs} | {ts.harness_errors} | "
+            f"{ts.passes}/{ts.valid_runs} | {ts.harness_errors} | {ts.tool_protocol_errors} | "
             f"{_fmt(ts.pass_at_1)} | {_fmt(ts.pass_hat_k)} | "
             f"{_fmt(ts.pass_pow_k)} | {cost_str} | {ts.mean_duration_s:.2f} |"
         )
 
+    lines.extend(
+        [
+            "",
+            "## Per-Trial Runs",
+            "",
+            "| Task | Engine | Run | Passed | Cost (USD) | Tool Protocol Errors | Run Dir |",
+            "|---|---|---:|---|---:|---:|---|",
+        ]
+    )
+    for ts in task_summaries:
+        for run in ts.runs:
+            run_cost = f"{run.cost_usd:.4f}" if run.cost_usd is not None else "n/a"
+            lines.append(
+                f"| {run.task_id} | {run.model} | {run.run_index} | "
+                f"{'yes' if run.passed else 'no'} | {run_cost} | "
+                f"{run.tool_protocol_errors} | `{run.run_dir}` |"
+            )
+
     lines.append("")
     return "\n".join(lines)
+
+
+class _EnginesModelsAction(argparse.Action):
+    """Store both ``engines`` and ``models`` attributes on the parsed Namespace."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        """Assign ``values`` to both ``namespace.engines`` and ``namespace.models``."""
+        setattr(namespace, "models", values)
+        setattr(namespace, "engines", values)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser for ``eval/run_eval.py``."""
     repo_root = Path(__file__).resolve().parent.parent
     default_eval_dir = repo_root / "eval"
+    default_engines_cfg = repo_root / "runner" / "engines.example.toml"
 
     parser = argparse.ArgumentParser(
         prog="run_eval.py",
         description=(
-            "Run ai-devpack evaluation tasks across models in an isolated environment "
+            "Run ai-devpack evaluation tasks across engines in an isolated environment "
             "and compute pass@1 and pass^k metrics."
         ),
     )
     parser.add_argument(
+        "--engines",
         "--models",
+        dest="models",
+        action=_EnginesModelsAction,
         default="sonnet,haiku",
-        help="Comma-separated model names to evaluate (default: sonnet,haiku)",
+        help="Comma-separated engine/model names to evaluate (default: sonnet,haiku)",
     )
+    parser.set_defaults(engines="sonnet,haiku", models="sonnet,haiku")
     parser.add_argument(
         "--k",
         type=int,
         default=5,
-        help="Number of trials per (task, model) pair (default: 5)",
+        help="Number of trials per (task, engine) pair (default: 5)",
     )
     parser.add_argument(
         "--tasks",
@@ -1048,6 +838,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--out",
         default="eval/results",
         help="Output directory for summary.md and results.json (default: eval/results)",
+    )
+    parser.add_argument(
+        "--runs-root",
+        default="",
+        help="Directory for per-trial run directories (default: <out>/<date>/runs)",
+    )
+    parser.add_argument(
+        "--engines-config",
+        default=str(default_engines_cfg),
+        help="Path to engines.toml configuration (default: runner/engines.example.toml)",
     )
     parser.add_argument(
         "--dry-run",
@@ -1127,14 +927,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("error: --max-parallel must be >= 1", file=sys.stderr)
         return 2
 
-    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    raw_engines = getattr(args, "engines", None) or args.models
+    models = [m.strip() for m in raw_engines.split(",") if m.strip()]
     if not models:
-        print("error: --models must specify at least one model", file=sys.stderr)
+        print("error: --engines/--models must specify at least one engine", file=sys.stderr)
         return 2
 
     fixture_dir = Path(args.fixture_dir).resolve()
     tasks_dir = Path(args.tasks_dir).resolve()
     dockerfile_path = Path(args.dockerfile).resolve()
+
+    loaded_engines: EnginesConfig | None = None
+    if args.engines_config:
+        cfg_file = Path(args.engines_config)
+        if cfg_file.is_file():
+            try:
+                loaded_engines = load_engines(cfg_file)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+
+    engine_map: dict[str, EngineConfig] = {
+        m: resolve_engine(m, loaded_engines) for m in models
+    }
 
     try:
         validate_fixture_dir(fixture_dir)
@@ -1157,41 +972,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run:
         print(f"DRY-RUN plan ({len(plan_items)} total trials):")
         print(f"  isolation: {args.isolation}")
-        print(f"  models: {', '.join(models)}")
+        print(f"  engines: {', '.join(models)}")
         print(f"  k: {args.k}")
         print(f"  tasks ({len(tasks)}): {', '.join(t.task_id for t in tasks)}")
         for idx, (task, model, run_idx) in enumerate(plan_items, start=1):
             print(
                 f"  [{idx:03d}/{len(plan_items):03d}] "
-                f"task={task.task_id} category={task.category} model={model} run={run_idx}/{args.k}"
+                f"task={task.task_id} category={task.category} engine={model} run={run_idx}/{args.k}"
             )
         return 0
 
-    if not args.credentials:
+    needs_cloud_creds = any(eng.is_cloud for eng in engine_map.values())
+    credentials_path: Path | None = None
+    extra_secrets: list[str] = []
+
+    if args.credentials:
+        credentials_path = Path(args.credentials).resolve()
+        if not credentials_path.is_file():
+            print(
+                f"error: credentials file does not exist: {args.credentials}",
+                file=sys.stderr,
+            )
+            return 1
+        cred_secret_text = credentials_path.read_text(encoding="utf-8").strip()
+        extra_secrets.extend(
+            s for s in (cred_secret_text, str(credentials_path), args.credentials) if s
+        )
+        try:
+            extra_secrets.extend(json_string_leaves(json.loads(cred_secret_text)))
+        except json.JSONDecodeError:
+            pass
+    elif needs_cloud_creds:
         print(
             "error: credentials file required via --credentials or DEVPACK_CLAUDE_CREDENTIALS",
             file=sys.stderr,
         )
         return 1
 
-    credentials_path = Path(args.credentials).resolve()
-    if not credentials_path.is_file():
-        print(
-            f"error: credentials file does not exist: {args.credentials}",
-            file=sys.stderr,
-        )
-        return 1
-
-    cred_secret_text = credentials_path.read_text(encoding="utf-8").strip()
-    extra_secrets = [
-        s
-        for s in (cred_secret_text, str(credentials_path), args.credentials)
-        if s
-    ]
-    try:
-        extra_secrets.extend(_json_string_leaves(json.loads(cred_secret_text)))
-    except json.JSONDecodeError:
-        pass
     repo_root = Path(__file__).resolve().parent.parent
     work_root = Path(args.work_root).resolve()
     path_replacements = [
@@ -1211,6 +1028,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+
+    out_dir = Path(args.out)
+    dated_dir = out_dir / date_str
+    runs_root = Path(args.runs_root) if args.runs_root else (dated_dir / "runs")
+    runs_root.mkdir(parents=True, exist_ok=True)
 
     run_root = work_root / run_id
     run_root.mkdir(parents=True, exist_ok=True)
@@ -1234,6 +1056,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         extra_secrets=extra_secrets,
                         path_replacements=path_replacements,
                         image_tag=image_tag,
+                        runs_root=runs_root,
+                        engine_config=engine_map[model],
                     )
                 )
         else:
@@ -1254,6 +1078,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         extra_secrets,
                         path_replacements,
                         image_tag,
+                        runs_root,
+                        engine_map[model],
                     )
                     for task, model, run_idx in plan_items
                 ]
@@ -1275,7 +1101,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "date": date_str,
         "isolation": args.isolation,
         "models": models,
+        "engines": models,
         "k": args.k,
+        "runs_root": str(runs_root),
         "tasks": [asdict(ts) for ts in task_summaries],
         "categories": category_summaries,
     }
@@ -1283,6 +1111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raw_payload,
         extra_secrets=extra_secrets,
         path_replacements=path_replacements,
+        home_placeholder="$HOME",
     )
 
     raw_markdown = render_summary_markdown(
@@ -1298,10 +1127,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         raw_markdown,
         extra_secrets=extra_secrets,
         path_replacements=path_replacements,
+        home_placeholder="$HOME",
     )
 
-    out_dir = Path(args.out)
-    dated_dir = out_dir / date_str
     for target_dir in (out_dir, dated_dir):
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "results.json").write_text(

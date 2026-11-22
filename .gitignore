@@ -1,3 +1,4 @@
 gate_receipt.json
 evidence/*.json
 .worktrees/
+runs/
