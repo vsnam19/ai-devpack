@@ -1206,8 +1206,13 @@ def run_orchestrator_trial(
     image_tag: str = DOCKER_IMAGE_TAG,
     runs_root: Path | None = None,
     allow_unsandboxed_local: bool = False,
+    engines_config: Path | None = None,
 ) -> TrialResult:
-    """Execute one orchestrator-mode trial, analyze transcript compliance, and run check.sh."""
+    """Execute one orchestrator-mode trial, analyze transcript compliance, and run check.sh.
+
+    ``engines_config`` is forwarded to the broker as an absolute ``--engines`` path so that
+    custom engine files (for example local-model workers) are honoured by the broker.
+    """
     safe_label = orch_label.replace(":", "-")
     trial_name = f"{goal.goal_id}__{safe_label}__run{run_index}"
     trial_root = run_root / trial_name
@@ -1332,6 +1337,8 @@ def run_orchestrator_trial(
         ]
         if credentials_path is not None:
             broker_command.extend(["--credentials", str(credentials_path)])
+        if engines_config is not None:
+            broker_command.extend(["--engines", str(Path(engines_config).resolve())])
         broker_log = (trial_run_dir / "broker.txt").open("w", encoding="utf-8")
         broker = subprocess.Popen(broker_command, stdout=broker_log, stderr=broker_log,
                                   start_new_session=True)
@@ -2004,6 +2011,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"error: {exc}", file=sys.stderr)
                 return 2
 
+    engines_config_path: Path | None = (
+        Path(args.engines_config).resolve() if args.engines_config else None
+    )
+
     mode = args.mode
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
@@ -2189,6 +2200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             image_tag=image_tag,
                             runs_root=runs_root,
                             allow_unsandboxed_local=args.allow_unsandboxed_local,
+                            engines_config=engines_config_path,
                         )
                     )
             else:
@@ -2213,6 +2225,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             image_tag,
                             runs_root,
                             args.allow_unsandboxed_local,
+                            engines_config_path,
                         )
                         for g, run_idx in orch_jobs
                     ]

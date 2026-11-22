@@ -289,6 +289,17 @@ class Broker:
             return
 
 
+def parse_worker_names(text):
+    """Split a comma-separated worker list, strip whitespace and drop empty names.
+
+    Returns the list of names in order. Raises ValueError when the text names no engine at all.
+    """
+    names = [name.strip() for name in text.split(',') if name.strip()]
+    if not names:
+        raise ValueError('--workers names no engine')
+    return names
+
+
 def main(argv=None):
     """Run a host broker until interrupted, keeping launch options outside the queue."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -313,12 +324,13 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, stop_broker)
     signal.signal(signal.SIGINT, stop_broker)
     try:
+        allowed = parse_worker_names(args.workers) if args.workers else None
         broker = Broker(args.workdir, args.runs_root, credentials_path=args.credentials,
                         engines_path=args.engines, isolation=args.isolation,
                         allow_unsandboxed_local=args.allow_unsandboxed_local,
                         agent_bin=args.agent_bin, gate_cmd=args.gate_cmd,
                         docker_bin=args.docker_bin, image_tag=args.image_tag,
-                        allowed_engines=args.workers.split(',') if args.workers else None)
+                        allowed_engines=allowed)
         try:
             while not stop.is_set():
                 broker.poll()
