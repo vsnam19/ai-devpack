@@ -14,6 +14,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,8 @@ from runner.agent_exec import AgentRequest, EngineConfig, run_agent
 
 MAX_DESCRIPTION_LENGTH = 1024
 MAX_BODY_LINES = 200
+ABSOLUTE_PATH_PATTERN = re.compile(r"(?:^|[\s`(])(?:/(?:Users|home|opt|usr|var|etc|tmp|mnt)/|[A-Za-z]:[\\\\/])")
+MARKDOWN_LINK_PATTERN = re.compile(r"\]\(([^)]+)\)")
 
 
 def load_config(skill_dir: Path) -> dict[str, Any]:
@@ -84,11 +88,14 @@ def lint_skill(skill_dir: Path) -> list[str]:
     if len(body) > MAX_BODY_LINES:
         errors.append("body exceeds 200 lines")
     content = skill_file.read_text(encoding="utf-8")
-    if "/" + "home/" in content or "\\" in content and ":\\" in content:
+    if ABSOLUTE_PATH_PATTERN.search(content):
         errors.append("absolute path found")
     for line in content.splitlines():
-        if "](" in line:
-            target = line.split("](", 1)[1].split(")", 1)[0].split("#", 1)[0]
+        for match in MARKDOWN_LINK_PATTERN.finditer(line):
+            target = match.group(1).split("#", 1)[0]
+            if target.startswith("/"):
+                errors.append("absolute path found")
+                continue
             if target and not target.startswith(("http://", "https://", "mailto:")):
                 if not (skill_dir / target).resolve().is_file():
                     errors.append(f"relative link does not resolve: {target}")
@@ -106,6 +113,21 @@ def lint_skill(skill_dir: Path) -> list[str]:
         errors.append("requires at least two trigger-negative cases")
     if not config.get("behaviour", []):
         errors.append("requires at least one behaviour case")
+    fixtures_root = skill_dir / "tests" / "fixtures"
+    input_dirs = list(fixtures_root.glob("*/input")) if fixtures_root.is_dir() else []
+    if input_dirs:
+        declared_inputs = {item.get("fixture") for item in config.get("behaviour", [])}
+        for item in config.get("behaviour", []):
+            fixture = item.get("fixture")
+            grader = item.get("grader")
+            if not isinstance(fixture, str) or not (skill_dir / "tests" / fixture).is_dir():
+                errors.append(f"behaviour fixture does not resolve: {fixture}")
+            if not isinstance(grader, str) or not (skill_dir / "tests" / grader / "check.sh").is_file():
+                errors.append(f"behaviour grader does not resolve: {grader}")
+        for input_dir in input_dirs:
+            relative = input_dir.relative_to(skill_dir / "tests").as_posix()
+            if relative not in declared_inputs:
+                errors.append(f"unreferenced fixture directory: {relative}")
     return errors
 
 
@@ -156,7 +178,8 @@ def _trial_run_dir(root: Path, label: str) -> Path:
 
 def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run_dir: Path,
                    fixture: Path | None, agent_bin: str, isolation: str,
-                   check_command: str | None = None) -> tuple[bool, bool, dict[str, Any]]:
+                   check_command: str | None = None, grader: Path | None = None,
+                   expectations: dict[str, Any] | None = None) -> tuple[bool, bool, dict[str, Any]]:
     """Run one agent trial and return trigger status plus serialized telemetry."""
     with tempfile.TemporaryDirectory(prefix="skilltest-") as temp:
         workdir = Path(temp) / "work"
@@ -172,9 +195,15 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
         ))
         raw = result.transcript_path.read_text(encoding="utf-8") if result.transcript_path.is_file() else ""
         passed = False
-        if check_command is not None:
+        grader_names = {path.name for path in grader.rglob("*") if path.is_file()} if grader else set()
+        contaminated = any(path.name in grader_names for path in workdir.rglob("*") if path.is_file())
+        if check_command is not None and grader is not None and not contaminated:
             check_env = {**os.environ, "DEVPACK_ROOT": str(REPOSITORY_ROOT)}
-            passed = subprocess.run(check_command, shell=True, cwd=workdir, env=check_env, check=False).returncode == 0
+            for key, value in (expectations or {}).items():
+                check_env[f"SKILLTEST_EXPECTED_{key.upper()}"] = str(value)
+            passed = subprocess.run(
+                [*shlex.split(check_command), str(workdir)], cwd=grader, env=check_env, check=False,
+            ).returncode == 0
         return transcript_triggered(raw, skill_dir.name), passed, asdict(result)
 
 
@@ -214,10 +243,12 @@ def run_experiment(args: argparse.Namespace) -> int:
         for arm, enabled in (("with_skill", True), ("without_skill", False)):
             for case in config["behaviour"]:
                 fixture = skill_dir / "tests" / case["fixture"]
+                grader = skill_dir / "tests" / case["grader"]
                 for _ in range(args.k):
                     serial += 1
                     _, passed, telemetry = _execute_trial(skill_dir, engine, case["prompt"], enabled,
-                        _trial_run_dir(output, f"{serial:03d}-{arm}-{engine}"), fixture, args.agent_bin, args.isolation, case["check"])
+                        _trial_run_dir(output, f"{serial:03d}-{arm}-{engine}"), fixture, args.agent_bin, args.isolation,
+                        case["check"], grader, {key: case[key] for key in ("category", "severity", "verdict") if key in case})
                     trials.append({"engine": engine, "arm": arm, "case": case["name"], "passed": passed, "telemetry": telemetry})
     report = {"skill": skill_dir.name, "trials": trials}
     trigger_report: dict[str, Any] = {}

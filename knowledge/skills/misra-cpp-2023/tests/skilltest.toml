@@ -16,11 +16,13 @@ prompt = "Format this JSON document."
 expect = false
 [[behaviour]]
 name = "runtime-counter"
-fixture = "fixtures/runtime-counter"
+fixture = "fixtures/runtime-counter/input"
+grader = "graders/runtime-counter"
 prompt = "Make this runtime counter suitable for an embedded C++17 build."
-check = "bash check.sh ."
+check = "bash check.sh"
 [[behaviour]]
 name = "constructor-contract"
-fixture = "fixtures/constructor-contract"
+fixture = "fixtures/constructor-contract/input"
+grader = "graders/constructor-contract"
 prompt = "Bring this small C++ value type up to our embedded coding standard."
-check = "bash check.sh ."
+check = "bash check.sh"

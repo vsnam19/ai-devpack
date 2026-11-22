@@ -1,3 +1,0 @@
-| ID | Category | Severity |
-|---|---|---|
-VERDICT: APPROVE

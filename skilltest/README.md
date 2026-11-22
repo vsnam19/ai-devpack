@@ -22,11 +22,12 @@ expect = true
 
 [[behaviour]]
 name = "documentation is complete"
-fixture = "fixtures/missing-docs"
+fixture = "fixtures/missing-docs/input"
+grader = "graders/missing-docs"
 prompt = "repair the fixture"
-check = "bash check.sh ."
+check = "bash check.sh"
 ```
 
-Use at least two true and two false `[[trigger]]` entries and one `[[behaviour]]` entry. `fixture` is relative to `tests/`; it is copied into an isolated work directory for each behaviour arm. The `check` runs there; exit 0 means pass. Store a corrected fixture under `tests/expected/` and verify in a unit test that the check fails on the supplied fixture and passes on the expected output.
+Use at least two true and two false `[[trigger]]` entries and one `[[behaviour]]` entry. `fixture` is relative to `tests/` and names an `input/` directory copied into an isolated work directory for each behaviour arm. `grader` names a separate directory that is never copied; the check runs from that directory and receives the work directory as its final argument. Exit 0 means pass. Store a corrected fixture under `tests/expected/` and verify in a unit test that the check fails on the supplied fixture and passes on the expected output.
 
 Trigger evidence is a stream-json `Skill` tool call that names the skill, or a `Read` tool call for `.claude/skills/<name>/SKILL.md`. The report computes pass-rate delta (`with_skill - without_skill`) and flags no measurable benefit when the delta is zero or negative.

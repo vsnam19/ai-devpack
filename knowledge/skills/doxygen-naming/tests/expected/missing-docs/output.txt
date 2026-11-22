@@ -1,2 +1,0 @@
-/** @brief Encode a signal. */
-int encodeSignal(int value);

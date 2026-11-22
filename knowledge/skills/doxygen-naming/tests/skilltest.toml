@@ -16,11 +16,13 @@ prompt = "Write a Markdown contributor guide for this repository."
 expect = false
 [[behaviour]]
 name = "header-contract"
-fixture = "fixtures/header-contract"
+fixture = "fixtures/header-contract/input"
+grader = "graders/header-contract"
 prompt = "Add documentation to this header so it passes our review; preserve its interface."
-check = "bash check.sh ."
+check = "bash check.sh"
 [[behaviour]]
 name = "direction-contract"
-fixture = "fixtures/direction-contract"
+fixture = "fixtures/direction-contract/input"
+grader = "graders/direction-contract"
 prompt = "Document this signal update API for review and correct any declaration naming issues."
-check = "bash check.sh ."
+check = "bash check.sh"

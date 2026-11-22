@@ -28,4 +28,4 @@ prompt = "edit the fixture to meet the skill rule"
 check = "bash check.sh ."
 ```
 
-Supply two positive and two negative trigger entries. The fixture must initially fail its check. Store a corrected copy under `fixtures/expected/`; add a unit test that proves the check passes there.
+Supply two positive and two negative trigger entries. The fixture must initially fail its check. Store a corrected copy under the tests/expected/ directory; add a unit test that proves the check passes there.

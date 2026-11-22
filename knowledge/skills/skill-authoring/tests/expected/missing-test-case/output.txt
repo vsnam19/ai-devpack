@@ -1,4 +1,0 @@
-[[trigger]]
-name = "one"
-[[behaviour]]
-name = "check"

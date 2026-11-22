@@ -16,11 +16,13 @@ prompt = "Calculate this result."
 expect = false
 [[behaviour]]
 name = "frontmatter-draft"
-fixture = "fixtures/frontmatter-draft"
+fixture = "fixtures/frontmatter-draft/input"
+grader = "graders/frontmatter-draft"
 prompt = "Turn this draft directory into a reusable agent skill and add its test plan."
-check = "bash check.sh ."
+check = "bash check.sh"
 [[behaviour]]
 name = "test-matrix"
-fixture = "fixtures/test-matrix"
+fixture = "fixtures/test-matrix/input"
+grader = "graders/test-matrix"
 prompt = "Finish this draft agent skill so it is ready for skilltest lint."
-check = "bash check.sh ."
+check = "bash check.sh"
