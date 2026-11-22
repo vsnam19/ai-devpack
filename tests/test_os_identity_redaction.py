@@ -241,5 +241,171 @@ class OsIdentityRedactionTests(unittest.TestCase):
                 self.assertIn("[HOST]", rendered)
 
 
+    def test_stream_protocol_fields_survive_identity_collision_with_user_and_host(self) -> None:
+        """Identity named 'user' and host named 'result' must not corrupt stream-json protocol fields."""
+        result_event = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "num_turns": 1,
+            "duration_ms": 50,
+            "total_cost_usd": 0.001,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "result": "done",
+        }
+        tool_result_event = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": "-rw-r--r-- 1 user user 10 f",
+                    }
+                ],
+            },
+        }
+        raw_lines = [json.dumps(tool_result_event), json.dumps(result_event)]
+        with _mock_os_context(user="user", primary_group="user", hostname="result"):
+            redacted_lines = [agent_exec.redact_sensitive_text(line) for line in raw_lines]
+            with tempfile.TemporaryDirectory() as tmp:
+                jsonl_path = Path(tmp) / "stream.jsonl"
+                jsonl_path.write_text("\n".join(redacted_lines) + "\n", encoding="utf-8")
+                parsed = agent_exec.parse_stream(jsonl_path)
+
+        self.assertNotIn("no result event", parsed.error)
+        self.assertEqual("ok", parsed.status)
+        self.assertEqual("done", parsed.final_text)
+
+        user_event = json.loads(redacted_lines[0])
+        self.assertEqual("user", user_event["type"])
+        self.assertEqual("user", user_event["message"]["role"])
+        self.assertEqual("tool_result", user_event["message"]["content"][0]["type"])
+        self.assertEqual(
+            "-rw-r--r-- 1 [USER] [GROUP] 10 f",
+            user_event["message"]["content"][0]["content"],
+        )
+        result_obj = json.loads(redacted_lines[1])
+        self.assertEqual("result", result_obj["type"])
+        self.assertEqual("success", result_obj["subtype"])
+
+    def test_identity_redaction_never_touches_json_keys_or_protocol_values(self) -> None:
+        """Keys and protocol values are preserved while free-text string values are redacted."""
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "role": "jdoe_eng",
+                "model": "jdoe_eng",
+                "id": "jdoe_eng",
+                "name": "jdoe_eng",
+                "message": {"content": [{"type": "text", "text": "owner is jdoe_eng"}]},
+                "jdoe_eng": "jdoe_eng",
+            }
+        )
+        with _mock_os_context():
+            redacted = agent_exec.redact_sensitive_text(line)
+        obj = json.loads(redacted)
+        self.assertEqual("assistant", obj["type"])
+        self.assertEqual("jdoe_eng", obj["role"])
+        self.assertEqual("jdoe_eng", obj["model"])
+        self.assertEqual("jdoe_eng", obj["id"])
+        self.assertEqual("jdoe_eng", obj["name"])
+        self.assertIn("jdoe_eng", obj)
+        self.assertEqual("[USER]", obj["jdoe_eng"])
+        self.assertEqual("owner is [USER]", obj["message"]["content"][0]["text"])
+
+    def test_devpack_logs_render_keeps_result_event_when_user_and_host_collide(self) -> None:
+        """devpack_logs.render keeps protocol fields intact when identities collide with JSON words."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "20261122T120000Z-fedcba"
+            steps_dir = run_dir / "steps"
+            steps_dir.mkdir(parents=True)
+            (run_dir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_dir.name,
+                        "kind": "task",
+                        "started": "2026-11-22T12:00:00Z",
+                        "finished": "2026-11-22T12:00:05Z",
+                        "engines": {"implementer": "haiku"},
+                        "task": "check-ls",
+                        "outcome": "ok",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events = [
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tu_1",
+                                "content": "-rw-r--r-- 1 user user 10 f",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "num_turns": 1,
+                    "duration_ms": 50,
+                    "total_cost_usd": 0.001,
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "result": "all listed",
+                },
+            ]
+            (steps_dir / "01-implementer-haiku.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in events) + "\n",
+                encoding="utf-8",
+            )
+            (steps_dir / "01-implementer-haiku.meta.json").write_text(
+                json.dumps(
+                    {
+                        "role": "implementer",
+                        "engine": "haiku",
+                        "status": "ok",
+                        "prompt_sha256": "0" * 64,
+                        "prompt_file": "01-implementer-haiku.prompt.md",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with _mock_os_context(user="user", primary_group="user", hostname="result"):
+                rc = devpack_logs.main(["render", str(run_dir)])
+            self.assertEqual(0, rc)
+            transcript = (run_dir / "transcript.md").read_text(encoding="utf-8")
+
+        self.assertIn("-rw-r--r-- 1 [USER] [GROUP] 10 f", transcript)
+        self.assertIn("all listed", transcript)
+        self.assertNotIn("no result event", transcript)
+
+
+    def test_devpack_logs_redactor_keeps_json_protocol_fields_on_whole_lines(self) -> None:
+        """Redactor.redact on a raw stream-json line keeps keys and protocol values intact."""
+        line = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "role": "user",
+                "result": "listed result files",
+            }
+        )
+        with _mock_os_context(user="jdoe_eng", primary_group="eng_team", hostname="result"):
+            redactor = devpack_logs.Redactor()
+            redacted = redactor.redact(line)
+        obj = json.loads(redacted)
+        self.assertEqual("result", obj["type"])
+        self.assertEqual("success", obj["subtype"])
+        self.assertEqual("user", obj["role"])
+        self.assertEqual("listed [HOST] files", obj["result"])
+
+
 if __name__ == "__main__":
     unittest.main()

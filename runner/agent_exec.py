@@ -1777,6 +1777,74 @@ def redact_os_identities(
     return out
 
 
+# Stream-json protocol fields whose string values must never be rewritten by OS identity
+# redaction: rewriting them (e.g. ``"type":"result"`` when the host is named ``result``)
+# breaks stream parsing. Keys are never redacted either.
+_PROTOCOL_FIELD_NAMES = frozenset(
+    {
+        "type",
+        "subtype",
+        "role",
+        "model",
+        "id",
+        "tool_use_id",
+        "session_id",
+        "uuid",
+        "stop_reason",
+        "name",
+    }
+)
+
+
+def _redact_identities_in_json_value(
+    value: Any,
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]],
+) -> Any:
+    """Return ``value`` with OS identities redacted in string values, skipping protocol fields."""
+    if isinstance(value, str):
+        return redact_os_identities(value, identities)
+    if isinstance(value, list):
+        return [_redact_identities_in_json_value(item, identities) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: (
+                item
+                if key in _PROTOCOL_FIELD_NAMES
+                else _redact_identities_in_json_value(item, identities)
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
+def redact_os_identities_line(
+    text: str,
+    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
+) -> str:
+    """Redact OS identities in one log line, structurally when it is a JSON object.
+
+    A line that parses as a JSON object is re-serialized with identities redacted only inside
+    string values (never keys, never protocol fields such as ``type`` or ``role``). Any other
+    text gets the plain whole-word text redaction of :func:`redact_os_identities`. A trailing
+    line ending is preserved.
+    """
+    if not text:
+        return text
+    ids = identities if identities is not None else collect_os_identities()
+    body = text.rstrip("\r\n")
+    ending = text[len(body):]
+    stripped = body.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            redacted_obj = _redact_identities_in_json_value(parsed, ids)
+            return json.dumps(redacted_obj, ensure_ascii=False, separators=(",", ":")) + ending
+    return redact_os_identities(text, ids)
+
+
 def redact_sensitive_text(
     text: str,
     extra_secrets: Sequence[str] = (),
@@ -1821,7 +1889,7 @@ def redact_sensitive_text(
         pass
 
     result = _HOST_HOME_RE.sub(home_placeholder, result)
-    result = redact_os_identities(result)
+    result = redact_os_identities_line(result)
     return result
 
 
