@@ -3,6 +3,22 @@
 All notable changes to ai-devpack are recorded here. Versioning follows
 [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH, see `VERSION`.
 
+## [Unreleased]
+
+### Added
+- **Automotive C++17 skill (`knowledge/skills/automotive-cpp/`)**: consolidated,
+  source-grounded coding and review skill merging MISRA C++:2023 themes, ISO 26262-6
+  unit design principles (with recorded ASIL-rating conflicts marked verify), Doxygen
+  and naming conventions, and non-exception error handling
+  (`knowledge/skills/automotive-cpp/references/rules.md`,
+  `knowledge/skills/automotive-cpp/references/iso26262-unit-design.md`,
+  `knowledge/skills/automotive-cpp/references/sources.md`, and
+  `knowledge/skills/automotive-cpp/tests/skilltest.toml` with 3 behaviour cases).
+
+### Deprecated
+- `knowledge/skills/misra-cpp-2023/` and `knowledge/skills/doxygen-naming/` are marked
+  superseded by `automotive-cpp` and kept in place for A/B comparison.
+
 ## [0.2.0] - 2026-11-23
 
 ### Added

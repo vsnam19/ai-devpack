@@ -2,6 +2,7 @@
 name: misra-cpp-2023
 description: Generic MISRA C++:2023 coding guidance and pre-flight verification for agents writing automotive C++17 code.
 ---
+Deprecated: superseded by automotive-cpp
 
 # MISRA C++:2023 guidance for agents
 
