@@ -496,7 +496,9 @@ class HarnessErrorTests(unittest.TestCase):
         )
         # Per-trial dirs differ so n is always 1; use a shared marker via env-free path.
         body = body.replace("cwd.parent / 'count'", "pathlib.Path(__file__).parent / 'count'")
-        rc, results, _, _ = self._run(body, k=2)
+        # 1 harness error in 2 trials is above the default 10% cap, so the cap is raised here
+        # to test the exclusion itself; the cap behaviour is tested separately.
+        rc, results, _, _ = self._run(body, ["--max-harness-error-rate", "0.5"], k=2)
         self.assertEqual(1, rc)
         task = results["tasks"][0]
         self.assertEqual(1, task["harness_errors"])
@@ -661,8 +663,8 @@ class HarnessErrorTests(unittest.TestCase):
             self.assertIn("450/120", md)
             self.assertNotIn("0.1974", md)
 
-    def test_devpack_root_set_in_check_env_and_grader_misconfigured_is_harness_error(self) -> None:
-        """check.sh receives DEVPACK_ROOT and exit 2 / GRADER_MISCONFIGURED classifies as harness_error."""
+    def test_devpack_root_set_in_check_env_and_bare_exit_2_is_fail_not_harness_error(self) -> None:
+        """check.sh receives DEVPACK_ROOT; a bare exit 2 without a marker is a fail, not a harness error."""
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
@@ -694,14 +696,13 @@ class HarnessErrorTests(unittest.TestCase):
                     "--out", str(out),
                 ]
             )
-            self.assertEqual(1, rc)
+            self.assertEqual(0, rc)
             captured = json.loads(env_dump.read_text(encoding="utf-8"))
             self.assertEqual(str(REPO_ROOT), captured.get("DEVPACK_ROOT"))
             results = json.loads((out / "results.json").read_text(encoding="utf-8"))
             run_rec = results["tasks"][0]["runs"][0]
-            self.assertTrue(run_rec["harness_error"])
+            self.assertFalse(run_rec["harness_error"])
             self.assertFalse(run_rec["passed"])
-            self.assertIn("GRADER_MISCONFIGURED", run_rec["harness_error_reason"])
 
     def test_sandbox_local_refused_without_allow_flag(self) -> None:
         """run_eval refuses --isolation local without --allow-unsandboxed-local."""

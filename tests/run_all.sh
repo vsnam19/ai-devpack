@@ -9,6 +9,16 @@
 # Fails when a core directory containing test_*.py files reports "Ran 0 tests".
 # Exit codes: 0 all steps passed; 1 at least one step failed; 2 bad usage.
 set -euo pipefail
+# Isolate from the caller's shell: CI and DEVPACK_* settings (base ref, component selection,
+# test XML, deviations, baseline SHA, grader nonces, credentials) change results between runs.
+unset CI DEVPACK_BASE DEVPACK_COMPONENTS DEVPACK_TEST_XML DEVPACK_DEVIATIONS DEVPACK_GCOV_OBJ_DIR \
+  DEVPACK_BASELINE_SHA DEVPACK_AGENT_BIN DEVPACK_EVAL_AGENT_BIN DEVPACK_BROKER \
+  DEVPACK_CLAUDE_CREDENTIALS DEVPACK_CPPCHECK_BIN DEVPACK_DIR DEVPACK_FRAMEWORK_GUARD \
+  DEVPACK_HARNESS_MARKER_DIR DEVPACK_HARNESS_MARKER_NONCE DEVPACK_HARNESS_NONCE \
+  DEVPACK_HARNESS_NONCE_FILE DEVPACK_LOCAL_AUTH_TOKEN DEVPACK_LOCAL_BASE_URL \
+  DEVPACK_OPERATOR_CONFIG DEVPACK_SECRET_PATTERNS DEVPACK_TEST_PROOF_DIR DEVPACK_TESTS_COMPLETED \
+  DEVPACK_VENDOR_DIR
+unset DEVPACK_PROJECT_CONFIG
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'

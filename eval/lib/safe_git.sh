@@ -151,13 +151,40 @@ verify_test_completion_output() {
     return 0
 }
 
-# Emit GRADER_MISCONFIGURED, record DEVPACK_HARNESS_NONCE if configured, and exit 2.
+# Write the structured pre-candidate marker the wrapper accepts: harness_error.json in
+# DEVPACK_HARNESS_MARKER_DIR carrying DEVPACK_HARNESS_MARKER_NONCE, a stage and a reason.
+# A no-op unless the wrapper provided both values. Only call this before candidate code runs.
+# Usage: write_harness_marker STAGE REASON
+write_harness_marker() {
+    local stage="$1"
+    local reason="$2"
+    local marker_dir="${DEVPACK_HARNESS_MARKER_DIR:-}"
+    local nonce="${DEVPACK_HARNESS_MARKER_NONCE:-}"
+    if [[ -z "$marker_dir" || -z "$nonce" ]]; then
+        return 0
+    fi
+    python3 -I -c '
+import json, os, sys
+payload = {"nonce": os.environ["DEVPACK_HARNESS_MARKER_NONCE"], "stage": sys.argv[2], "reason": sys.argv[3]}
+with open(os.path.join(sys.argv[1], "harness_error.json"), "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload))
+' "$marker_dir" "$stage" "$reason" 2>/dev/null || true
+}
+
+# Emit GRADER_MISCONFIGURED and exit 2. Exit 2 alone is a candidate failure in the wrapper;
+# only a pre-candidate call to grader_misconfigured_at adds a marker that counts as harness error.
 grader_misconfigured() {
     echo "GRADER_MISCONFIGURED: $*" >&2
-    if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
-        printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
-    fi
     exit 2
+}
+
+# Pre-candidate failure: write the stage marker, then behave like grader_misconfigured.
+# Usage: grader_misconfigured_at STAGE MESSAGE...   (STAGE: pack_file | reference_build)
+grader_misconfigured_at() {
+    local stage="$1"
+    shift
+    write_harness_marker "$stage" "$*"
+    grader_misconfigured "$*"
 }
 
 # Enumerate changed and untracked files using scope_check.py (without --exclude-standard).
@@ -168,7 +195,7 @@ list_changed_files() {
     local pack_root="${DEVPACK_ROOT:-$_SAFE_GIT_DEFAULT_ROOT}"
     local scope_py="$pack_root/enforcement/checks/scope_check.py"
     if [[ ! -f "$scope_py" ]]; then
-        grader_misconfigured "missing $scope_py"
+        grader_misconfigured_at pack_file "missing $scope_py"
     fi
     python3 "$scope_py" --repo "$workdir" --base "$base_ref" --list-changed
 }
@@ -182,7 +209,8 @@ run_verified_test_binary() {
     local tmp_out
     tmp_out="$(mktemp "${TMPDIR:-/tmp}/devpack-test-proof.XXXXXX")"
     local rc=0
-    env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE "$@" >"$tmp_out" 2>&1 || rc=$?
+    # Candidate code runs without the marker nonce or marker directory (see write_harness_marker).
+    env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE -u DEVPACK_HARNESS_MARKER_NONCE -u DEVPACK_HARNESS_MARKER_DIR "$@" >"$tmp_out" 2>&1 || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         cat "$tmp_out" >&2 || true
         rm -f "$tmp_out"
@@ -214,7 +242,7 @@ run_gcov_hidden_tests() {
     local pack_fw="$pack_root/eval/fixture/tests/test_framework.hpp"
 
     if [[ ! -f "$proof_py" || ! -f "$pack_fw" ]]; then
-        grader_misconfigured "missing test_proof.py or test_framework.hpp under DEVPACK_ROOT=$pack_root"
+        grader_misconfigured_at pack_file "missing test_proof.py or test_framework.hpp under DEVPACK_ROOT=$pack_root"
     fi
 
     local tmp_grade_dir
@@ -287,7 +315,7 @@ run_gcov_hidden_tests() {
     proof_args+=(-- "$tmp_grade_dir/hidden_test")
 
     local rc=0
-    python3 "$proof_py" "${proof_args[@]}" || rc=$?
+    env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE -u DEVPACK_HARNESS_MARKER_NONCE -u DEVPACK_HARNESS_MARKER_DIR python3 "$proof_py" "${proof_args[@]}" || rc=$?
     rm -rf "$tmp_grade_dir"
     if [[ "$rc" -eq 3 ]]; then
         grader_misconfigured "gcov TOOL_MISSING"
@@ -309,7 +337,7 @@ run_gcov_visible_tests() {
     local fixture_tests_dir="$pack_root/eval/fixture/tests"
 
     if [[ ! -f "$proof_py" || ! -d "$fixture_tests_dir" ]]; then
-        grader_misconfigured "missing test_proof.py or fixture/tests under DEVPACK_ROOT=$pack_root"
+        grader_misconfigured_at pack_file "missing test_proof.py or fixture/tests under DEVPACK_ROOT=$pack_root"
     fi
 
     local tmp_vis_dir
@@ -319,7 +347,7 @@ run_gcov_visible_tests() {
 
     local out_file="$tmp_vis_dir/visible.out"
     local test_rc=0
-    env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE \
+    env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE -u DEVPACK_HARNESS_MARKER_NONCE -u DEVPACK_HARNESS_MARKER_DIR \
         DEVPACK_ROOT="$pack_root" DEVPACK_GCOV_OBJ_DIR="$cov_dir" \
         bash "$workdir/build_and_test.sh" --no-cmake >"$out_file" 2>&1 || test_rc=$?
 
@@ -340,7 +368,8 @@ run_gcov_visible_tests() {
     done
 
     local proof_rc=0
-    python3 "$proof_py" "${proof_args[@]}" || proof_rc=$?
+    env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE -u DEVPACK_HARNESS_MARKER_NONCE -u DEVPACK_HARNESS_MARKER_DIR \
+        python3 "$proof_py" "${proof_args[@]}" || proof_rc=$?
     if [[ "$proof_rc" -eq 3 ]]; then
         rm -rf "$tmp_vis_dir"
         grader_misconfigured "gcov TOOL_MISSING"
@@ -363,17 +392,13 @@ require_baseline_sha() {
         sha="$(head -n 1 "$trial_dir/baseline.sha" | tr -d '[:space:]')"
     fi
     if [[ -z "$sha" || ! "$sha" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+        write_harness_marker reference_build "missing external DEVPACK_BASELINE_SHA (commit-message lookup is disabled)"
         echo "GRADER_MISCONFIGURED: missing external DEVPACK_BASELINE_SHA (commit-message lookup is disabled)" >&2
-        if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
-            printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
-        fi
         return 2
     fi
     if ! safe_git -C "$workdir" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+        write_harness_marker reference_build "DEVPACK_BASELINE_SHA '$sha' does not resolve to a commit"
         echo "GRADER_MISCONFIGURED: DEVPACK_BASELINE_SHA '$sha' does not resolve to a commit in $workdir" >&2
-        if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
-            printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
-        fi
         return 2
     fi
     echo "$sha"
@@ -390,7 +415,7 @@ run_static_lint_on_files() {
     local preflight_cfg="$pack_root/eval/fixture/preflight.toml"
 
     if [[ ! -f "$preflight_py" || ! -f "$cppcheck_py" || ! -f "$preflight_cfg" ]]; then
-        grader_misconfigured "missing preflight_lint.py, cppcheck_check.py, or preflight.toml under DEVPACK_ROOT=$pack_root"
+        grader_misconfigured_at pack_file "missing preflight_lint.py, cppcheck_check.py, or preflight.toml under DEVPACK_ROOT=$pack_root"
     fi
 
     if find "$workdir" -maxdepth 4 -path '*/.git' -prune -o -name '.gitignore' -print -quit | grep -q .; then

@@ -14,8 +14,12 @@
 #
 # Exit codes:
 #   0 - All mutants were killed by the worker's test file
-#   1 - Worker test failed on unmutated code or failed to kill a mutant
-#   2 - Invalid usage, missing tools/files, or mutant compilation error
+#   1 - Candidate failure: worker test failed on unmutated code, did not kill a mutant,
+#       or a source/mutant file does not compile or link against the candidate
+#       (MUTANT-BUILD-FAILED). Everything caused by candidate code is exit 1.
+#   2 - Harness precondition failure before any candidate file was compiled (pack framework
+#       missing, invalid mutant spec, usage). Exit 2 is honoured as a harness error only when
+#       a valid harness_error.json marker is also written (see write_harness_marker).
 """Isolated C++ mutation runner for worker-authored test files."""
 
 from __future__ import annotations
@@ -39,6 +43,24 @@ int main() {
     return can_fixture_test::printSummaryAndExitCode<0>();
 }
 """
+
+
+def write_harness_marker(stage: str, reason: str) -> bool:
+    """Write the structured pre-candidate harness marker if the wrapper provided a dir and nonce.
+
+    The wrapper reads ``harness_error.json`` from ``DEVPACK_HARNESS_MARKER_DIR`` and accepts it
+    only when it echoes ``DEVPACK_HARNESS_MARKER_NONCE``. Returns True when the marker was written.
+    """
+    marker_dir = os.environ.get("DEVPACK_HARNESS_MARKER_DIR", "")
+    nonce = os.environ.get("DEVPACK_HARNESS_MARKER_NONCE", "")
+    if not marker_dir or not nonce:
+        return False
+    payload = {"nonce": nonce, "stage": stage, "reason": reason}
+    try:
+        (Path(marker_dir) / "harness_error.json").write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def mask_cpp_comments_and_literals(text: str) -> str:
@@ -156,15 +178,22 @@ def run_mutants(workdir: Path, test_file: str, mutants: list[dict[str, Any]], pa
     pack_fw = pack_root / "eval" / "fixture" / "tests" / "test_framework.hpp"
     pack_tests_dir = pack_root / "eval" / "fixture" / "tests"
     if not pack_fw.is_file():
-        print(f"GRADER_MISCONFIGURED: missing {pack_fw}", file=sys.stderr)
+        reason = f"missing pack framework {pack_fw}"
+        write_harness_marker("pack_file", reason)
+        print(f"GRADER_MISCONFIGURED: {reason}", file=sys.stderr)
         return 2
+
+    # Candidate compile and run steps below must not inherit the harness marker nonce or directory.
+    for marker_var in ("DEVPACK_HARNESS_MARKER_DIR", "DEVPACK_HARNESS_MARKER_NONCE"):
+        os.environ.pop(marker_var, None)
 
     src_dir = workdir / "src"
     inc_dir = workdir / "include"
     src_files = sorted(src_dir.glob("*.cpp"))
     if not src_files:
-        print(f"GRADER_MISCONFIGURED: no .cpp files under {src_dir}", file=sys.stderr)
-        return 2
+        # The candidate owns src/; removing every source file is a candidate failure.
+        print(f"FAIL: no .cpp files under {src_dir} (MUTANT-BUILD-FAILED)", file=sys.stderr)
+        return 1
 
     cxx = os.environ.get("CXX", "g++")
     cxxflags = [
@@ -246,13 +275,15 @@ def run_mutants(workdir: Path, test_file: str, mutants: list[dict[str, Any]], pa
             rel_file = str(mutant["file"])
             target_src = workdir / rel_file
             if not target_src.is_file() or rel_file not in src_objs:
-                print(f"GRADER_MISCONFIGURED: unknown mutant target {rel_file}", file=sys.stderr)
-                return 2
+                print(f"FAIL: mutant target {rel_file} is missing from the candidate (MUTANT-TARGET-MISSING)",
+                      file=sys.stderr)
+                return 1
             try:
                 mutated_text = apply_mutant(target_src.read_text(encoding="utf-8"), mutant)
             except (KeyError, ValueError) as exc:
-                print(f"GRADER_MISCONFIGURED: mutant '{name}' error: {exc}", file=sys.stderr)
-                return 2
+                print(f"FAIL: mutant '{name}' cannot be applied to the candidate (MUTANT-APPLY-FAILED): {exc}",
+                      file=sys.stderr)
+                return 1
 
             mut_src = tmp_path / f"mut_{idx}_{target_src.name}"
             mut_src.write_text(mutated_text, encoding="utf-8")
@@ -264,11 +295,13 @@ def run_mutants(workdir: Path, test_file: str, mutants: list[dict[str, Any]], pa
                 check=False,
             )
             if comp.returncode != 0:
+                # The mutant is built from the candidate's own source, so a compile failure
+                # is a candidate failure (MUTANT-BUILD-FAILED), not a harness error.
                 print(
-                    f"GRADER_MISCONFIGURED: mutant '{name}' failed to compile:\n{comp.stderr}",
+                    f"FAIL: MUTANT-BUILD-FAILED mutant '{name}' does not compile against the candidate:\n{comp.stderr}",
                     file=sys.stderr,
                 )
-                return 2
+                return 1
 
             mut_objs = [mut_obj if k == rel_file else obj for k, obj in src_objs.items()]
             mut_bin = tmp_path / f"mut_{idx}_runner"
@@ -280,10 +313,10 @@ def run_mutants(workdir: Path, test_file: str, mutants: list[dict[str, Any]], pa
             )
             if link.returncode != 0:
                 print(
-                    f"GRADER_MISCONFIGURED: mutant '{name}' failed to link:\n{link.stderr}",
+                    f"FAIL: MUTANT-BUILD-FAILED mutant '{name}' does not link against the candidate:\n{link.stderr}",
                     file=sys.stderr,
                 )
-                return 2
+                return 1
 
             run_mut = subprocess.run([str(mut_bin)], capture_output=True, text=True, check=False)
             if run_mut.returncode == 0:
@@ -306,8 +339,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("specify exactly one of --spec-file or --spec-stdin")
 
     raw_spec = args.spec_file.read_text(encoding="utf-8") if args.spec_file else sys.stdin.read()
-    mutants = json.loads(raw_spec)
+    try:
+        mutants = json.loads(raw_spec)
+    except ValueError as exc:
+        write_harness_marker("mutant_spec", f"mutant spec is not valid JSON: {exc}")
+        print(f"GRADER_MISCONFIGURED: mutant spec is not valid JSON: {exc}", file=sys.stderr)
+        return 2
     if not isinstance(mutants, list) or not mutants:
+        write_harness_marker("mutant_spec", "mutant spec must be a non-empty JSON list")
         print("GRADER_MISCONFIGURED: mutant spec must be a non-empty JSON list", file=sys.stderr)
         return 2
 

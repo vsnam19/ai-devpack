@@ -110,6 +110,14 @@ EXCERPT_MAX_CHARS = 4000
 STDERR_TAIL_MAX_CHARS = 2000
 ORCHESTRATOR_PACK_PATH = Path(".devpack/pack")
 CPP_EXTENSIONS = frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp"})
+# A trial is a harness error only when a grader writes a valid marker naming one of these
+# stages. Every stage runs before any candidate file is compiled, linted or executed.
+HARNESS_MARKER_FILE = "harness_error.json"
+PRE_CANDIDATE_HARNESS_STAGES = frozenset(
+    {"docker_preflight", "baseline_sha", "pack_file", "reference_build", "mutant_spec"}
+)
+# Harness errors above this fraction of a run's trials mark the whole run INVALID_RUN.
+DEFAULT_MAX_HARNESS_ERROR_RATE = 0.10
 
 REQUIRED_TASK_FILES = ("task.md", "check.sh", "setup.patch", "solution.patch")
 
@@ -1214,6 +1222,34 @@ def build_docker_grader_invocation(
     ]
 
 
+def read_harness_marker(marker_dir: Path, nonce: str) -> str | None:
+    """Return the reason from a valid pre-candidate ``harness_error.json`` marker, else None.
+
+    The marker must be a regular file in the harness-owned ``marker_dir``, carry the
+    per-run ``nonce`` the wrapper issued, and name a stage in
+    ``PRE_CANDIDATE_HARNESS_STAGES``. Exit code 2 alone is never enough.
+    """
+    if not nonce:
+        return None
+    path = marker_dir / HARNESS_MARKER_FILE
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    got_nonce = data.get("nonce")
+    stage = data.get("stage")
+    if not isinstance(got_nonce, str) or not hmac.compare_digest(got_nonce, nonce):
+        return None
+    if stage not in PRE_CANDIDATE_HARNESS_STAGES:
+        return None
+    reason = str(data.get("reason", "")).strip() or str(stage)
+    return f"{stage}: {reason}"
+
+
 def _run_check_script(
     check_sh: Path,
     work_dir: Path,
@@ -1293,7 +1329,13 @@ def _run_check_script(
 
     grader_out_dir = Path(tempfile.mkdtemp(prefix="devpack-grader-out-"))
     nonce = secrets.token_hex(16)
-    nonce_file = grader_out_dir / "harness_nonce"
+    # Graders that detect a pre-candidate precondition failure write harness_error.json
+    # here, echoing the nonce. The wrapper never trusts a bare exit code 2.
+    wrapper_env = {
+        **wrapper_env,
+        "DEVPACK_HARNESS_MARKER_DIR": str(grader_out_dir),
+        "DEVPACK_HARNESS_MARKER_NONCE": nonce,
+    }
     wrapper_sh = grader_out_dir / "run_grader.sh"
     try:
         cmd_str = " ".join(shlex.quote(arg) for arg in grader_cmd)
@@ -1302,9 +1344,6 @@ def _run_check_script(
             "set -u\n"
             "rc=0\n"
             f"env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE {cmd_str} || rc=$?\n"
-            "if [[ \"$rc\" -eq 2 ]]; then\n"
-            f"    printf '%s\\n' {shlex.quote(nonce)} > {shlex.quote(str(nonce_file))}\n"
-            "fi\n"
             "exit \"$rc\"\n",
             encoding="utf-8",
         )
@@ -1319,15 +1358,17 @@ def _run_check_script(
                 timeout=timeout_s,
                 check=False,
             )
-            raw_nonce = nonce_file.read_text(encoding="utf-8").strip() if nonce_file.is_file() else ""
-            confirmed_harness = (
-                check_proc.returncode == 2
-                and bool(raw_nonce)
-                and hmac.compare_digest(raw_nonce, nonce)
-            )
             combined_out = (check_proc.stdout + "\n" + check_proc.stderr).strip()
-            return check_proc.returncode, combined_out, confirmed_harness
+            marker_reason = (
+                read_harness_marker(grader_out_dir, nonce)
+                if check_proc.returncode == 2
+                else None
+            )
+            if marker_reason is not None:
+                combined_out = f"HARNESS_ERROR: {marker_reason}\n{combined_out}".strip()
+            return check_proc.returncode, combined_out, marker_reason is not None
         except subprocess.TimeoutExpired:
+            # A timeout is attributed to the candidate; it is never a harness error.
             return 124, f"check.sh timed out after {timeout_s}s", False
     finally:
         shutil.rmtree(grader_out_dir, ignore_errors=True)
@@ -2839,14 +2880,15 @@ def run_memory_trial(
                     docker_bin=docker_bin,
                     image_tag=image_tag,
                 )
-                if build_rc == 124 or build_harness_error:
+                if build_harness_error:
                     any_harness_err = True
                     if not harness_reason:
-                        harness_reason = _redact(
-                            f"step {step_idx}: "
-                            + (f"build_timeout: build_and_test.sh timed out after {timeout_s}s"
-                               if build_rc == 124 else f"build grader error: {build_out}")
-                        )
+                        harness_reason = _redact(f"step {step_idx}: build grader error: {build_out}")
+                    break
+                if build_rc == 124:
+                    # The build ran past the step timeout: the candidate's code is the cause,
+                    # so the trial is a timeout failure, not a harness error.
+                    any_timeout = True
                     break
                 if build_rc == 0:
                     prop_res = process_memory_proposals(
@@ -2980,8 +3022,13 @@ def aggregate_results(
     models: Sequence[str],
     k: int,
     trials: Sequence[TrialResult],
+    invalid_run: bool = False,
 ) -> tuple[list[TaskModelSummary], list[dict[str, Any]]]:
-    """Aggregate trial results into per-task and per-category summaries."""
+    """Aggregate trial results into per-task and per-category summaries.
+
+    When ``invalid_run`` is true (harness errors exceeded the cap), pass@1, pass^k and
+    pass@k are not reported (None); counts and costs are still reported.
+    """
     by_task_model: dict[tuple[str, str], list[TrialResult]] = {}
     for trial in trials:
         by_task_model.setdefault((trial.task_id, trial.model), []).append(trial)
@@ -3011,7 +3058,7 @@ def aggregate_results(
             with_mem_runs = [r for r in memory_runs if r.memory_arm == "with_memory"]
             without_mem_runs = [r for r in memory_runs if r.memory_arm == "without_memory"]
             scored_valid = with_mem_runs if with_mem_runs else valid
-            has_valid = bool(scored_valid)
+            has_valid = bool(scored_valid) and not invalid_run
             total = len(scored_valid) if has_valid else 0
             passes = sum(1 for r in scored_valid if r.passed)
             is_local = any(r.engine_class == "local" for r in runs) and all(
@@ -3757,6 +3804,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--allow-harness-errors",
         action="store_true",
         help="Exit 0 even when some runs were harness errors (default: exit 1)",
+    )
+    parser.add_argument(
+        "--max-harness-error-rate",
+        type=float,
+        default=DEFAULT_MAX_HARNESS_ERROR_RATE,
+        help=(
+            "Fraction of trials (0-1) that may be harness errors before the run is marked "
+            f"INVALID_RUN and pass metrics are withheld (default: {DEFAULT_MAX_HARNESS_ERROR_RATE})"
+        ),
     )
     parser.add_argument(
         "--record-qualification",
@@ -4584,11 +4640,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                 )
 
+    harness_total = sum(1 for t in trials if t.harness_error)
+    harness_rate = (harness_total / len(trials)) if trials else 0.0
+    run_invalid = bool(trials) and harness_rate > args.max_harness_error_rate
+    run_status = "INVALID_RUN" if run_invalid else "VALID"
     task_summaries, category_summaries = aggregate_results(
         tasks=eval_units,
         models=unit_labels,
         k=args.k,
         trials=trials,
+        invalid_run=run_invalid,
     )
     failure_causes = _compute_failure_cause_rows(unit_labels, task_summaries)
 
@@ -4613,6 +4674,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "models": unit_labels,
         "engines": unit_labels,
         "k": args.k,
+        "run_status": run_status,
+        "harness_errors": harness_total,
+        "harness_error_rate": round(harness_rate, 4),
+        "max_harness_error_rate": args.max_harness_error_rate,
         "runs_root": str(runs_root),
         "tasks": serialized_tasks,
         "categories": category_summaries,
@@ -4637,6 +4702,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         mode=mode,
         ablation_records=ablation_records,
     )
+    if run_invalid:
+        raw_markdown = (
+            f"# INVALID_RUN\n\n{harness_total}/{len(trials)} trial(s) "
+            f"({harness_rate:.1%}) were harness errors, above the "
+            f"{args.max_harness_error_rate:.1%} cap. pass@1, pass^k and pass@k are not reported.\n\n"
+        ) + raw_markdown
     redacted_markdown = redact_sensitive_text(
         raw_markdown,
         extra_secrets=extra_secrets,
@@ -4655,7 +4726,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             encoding="utf-8",
         )
 
-    harness_total = sum(1 for t in trials if t.harness_error)
+    if run_invalid:
+        print(
+            f"INVALID_RUN: {harness_total}/{len(trials)} trial(s) were harness errors "
+            f"({harness_rate:.1%}), above the {args.max_harness_error_rate:.1%} cap; "
+            "pass metrics were not reported.",
+            file=sys.stderr,
+        )
+        if not args.allow_harness_errors:
+            return 1
     if harness_total:
         print(
             f"warning: {harness_total} run(s) were harness errors "

@@ -7,9 +7,20 @@ variables:
   DEVPACK_DIR: "devpack"
   GATE_CONFIG: ".devpack/gate.toml"
   ENGINES_CONFIG: ".devpack/engines.toml"
-  DEVPACK_BASE: "origin/main" # fetch this ref and choose the project's merge base
+
+# DEVPACK_BASE is chosen per pipeline type. Merge-request pipelines diff against the
+# merge-request base SHA; default-branch pipelines diff against the previous commit.
+# Set it explicitly (never to HEAD) and keep the base trusted.
+.devpack_base: &devpack_base
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        DEVPACK_BASE: "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+    - variables:
+        DEVPACK_BASE: "HEAD~1"
 
 preflight:
+  <<: *devpack_base
   stage: preflight
   image: devpack-checks:latest # Python 3.11+, git, clang, cppcheck, project build tools
   script:
@@ -29,6 +40,7 @@ implement_review:
     when: always
 
 gate:
+  <<: *devpack_base
   stage: gate
   image: devpack-checks:latest
   script:

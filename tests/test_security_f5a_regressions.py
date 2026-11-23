@@ -599,7 +599,7 @@ class SecurityF5aRegressionsTests(unittest.TestCase):
             self.assertEqual(rc1, 1)
             self.assertFalse(herr1, out1)
 
-            # Real exit 2 confirmed by wrapper nonce IS harness_error
+            # A bare exit 2 without a harness marker is NOT a harness error (exit code alone is not enough).
             real_chk = base / "check_err2.sh"
             real_chk.write_text("#!/usr/bin/env bash\necho 'GRADER_MISCONFIGURED: missing dep' >&2\nexit 2\n")
             os.chmod(real_chk, stat.S_IRWXU)
@@ -607,7 +607,22 @@ class SecurityF5aRegressionsTests(unittest.TestCase):
                 real_chk, work, home, tmpd, 10, baseline_sha="deadbeef", isolation="local", allow_unsandboxed_local=True
             )
             self.assertEqual(rc2, 2)
-            self.assertTrue(herr2, out2)
+            self.assertFalse(herr2, out2)
+
+            # A pre-candidate grader that writes a valid nonce-bearing harness_error.json IS a harness error.
+            marker_chk = base / "check_marker2.sh"
+            marker_chk.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '{\"nonce\":\"%s\",\"stage\":\"pack_file\",\"reason\":\"missing fixture\"}' "
+                "\"$DEVPACK_HARNESS_MARKER_NONCE\" > \"$DEVPACK_HARNESS_MARKER_DIR/harness_error.json\"\n"
+                "echo 'GRADER_MISCONFIGURED: missing fixture' >&2\nexit 2\n"
+            )
+            os.chmod(marker_chk, stat.S_IRWXU)
+            rc3, out3, herr3 = run_eval._run_check_script(
+                marker_chk, work, home, tmpd, 10, baseline_sha="deadbeef", isolation="local", allow_unsandboxed_local=True
+            )
+            self.assertEqual(rc3, 2)
+            self.assertTrue(herr3, out3)
 
             # N2 end-to-end in run_single_trial: exit 1 with GRADER_MISCONFIGURED string -> outcome == 'fail'
             fixture_dir = REPO_ROOT / "eval" / "fixture"

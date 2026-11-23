@@ -237,8 +237,11 @@ bash "$DEVPACK_ROOT/enforcement/hooks/install.sh" --repo "$PWD"
   --config enforcement/gate/gate.example.toml --receipt /tmp/devpack_receipt.json)
 
 # Plan a task; engines and gate paths come from this project's .devpack/project.toml.
+# --allowed-files globs are relative to [workspace].root (for example root =
+# "meta-org/recipes-org/src" makes "middleware/ipc_bus/src/*.cpp" the glob). The dry-run
+# prints a WARNING for any glob outside the workspace root or matching no file inside it.
 python3 "$DEVPACK_ROOT/runner/devpack_run.py" --task-id task-001 \
-  --title "Short title" --goal "One-paragraph goal" --allowed-files "src/*.cpp" --dry-run
+  --title "Short title" --goal "One-paragraph goal" --allowed-files "middleware/ipc_bus/src/*.cpp" --dry-run
 
 # Both runners check allowed scope, protected nested tests (--no-deviation),
 # and gate-protected control files after each implementer/fixer step.
