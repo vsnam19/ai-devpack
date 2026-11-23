@@ -151,6 +151,28 @@ verify_test_completion_output() {
     return 0
 }
 
+# Emit GRADER_MISCONFIGURED, record DEVPACK_HARNESS_NONCE if configured, and exit 2.
+grader_misconfigured() {
+    echo "GRADER_MISCONFIGURED: $*" >&2
+    if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
+        printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
+    fi
+    exit 2
+}
+
+# Enumerate changed and untracked files using scope_check.py (without --exclude-standard).
+# Usage: list_changed_files WORKDIR BASE_REF
+list_changed_files() {
+    local workdir="$1"
+    local base_ref="$2"
+    local pack_root="${DEVPACK_ROOT:-$_SAFE_GIT_DEFAULT_ROOT}"
+    local scope_py="$pack_root/enforcement/checks/scope_check.py"
+    if [[ ! -f "$scope_py" ]]; then
+        grader_misconfigured "missing $scope_py"
+    fi
+    python3 "$scope_py" --repo "$workdir" --base "$base_ref" --list-changed
+}
+
 # Execute a test command/binary and require exit 0 + valid DEVPACK_TESTS_COMPLETED proof.
 # Usage: run_verified_test_binary LABEL EXPECTED_MIN CMD [ARGS...]
 run_verified_test_binary() {
@@ -160,11 +182,14 @@ run_verified_test_binary() {
     local tmp_out
     tmp_out="$(mktemp "${TMPDIR:-/tmp}/devpack-test-proof.XXXXXX")"
     local rc=0
-    "$@" >"$tmp_out" 2>&1 || rc=$?
+    env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE "$@" >"$tmp_out" 2>&1 || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         cat "$tmp_out" >&2 || true
         rm -f "$tmp_out"
         echo "FAIL: $label exited with status $rc" >&2
+        if [[ "$rc" -eq 2 ]]; then
+            return 1
+        fi
         return "$rc"
     fi
     if ! verify_test_completion_output "$label" "$expected_min" "$tmp_out"; then
@@ -173,6 +198,158 @@ run_verified_test_binary() {
         return 1
     fi
     rm -f "$tmp_out"
+    return 0
+}
+
+# Build and run C++ test sources with --coverage on TEST TUs only and pack test_framework.hpp force-included,
+# then verify out-of-process gcov coverage of every CHECK* line in the pristine test sources.
+# Usage: run_gcov_hidden_tests LABEL WORKDIR HIDDEN_DIR [ASSERT_REGEX]
+run_gcov_hidden_tests() {
+    local label="$1"
+    local workdir="$2"
+    local hidden_dir="$3"
+    local assert_regex="${4:-}"
+    local pack_root="${DEVPACK_ROOT:-$_SAFE_GIT_DEFAULT_ROOT}"
+    local proof_py="$pack_root/enforcement/checks/test_proof.py"
+    local pack_fw="$pack_root/eval/fixture/tests/test_framework.hpp"
+
+    if [[ ! -f "$proof_py" || ! -f "$pack_fw" ]]; then
+        grader_misconfigured "missing test_proof.py or test_framework.hpp under DEVPACK_ROOT=$pack_root"
+    fi
+
+    local tmp_grade_dir
+    tmp_grade_dir="$(mktemp -d "${TMPDIR:-/tmp}/devpack-gcov-hidden.XXXXXX")"
+    local cov_dir="$tmp_grade_dir/cov"
+    mkdir -p "$tmp_grade_dir/work" "$tmp_grade_dir/work/hidden_tests" "$cov_dir"
+    cp -r "$workdir/." "$tmp_grade_dir/work/"
+    cp -r "$hidden_dir/." "$tmp_grade_dir/work/hidden_tests/"
+
+    local cxx_bin="${CXX:-g++}"
+    local cxxflags=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachable-code -fno-exceptions -fno-rtti)
+    local guard_macro
+    guard_macro="DEVPACK_TF_GUARD_$(date +%s)_$$"
+
+    local src_objs=()
+    local src_f
+    while IFS= read -r src_f; do
+        local obj_f
+        obj_f="$tmp_grade_dir/$(basename "${src_f%.cpp}").o"
+        if ! "$cxx_bin" "${cxxflags[@]}" -I"$tmp_grade_dir/work/include" -c "$src_f" -o "$obj_f"; then
+            rm -rf "$tmp_grade_dir"
+            echo "FAIL: $label failed to compile worker source $(basename "$src_f")" >&2
+            return 1
+        fi
+        src_objs+=("$obj_f")
+    done < <(find "$tmp_grade_dir/work/src" -maxdepth 1 -type f -name '*.cpp' | sort)
+
+    local hidden_srcs=()
+    local test_objs=()
+    local h_f
+    while IFS= read -r h_f; do
+        hidden_srcs+=("$h_f")
+        local obj_f
+        obj_f="$cov_dir/$(basename "${h_f%.cpp}").o"
+        local tf_flags=("-DDEVPACK_FRAMEWORK_GUARD=$guard_macro" "-include" "$pack_fw")
+        if [[ -n "$assert_regex" ]]; then
+            tf_flags=()
+        fi
+        if ! "$cxx_bin" "${cxxflags[@]}" --coverage "${tf_flags[@]}" \
+            -I"$tmp_grade_dir/work/hidden_tests" \
+            -I"$tmp_grade_dir/work/include" \
+            -I"$tmp_grade_dir/work/tests" \
+            -c "$h_f" -o "$obj_f"; then
+            rm -rf "$tmp_grade_dir"
+            echo "FAIL: $label failed to compile hidden test $(basename "$h_f")" >&2
+            return 1
+        fi
+        test_objs+=("$obj_f")
+    done < <(find "$tmp_grade_dir/work/hidden_tests" -maxdepth 1 -type f \( -name '*.cpp' -o -name '*.c' -o -name '*.cc' \) | sort)
+
+    if [[ "${#hidden_srcs[@]}" -eq 0 ]]; then
+        rm -rf "$tmp_grade_dir"
+        echo "FAIL: no hidden test source found in $hidden_dir" >&2
+        return 1
+    fi
+
+    if ! "$cxx_bin" --coverage "${src_objs[@]}" "${test_objs[@]}" -o "$tmp_grade_dir/hidden_test"; then
+        rm -rf "$tmp_grade_dir"
+        echo "FAIL: $label failed to link hidden_test" >&2
+        return 1
+    fi
+
+    local proof_args=(run --obj-dir "$cov_dir" --label "$label")
+    if [[ -n "$assert_regex" ]]; then
+        proof_args+=(--assert-regex "$assert_regex")
+    fi
+    for h_f in "${hidden_srcs[@]}"; do
+        proof_args+=(--test-src "$h_f")
+    done
+    proof_args+=(-- "$tmp_grade_dir/hidden_test")
+
+    local rc=0
+    python3 "$proof_py" "${proof_args[@]}" || rc=$?
+    rm -rf "$tmp_grade_dir"
+    if [[ "$rc" -eq 3 ]]; then
+        grader_misconfigured "gcov TOOL_MISSING"
+    elif [[ "$rc" -ne 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Build and run visible fixture tests with --coverage on TEST TUs only and verify gcov proof.
+# Usage: run_gcov_visible_tests LABEL WORKDIR [EXTRA_TEST_SRC...]
+run_gcov_visible_tests() {
+    local label="$1"
+    local workdir="$2"
+    shift 2
+    local extra_tests=("$@")
+    local pack_root="${DEVPACK_ROOT:-$_SAFE_GIT_DEFAULT_ROOT}"
+    local proof_py="$pack_root/enforcement/checks/test_proof.py"
+    local fixture_tests_dir="$pack_root/eval/fixture/tests"
+
+    if [[ ! -f "$proof_py" || ! -d "$fixture_tests_dir" ]]; then
+        grader_misconfigured "missing test_proof.py or fixture/tests under DEVPACK_ROOT=$pack_root"
+    fi
+
+    local tmp_vis_dir
+    tmp_vis_dir="$(mktemp -d "${TMPDIR:-/tmp}/devpack-gcov-visible.XXXXXX")"
+    local cov_dir="$tmp_vis_dir/cov"
+    mkdir -p "$cov_dir"
+
+    local out_file="$tmp_vis_dir/visible.out"
+    local test_rc=0
+    env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE \
+        DEVPACK_ROOT="$pack_root" DEVPACK_GCOV_OBJ_DIR="$cov_dir" \
+        bash "$workdir/build_and_test.sh" --no-cmake >"$out_file" 2>&1 || test_rc=$?
+
+    if [[ "$test_rc" -ne 0 ]]; then
+        cat "$out_file" >&2 || true
+        rm -rf "$tmp_vis_dir"
+        echo "FAIL: $label exited with status $test_rc" >&2
+        return 1
+    fi
+
+    local proof_args=(verify --obj-dir "$cov_dir" --stdout-file "$out_file" --returncode "$test_rc" --label "$label")
+    local f
+    for f in "$fixture_tests_dir"/*.cpp; do
+        [[ -f "$f" ]] && proof_args+=(--test-src "$f")
+    done
+    for f in "${extra_tests[@]}"; do
+        [[ -n "$f" && -f "$f" ]] && proof_args+=(--test-src "$f")
+    done
+
+    local proof_rc=0
+    python3 "$proof_py" "${proof_args[@]}" || proof_rc=$?
+    if [[ "$proof_rc" -eq 3 ]]; then
+        rm -rf "$tmp_vis_dir"
+        grader_misconfigured "gcov TOOL_MISSING"
+    elif [[ "$proof_rc" -ne 0 ]]; then
+        cat "$out_file" >&2 || true
+        rm -rf "$tmp_vis_dir"
+        return 1
+    fi
+    rm -rf "$tmp_vis_dir"
     return 0
 }
 
@@ -187,11 +364,84 @@ require_baseline_sha() {
     fi
     if [[ -z "$sha" || ! "$sha" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
         echo "GRADER_MISCONFIGURED: missing external DEVPACK_BASELINE_SHA (commit-message lookup is disabled)" >&2
+        if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
+            printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
+        fi
         return 2
     fi
     if ! safe_git -C "$workdir" cat-file -e "${sha}^{commit}" 2>/dev/null; then
         echo "GRADER_MISCONFIGURED: DEVPACK_BASELINE_SHA '$sha' does not resolve to a commit in $workdir" >&2
+        if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
+            printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
+        fi
         return 2
     fi
     echo "$sha"
+}
+
+# Reject hidden .gitignore files and run preflight_lint + cppcheck on C/C++ files BEFORE execution.
+# Usage: run_static_lint_on_files WORKDIR [FILE...]
+run_static_lint_on_files() {
+    local workdir="$1"
+    shift
+    local pack_root="${DEVPACK_ROOT:-$_SAFE_GIT_DEFAULT_ROOT}"
+    local preflight_py="$pack_root/enforcement/lint/preflight_lint.py"
+    local cppcheck_py="$pack_root/enforcement/static/cppcheck_check.py"
+    local preflight_cfg="$pack_root/eval/fixture/preflight.toml"
+
+    if [[ ! -f "$preflight_py" || ! -f "$cppcheck_py" || ! -f "$preflight_cfg" ]]; then
+        grader_misconfigured "missing preflight_lint.py, cppcheck_check.py, or preflight.toml under DEVPACK_ROOT=$pack_root"
+    fi
+
+    if find "$workdir" -maxdepth 4 -path '*/.git' -prune -o -name '.gitignore' -print -quit | grep -q .; then
+        echo "FAIL: scope violation - unexpected .gitignore file found in workdir" >&2
+        return 1
+    fi
+
+    local lint_targets=()
+    local f
+    for f in "$@"; do
+        [[ -z "$f" ]] && continue
+        local full_f="$f"
+        if [[ "$full_f" != /* ]]; then
+            full_f="$workdir/$f"
+        fi
+        case "$full_f" in
+            *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx)
+                if [[ -f "$full_f" ]]; then
+                    lint_targets+=("$full_f")
+                fi
+                ;;
+        esac
+    done
+
+    if [[ "${#lint_targets[@]}" -eq 0 ]]; then
+        return 0
+    fi
+
+    local base_args=()
+    if [[ -n "${DEVPACK_BASELINE_SHA:-}" ]]; then
+        base_args=(--base "$DEVPACK_BASELINE_SHA")
+    elif safe_git -C "$workdir" rev-parse --verify HEAD >/dev/null 2>&1; then
+        base_args=(--base HEAD)
+    fi
+
+    if ! python3 "$preflight_py" --no-cache --repo-root "$workdir" --config "$preflight_cfg" "${base_args[@]}" "${lint_targets[@]}" >/dev/null; then
+        echo "FAIL: preflight_lint found blocking violations" >&2
+        return 1
+    fi
+
+    local cppcheck_out=""
+    local cppcheck_rc=0
+    cppcheck_out="$(python3 "$cppcheck_py" --repo-root "$workdir" --config "$preflight_cfg" "${lint_targets[@]}" 2>&1)" || cppcheck_rc=$?
+    if [[ "$cppcheck_rc" -eq 3 ]]; then
+        grader_misconfigured "cppcheck TOOL_MISSING: $cppcheck_out"
+    elif [[ "$cppcheck_rc" -eq 2 ]]; then
+        grader_misconfigured "cppcheck_check execution error: $cppcheck_out"
+    elif [[ "$cppcheck_rc" -ne 0 ]]; then
+        echo "FAIL: cppcheck static analysis blocking findings:" >&2
+        echo "$cppcheck_out" >&2
+        return 1
+    fi
+    return 0
 }

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from skilltest.skilltest import load_config
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -188,6 +189,89 @@ class SkilltestCliTests(unittest.TestCase):
                 "bash check.sh", grader,
             )
             self.assertFalse(passed)
+
+    def test_behaviour_grader_uses_shared_isolation_and_records_mode(self) -> None:
+        """Skill grading uses the eval sandbox and classifies authenticated exit-2 errors."""
+        from skilltest import skilltest
+        from types import SimpleNamespace
+
+        skill = ROOT / "knowledge/skills/doxygen-naming"
+        fixture = skill / "tests/fixtures/header-contract/input"
+        grader = skill / "tests/graders/header-contract"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            transcript = root / "transcript.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            result = SimpleNamespace(status="ok", tool_protocol_errors=0, transcript_path=transcript)
+            for mode, rc, harness_error, expected in (
+                ("docker", 0, False, "pass"),
+                ("docker", 1, False, "fail"),
+                ("docker", 2, True, "error"),
+                ("local", 0, False, "pass"),
+            ):
+                with self.subTest(mode=mode, rc=rc), \
+                        mock.patch.object(skilltest, "run_agent", return_value=result), \
+                        mock.patch.object(skilltest, "asdict", return_value={}), \
+                        mock.patch.object(skilltest, "_run_check_script", return_value=(rc, "GRADER_MISCONFIGURED: output", harness_error)) as check:
+                    run_dir = root / f"{mode}-{rc}"
+                    _, passed, telemetry = skilltest._execute_trial(
+                        skill, "haiku", "fix contract", False, run_dir, fixture,
+                        "fake-agent", mode, "bash check.sh", grader,
+                        {"category": "COR"}, allow_unsandboxed_local=mode == "local",
+                    )
+                    self.assertEqual(passed, expected == "pass")
+                    self.assertEqual(telemetry["outcome"], expected)
+                    self.assertEqual(check.call_args.kwargs["isolation"], mode)
+                    self.assertEqual(check.call_args.kwargs["allow_unsandboxed_local"], mode == "local")
+                    self.assertEqual(check.call_args.kwargs["grader_command"], ["bash", "check.sh"])
+                    self.assertEqual(check.call_args.kwargs["grader_env"], {"SKILLTEST_EXPECTED_CATEGORY": "COR"})
+                    record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+                    self.assertEqual(record["grader_isolation"], mode)
+
+    def test_skill_grader_docker_boundaries_and_local_opt_in(self) -> None:
+        """Run the real wrapper with fake Docker; never execute a candidate on the host."""
+        from eval.run_eval import _run_check_script
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            work, home, tmp = (root / name for name in ("work", "home", "tmp"))
+            for directory in (work, home, tmp):
+                directory.mkdir()
+            grader = root / "grader"
+            grader.mkdir()
+            marker = root / "host-execution"
+            check = grader / "check.sh"
+            check.write_text(f"touch '{marker}'\n", encoding="utf-8")
+            log = root / "docker-args.json"
+            docker = root / "docker"
+            docker.write_text(
+                "#!/usr/bin/env python3\nimport json, pathlib, sys\n"
+                f"pathlib.Path({str(log)!r}).write_text(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "secret-test-value"}):
+                rc, output, error = _run_check_script(
+                    check, work, home, tmp, 10, docker_bin=str(docker),
+                    grader_command=["bash", "check.sh"],
+                    grader_env={"SKILLTEST_EXPECTED_VERDICT": "APPROVE"},
+                )
+            self.assertEqual(rc, 0, output)
+            self.assertFalse(error)
+            self.assertFalse(marker.exists())
+            args = json.loads(log.read_text(encoding="utf-8"))
+            self.assertIn("--network=none", args)
+            self.assertIn(f"{ROOT}:/workspace/pack:ro", args)
+            self.assertIn(f"{grader}:/workspace/grader:ro", args)
+            self.assertIn("/workspace/grader", args)
+            self.assertIn("SKILLTEST_EXPECTED_VERDICT=APPROVE", args)
+            self.assertEqual(args[-3:], ["bash", "check.sh", "/workspace/task"])
+            self.assertNotIn("secret-test-value", " ".join(args))
+            self.assertFalse(any("credentials" in arg for arg in args))
+            with self.assertRaisesRegex(ValueError, "allow-unsandboxed-local"):
+                _run_check_script(check, work, home, tmp, 10, isolation="local",
+                                  grader_command=["bash", "check.sh"])
+            self.assertFalse(marker.exists())
 
     def test_dry_run_prints_plan(self) -> None:
         """Dry-run displays every trial without requiring an agent binary."""

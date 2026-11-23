@@ -1,11 +1,25 @@
-diff --git a/tests/test_link_state_machine.cpp b/tests/test_link_state_machine.cpp
-index 199f640..127f4f0 100644
---- a/tests/test_link_state_machine.cpp
-+++ b/tests/test_link_state_machine.cpp
-@@ -112,6 +112,41 @@ void testResetFromAnyState() {
-     CHECK_EQ(machine.state(), LinkState::Connecting);
- }
- 
+diff --git a/tests/test_link_recovery.cpp b/tests/test_link_recovery.cpp
+new file mode 100644
+index 0000000..c5d9182
+--- /dev/null
++++ b/tests/test_link_recovery.cpp
+@@ -0,0 +1,56 @@
++/**
++ * @file test_link_recovery.cpp
++ * @brief Unit tests for LinkStateMachine heartbeat recovery and invalid-state rejection.
++ */
++
++#include "link_state_machine.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::LinkConfig;
++using can_fixture::LinkState;
++using can_fixture::LinkStateMachine;
++
 +/**
 + * @brief Verify Degraded recovery resets retryCount on heartbeat and invalid states reject heartbeat.
 + * @req REQ-LINK-005
@@ -41,14 +55,8 @@ index 199f640..127f4f0 100644
 +    CHECK_EQ(machine.state(), LinkState::Fault);
 +}
 +
- }  // namespace
- 
- void runLinkStateMachineTests() {
-@@ -119,6 +154,7 @@ void runLinkStateMachineTests() {
-     testHandshakeRetryAndFault();
-     testHeartbeatSupervisionAndDegradedEscalation();
-     testResetFromAnyState();
-+    testDegradedRecoveryAndInvalidHeartbeats();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testDegradedRecoveryAndInvalidHeartbeats);
++
++}  // namespace can_fixture_test

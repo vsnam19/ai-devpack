@@ -27,18 +27,29 @@ target_include_directories(can_fixture_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+file(GLOB FIXTURE_TEST_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp"
+)
 add_executable(fixture_tests
-    tests/test_main.cpp
-    tests/test_can_codec.cpp
-    tests/test_ring_buffer.cpp
-    tests/test_link_state_machine.cpp
-    tests/test_dtc_debouncer.cpp
+    ${FIXTURE_TEST_SOURCES}
 )
 target_include_directories(fixture_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
 )
 target_link_libraries(fixture_tests PRIVATE can_fixture_lib)
+if(DEFINED ENV{DEVPACK_ROOT})
+    set(DEVPACK_FRAMEWORK "$ENV{DEVPACK_ROOT}/eval/fixture/tests/test_framework.hpp")
+else()
+    set(DEVPACK_FRAMEWORK "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_framework.hpp")
+endif()
+string(RANDOM LENGTH 24 ALPHABET ABCDEF0123456789 DEVPACK_GUARD_SUFFIX)
+target_compile_options(fixture_tests PRIVATE
+    --coverage -O0
+    "-DDEVPACK_FRAMEWORK_GUARD=DEVPACK_TF_${DEVPACK_GUARD_SUFFIX}"
+    -include "${DEVPACK_FRAMEWORK}"
+)
+target_link_options(fixture_tests PRIVATE --coverage)
 
 enable_testing()
 add_test(NAME fixture_tests COMMAND fixture_tests)

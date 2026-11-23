@@ -9,12 +9,11 @@ Under sustained traffic, the ring buffer retains the newest frames with the expe
 ## Files allowed
 - `src/can_codec.cpp`
 - `src/ring_buffer.cpp`
-- tests/test_can_codec.cpp
-- tests/test_ring_buffer.cpp
+- tests/test_vague_frame_retention.cpp
 - `STOP_REPORT.md`
 
 ## Commands
 - `bash build_and_test.sh`
 
 ## STOP rule
-If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never modify or delete existing tests; adding new test cases in files listed under Files allowed is expected when the goal asks for it.
+If the request cannot be completed within Files allowed, or it conflicts with a requirement or an existing test, do not work around it: write `STOP_REPORT.md` explaining the conflict and stop. Never modify or delete existing tests/test_*.cpp files; add any new test cases in tests/test_vague_frame_retention.cpp and register them with `REGISTER_TEST_SUITE(...)`.

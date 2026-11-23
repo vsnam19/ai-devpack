@@ -37,7 +37,9 @@ _REPO_ROOT_STR = str(Path(__file__).resolve().parents[2])
 if _REPO_ROOT_STR not in sys.path:
     sys.path.insert(0, _REPO_ROOT_STR)
 
-from runner.safe_git import GitSecurityError, run_git  # noqa: E402
+from enforcement.checks.deviations import verify_deviation  # noqa: E402
+from enforcement.checks.scope_check import get_changed_files  # noqa: E402
+from runner.safe_git import GitSecurityError  # noqa: E402
 from runner.workspace_scope import ComponentSpec, WorkspaceScope, resolve_workspace_scope  # noqa: E402
 
 try:
@@ -60,7 +62,7 @@ SKIP_DIRS = {
 DEFAULT_ENABLE = ("warning", "style", "performance", "portability")
 DEFAULT_FAIL_ON = ("error", "warning")
 DEFAULT_INCLUDE_DIRS = ("include",)
-DEFAULT_EXTRA_ARGS = ("--inline-suppr",)
+DEFAULT_EXTRA_ARGS: tuple[str, ...] = ()
 BASELINE_SCHEMA_VERSION = 1
 KNOWN_FAIL_ON_SEVERITIES: frozenset[str] = frozenset(
     {"error", "warning", "style", "performance", "portability", "information"}
@@ -604,35 +606,12 @@ def filter_findings_with_baseline(
 
 def discover_changed_cpp_files(repo_root: Path, base_ref: str) -> list[Path]:
     """Return sorted existing C/C++ files changed since ``base_ref`` in ``repo_root``."""
-    try:
-        verify = run_git(
-            ["rev-parse", "--verify", f"{base_ref}^{{commit}}"],
-            repo_root=repo_root,
-            check=False,
-        )
-        if verify.returncode != 0:
-            err = verify.stderr.strip() or f"invalid base ref '{base_ref}'"
-            raise ValueError(f"git base ref error: {err}")
-
-        changed: set[str] = set()
-        for cmd in (
-            ["diff", "--name-only", base_ref],
-            ["diff", "--name-only", f"{base_ref}..HEAD"],
-            ["diff", "--cached", "--name-only"],
-            ["ls-files", "--others", "--exclude-standard"],
-        ):
-            proc = run_git(cmd, repo_root=repo_root, check=False)
-            if proc.returncode != 0:
-                raise ValueError(proc.stderr.strip() or "git diff failed")
-            for line in proc.stdout.splitlines():
-                cleaned = line.strip()
-                if cleaned:
-                    changed.add(cleaned)
-    except GitSecurityError as exc:
-        raise ValueError(f"git security error: {exc}") from exc
+    changed, err = get_changed_files(repo_root, base_ref)
+    if changed is None:
+        raise ValueError(f"git base ref error: {err}")
 
     files: list[Path] = []
-    for rel in sorted(changed):
+    for rel in changed:
         if not rel.lower().endswith(CPP_SUFFIXES):
             continue
         candidate = (repo_root / rel).resolve()
@@ -995,6 +974,53 @@ def _expand_workspace_cpp_targets(
     return ws_scope.filter(files), has_explicit_file
 
 
+_SUPPRESS_COMMENT_RE = re.compile(r"\bcppcheck-suppress\b")
+_DEVIATION_INLINE_RE = re.compile(r"\bDeviation:\s*(DEV-[A-Za-z0-9_.-]+)")
+
+
+def _find_unapproved_inline_suppressions(
+    target_files: Sequence[Path],
+    repo_root: Path,
+) -> list[CppcheckFinding]:
+    """Return blocking findings for any ``cppcheck-suppress`` comment lacking a registry Deviation."""
+    findings: list[CppcheckFinding] = []
+    for fp in target_files:
+        try:
+            rel_file = fp.resolve().relative_to(repo_root.resolve()).as_posix()
+        except ValueError:
+            rel_file = fp.name
+        try:
+            lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for idx, line in enumerate(lines, start=1):
+            if not _SUPPRESS_COMMENT_RE.search(line):
+                continue
+            m = _DEVIATION_INLINE_RE.search(line)
+            if m:
+                entry, _ = verify_deviation(
+                    m.group(1),
+                    files=(rel_file,),
+                    rule="SUPPRESSION-WITHOUT-DEVIATION",
+                    worktree_roots=(repo_root,),
+                )
+                if entry is not None:
+                    continue
+            findings.append(
+                CppcheckFinding(
+                    file=rel_file,
+                    line=idx,
+                    id="SUPPRESSION-WITHOUT-DEVIATION",
+                    severity="error",
+                    message=(
+                        "Inline cppcheck-suppress requires 'Deviation: DEV-<n>' on the same line "
+                        "matching DEVPACK_DEVIATIONS"
+                    ),
+                )
+            )
+    return findings
+
+
 def _invoke_cppcheck_cmd(
     cmd: list[str],
     effective_root: Path,
@@ -1149,8 +1175,6 @@ def run_cppcheck_check(
             cmd.append(f"--enable={','.join(config.enable)}")
         if config.std:
             cmd.append(f"--std={config.std}")
-        if "--inline-suppr" not in config.extra_args:
-            cmd.append("--inline-suppr")
         cmd.extend(["--xml", "--xml-version=2"])
         if config.suppressions_file:
             suppr_path = _resolve_suppressions_file(
@@ -1285,6 +1309,9 @@ def run_cppcheck_check(
                 cmd.extend(["-I", inc_path.relative_to(effective_root).as_posix()])
         cmd.extend(_rel_str(fp) for fp in target_files)
         parsed, raw_xml, raw_stdout = _invoke_cppcheck_cmd(cmd, effective_root, timeout_s)
+
+    if "--inline-suppr" in config.extra_args:
+        parsed.extend(_find_unapproved_inline_suppressions(target_files, effective_root))
 
     if baseline_update and baseline_path is not None:
         save_baseline(baseline_path, parsed)

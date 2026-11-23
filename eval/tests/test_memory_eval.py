@@ -70,15 +70,7 @@ class MemoryEvalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             fixture_dir = base / "fixture"
-            (fixture_dir / "src").mkdir(parents=True)
-            (fixture_dir / "include").mkdir(parents=True)
-            (fixture_dir / "tests").mkdir(parents=True)
-            (fixture_dir / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.16)\n", encoding="utf-8")
-            (fixture_dir / "build_and_test.sh").write_text(
-                "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
-                encoding="utf-8",
-            )
-            os.chmod(fixture_dir / "build_and_test.sh", stat.S_IRWXU)
+            shutil.copytree(REPO_ROOT / "eval/fixture", fixture_dir)
             (fixture_dir / "src" / "val.txt").write_text("0\n", encoding="utf-8")
 
             mem_tasks = base / "memory_tasks"

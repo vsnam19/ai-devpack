@@ -4,9 +4,9 @@
 # Usage: bash check.sh [--help] [--workdir DIR]
 #
 # Exit codes:
-#   0 - Visible tests, hidden tests, and preflight lint passed
+#   0 - Preflight lint, cppcheck, visible tests, and hidden tests passed
 #   1 - One or more checks failed
-#   2 - Invalid usage or missing DEVPACK_ROOT
+#   2 - Invalid usage, missing DEVPACK_ROOT, or missing DEVPACK_BASELINE_SHA (GRADER_MISCONFIGURED)
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -41,28 +41,32 @@ source "$SAFE_GIT_SH"
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 TASK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-expected_visible="$(count_expected_checks "$DEVPACK_ROOT/eval/fixture/tests"/*.cpp)"
-run_verified_test_binary "visible build_and_test (01-recall-decision)" "$expected_visible" \
-    bash "$WORKDIR/build_and_test.sh" --no-cmake
+# Resolve the external baseline before any check: lint diffs against it, never against HEAD.
+BASE_REF="$(require_baseline_sha "$WORKDIR")" || exit 2
 
-TMP_GRADE="$(mktemp -d "${TMPDIR:-/tmp}/devpack-mem-grade-01.XXXXXX")"
-# shellcheck disable=SC2064
-trap "rm -rf '$TMP_GRADE'" EXIT
-cp -r "$WORKDIR/." "$TMP_GRADE/work"
-mkdir -p "$TMP_GRADE/work/hidden_tests"
-cp -r "$TASK_DIR/hidden/." "$TMP_GRADE/work/hidden_tests/"
+# Enforce scope and test lock before lint, compilation, or test execution.
+python3 "$DEVPACK_ROOT/eval/lib/check_memory_scope.py" \
+    --workdir "$WORKDIR" --sequence "$TASK_DIR/sequence.toml"
 
-mapfile -t fixture_srcs < <(find "$TMP_GRADE/work/src" -maxdepth 1 -type f -name '*.cpp' | sort)
-mapfile -t hidden_srcs < <(find "$TMP_GRADE/work/hidden_tests" -maxdepth 1 -type f -name '*.cpp' | sort)
-"${CXX:-g++}" -std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachable-code -fno-exceptions -fno-rtti \
-    -I"$TMP_GRADE/work/hidden_tests" -I"$TMP_GRADE/work/include" -I"$TMP_GRADE/work/tests" \
-    "${fixture_srcs[@]}" "${hidden_srcs[@]}" -o "$TMP_GRADE/hidden_test"
-expected_hidden="$(count_expected_checks "${hidden_srcs[@]}")"
-run_verified_test_binary "hidden_test (01-recall-decision)" "$expected_hidden" "$TMP_GRADE/hidden_test"
-
+# Lint and cppcheck BEFORE running any worker code
 python3 "$DEVPACK_ROOT/enforcement/lint/preflight_lint.py" --no-cache \
-    --repo-root "$WORKDIR" --config "$DEVPACK_ROOT/eval/fixture/preflight.toml" \
+    --repo-root "$WORKDIR" --config "$DEVPACK_ROOT/eval/fixture/preflight.toml" --base "$BASE_REF" \
     "$WORKDIR/include/dtc_debouncer.hpp" "$WORKDIR/src/dtc_debouncer.cpp" >/dev/null
+set +e
+cppcheck_out="$(python3 "$DEVPACK_ROOT/enforcement/static/cppcheck_check.py" \
+    --repo-root "$WORKDIR" --config "$DEVPACK_ROOT/eval/fixture/preflight.toml" \
+    "$WORKDIR/include/dtc_debouncer.hpp" "$WORKDIR/src/dtc_debouncer.cpp" 2>&1)"
+cppcheck_rc=$?
+set -e
+if [[ "$cppcheck_rc" -eq 3 || "$cppcheck_rc" -eq 2 ]]; then
+    grader_misconfigured "cppcheck error ($cppcheck_rc): $cppcheck_out"
+elif [[ "$cppcheck_rc" -ne 0 ]]; then
+    echo "$cppcheck_out" >&2
+    exit 1
+fi
+
+run_gcov_visible_tests "visible build_and_test (01-recall-decision)" "$WORKDIR"
+run_gcov_hidden_tests "hidden_test (01-recall-decision)" "$WORKDIR" "$TASK_DIR/hidden"
 
 echo "PASS: 01-recall-decision"
 exit 0

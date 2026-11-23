@@ -74,9 +74,9 @@ fi
 source "$SAFE_GIT_SH"
 
 BASELINE_HASHES=(
-    "CMakeLists.txt:f4c74df4499acb3025e609acb21428e38c5336ca59b26d3728c73d4d0da33c75"
+    "CMakeLists.txt:22783b0ea0f6c9bc4e338c480c42effbaedf61b75340eff2a088174c143ab4b6"
     "include/dtc_debouncer.hpp:90c8aee02c289431b8992b2f8cb76f1481d56413222fb34d20ca93ffff68dc80"
-    "build_and_test.sh:f87d8c42f649a0d0a11f7fd6e48068da4ac661edb5463e424ca259e6551a6af0"
+    "build_and_test.sh:5838f5702218075be8cb64f690528ad16686fa750422a9de566ef14e62fc30c8"
     "include/can_codec.hpp:153417bd1a1c0526f9b4542bf7e19653683e3d408ad9503642d14ec8a6773511"
     "include/link_state_machine.hpp:6a73630a93bbbacbdbd19ba4314e4e63d079e2993b193bf53312d04fd9e8bf30"
     "include/ring_buffer.hpp:14512341e1c335f111ef9c7a59443d145efe8206aebe9e27ef50c7b58a416a96"
@@ -85,18 +85,18 @@ BASELINE_HASHES=(
     "src/link_state_machine.cpp:72114142bb41abd99fb4e9bd47594fd529c4cae92981474bc037b4a3b2b2d992"
     "src/ring_buffer.cpp:0730cb711223aff7f066aefe601064f2a21949bf8da7dc47d87f2f99b73dfccd"
     "tests/test_can_codec.cpp:a5d01a92642a5068c00e2688127a712b1f70b8d7096dc67329aa53384124a710"
-    "tests/test_framework.hpp:63c415272ae5a24fc8cb35dbdd59f94b94f3aba0c36782194e87f641aa7fac78"
+    "tests/test_framework.hpp:d4ac449c6f651f5ea22616cf4564eb63e1130a8d3fafbfa8af5e0f44a2862af2"
     "tests/test_link_state_machine.cpp:6ee4c883cd46d9a1cc414e807a840b3c269d6ff3df23e92b02eb77601ec094a9"
     "src/dtc_debouncer.cpp:46678c09a3ac7c083d5f12cf8320f08b7340ef72e9ec9899e1e23a4aa117ef45"
     "tests/test_dtc_debouncer.cpp:fb5c745929072ea96d588c7802dda277d02876d3caeb64e1ed215180b744d117"
-    "tests/test_main.cpp:01b1c4a1105e7461d07c468e37e5a70fc019197a25c8e9cabb76a1737a9a47e6"
+    "tests/test_main.cpp:c68da9c36c3c6484ff5c52ec6c6b2ead05193da4dbc8d08c2680fb0ed9853723"
     "tests/test_ring_buffer.cpp:8e4451cb6089f4f63007ae42e649d01490586a04d66048bba7e19c9b802d1df3"
 )
 
 ALLOWED_FILES=(
     "include/can_codec.hpp"
     "src/can_codec.cpp"
-    "tests/test_can_codec.cpp"
+    "tests/test_codec_raw_range.cpp"
 )
 
 is_allowed_file() {
@@ -149,6 +149,7 @@ while IFS= read -r existing_file; do
             echo "FAIL: scope violation - unexpected new file '$rel_existing'" >&2
             exit 1
         fi
+        CHANGED_COUNT=$((CHANGED_COUNT + 1))
     fi
 done < <(find "$WORKDIR/include" "$WORKDIR/src" "$WORKDIR/tests" -type f | sort)
 
@@ -157,36 +158,14 @@ if [[ "$CHANGED_COUNT" -eq 0 ]]; then
     exit 1
 fi
 
-# 2. Build and run fixture unit tests
-FIXTURE_TESTS_DIR="${DEVPACK_ROOT:+$DEVPACK_ROOT/eval/fixture/tests}"
-[[ -n "$FIXTURE_TESTS_DIR" && -d "$FIXTURE_TESTS_DIR" ]] || FIXTURE_TESTS_DIR="$SCRIPT_DIR/../../fixture/tests"
-[[ -d "$FIXTURE_TESTS_DIR" ]] || FIXTURE_TESTS_DIR="$WORKDIR/tests"
-expected_visible="$(count_expected_checks "$FIXTURE_TESTS_DIR"/*.cpp)"
-run_verified_test_binary "visible build_and_test" "$expected_visible" \
-    bash "$WORKDIR/build_and_test.sh" --no-cmake
+# Reject .gitignore and run preflight_lint + cppcheck BEFORE running any worker code
+run_static_lint_on_files "$WORKDIR" "${ALLOWED_FILES[@]}"
 
-# 3. Compile and run hidden test suite
-TMP_GRADE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/devpack-grade-07-small-feature-codec-raw-range.XXXXXX")"
-# shellcheck disable=SC2317,SC2329
-cleanup_grade() {
-    rm -rf "$TMP_GRADE_DIR"
-}
-trap cleanup_grade EXIT
+# 2. Build and run fixture unit tests with out-of-process gcov proof
+run_gcov_visible_tests "visible build_and_test" "$WORKDIR" "$WORKDIR/tests/test_codec_raw_range.cpp"
 
-CXX_BIN="${CXX:-g++}"
-CXXFLAGS=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachable-code -fno-exceptions -fno-rtti)
-
-"$CXX_BIN" "${CXXFLAGS[@]}" \
-    -I"$WORKDIR/include" \
-    -I"$WORKDIR/tests" \
-    "$WORKDIR/src/can_codec.cpp" \
-    "$WORKDIR/src/ring_buffer.cpp" \
-    "$WORKDIR/src/link_state_machine.cpp" \
-    "$WORKDIR/src/dtc_debouncer.cpp" \
-    "$HIDDEN_DIR/hidden_test.cpp" \
-    -o "$TMP_GRADE_DIR/hidden_test"
-expected_hidden="$(count_expected_checks "$HIDDEN_DIR/hidden_test.cpp")"
-run_verified_test_binary "hidden_test" "$expected_hidden" "$TMP_GRADE_DIR/hidden_test"
+# 3. Compile and run hidden test suite with out-of-process gcov proof
+run_gcov_hidden_tests "hidden_test" "$WORKDIR" "$HIDDEN_DIR"
 
 # 4. Task-specific checks
 python3 - "$WORKDIR" <<'PY'
@@ -196,10 +175,17 @@ import sys
 
 workdir = pathlib.Path(sys.argv[1])
 hdr = (workdir / "include/can_codec.hpp").read_text(encoding="utf-8")
-test_text = (workdir / "tests/test_can_codec.cpp").read_text(encoding="utf-8")
+test_path = workdir / "tests/test_codec_raw_range.cpp"
+if not test_path.is_file():
+    print("FAIL: missing new test file tests/test_codec_raw_range.cpp", file=sys.stderr)
+    sys.exit(1)
+test_text = test_path.read_text(encoding="utf-8")
 
 if not re.search(r"@req\s+REQ-CODEC-007\b", test_text):
-    print("FAIL: missing @req REQ-CODEC-007 tag in tests/test_can_codec.cpp", file=sys.stderr)
+    print("FAIL: missing @req REQ-CODEC-007 tag in tests/test_codec_raw_range.cpp", file=sys.stderr)
+    sys.exit(1)
+if "REGISTER_TEST_SUITE" not in test_text:
+    print("FAIL: tests/test_codec_raw_range.cpp must register its suite via REGISTER_TEST_SUITE", file=sys.stderr)
     sys.exit(1)
 if re.search(r"@param\b(?!\s*\[(?:in|out|in,out)\])", hdr):
     print("FAIL: @param missing [in]/[out] direction in include/can_codec.hpp", file=sys.stderr)

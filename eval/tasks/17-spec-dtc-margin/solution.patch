@@ -33,14 +33,28 @@ index ed31f39..a26ad94 100644
 +}
 +
  }  // namespace can_fixture
-diff --git a/tests/test_dtc_debouncer.cpp b/tests/test_dtc_debouncer.cpp
-index 517f3f8..75c3c03 100644
---- a/tests/test_dtc_debouncer.cpp
-+++ b/tests/test_dtc_debouncer.cpp
-@@ -141,6 +141,22 @@ void testResetAndUnconfirmedPassRecovery() {
-     CHECK(!debouncer.isConfirmed());
- }
- 
+diff --git a/tests/test_dtc_margin.cpp b/tests/test_dtc_margin.cpp
+new file mode 100644
+index 0000000..c5d9181
+--- /dev/null
++++ b/tests/test_dtc_margin.cpp
+@@ -0,0 +1,37 @@
++/**
++ * @file test_dtc_margin.cpp
++ * @brief Unit tests for REQ-DTC-006 DtcDebouncer::remainingToConfirm.
++ */
++
++#include "dtc_debouncer.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::DtcConfig;
++using can_fixture::DtcDebouncer;
++using can_fixture::DtcState;
++
 +/**
 + * @brief Verify remainingToConfirm for invalid config, pending, and confirmed states.
 + * @req REQ-DTC-006
@@ -57,14 +71,8 @@ index 517f3f8..75c3c03 100644
 +    CHECK_EQ(debouncer.remainingToConfirm(), static_cast<std::int16_t>(0));
 +}
 +
- }  // namespace
- 
- void runDtcDebouncerTests() {
-@@ -148,6 +164,7 @@ void runDtcDebouncerTests() {
-     testPendingAndConfirmDebounceThresholds();
-     testOperationCycleAgingAndHealing();
-     testResetAndUnconfirmedPassRecovery();
-+    testRemainingToConfirmMargin();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testRemainingToConfirmMargin);
++
++}  // namespace can_fixture_test

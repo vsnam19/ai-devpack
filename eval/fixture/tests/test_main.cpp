@@ -14,5 +14,6 @@ int main() {
     can_fixture_test::runRingBufferTests();
     can_fixture_test::runLinkStateMachineTests();
     can_fixture_test::runDtcDebouncerTests();
+    can_fixture_test::runRegisteredTestSuites();
     return can_fixture_test::printSummaryAndExitCode<0>();
 }

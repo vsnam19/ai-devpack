@@ -34,7 +34,6 @@ enable = ["warning", "style", "performance", "portability"]
 std = "c++17"
 include_dirs = ["include"]
 suppressions_file = ""
-extra_args = ["--inline-suppr"]
 fail_on = ["error", "warning"]
 ```
 
@@ -43,6 +42,10 @@ fail_on = ["error", "warning"]
   verbatim into the fixer prompt alongside `preflight_lint.py` findings.
 - `style`, `performance`, and `portability` findings are reported in output and JSON
   (`"blocking": false`) but do not block unless added to `fail_on`.
+- `--inline-suppr` is **disabled by default** in both `enforcement/static/cppcheck_check.py`
+  and `runner/devpack_dispatch.py`. Even if `--inline-suppr` is explicitly enabled via
+  trusted config, `cppcheck-suppress` without a matching `Deviation: DEV-<n>` verified in
+  `DEVPACK_DEVIATIONS` fails as `SUPPRESSION-WITHOUT-DEVIATION`.
 - `[cppcheck].extra_args` and `--extra-arg` are validated against a strict allowlist
   (`--inline-suppr`, `--check-level=normal|exhaustive`, `--suppress=<id>[:path]`,
   `--std=c++NN`, `-D<NAME>[=value]`, `-U<NAME>`, `--platform=<name>`,
@@ -60,18 +63,40 @@ fail_on = ["error", "warning"]
 
 ## Suppressions and deviations
 
-Every suppression is a deviation (`policy/deviations.md`) and requires an approved
-Deviation ID (`DEV-<nnn>`). Agents may propose a suppression in an escalation note, but
-must never invent a Deviation ID.
+Every inline or file suppression (`cppcheck-suppress`, `NOLINT`, `NOLINTNEXTLINE`,
+`#pragma GCC/clang diagnostic`, `_Pragma(...diagnostic...)`) is a deviation
+(`policy/deviations.md`) and requires an approved Deviation ID (`DEV-<nnn>`) registered
+in `DEVPACK_DEVIATIONS` naming both the affected file and the rule
+(`SUPPRESSION-WITHOUT-DEVIATION`). Agents may propose a suppression in an escalation note,
+but must never invent a Deviation ID. Any worker-added suppression without `Deviation: DEV-<n>`
+verified in `DEVPACK_DEVIATIONS` is blocked by `preflight_lint.py` and `cppcheck_check.py`
+as `SUPPRESSION-WITHOUT-DEVIATION`.
 
 Inline suppression format:
 
 ```cpp
-// cppcheck-suppress <id> -- DEV-012: <brief justification and expiry>
+// cppcheck-suppress <id> -- Deviation: DEV-012 (<brief justification and expiry>)
 ```
 
 Project-wide suppressions may be placed in the file configured by
 `[cppcheck].suppressions_file`, with each line documented by its `DEV-<nnn>` reference.
+
+## Test execution proof (`--check tests`)
+
+`enforcement/gate/project_checks.py --check tests` refuses to trust plain exit code `0` as
+test proof:
+
+- For projects using the pack test framework (`test_framework.hpp` / `CHECK*`), the gate
+  requires out-of-process `gcov` line-coverage proof (`enforcement/checks/test_proof.py`)
+  confirming every `CHECK*` assertion line in pristine test sources executed at least once
+  with zero failure lines and exit `0`.
+- For non-pack / third-party test runners (e.g. GoogleTest, Catch2, CTest), the gate
+  requires a JUnit XML (`--junitxml` / `Test.xml`) or CTest XML report produced by the run
+  showing executed test count `> 0` and zero failures/errors/crashes. Note: JUnit/CTest XML
+  or exit-code-only evidence for non-pack runners is **weaker** than pack out-of-process
+  `gcov` assertion proof (a test binary running inside the same process could still exit
+  cleanly after generating XML in custom harnesses unless paired with CI-enforced test-binary
+  isolation).
 
 ## Baselines for legacy code
 

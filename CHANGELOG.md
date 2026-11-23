@@ -5,14 +5,21 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
-### Adoption
-- Protect nested and component-specific tests; expose runner protection flags and scope/test-lock plans.
-- Require explicit empty-diff and unowned-file exceptions; diagnose missing or shallow CI baselines.
-- Load component-specific coding conventions and remove brief creation-symbol false positives.
-- Skip deprecated skills during installation and share expanded credential rules with the pre-commit scanner.
-- Correct installed-project quickstart paths, generated-file ignore guidance, layout, and release notes.
+## [0.2.2] - 2026-11-23
 
 ### Security
+- **Out-of-process gcov test proof & framework tamper protection (`enforcement/checks/test_proof.py`, `enforcement/gate/project_checks.py`, `eval/fixture/tests/test_framework.hpp`, `eval/fixture/tests/test_main.cpp`, `eval/fixture/build_and_test.sh`, `eval/lib/safe_git.sh`, `eval/tasks/**/check.sh`)**:
+  Replaced trust in in-process `DEVPACK_TESTS_COMPLETED` stdout lines with out-of-process `gcov -j` line-coverage verification over pristine test sources (`CHECK*` lines executed `>= 1` and completion summary executed, exiting `3` `TOOL_MISSING` if `gcov` is absent), with `--coverage` applied only to test translation units and pack `test_framework.hpp` force-included via `-include` and `-DDEVPACK_FRAMEWORK_GUARD`. Worker attempts to define or shadow framework guard/macros/symbols fail `TEST-FRAMEWORK-TAMPER` lint and compilation.
+- **Preprocessed token-stream `PROCESS-TERMINATION` & suppression deviation gates (`enforcement/lint/preflight_lint.py`, `enforcement/static/cppcheck_check.py`, `enforcement/checks/deviations.py`, `runner/devpack_dispatch.py`)**:
+  Evaluated `PROCESS-TERMINATION` over the compiler-preprocessed token stream (`g++ -E`) covering termination/syscall/dynamic-load/process-spawn/jump/ctor-dtor/`_Pragma` identifiers and forbidden literals across all worker-changed files without test-path exemption. Disabled `--inline-suppr` by default, flagged worker-added `cppcheck-suppress`/`NOLINT`/`#pragma`/`_Pragma` diagnostics without verified `Deviation: DEV-<n>` as `SUPPRESSION-WITHOUT-DEVIATION`, and rejected rule-less entries in `DEVPACK_DEVIATIONS`.
+- **Strict test lock & new test file eval tasks (`enforcement/checks/test_lock.py`, `eval/tasks/`, `eval/orchestrator_goals/01-link-fault-recovery/`)**:
+  Tightened `test_lock.py` so protected test files allow no insertions, deletions, or modifications unless named in `DEVPACK_DEVIATIONS`, and updated eval tasks that add tests to target dedicated new tests/test_*.cpp files registered via `REGISTER_TEST_SUITE(...)`.
+- **Untracked enumeration without `--exclude-standard` (`enforcement/checks/scope_check.py`)**:
+  Stopped passing `--exclude-standard` to `git ls-files --others`, applying only base-commit `.gitignore` snapshots, build directories, and pack excludes, while flagging any `.gitignore` edit/creation as `gate-touched`.
+- **Docker grader isolation & wrapper-nonce harness errors (`eval/run_eval.py`, `skilltest/skilltest.py`)**:
+  Executed task, memory, orchestrator, and skill graders inside Docker isolation (`--network=none`, read-only pack mount, no credentials) by default, ran lint and `cppcheck` before any worker code executes, and keyed `harness_error` classification strictly on grader-wrapper exit code `2` verified against a per-run out-of-workdir nonce. Skill grading preserves configured command arguments and expectations, records the isolation mode, and requires explicit local opt-in.
+- **Memory note fencing & normalized lexicon (`runner/memory.py`)**:
+  Rendered auto-accepted `handoff`/`known-gap` notes inside verbatim fenced ```` ```text ```` blocks with backticks and headings escaped, and extended policy-changing lexicon detection with Unicode NFKC normalization and zero-width character stripping.
 - **Docker `.git` mount sources no longer chosen by repository content (`runner/agent_exec.py`, `runner/tests/test_docker_git_mounts.py`)**:
   A `.git` symlink is refused, a real `.git` directory is mounted read-only, and a worktree `.git`
   pointer file is mounted only when its gitdir is a direct child of `<common_dir>/worktrees/` (with
@@ -21,6 +28,12 @@ All notable changes to ai-devpack are recorded here. Versioning follows
   read-only mount at any host directory (T24).
 
 ### Fixed
+- **Adoption & installation fixes (`enforcement/gate/project_checks.py`, `enforcement/lint/preflight_lint.py`, `runner/devpack_dispatch.py`, `runner/devpack_run.py`, `runner/redaction.py`, `runner/brief_lint.py`, `runner/workspace_scope.py`)**:
+  - Protect nested and component-specific tests; expose runner protection flags and scope/test-lock plans.
+  - Require explicit empty-diff and unowned-file exceptions; diagnose missing or shallow CI baselines.
+  - Load component-specific coding conventions and remove brief creation-symbol false positives.
+  - Skip deprecated skills during installation and share expanded credential rules with the pre-commit scanner.
+  - Correct installed-project quickstart paths, generated-file ignore guidance, layout, and release notes.
 - **Eval & skill grader validity (`knowledge/skills/automotive-cpp/`, `knowledge/skills/requirements-analysis/`, `eval/tasks/`, `eval/memory_tasks/01-recall-decision/`)**:
   Replaced `assert()` with grader-owned `GRADER_CHECK` and rejected `NDEBUG`, diagnostic pragmas, and grader macro tampering in `automotive-cpp` graders; added `modernize-use-auto` (`const auto` cast initialization) and `clang-tidy` enforcement notes to `automotive-cpp/SKILL.md`. Tightened `requirements-analysis/tests/grade_findings.py` with verbatim section quote checks, checklist vocabulary validation, number-word detection, clean-requirement coverage (`>= 2` clean IDs per case), and open-question/ID-link enforcement on derived test ideas. Hardened `08-doxygen-naming-codec` and `09-doxygen-naming-link` nearest-block Doxygen/parameter checks, `18-review-fault-recovery` range/evidence/extra-blocker checks, `10-trap-contradictory-test` `file:line` and unmodified-`src/` checks, `04-add-test-codec-bounds` baseline-relative assertion count and null-pointer guard mutants, and `01-recall-decision` Step 2 baseline reset so Step 2 requires recalled memory.
 - **Metric accounting (`eval/run_eval.py`, `skilltest/skilltest.py`)**:

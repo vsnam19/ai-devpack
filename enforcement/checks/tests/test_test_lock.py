@@ -79,19 +79,23 @@ class TestTestLock(unittest.TestCase):
             code = test_lock.main(args)
         return code, out_buf.getvalue(), err_buf.getvalue()
 
-    def test_happy_path_unchanged_or_increased_assertions_passes(self) -> None:
-        """Adding an assertion to a protected test file passes with exit code 0."""
+    def test_happy_path_unchanged_or_new_test_file_passes(self) -> None:
+        """Trailing-whitespace-only changes and new test files pass with exit code 0."""
         (self.repo_dir / "tests" / "test_codec.cpp").write_text(
-            "void test_decode() {\n"
+            "void test_decode() {   \n"
             "    ASSERT_EQ(1, 1);\n"
             "    EXPECT_TRUE(true);\n"
             "    REQUIRE(2 == 2);\n"
-            "    CHECK_EQ(3, 3);\n"
             "}\n",
             encoding="utf-8",
         )
+        (self.repo_dir / "tests" / "test_new_suite.cpp").write_text(
+            "void test_added() {\n    CHECK_EQ(3, 3);\n}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(self.repo_dir), "add", "."], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         subprocess.run(
-            ["git", "-C", str(self.repo_dir), "commit", "-am", "add assertion"],
+            ["git", "-C", str(self.repo_dir), "commit", "-m", "add new test file"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -110,8 +114,8 @@ class TestTestLock(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("TEST_LOCK_OK", out)
 
-    def test_comment_aware_line_preservation(self) -> None:
-        """Protect code while allowing comments and inserted tests anywhere."""
+    def test_strict_byte_identical_except_trailing_whitespace(self) -> None:
+        """Protected files reject insertions, deletions, comment edits, and code changes."""
         path = self.repo_dir / "tests/test_codec.cpp"
         original = path.read_text()
         baseline = '/**\n * old documentation ASSERT_FAKE(x)\n */\n' + original
@@ -119,13 +123,14 @@ class TestTestLock(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo_dir), "commit", "-am", "document tests"],
                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         cases = [
-            (baseline.replace("old documentation ASSERT_FAKE(x)", "new documentation"), 0),
+            (baseline.replace("    ASSERT_EQ(1, 1);", "    ASSERT_EQ(1, 1);   "), 0),
+            (baseline.replace("old documentation ASSERT_FAKE(x)", "new documentation"), 1),
             (baseline.replace("ASSERT_EQ(1, 1)", "ASSERT_EQ(1, 2)"), 1),
             (baseline.replace("void test_decode() {", "void changed_name() {"), 1),
             (baseline.replace("    EXPECT_TRUE(true);\n", ""), 1),
-            (baseline.replace(original, "void added() { CHECK(true); }\n" + original), 0),
+            (baseline.replace(original, "void added() { CHECK(true); }\n" + original), 1),
             (baseline.replace("ASSERT_EQ(1, 1);", "ASSERT_EQ(1, 2); // explanation"), 1),
-            (baseline.replace("ASSERT_EQ(1, 1);", "ASSERT_EQ(1, 1); // explanation"), 0),
+            (baseline.replace("ASSERT_EQ(1, 1);", "ASSERT_EQ(1, 1); // explanation"), 1),
             (baseline.replace("    ASSERT_EQ(1, 1);", "/*    ASSERT_EQ(1, 1); */"), 1),
         ]
         for content, expected in cases:
@@ -265,7 +270,7 @@ class TestTestLock(unittest.TestCase):
         with tempfile.TemporaryDirectory() as reg_dir:
             reg = pathlib.Path(reg_dir) / "deviations.json"
             reg.write_text(
-                '{"deviations":[{"id":"DEV-404","files":["tests/test_codec.cpp"],'
+                '{"deviations":[{"id":"DEV-404","files":["tests/test_codec.cpp"],"rules":["test_lock"],'
                 '"approved_by":"tech-lead","expires":"2099-12-31"}]}',
                 encoding="utf-8",
             )
@@ -324,7 +329,7 @@ class TestTestLock(unittest.TestCase):
         with tempfile.TemporaryDirectory() as reg_dir:
             reg = pathlib.Path(reg_dir) / "deviations.json"
             reg.write_text(
-                '{"deviations":[{"id":"DEV-777","files":["tests/test_codec.cpp"],'
+                '{"deviations":[{"id":"DEV-777","files":["tests/test_codec.cpp"],"rules":["test_lock"],'
                 '"approved_by":"tech-lead","expires":"2099-12-31"}]}',
                 encoding="utf-8",
             )
@@ -337,7 +342,7 @@ class TestTestLock(unittest.TestCase):
 
                 code, out, _ = self._run_lock(protected_args + ["--no-deviation"])
                 self.assertEqual(code, 1)
-                self.assertIn("existing non-comment test lines modified or deleted", out)
+                self.assertIn("protected test file modified", out)
                 self.assertNotIn("Deviation", out)
             finally:
                 if old_env is None:

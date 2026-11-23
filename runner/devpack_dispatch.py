@@ -112,7 +112,7 @@ _CPPCHECK_SUMMARY_RE = re.compile(
 DEFAULT_TRUSTED_GATE_TOML = (
     '[general]\nstd = "c++17"\n\n'
     '[cppcheck]\nenable = ["warning", "style", "performance", "portability"]\n'
-    'std = "c++17"\ninclude_dirs = ["include"]\nextra_args = ["--inline-suppr"]\n'
+    'std = "c++17"\ninclude_dirs = ["include"]\n'
     'fail_on = ["error", "warning"]\n'
 )
 
@@ -453,6 +453,8 @@ def run_preflight_lint_on_changed(
         ]
         if project_config_path is not None:
             cmd.extend(["--project-config", str(project_config_path)])
+        if base_ref:
+            cmd.extend(["--base", str(base_ref)])
         if active_scope.configured:
             if active_scope.scan_mode == "all":
                 cmd.append("--all-components")
@@ -561,6 +563,8 @@ def run_cppcheck_on_changed(
             cmd.extend(["--trusted-suppressions-dir", str(snapshot_dir)])
         if project_config_path is not None:
             cmd.extend(["--project-config", str(project_config_path)])
+        if base_ref:
+            cmd.extend(["--base", str(base_ref)])
         if active_scope.configured:
             if active_scope.scan_mode == "all":
                 cmd.append("--all-components")

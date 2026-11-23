@@ -155,8 +155,8 @@ class DevpackDispatchTests(unittest.TestCase):
             self.assertIn("Code Quality Checklist", prompt_saved)
 
     def test_dispatch_shared_comment_aware_lock(self) -> None:
-        """Dispatch permits comment edits and rejects changed assertion values."""
-        for replacement, expected in [("1 == 2", 1), ("1 == 1", 0)]:
+        """Dispatch enforces strict test_lock (rejects assertion and comment edits on protected tests)."""
+        for replacement, expected in [("1 == 2", 1), ("1 == 1", 1)]:
             with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as tmp:
                 base = Path(tmp)
                 wt = base / "wt"

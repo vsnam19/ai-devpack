@@ -11,7 +11,7 @@ Human-authorized deviations live **outside agent-writable worktrees** in a human
 |---|---|
 | `id` | `DEV-<nnn>` (unique deviation identifier) |
 | `files` | List of relative file paths / globs covered by the deviation |
-| `rules` | Optional rule/check IDs covered (e.g. `test_lock`, `PROCESS-TERMINATION`, `max_fix_rounds`) |
+| `rules` | **Required** non-empty list of rule/check IDs covered (e.g. `test_lock`, `PROCESS-TERMINATION`, `SUPPRESSION-WITHOUT-DEVIATION`, `max_fix_rounds`); rule-less entries are rejected |
 | `approved_by` | Non-empty human approver identifier (TL / safety manager for safety-relevant items) |
 | `expires` | ISO-8601 date (`YYYY-MM-DD`) or timestamp; expiry at most 90 days |
 | `reason` | Why the requirement cannot be met now and compensating measure |

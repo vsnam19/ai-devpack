@@ -40,6 +40,7 @@ from runner.agent_exec import (
     update_run_json,
 )
 from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs
+from eval.run_eval import _run_check_script
 
 
 MAX_DESCRIPTION_LENGTH = 1024
@@ -360,7 +361,9 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
                    allow_unsandboxed_local: bool = False) -> tuple[bool, bool, dict[str, Any]]:
     """Run one agent trial and return trigger status plus serialized telemetry."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    update_run_json(run_dir, kind="skilltest", engines=[engine], task=prompt, outcome="running")
+    update_run_json(run_dir, kind="skilltest", engines=[engine], task=prompt, outcome="running",
+                    grader_isolation=isolation,
+                    allow_unsandboxed_local=allow_unsandboxed_local)
     redactor = Redactor()
     triggered = passed = False
     telemetry: dict[str, Any] = {}
@@ -402,19 +405,23 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
                 elif grader is None:
                     reason = "Grader directory is missing"
                 else:
-                    check_env = {**os.environ, "DEVPACK_ROOT": str(REPOSITORY_ROOT)}
-                    for key, value in (expectations or {}).items():
-                        check_env[f"SKILLTEST_EXPECTED_{key.upper()}"] = str(value)
-                    check = subprocess.run(
-                        [*shlex.split(check_command), str(workdir)], cwd=grader, env=check_env,
-                        check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    check_env = {
+                        f"SKILLTEST_EXPECTED_{key.upper()}": str(value)
+                        for key, value in (expectations or {}).items()
+                    }
+                    home_dir, tmp_dir = Path(temp) / "grader-home", Path(temp) / "grader-tmp"
+                    home_dir.mkdir()
+                    tmp_dir.mkdir()
+                    check_rc, grader_output, harness_error = _run_check_script(
+                        grader / "check.sh", workdir, home_dir, tmp_dir, 300,
+                        isolation=isolation, allow_unsandboxed_local=allow_unsandboxed_local,
+                        grader_command=shlex.split(check_command), grader_env=check_env,
                     )
-                    grader_output = check.stdout
-                    passed = check.returncode == 0
-                    outcome = "pass" if passed else "fail"
+                    passed = check_rc == 0
+                    outcome = "error" if harness_error or check_rc == 124 else ("pass" if passed else "fail")
                     lines = [line.strip() for line in grader_output.splitlines() if line.strip()]
                     failures = [line for line in lines if re.search(r"FAIL|ERROR|error:|failed", line)]
-                    reason = "" if passed else next(iter(failures or lines), f"Grader exited with code {check.returncode}")
+                    reason = "" if passed else next(iter(failures or lines), f"Grader exited with code {check_rc}")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         reason = f"Trial error: {error}"
     finally:

@@ -187,8 +187,8 @@ text = path.read_text(encoding="utf-8")
 assert " * @brief " in text
 path.write_text(text.replace(" * @brief ", " * @brief Updated documentation: ", 1), encoding="utf-8")
 PYCOMMENT
-        if ! DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1; then
-            echo "META-CHECK FAIL ($task_id): comment-only test edit rejected" >&2
+        if DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1; then
+            echo "META-CHECK FAIL ($task_id): comment-only protected-test edit accepted" >&2
             after_solve="FAIL(BAD)"
         fi
         cp "$saved_test" "$protected_test"
@@ -299,7 +299,7 @@ PY
         git -C "$review_dir" clean -q -fd
         if [[ ! -f "$task_dir/review.patch" ]] ||
             ! git -C "$review_dir" apply "$task_dir/review.patch" ||
-            ! bash "$review_dir/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
+            ! DEVPACK_ROOT="$PACK_ROOT" bash "$review_dir/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
             echo "META-CHECK FAIL ($task_id): review.patch must apply and pass fixture build" >&2
             v2_meta_ok=0
         fi

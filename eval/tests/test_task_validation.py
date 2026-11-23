@@ -218,7 +218,7 @@ class TaskValidationTests(unittest.TestCase):
             # Task 04: removing null-pointer tests from solution fails null-guard mutants.
             t04, w04, s04 = self._setup_task_workdir(root / "t04", "04-add-test-codec-bounds")
             subprocess.run(["git", "apply", str(t04 / "solution.patch")], cwd=w04, check=True)
-            tcpp04 = w04 / "tests" / "test_can_codec.cpp"
+            tcpp04 = w04 / "tests" / "test_codec_bounds.cpp"
             txt04 = tcpp04.read_text(encoding="utf-8")
             no_null = "\n".join(ln for ln in txt04.splitlines() if "nullptr" not in ln) + "\n"
             tcpp04.write_text(no_null, encoding="utf-8")

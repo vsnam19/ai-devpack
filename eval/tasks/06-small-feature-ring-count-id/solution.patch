@@ -36,14 +36,31 @@ index 0b7dc0b..dc8bfc5 100644
 +}
 +
  }  // namespace can_fixture
-diff --git a/tests/test_ring_buffer.cpp b/tests/test_ring_buffer.cpp
-index 843ff85..a30f79e 100644
---- a/tests/test_ring_buffer.cpp
-+++ b/tests/test_ring_buffer.cpp
-@@ -104,12 +104,35 @@ void testRingBufferPeekAndClear() {
-     CHECK_EQ(ring.droppedCount(), static_cast<std::size_t>(0U));
- }
- 
+diff --git a/tests/test_ring_count_id.cpp b/tests/test_ring_count_id.cpp
+new file mode 100644
+index 0000000..c5d9181
+--- /dev/null
++++ b/tests/test_ring_count_id.cpp
+@@ -0,0 +1,46 @@
++/**
++ * @file test_ring_count_id.cpp
++ * @brief Unit tests for FrameRingBuffer::countByCanId.
++ */
++
++#include "ring_buffer.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::CanFrame;
++using can_fixture::FrameRingBuffer;
++
++CanFrame makeSampleFrame(std::uint32_t canId, std::uint8_t tag) {
++    return CanFrame{canId, 8U, {tag, 0U, 0U, 0U, 0U, 0U, 0U, 0U}};
++}
++
 +/**
 + * @brief Verify countByCanId counts matching frames across wrap-around without mutating state.
 + * @req REQ-RING-004
@@ -66,13 +83,8 @@ index 843ff85..a30f79e 100644
 +    CHECK_EQ(ring.size(), static_cast<std::size_t>(3U));
 +}
 +
- }  // namespace
- 
- void runRingBufferTests() {
-     testRingBufferFifoAndFullRejection();
-     testRingBufferPushOverwrite();
-     testRingBufferPeekAndClear();
-+    testRingBufferCountByCanId();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testRingBufferCountByCanId);
++
++}  // namespace can_fixture_test

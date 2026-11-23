@@ -115,7 +115,7 @@ class RunnerTrialInitInfoTests(unittest.TestCase):
             devpack_run,
             "run_task_workflow",
             side_effect=_make_stub_workflow(implementer_model, implementer_digest),
-        ), mock.patch.object(run_eval, "_run_check_script", return_value=(0, "")):
+        ), mock.patch.object(run_eval, "_run_check_script", return_value=(0, "", False)):
             return run_eval.run_runner_trial(
                 task=task,
                 pair_label="haiku:haiku",
