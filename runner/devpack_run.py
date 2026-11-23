@@ -52,6 +52,7 @@ from agent_exec import (  # noqa: E402
     AgentRequest,
     EngineConfig,
     EnginesConfig,
+    WORKDIR_SANDBOX_OPT_OUT_WARNING,
     check_local_isolation_allowed,
     format_command,
     load_engines,
@@ -70,6 +71,12 @@ from devpack_dispatch import (  # noqa: E402
 )
 from enforcement.checks.scope_check import get_changed_files, is_gate_protected_path  # noqa: E402
 from memory import memory_root_for, process_memory_proposals  # noqa: E402
+from safe_git import (  # noqa: E402
+    GitSecurityError,
+    check_git_metadata_unchanged,
+    run_git,
+    snapshot_git_metadata,
+)
 from workspace_scope import resolve_workspace_scope  # noqa: E402
 
 ESCALATE_TO_HUMAN = "ESCALATE_TO_HUMAN"
@@ -341,13 +348,12 @@ def parse_review_verdict(review_output: str) -> str:
 
 def compute_worktree_diff(worktree: Path) -> str:
     """Collect the current git diff in ``worktree`` (or empty string if not a git repo)."""
-    for args in (["git", "diff", "HEAD"], ["git", "diff"]):
+    for args in (["diff", "HEAD"], ["diff"]):
         try:
-            proc = subprocess.run(
+            proc = run_git(
                 args,
-                cwd=str(worktree),
-                capture_output=True,
-                text=True,
+                repo_root=worktree,
+                cwd=worktree,
                 timeout=30,
                 check=False,
             )
@@ -446,10 +452,9 @@ def _coerce_role_engine(config: EnginesConfig | dict[str, Any], role: str, fallb
 def _resolve_git_base_ref(worktree: Path) -> str | None:
     """Return HEAD SHA if ``worktree`` is a git repository with a commit, else None."""
     try:
-        proc = subprocess.run(
-            ["git", "-C", str(worktree), "rev-parse", "--verify", "HEAD"],
-            capture_output=True,
-            text=True,
+        proc = run_git(
+            ["rev-parse", "--verify", "HEAD"],
+            repo_root=worktree,
             timeout=15,
             check=False,
         )
@@ -598,13 +603,16 @@ def run_task_workflow(
     )
     if not iso_ok:
         sys.stderr.write(iso_msg + "\n")
-        update_run_json(
-            active_run_dir,
-            outcome="refused",
-            isolation=isolation,
-            refusal_reason=iso_msg,
-            finished=datetime.now(timezone.utc).isoformat(),
-        )
+        refused_iso: dict[str, Any] = {
+            "outcome": "refused",
+            "isolation": isolation,
+            "refusal_reason": iso_msg,
+            "finished": datetime.now(timezone.utc).isoformat(),
+        }
+        if WORKDIR_SANDBOX_OPT_OUT_WARNING in iso_msg:
+            refused_iso["sandbox_warning"] = iso_msg
+            refused_iso["ignored_workdir_sandbox_opt_out"] = True
+        update_run_json(active_run_dir, **refused_iso)
         return 1, {
             "task_id": context["TASK_ID"],
             "task_title": context["TASK_TITLE"],
@@ -620,8 +628,19 @@ def run_task_workflow(
             "harness_error_reason": iso_msg,
             "timed_out": False,
         }
+    if iso_msg:
+        warn_iso: dict[str, Any] = {"sandbox_warning": iso_msg}
+        if WORKDIR_SANDBOX_OPT_OUT_WARNING in iso_msg:
+            warn_iso["ignored_workdir_sandbox_opt_out"] = True
+        update_run_json(active_run_dir, **warn_iso)
 
     base_ref = _resolve_git_base_ref(worktree)
+    git_snap = snapshot_git_metadata(worktree)
+    update_run_json(
+        active_run_dir,
+        git_config_sha256=git_snap.config_sha256,
+        git_hooks_listing=git_snap.hooks_entries_for_log(),
+    )
     lint_pack_root = repo_root if (repo_root / "enforcement" / "lint" / "preflight_lint.py").is_file() else REPO_ROOT
     static_pack_root = repo_root if (repo_root / "enforcement" / "static" / "cppcheck_check.py").is_file() else REPO_ROOT
     pre_run_proj_bytes: bytes | None = None
@@ -655,13 +674,15 @@ def run_task_workflow(
     pending_proposals: list[str] = []
     rejected_proposals: list[dict[str, str]] = []
     pending_proposal_texts: list[str] = []
+    git_tampered = False
+    git_tamper_reason = ""
 
     def _invoke_role(role_name: str, engine: EngineConfig, prompt_text: str) -> agent_exec.AgentResult:
         """Run a role via agent_exec.run_agent and accumulate telemetry."""
         nonlocal local_tokens, local_wall_s
         nonlocal total_cost_usd, total_tokens_in, total_tokens_out, total_duration_s
         nonlocal total_tool_protocol_errors, any_timeout, any_harness_error, first_harness_error
-        nonlocal total_memory_tokens
+        nonlocal total_memory_tokens, git_tampered, git_tamper_reason
         step_stem = f"{step_index:02d}-{role_name}-{engine.name}"
         if profile_overrides is not None and engine.name in profile_overrides:
             resolved_profile = profile_overrides[engine.name]
@@ -723,12 +744,16 @@ def run_task_workflow(
             any_harness_error = True
             if not first_harness_error:
                 first_harness_error = res.error or "agent harness_error"
+        git_ok, tamper_reason = check_git_metadata_unchanged(git_snap)
+        if not git_ok:
+            git_tampered = True
+            git_tamper_reason = tamper_reason
         return res
 
     # Step 1: Implement
     step_index += 1
     impl_res = _invoke_role("implementer", impl_engine, impl_brief)
-    if impl_res.status == "ok" and impl_res.final_text:
+    if impl_res.status == "ok" and impl_res.final_text and not git_tampered:
         pending_proposal_texts.append(impl_res.final_text)
     log_file = write_step_log(
         log_dir,
@@ -759,6 +784,10 @@ def run_task_workflow(
     escalation_reason = ""
 
     while True:
+        if git_tampered:
+            final_status = "git_metadata_tampered"
+            escalation_reason = git_tamper_reason
+            break
         # Step: Gate (configured gate_cmd + preflight lint on changed C/C++ files)
         step_index += 1
         gate_rc, gate_out, gate_err, gate_dur = execute_command(
@@ -981,6 +1010,10 @@ def run_task_workflow(
             git_diff=diff_text,
         )
         rev_res = _invoke_role("reviewer", rev_engine, rev_brief)
+        if git_tampered:
+            final_status = "git_metadata_tampered"
+            escalation_reason = git_tamper_reason
+            break
         verdict = (
             parse_review_verdict(rev_res.final_text)
             if rev_res.exit_code == 0 and rev_res.status == "ok"
@@ -1093,11 +1126,18 @@ def run_task_workflow(
         )
         step_logs.append(esc_log.name)
 
+    run_json_extra: dict[str, Any] = {}
+    if git_tampered:
+        run_json_extra["scope"] = "violation"
+        run_json_extra["scope_violation"] = "git_metadata_tampered"
+        run_json_extra["git_metadata_tampered"] = True
+        run_json_extra["tamper_reason"] = git_tamper_reason
+
     update_run_json(
         active_run_dir,
         task=context["TASK_ID"],
         engines=role_engine_map,
-        outcome=final_status,
+        outcome="fail" if git_tampered else final_status,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
         lint_findings_first_attempt=lint_findings_first_attempt,
@@ -1105,6 +1145,7 @@ def run_task_workflow(
         static_findings_first_attempt=static_findings_first_attempt,
         static_clean_final=bool(last_static_clean),
         finished=datetime.now(timezone.utc).isoformat(),
+        **run_json_extra,
     )
 
     summary = {
@@ -1112,6 +1153,9 @@ def run_task_workflow(
         "task_title": context["TASK_TITLE"],
         "status": final_status,
         "verdict": final_verdict,
+        "scope": "violation" if git_tampered else "ok",
+        "scope_violation": "git_metadata_tampered" if git_tampered else "",
+        "git_metadata_tampered": git_tampered,
         "components": active_component_names,
         "scan_mode": ws_scope.scan_mode,
         "fix_rounds_used": fix_rounds_used,

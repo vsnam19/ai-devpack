@@ -20,6 +20,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from enforcement.checks.scope_check import glob_to_regex, matches_any_glob  # noqa: E402
+from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 
 DEFAULT_ASSERT_REGEX = r"\b(ASSERT|EXPECT|CHECK|REQUIRE)\w*\(|\bassert\b"
 DEVIATION_PATTERN = re.compile(r"\bDeviation:\s*([A-Za-z0-9_.-]+)")
@@ -27,13 +28,14 @@ DEVIATION_PATTERN = re.compile(r"\bDeviation:\s*([A-Za-z0-9_.-]+)")
 
 def get_head_deviation(repo_root: pathlib.Path) -> str | None:
     """Return the deviation ID from HEAD's commit message if ``Deviation: <ID>`` is present."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "log", "-1", "--format=%B", "HEAD"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = run_git(
+            ["log", "-1", "--format=%B", "HEAD"],
+            repo_root=repo_root,
+            check=False,
+        )
+    except GitSecurityError:
+        return None
     if proc.returncode != 0:
         return None
     match = DEVIATION_PATTERN.search(proc.stdout)
@@ -42,25 +44,24 @@ def get_head_deviation(repo_root: pathlib.Path) -> str | None:
 
 def list_base_files(repo_root: pathlib.Path, base_ref: str) -> tuple[list[str] | None, str | None]:
     """List all tracked file paths in ``repo_root`` at git reference ``base_ref``."""
-    verify = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{base_ref}^{{commit}}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if verify.returncode != 0:
-        return None, verify.stderr.strip() or f"invalid base ref '{base_ref}'"
+    try:
+        verify = run_git(
+            ["rev-parse", "--verify", f"{base_ref}^{{commit}}"],
+            repo_root=repo_root,
+            check=False,
+        )
+        if verify.returncode != 0:
+            return None, verify.stderr.strip() or f"invalid base ref '{base_ref}'"
 
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", base_ref],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        return None, proc.stderr.strip() or f"failed to list tree at '{base_ref}'"
+        proc = run_git(
+            ["ls-tree", "-r", "--name-only", base_ref],
+            repo_root=repo_root,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None, proc.stderr.strip() or f"failed to list tree at '{base_ref}'"
+    except GitSecurityError as exc:
+        return None, str(exc)
 
     files = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     return sorted(files), None
@@ -74,17 +75,11 @@ def detect_renames_and_deletions(
     renamed: dict[str, str] = {}
     deleted: set[str] = set()
     diff_cmds = [
-        ["git", "-C", str(repo_root), "diff", "--name-status", "-M", base_ref],
-        ["git", "-C", str(repo_root), "diff", "--name-status", "-M", f"{base_ref}..HEAD"],
+        ["diff", "--name-status", "-M", base_ref],
+        ["diff", "--name-status", "-M", f"{base_ref}..HEAD"],
     ]
     for cmd in diff_cmds:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
+        proc = run_git(cmd, repo_root=repo_root, check=False)
         if proc.returncode != 0:
             continue
         for raw_line in proc.stdout.splitlines():
@@ -103,11 +98,9 @@ def detect_renames_and_deletions(
 
 def read_file_at_ref(repo_root: pathlib.Path, ref: str, rel_path: str) -> str | None:
     """Return file content at ``ref:rel_path``, or None on error."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "show", f"{ref}:{rel_path}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    proc = run_git(
+        ["show", f"{ref}:{rel_path}"],
+        repo_root=repo_root,
         check=False,
     )
     if proc.returncode != 0:

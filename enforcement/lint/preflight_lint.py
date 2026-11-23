@@ -59,6 +59,8 @@ _REPO_ROOT_STR = str(pathlib.Path(__file__).resolve().parents[2])
 if _REPO_ROOT_STR not in sys.path:
     sys.path.insert(0, _REPO_ROOT_STR)
 
+from runner.safe_git import GitSecurityError, run_git  # noqa: E402
+
 from runner.workspace_scope import WorkspaceScope, resolve_workspace_scope  # noqa: E402
 
 VERSION = "0.1.0"
@@ -3111,13 +3113,14 @@ def _detect_git_revision(repository_root: pathlib.Path) -> str:
     @param[in] repository_root Repository root directory.
     @return Commit SHA string or 'unknown'.
     """
-    res = subprocess.run(
-        ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        res = run_git(
+            ["rev-parse", "HEAD"],
+            repo_root=repository_root,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, GitSecurityError):
+        return "unknown"
     return res.stdout.strip() if res.returncode == 0 and res.stdout.strip() else "unknown"
 
 

@@ -75,6 +75,7 @@ from runner.agent_exec import (  # noqa: E402
     AgentResult,
     EngineConfig,
     EnginesConfig,
+    WORKDIR_SANDBOX_OPT_OUT_WARNING,
     check_data_class_allowed,
     check_local_isolation_allowed,
     compute_engine_config_hash,
@@ -93,6 +94,12 @@ from runner.agent_exec import (  # noqa: E402
 from runner.brief_lint import lint_brief_text  # noqa: E402
 from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
+from runner.safe_git import (  # noqa: E402
+    GitSecurityError,
+    check_git_metadata_unchanged,
+    run_git,
+    snapshot_git_metadata,
+)
 from runner.workspace_scope import WorkspaceScope, parse_toml_with_arrays, resolve_workspace_scope  # noqa: E402
 
 CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
@@ -125,11 +132,9 @@ def _git_show_regular_blob(workdir: Path, ref: str, rel_path: str) -> bytes | No
     """Return raw bytes for ``ref:rel_path`` in ``workdir`` if it is a regular git blob."""
     if not ref or not (workdir / ".git").exists():
         return None
-    ls_proc = subprocess.run(
-        ["git", "-C", str(workdir), "ls-tree", ref, "--", rel_path],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
+    ls_proc = run_git(
+        ["ls-tree", ref, "--", rel_path],
+        repo_root=workdir,
         timeout=30,
         check=False,
     )
@@ -139,11 +144,11 @@ def _git_show_regular_blob(workdir: Path, ref: str, rel_path: str) -> bytes | No
     mode = first_line.split(None, 1)[0]
     if mode == "120000":
         raise ValueError(f"{rel_path} in base commit {ref} must not be a symlink")
-    show_proc = subprocess.run(
-        ["git", "-C", str(workdir), "show", f"{ref}:{rel_path}"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
+    show_proc = run_git(
+        ["show", f"{ref}:{rel_path}"],
+        repo_root=workdir,
         timeout=30,
+        text=False,
         check=False,
     )
     if show_proc.returncode != 0:
@@ -350,10 +355,13 @@ def _run_subprocess(cmd: Sequence[str], cwd: Path, timeout_s: int = 300) -> tupl
 
 def _resolve_git_head(workdir: Path) -> str | None:
     """Return the HEAD commit SHA for ``workdir``, or None if not a valid git repo."""
-    rc, out, _ = _run_subprocess(["git", "-C", str(workdir), "rev-parse", "--verify", "HEAD"], workdir, 30)
-    if rc != 0:
+    try:
+        proc = run_git(["rev-parse", "--verify", "HEAD"], repo_root=workdir, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
         return None
-    sha = out.strip()
+    if proc.returncode != 0:
+        return None
+    sha = proc.stdout.strip()
     return sha if sha else None
 
 
@@ -1066,13 +1074,16 @@ def _dispatch_job_with_trusted_cfg(
 
     if not iso_ok:
         sys.stderr.write(iso_msg + "\n")
-        update_run_json(
-            run_dir,
-            outcome="refused",
-            isolation=isolation,
-            refusal_reason=iso_msg,
-            finished=datetime.now(timezone.utc).isoformat(),
-        )
+        refused_iso: dict[str, Any] = {
+            "outcome": "refused",
+            "isolation": isolation,
+            "refusal_reason": iso_msg,
+            "finished": datetime.now(timezone.utc).isoformat(),
+        }
+        if WORKDIR_SANDBOX_OPT_OUT_WARNING in iso_msg:
+            refused_iso["sandbox_warning"] = iso_msg
+            refused_iso["ignored_workdir_sandbox_opt_out"] = True
+        update_run_json(run_dir, **refused_iso)
         payload = {
             "run_dir": str(run_dir),
             "status": "refused",
@@ -1086,6 +1097,12 @@ def _dispatch_job_with_trusted_cfg(
         _render_run_dir_quietly(run_dir)
         _emit_json_line(payload)
         return 1, payload
+
+    if iso_msg:
+        warn_iso: dict[str, Any] = {"sandbox_warning": iso_msg}
+        if WORKDIR_SANDBOX_OPT_OUT_WARNING in iso_msg:
+            warn_iso["ignored_workdir_sandbox_opt_out"] = True
+        update_run_json(run_dir, **warn_iso)
 
     if not qual_ok and not allow_unqualified:
         sys.stderr.write(qual_reason + "\n")
@@ -1128,7 +1145,7 @@ def _dispatch_job_with_trusted_cfg(
         run_dir=run_dir,
         step_name=f"01-{role}-{engine.name}",
         isolation=isolation,
-        allow_unsandboxed_local=allow_unsandboxed_local or bool(project_cfg.get("allow_unsandboxed_local", False)),
+        allow_unsandboxed_local=allow_unsandboxed_local,
         timeout_s=engine.timeout_s,
         credentials_path=credentials_path,
         agent_bin=agent_bin,
@@ -1145,7 +1162,46 @@ def _dispatch_job_with_trusted_cfg(
         memory_task_text=brief_raw,
     )
     control_before = _control_snapshot(workdir)
+    git_snap = snapshot_git_metadata(workdir)
+    update_run_json(
+        run_dir,
+        git_config_sha256=git_snap.config_sha256,
+        git_hooks_listing=git_snap.hooks_entries_for_log(),
+    )
     agent_res = run_agent(req)
+
+    git_ok, git_tamper_reason = check_git_metadata_unchanged(git_snap)
+    if not git_ok:
+        tamper_msg = f"SCOPE_VIOLATION: {git_tamper_reason}"
+        sys.stderr.write(tamper_msg + "\n")
+        update_run_json(
+            run_dir,
+            task=brief_path.stem,
+            outcome="fail",
+            gate="skipped",
+            scope="violation",
+            scope_violation="git_metadata_tampered",
+            git_metadata_tampered=True,
+            refusal_reason=git_tamper_reason,
+            finished=datetime.now(timezone.utc).isoformat(),
+        )
+        _render_run_dir_quietly(run_dir)
+        cost_val_tamper: float | None = None if engine.is_local else round(float(agent_res.cost_usd or 0.0), 6)
+        payload = {
+            "run_dir": str(run_dir),
+            "status": agent_res.status,
+            "gate": "skipped",
+            "scope": "violation",
+            "scope_violation": "git_metadata_tampered",
+            "git_metadata_tampered": True,
+            "scope_detail": tamper_msg,
+            "changed_files": [],
+            "final_text_tail": agent_res.final_text[-800:],
+            "cost_usd": cost_val_tamper,
+            "error": git_tamper_reason,
+        }
+        _emit_json_line(payload)
+        return 1, payload
 
     model_ok, model_reason = check_model_change_post_run(engine, agent_res, qual_path)
     if not model_ok:
@@ -1715,9 +1771,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             all_components=bool(args.all_components),
         )
         return rc
-    except ValueError as exc:
+    except (ValueError, GitSecurityError) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return 1 if isinstance(exc, GitSecurityError) else 2
 
 
 if __name__ == "__main__":

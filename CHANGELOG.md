@@ -6,6 +6,23 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 ## [Unreleased]
 
 ### Security
+- **Host-side git hardening & universal Docker `.git:ro` mounts (`runner/agent_exec.py`, `runner/safe_git.py`, `eval/lib/safe_git.sh`)**:
+  Docker isolation now mounts `.git` (and any worktree `gitdir`) read-only for every role,
+  not only `broker-worker`. All host-side git invocations in `runner/`, `enforcement/`, and
+  `eval/run_eval.py` now route through `runner/safe_git.py` (with `-c` overrides for
+  `core.fsmonitor`, `core.hooksPath`, `diff.external`, `core.sshCommand`, `protocol.allow`,
+  and `core.pager`; `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_TERMINAL_PROMPT=0`; `--no-ext-diff`/`--no-textconv` where applicable; and a pre-exec
+  `.git/config` denylist check), while shell graders source `eval/lib/safe_git.sh` and use
+  `safe_git`. `runner/devpack_dispatch.py`, `runner/devpack_run.py`, and `eval/run_eval.py`
+  snapshot `.git/config` sha256 and hooks directory entries before each agent step and fail
+  any modification as a `git_metadata_tampered` scope violation (see LSN-021 in
+  `knowledge/lessons.md`).
+- **Remove repo-controlled sandbox opt-out (`runner/agent_exec.py`, `runner/devpack_dispatch.py`)**:
+  `allow_unsandboxed_local` in workdir `.devpack/project.toml` is now ignored with a warning
+  recorded in `run.json`; unsandboxed `--isolation local` is authorized only by explicit
+  CLI/API flags or an operator-owned config file outside the workdir via
+  `DEVPACK_OPERATOR_CONFIG`.
 - **Trusted gate configuration (`runner/devpack_dispatch.py`, `runner/devpack_run.py`, `runner/devpack_broker.py`, `enforcement/checks/scope_check.py`)**:
   preflight lint and `cppcheck` configuration is now snapshotted from the base commit
   (`git show <base>:preflight.toml` into a temporary file outside `workdir`) or from

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -542,29 +543,124 @@ class AgentExecUnitTests(unittest.TestCase):
             self.assertEqual("local", rj["isolation"])
             self.assertIn("WARNING:", rj["sandbox_warning"])
 
-            # 3. Allowed via .devpack/project.toml allow_unsandboxed_local = true
+            # 3. Workdir .devpack/project.toml allow_unsandboxed_local = true MUST BE IGNORED
+            #    with a warning recorded in run.json.
             (workdir / ".devpack").mkdir()
             (workdir / ".devpack" / "project.toml").write_text(
                 'data_class = "internal"\nallow_unsandboxed_local = true\n',
                 encoding="utf-8",
             )
-            run_proj = new_run_dir(base / "runs", kind="task", task="allow-proj", engines=["haiku"])
+            run_proj = new_run_dir(base / "runs", kind="task", task="ignore-proj", engines=["haiku"])
             stderr_buf3 = io.StringIO()
-            with mock.patch("sys.stderr", stderr_buf3):
-                res_proj = run_agent(
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("DEVPACK_OPERATOR_CONFIG", None)
+                with mock.patch("sys.stderr", stderr_buf3):
+                    res_proj = run_agent(
+                        AgentRequest(
+                            engine=eng,
+                            prompt="test",
+                            workdir=workdir,
+                            run_dir=run_proj,
+                            isolation="local",
+                            agent_bin=str(fake_claude),
+                        )
+                    )
+            self.assertEqual("harness_error", res_proj.status)
+            self.assertIn("ignoring allow_unsandboxed_local", stderr_buf3.getvalue())
+            rj_proj = json.loads((run_proj / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("refused", rj_proj["outcome"])
+            self.assertTrue(rj_proj["ignored_workdir_sandbox_opt_out"])
+            self.assertIn("ignoring allow_unsandboxed_local", rj_proj["sandbox_warning"])
+
+            # 4. Operator-owned DEVPACK_OPERATOR_CONFIG outside workdir IS honoured.
+            op_cfg = base / "operator.toml"
+            op_cfg.write_text("allow_unsandboxed_local = true\n", encoding="utf-8")
+            run_op = new_run_dir(base / "runs", kind="task", task="allow-op", engines=["haiku"])
+            stderr_buf4 = io.StringIO()
+            with mock.patch.dict(os.environ, {"DEVPACK_OPERATOR_CONFIG": str(op_cfg)}, clear=False):
+                with mock.patch("sys.stderr", stderr_buf4):
+                    res_op = run_agent(
+                        AgentRequest(
+                            engine=eng,
+                            prompt="test",
+                            workdir=workdir,
+                            run_dir=run_op,
+                            isolation="local",
+                            agent_bin=str(fake_claude),
+                        )
+                    )
+            self.assertEqual("ok", res_op.status)
+            rj_op = json.loads((run_op / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("local", rj_op["isolation"])
+            self.assertIn("WARNING:", rj_op["sandbox_warning"])
+
+            # 5. DEVPACK_OPERATOR_CONFIG placed inside workdir is refused (fail-closed).
+            evil_op = workdir / "operator_inside.toml"
+            evil_op.write_text("allow_unsandboxed_local = true\n", encoding="utf-8")
+            run_evil_op = new_run_dir(base / "runs", kind="task", task="refuse-evil-op", engines=["haiku"])
+            with mock.patch.dict(os.environ, {"DEVPACK_OPERATOR_CONFIG": str(evil_op)}, clear=False):
+                res_evil_op = run_agent(
                     AgentRequest(
                         engine=eng,
                         prompt="test",
                         workdir=workdir,
-                        run_dir=run_proj,
+                        run_dir=run_evil_op,
                         isolation="local",
                         agent_bin=str(fake_claude),
                     )
                 )
-            self.assertEqual("ok", res_proj.status)
-            self.assertIn("WARNING:", stderr_buf3.getvalue())
-            rj_proj = json.loads((run_proj / "run.json").read_text(encoding="utf-8"))
-            self.assertIn("WARNING:", rj_proj["sandbox_warning"])
+            self.assertEqual("harness_error", res_evil_op.status)
+            self.assertIn("must be outside workdir", res_evil_op.error)
+
+    def test_docker_mounts_dot_git_read_only_for_every_role_and_worktrees(self) -> None:
+        """Container mount list must include .git:ro for every role, plus worktree gitdir:ro."""
+        eng = EngineConfig(name="haiku", model="haiku", engine_class="cloud")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            for args in (
+                ["init", "-q"],
+                ["config", "user.email", "t@example.invalid"],
+                ["config", "user.name", "Tester"],
+                ["commit", "-q", "--allow-empty", "-m", "init"],
+            ):
+                subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True)
+
+            for role in ("implementer", "reviewer", "fixer", "orchestrator", "broker-worker", "eval"):
+                req = AgentRequest(
+                    engine=eng,
+                    prompt="check mounts",
+                    workdir=repo,
+                    run_dir=base / "runs" / role,
+                    isolation="docker",
+                    role=role,
+                )
+                argv, _ = build_invocation(req)
+                mounts = [argv[i + 1] for i, tok in enumerate(argv) if tok == "-v"]
+                self.assertIn(f"{repo / '.git'}:/workspace/task/.git:ro", mounts, f"role={role}")
+
+            # Worktree: .git is a pointer file; both .git and the external gitdir must be mounted :ro
+            wt = base / "wt"
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "wt-ro", str(wt)],
+                check=True,
+                capture_output=True,
+            )
+            wt_gitdir = (repo / ".git" / "worktrees" / "wt").resolve()
+            for role in ("implementer", "reviewer", "orchestrator"):
+                req_wt = AgentRequest(
+                    engine=eng,
+                    prompt="check worktree mounts",
+                    workdir=wt,
+                    run_dir=base / "runs" / f"wt-{role}",
+                    isolation="docker",
+                    role=role,
+                )
+                argv_wt, _ = build_invocation(req_wt)
+                mounts_wt = [argv_wt[i + 1] for i, tok in enumerate(argv_wt) if tok == "-v"]
+                self.assertIn(f"{wt / '.git'}:/workspace/task/.git:ro", mounts_wt, f"role={role}")
+                self.assertIn(f"{wt_gitdir}:{wt_gitdir}:ro", mounts_wt, f"role={role}")
 
     def test_profile_injection_meta_hash_and_hot_reload_from_disk(self) -> None:
         """Verify profile_path injects under '## Known mistakes for this engine', records sha256+version in meta, and reloads per call."""

@@ -89,6 +89,12 @@ from runner.agent_exec import (  # noqa: E402
 )
 from runner.devpack_dispatch import run_cppcheck_on_changed, run_preflight_lint_on_changed  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
+from runner.safe_git import (  # noqa: E402
+    GitSecurityError,
+    check_git_metadata_unchanged,
+    run_git,
+    snapshot_git_metadata,
+)
 from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 
 EXCERPT_MAX_CHARS = 4000
@@ -919,12 +925,11 @@ def prepare_isolated_trial_dir(
 
     def _run_git(args: Sequence[str]) -> None:
         """Execute a git subcommand inside the isolated task workdir."""
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=str(work_dir),
+        proc = run_git(
+            args,
+            repo_root=work_dir,
+            cwd=work_dir,
             env=git_env,
-            capture_output=True,
-            text=True,
             check=False,
         )
         if proc.returncode != 0:
@@ -1059,10 +1064,9 @@ def compute_pass_pow_k(passes: int, total: int, k: int | None = None) -> float:
 def _resolve_baseline_ref(work_dir: Path) -> str:
     """Return the post-setup baseline commit SHA for ``work_dir``."""
     for grep_pat in ("^chore: apply setup\\.patch$", "^chore: base fixture$"):
-        proc = subprocess.run(
-            ["git", "-C", str(work_dir), "log", "--format=%H", f"--grep={grep_pat}", "-n", "1"],
-            capture_output=True,
-            text=True,
+        proc = run_git(
+            ["log", "--format=%H", f"--grep={grep_pat}", "-n", "1"],
+            repo_root=work_dir,
             check=False,
         )
         if proc.returncode == 0 and proc.stdout.strip():
@@ -1287,6 +1291,12 @@ def _run_trial_body(
         home_placeholder="$HOME",
         profile_path=resolved_profile,
     )
+    git_snap = snapshot_git_metadata(work_dir)
+    update_run_json(
+        trial_run_dir,
+        git_config_sha256=git_snap.config_sha256,
+        git_hooks_listing=git_snap.hooks_entries_for_log(),
+    )
     agent_res = run_agent(request)
 
     def _redact(text: str) -> str:
@@ -1314,6 +1324,62 @@ def _run_trial_body(
     task_prompt_in_work = work_dir / "TASK_PROMPT.md"
     if task_prompt_in_work.exists():
         task_prompt_in_work.unlink()
+
+    git_ok, git_tamper_reason = check_git_metadata_unchanged(git_snap)
+    if not git_ok:
+        tamper_out = _redact(f"SCOPE_VIOLATION: {git_tamper_reason}")
+        (trial_run_dir / "steps" / "02-gate.txt").write_text(
+            tamper_out + "\n", encoding="utf-8"
+        )
+        update_run_json(
+            trial_run_dir,
+            outcome="fail",
+            scope="violation",
+            scope_violation="git_metadata_tampered",
+            git_metadata_tampered=True,
+            refusal_reason=git_tamper_reason,
+            timed_out=timed_out,
+            context=context_mode,
+            brief_variant=brief_variant,
+            skills_enabled=skills_enabled,
+            arm=arm,
+            finished=datetime.now(timezone.utc).isoformat(),
+        )
+        trial_cost_tamper: float | None = None
+        if not is_harness_err and not engine.is_local:
+            trial_cost_tamper = agent_res.cost_usd
+        return TrialResult(
+            task_id=task.task_id,
+            category=task.category,
+            model=model,
+            run_index=run_index,
+            passed=False,
+            agent_returncode=agent_res.exit_code,
+            check_returncode=1,
+            cost_usd=trial_cost_tamper,
+            turns=agent_res.num_turns if not is_harness_err else None,
+            duration_s=float(agent_res.duration_s),
+            error=_redact(git_tamper_reason),
+            check_output=tamper_out,
+            harness_error=False,
+            harness_error_reason="",
+            agent_result_excerpt=excerpt,
+            permission_denials=denials_out if isinstance(denials_out, list) else [],
+            stderr_tail=stderr_tail,
+            tool_protocol_errors=int(agent_res.tool_protocol_errors),
+            run_dir=_redact(str(trial_run_dir)),
+            timed_out=timed_out,
+            engine_class=engine.engine_class,
+            tokens_in=int(agent_res.tokens_in) if not is_harness_err else 0,
+            tokens_out=int(agent_res.tokens_out) if not is_harness_err else 0,
+            mode="single",
+            init_model=agent_res.init_model,
+            init_digest=agent_res.init_digest,
+            brief_variant=brief_variant,
+            context_mode=context_mode,
+            skills_enabled=skills_enabled,
+            arm=arm,
+        )
 
     lint_findings_first: int | None = None
     lint_clean_final: bool | None = None
@@ -1603,6 +1669,12 @@ def run_runner_trial(
             goal=task_prompt_text,
             allowed_files=allowed_str,
         )
+        git_snap = snapshot_git_metadata(work_dir)
+        update_run_json(
+            trial_run_dir,
+            git_config_sha256=git_snap.config_sha256,
+            git_hooks_listing=git_snap.hooks_entries_for_log(),
+        )
         _rc, summary = devpack_run.run_task_workflow(
             config=cfg_obj,
             context=context,
@@ -1636,17 +1708,31 @@ def run_runner_trial(
         is_harness_err = bool(summary.get("harness_error", False))
         harness_reason = str(summary.get("harness_error_reason", ""))
 
-        check_rc, check_out = _run_check_script(
-            task.check_sh,
-            work_dir,
-            paths["home_dir"],
-            paths["tmp_dir"],
-            timeout_s,
-        )
-        if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
-            is_harness_err = True
-            if not harness_reason:
-                harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
+        git_ok, git_tamper_reason = check_git_metadata_unchanged(git_snap)
+        git_tampered = bool(summary.get("git_metadata_tampered", False)) or (not git_ok)
+        if git_tampered:
+            tamper_detail = git_tamper_reason or str(summary.get("escalation_reason", "git_metadata_tampered"))
+            check_rc = 1
+            check_out = f"SCOPE_VIOLATION: {tamper_detail}"
+            update_run_json(
+                trial_run_dir,
+                outcome="fail",
+                scope="violation",
+                scope_violation="git_metadata_tampered",
+                git_metadata_tampered=True,
+            )
+        else:
+            check_rc, check_out = _run_check_script(
+                task.check_sh,
+                work_dir,
+                paths["home_dir"],
+                paths["tmp_dir"],
+                timeout_s,
+            )
+            if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
+                is_harness_err = True
+                if not harness_reason:
+                    harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
 
         def _redact(text: str) -> str:
             """Redact secrets and paths from text."""
@@ -1808,12 +1894,11 @@ def run_orchestrator_trial(
             ["add", "-A"],
             ["commit", "-q", "-m", "chore: base fixture"],
         ):
-            proc = subprocess.run(
-                ["git", *args_git],
-                cwd=str(work_dir),
+            proc = run_git(
+                args_git,
+                repo_root=work_dir,
+                cwd=work_dir,
                 env=git_env,
-                capture_output=True,
-                text=True,
                 check=False,
             )
             if proc.returncode != 0:
@@ -1892,6 +1977,12 @@ def run_orchestrator_trial(
             broker_command.extend(["--credentials", str(credentials_path)])
         if engines_config is not None:
             broker_command.extend(["--engines", str(Path(engines_config).resolve())])
+        git_snap = snapshot_git_metadata(work_dir)
+        update_run_json(
+            trial_run_dir,
+            git_config_sha256=git_snap.config_sha256,
+            git_hooks_listing=git_snap.hooks_entries_for_log(),
+        )
         broker_log = (trial_run_dir / "broker.txt").open("w", encoding="utf-8")
         broker = subprocess.Popen(broker_command, stdout=broker_log, stderr=broker_log,
                                   start_new_session=True)
@@ -1930,22 +2021,33 @@ def run_orchestrator_trial(
 
         analysis = analyze_orchestrator_transcript(agent_res.transcript_path)
 
-        # Grade the same product tree without host-generated queue/client artifacts.
-        # Workers have their own clean Git baseline and an explicit control-file check.
-        grading_work = trial_root / "grading-work"
-        shutil.copytree(work_dir, grading_work, symlinks=True,
-                        ignore=shutil.ignore_patterns(".devpack"))
-        check_rc, check_out = _run_check_script(
-            goal.check_sh,
-            grading_work,
-            home_dir,
-            tmp_dir,
-            timeout_s,
-        )
-        if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
-            is_harness_err = True
-            if not harness_reason:
-                harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
+        git_ok, git_tamper_reason = check_git_metadata_unchanged(git_snap)
+        if not git_ok:
+            check_rc = 1
+            check_out = f"SCOPE_VIOLATION: {git_tamper_reason}"
+            update_run_json(
+                trial_run_dir,
+                scope="violation",
+                scope_violation="git_metadata_tampered",
+                git_metadata_tampered=True,
+            )
+        else:
+            # Grade the same product tree without host-generated queue/client artifacts.
+            # Workers have their own clean Git baseline and an explicit control-file check.
+            grading_work = trial_root / "grading-work"
+            shutil.copytree(work_dir, grading_work, symlinks=True,
+                            ignore=shutil.ignore_patterns(".devpack"))
+            check_rc, check_out = _run_check_script(
+                goal.check_sh,
+                grading_work,
+                home_dir,
+                tmp_dir,
+                timeout_s,
+            )
+            if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
+                is_harness_err = True
+                if not harness_reason:
+                    harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
 
         redacted_check_out = _redact(check_out)
         (trial_run_dir / "steps" / "02-gate.txt").write_text(
@@ -2035,21 +2137,20 @@ def _commit_step_baseline(work_dir: Path, git_env: Mapping[str, str]) -> str:
     the edits it made (earlier accepted steps are part of its baseline).
     """
     env = dict(git_env)
-    subprocess.run(["git", "add", "-A"], cwd=str(work_dir), env=env, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-q", "--allow-empty", "-m", MEMORY_STEP_BASELINE_MSG],
-        cwd=str(work_dir),
+    run_git(["add", "-A"], repo_root=work_dir, cwd=work_dir, env=env, check=True)
+    run_git(
+        ["commit", "-q", "--allow-empty", "-m", MEMORY_STEP_BASELINE_MSG],
+        repo_root=work_dir,
+        cwd=work_dir,
         env=env,
         check=True,
-        capture_output=True,
     )
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(work_dir),
+    head = run_git(
+        ["rev-parse", "HEAD"],
+        repo_root=work_dir,
+        cwd=work_dir,
         env=env,
         check=True,
-        capture_output=True,
-        text=True,
     )
     return head.stdout.strip()
 
@@ -2198,7 +2299,7 @@ def run_memory_trial(
             ["add", "-A"],
             ["commit", "-q", "-m", "chore: base fixture"],
         ):
-            subprocess.run(["git", *args], cwd=str(work_dir), env=git_env, check=True, capture_output=True)
+            run_git(args, repo_root=work_dir, cwd=work_dir, env=git_env, check=True)
 
         (work_dir / ".claude").mkdir(parents=True, exist_ok=True)
         (work_dir / ".claude" / "settings.json").write_text(
@@ -2291,6 +2392,12 @@ def run_memory_trial(
                 memory_config=memory_config,
             )
             step_base_ref = _commit_step_baseline(work_dir, git_env)
+            git_snap = snapshot_git_metadata(work_dir)
+            update_run_json(
+                trial_run_dir,
+                git_config_sha256=git_snap.config_sha256,
+                git_hooks_listing=git_snap.hooks_entries_for_log(),
+            )
             agent_res = run_agent(req)
             last_rc = agent_res.exit_code
             last_excerpt = _redact(agent_res.final_text)[:EXCERPT_MAX_CHARS]
@@ -2340,6 +2447,18 @@ def run_memory_trial(
                 total_over_recall_hits += len(bad_total)
                 total_over_recall_denom += max(1, len(injected_set | cited_forbidden))
 
+            git_ok, git_tamper_reason = check_git_metadata_unchanged(git_snap)
+            if not git_ok:
+                violation_reason = "git_metadata_tampered"
+                violation_detail = _redact(f"step {step_idx}: {git_tamper_reason}")
+                update_run_json(
+                    trial_run_dir,
+                    scope="violation",
+                    scope_violation="git_metadata_tampered",
+                    git_metadata_tampered=True,
+                )
+                break
+
             # Enforce scope and the test lock before accepting this step's proposals.
             enforce_kind, enforce_detail = _run_step_enforcement(
                 work_dir, step_base_ref, step.allowed_files, git_env, timeout_s
@@ -2384,17 +2503,21 @@ def run_memory_trial(
             if any_harness_err or any_timeout:
                 break
 
-        check_rc, check_out = _run_check_script(
-            seq.check_sh,
-            work_dir,
-            home_dir,
-            tmp_dir,
-            timeout_s,
-        )
-        if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
-            any_harness_err = True
-            if not harness_reason:
-                harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
+        if violation_reason == "git_metadata_tampered":
+            check_rc = 1
+            check_out = f"SCOPE_VIOLATION: {violation_detail}"
+        else:
+            check_rc, check_out = _run_check_script(
+                seq.check_sh,
+                work_dir,
+                home_dir,
+                tmp_dir,
+                timeout_s,
+            )
+            if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
+                any_harness_err = True
+                if not harness_reason:
+                    harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
 
         redacted_check_out = _redact(check_out)
         gate_step_num = len(seq.steps) + 1

@@ -52,11 +52,15 @@ PREFLIGHT_LINT="$DEVPACK_ROOT/enforcement/lint/preflight_lint.py"
 PREFLIGHT_CFG="$DEVPACK_ROOT/eval/fixture/preflight.toml"
 TEST_LOCK="$DEVPACK_ROOT/enforcement/checks/test_lock.py"
 SCOPE_CHECK="$DEVPACK_ROOT/enforcement/checks/scope_check.py"
+SAFE_GIT_SH="$DEVPACK_ROOT/eval/lib/safe_git.sh"
 
-if [[ ! -f "$PREFLIGHT_LINT" || ! -f "$PREFLIGHT_CFG" || ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" ]]; then
-    echo "GRADER_MISCONFIGURED: missing enforcement scripts or preflight.toml under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
+if [[ ! -f "$PREFLIGHT_LINT" || ! -f "$PREFLIGHT_CFG" || ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" || ! -f "$SAFE_GIT_SH" ]]; then
+    echo "GRADER_MISCONFIGURED: missing enforcement scripts, preflight.toml, or safe_git.sh under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
     exit 2
 fi
+
+# shellcheck source=/dev/null
+source "$SAFE_GIT_SH"
 
 GOAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HIDDEN_SRC="$GOAL_DIR/hidden/test_req_link_006.cpp"
@@ -74,14 +78,14 @@ if [[ ! -d "$WORKDIR" ]]; then
 fi
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 
-if ! git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if ! safe_git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "FAIL: workdir is not a git repository: $WORKDIR" >&2
     exit 1
 fi
 
-BASE_REF="$(git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
+BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
 if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="$(git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
+    BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
 fi
 if [[ -z "$BASE_REF" ]]; then
     BASE_REF="HEAD"
@@ -132,8 +136,8 @@ CXXFLAGS=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachabl
 # Preflight lint on changed C/C++ files
 mapfile -t CHANGED_CPP_FILES < <(
     {
-        git -C "$WORKDIR" diff --name-only "$BASE_REF" -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
-        git -C "$WORKDIR" ls-files --others --exclude-standard -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
+        safe_git -C "$WORKDIR" diff --name-only "$BASE_REF" -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
+        safe_git -C "$WORKDIR" ls-files --others --exclude-standard -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
     } | sort -u
 )
 if [[ "${#CHANGED_CPP_FILES[@]}" -gt 0 ]]; then

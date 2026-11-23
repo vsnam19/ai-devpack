@@ -265,7 +265,7 @@ class DevpackDispatchTests(unittest.TestCase):
             _init_git_repo(wt)
             (wt / ".devpack").mkdir()
             (wt / ".devpack" / "project.toml").write_text(
-                'data_class = "confidential"\nallow_unsandboxed_local = true\n',
+                'data_class = "confidential"\n',
                 encoding="utf-8",
             )
             brief = base / "brief.md"
@@ -288,6 +288,7 @@ class DevpackDispatchTests(unittest.TestCase):
                     "--runs-root", str(base / "runs"),
                     "--agent-bin", str(fake_agent),
                     "--isolation", "local",
+                    "--allow-unsandboxed-local",
                 ]
             )
             self.assertEqual(1, rc_cloud)
@@ -306,6 +307,7 @@ class DevpackDispatchTests(unittest.TestCase):
                     "--runs-root", str(base / "runs"),
                     "--agent-bin", str(fake_agent),
                     "--isolation", "local",
+                    "--allow-unsandboxed-local",
                 ],
                 env_extra={
                     "DEVPACK_LOCAL_BASE_URL": "http://127.0.0.1:11434",
@@ -1028,6 +1030,106 @@ class DevpackDispatchTests(unittest.TestCase):
             self.assertEqual(trusted_list, calls[-1]["suppressions_text"])
             run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
             self.assertEqual("cfg/suppr.txt", run_meta["gate_suppressions_path"])
+
+    def test_dispatch_fails_with_git_metadata_tampered_and_skips_marker(self) -> None:
+        """If an agent writes core.fsmonitor to .git/config, dispatch fails with git_metadata_tampered and never runs host git."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_repo(wt)
+            marker = base / "fsmonitor_marker.txt"
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nUpdate mod.\n", encoding="utf-8")
+            fake_agent = _write_fake_agent(
+                base / "fake_claude.py",
+                "cfg = pathlib.Path('.git/config')\n"
+                f"cfg.write_text(cfg.read_text(encoding='utf-8') + '\\n[core]\\n\\tfsmonitor = touch {marker}\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'is_error': False, 'result': 'done'}))\n",
+            )
+            rc, stdout, _ = self._run_dispatch(
+                [
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(base / "runs"),
+                    "--agent-bin", str(fake_agent),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(1, rc)
+            self.assertFalse(marker.exists())
+            data = json.loads(stdout.strip())
+            self.assertEqual("violation", data["scope"])
+            self.assertEqual("git_metadata_tampered", data["scope_violation"])
+            self.assertTrue(data["git_metadata_tampered"])
+            run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertIn("git_config_sha256", run_meta)
+            self.assertEqual(64, len(run_meta["git_config_sha256"]))
+            self.assertIsInstance(run_meta["git_hooks_listing"], list)
+            self.assertEqual("git_metadata_tampered", run_meta["scope_violation"])
+
+    def test_dispatch_ignores_workdir_project_toml_opt_out_and_honours_operator_config(self) -> None:
+        """Workdir .devpack/project.toml allow_unsandboxed_local is ignored with warning; DEVPACK_OPERATOR_CONFIG is honoured."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_repo(wt)
+            (wt / ".devpack").mkdir()
+            (wt / ".devpack" / "project.toml").write_text(
+                'data_class = "internal"\nallow_unsandboxed_local = true\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "commit project.toml"], cwd=wt, check=True)
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nSandbox test.\n", encoding="utf-8")
+            fake_agent = _write_fake_agent(
+                base / "fake_claude.py",
+                "print(json.dumps({'type': 'result', 'is_error': False, 'result': 'done'}))\n",
+            )
+
+            rc_refused, out_refused, err_refused = self._run_dispatch(
+                [
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(base / "runs"),
+                    "--agent-bin", str(fake_agent),
+                    "--isolation", "local",
+                ]
+            )
+            self.assertEqual(1, rc_refused)
+            self.assertIn("ignoring allow_unsandboxed_local", err_refused)
+            refused_data = json.loads(out_refused.strip())
+            self.assertEqual("refused", refused_data["status"])
+            refused_meta = json.loads((Path(refused_data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertTrue(refused_meta["ignored_workdir_sandbox_opt_out"])
+            self.assertIn("ignoring allow_unsandboxed_local", refused_meta["sandbox_warning"])
+
+            # Operator config outside workdir authorises local execution
+            op_cfg = base / "operator.toml"
+            op_cfg.write_text("allow_unsandboxed_local = true\n", encoding="utf-8")
+            rc_op, out_op, _ = self._run_dispatch(
+                [
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(base / "runs"),
+                    "--agent-bin", str(fake_agent),
+                    "--isolation", "local",
+                ],
+                env_extra={"DEVPACK_OPERATOR_CONFIG": str(op_cfg)},
+            )
+            self.assertEqual(0, rc_op)
+            op_data = json.loads(out_op.strip())
+            self.assertEqual("ok", op_data["status"])
 
 
 if __name__ == "__main__":

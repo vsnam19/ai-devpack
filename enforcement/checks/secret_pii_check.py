@@ -17,8 +17,13 @@ import argparse
 import os
 import pathlib
 import re
-import subprocess
 import sys
+
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 
 
 def get_builtin_rules() -> list[tuple[str, re.Pattern[str]]]:
@@ -81,12 +86,15 @@ def get_staged_files(repo_root: pathlib.Path) -> tuple[list[pathlib.Path] | None
     Paths are returned even if the working-tree copy was deleted, because the
     staged index blob is what gets scanned.
     """
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        proc = run_git(
+            ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"],
+            repo_root=repo_root,
+            text=False,
+            check=False,
+        )
+    except GitSecurityError as exc:
+        return None, str(exc)
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace").strip()
         return None, err or "git diff --cached failed"
@@ -101,12 +109,15 @@ def get_staged_files(repo_root: pathlib.Path) -> tuple[list[pathlib.Path] | None
 
 def read_staged_blob(repo_root: pathlib.Path, rel_path: str) -> bytes | None:
     """Return the staged index content of ``rel_path`` via ``git show :<path>``, or None on failure."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "show", f":{rel_path}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        proc = run_git(
+            ["show", f":{rel_path}"],
+            repo_root=repo_root,
+            text=False,
+            check=False,
+        )
+    except GitSecurityError:
+        return None
     return proc.stdout if proc.returncode == 0 else None
 
 

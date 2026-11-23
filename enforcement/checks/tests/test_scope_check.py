@@ -181,6 +181,23 @@ class TestScopeCheck(unittest.TestCase):
                 self.assertIn(rel, out)
                 target.unlink()
 
+    def test_refuses_tampered_git_config_fsmonitor_without_executing_command(self) -> None:
+        """scope_check refuses to run git when .git/config has core.fsmonitor and does not create marker."""
+        with tempfile.TemporaryDirectory() as tmp_marker_dir:
+            marker = pathlib.Path(tmp_marker_dir) / "scope_pwned.txt"
+            cfg = self.repo_dir / ".git" / "config"
+            cfg.write_text(
+                cfg.read_text(encoding="utf-8") + f"\n[core]\n\tfsmonitor = touch {marker}\n",
+                encoding="utf-8",
+            )
+            code, _, err = self._run_scope(
+                ["--repo", str(self.repo_dir), "--base", "HEAD", "--allow", "src/**"]
+            )
+            self.assertEqual(1, code)
+            self.assertIn("SCOPE_ERROR", err)
+            self.assertIn("git_metadata_tampered", err)
+            self.assertFalse(marker.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

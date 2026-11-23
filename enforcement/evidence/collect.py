@@ -17,9 +17,14 @@ from datetime import datetime, timezone
 import json
 import pathlib
 import re
-import subprocess
 import sys
 from typing import Any
+
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 
 CHANGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 VERDICT_LINE_PATTERN = re.compile(r"^VERDICT:\s*([A-Z_]+)\s*$")
@@ -70,49 +75,47 @@ def load_gate_receipt(receipt_path: pathlib.Path) -> tuple[dict[str, Any] | None
 
 def get_git_diff_stat(repo_root: pathlib.Path, base_ref: str) -> tuple[str | None, str | None, str | None]:
     """Return ``(head_sha, diff_stat_text, error)`` for ``repo_root`` against ``base_ref``."""
-    verify_base = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{base_ref}^{{commit}}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if verify_base.returncode != 0:
-        return None, None, verify_base.stderr.strip() or f"invalid base ref '{base_ref}'"
+    try:
+        verify_base = run_git(
+            ["rev-parse", "--verify", f"{base_ref}^{{commit}}"],
+            repo_root=repo_root,
+            check=False,
+        )
+        if verify_base.returncode != 0:
+            return None, None, verify_base.stderr.strip() or f"invalid base ref '{base_ref}'"
 
-    head_proc = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if head_proc.returncode != 0:
-        return None, None, head_proc.stderr.strip() or "unable to resolve git HEAD"
-    head_sha = head_proc.stdout.strip()
+        head_proc = run_git(
+            ["rev-parse", "HEAD"],
+            repo_root=repo_root,
+            check=False,
+        )
+        if head_proc.returncode != 0:
+            return None, None, head_proc.stderr.strip() or "unable to resolve git HEAD"
+        head_sha = head_proc.stdout.strip()
 
-    stat_proc = subprocess.run(
-        ["git", "-C", str(repo_root), "diff", "--stat", base_ref],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if stat_proc.returncode != 0:
-        return None, None, stat_proc.stderr.strip() or "git diff --stat failed"
+        stat_proc = run_git(
+            ["diff", "--stat", base_ref],
+            repo_root=repo_root,
+            check=False,
+        )
+        if stat_proc.returncode != 0:
+            return None, None, stat_proc.stderr.strip() or "git diff --stat failed"
+    except GitSecurityError as exc:
+        return None, None, str(exc)
 
     return head_sha, stat_proc.stdout.strip(), None
 
 
 def get_provenance_note(repo_root: pathlib.Path) -> str | None:
     """Return the note on ``HEAD`` from ``refs/notes/ai-provenance`` if present, else None."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "notes", "--ref", "ai-provenance", "show", "HEAD"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = run_git(
+            ["notes", "--ref", "ai-provenance", "show", "HEAD"],
+            repo_root=repo_root,
+            check=False,
+        )
+    except GitSecurityError:
+        return None
     if proc.returncode != 0:
         return None
     note = proc.stdout.strip()
