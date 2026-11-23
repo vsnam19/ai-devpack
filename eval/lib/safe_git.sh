@@ -226,12 +226,14 @@ run_gcov_hidden_tests() {
 
     local cxx_bin="${CXX:-g++}"
     local cxxflags=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachable-code -fno-exceptions -fno-rtti)
-    local guard_macro="DEVPACK_TF_GUARD_$(date +%s)_$$"
+    local guard_macro
+    guard_macro="DEVPACK_TF_GUARD_$(date +%s)_$$"
 
     local src_objs=()
     local src_f
     while IFS= read -r src_f; do
-        local obj_f="$tmp_grade_dir/$(basename "${src_f%.cpp}").o"
+        local obj_f
+        obj_f="$tmp_grade_dir/$(basename "${src_f%.cpp}").o"
         if ! "$cxx_bin" "${cxxflags[@]}" -I"$tmp_grade_dir/work/include" -c "$src_f" -o "$obj_f"; then
             rm -rf "$tmp_grade_dir"
             echo "FAIL: $label failed to compile worker source $(basename "$src_f")" >&2
@@ -245,7 +247,8 @@ run_gcov_hidden_tests() {
     local h_f
     while IFS= read -r h_f; do
         hidden_srcs+=("$h_f")
-        local obj_f="$cov_dir/$(basename "${h_f%.cpp}").o"
+        local obj_f
+        obj_f="$cov_dir/$(basename "${h_f%.cpp}").o"
         local tf_flags=("-DDEVPACK_FRAMEWORK_GUARD=$guard_macro" "-include" "$pack_fw")
         if [[ -n "$assert_regex" ]]; then
             tf_flags=()

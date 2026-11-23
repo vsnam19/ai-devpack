@@ -16,8 +16,8 @@ All notable changes to ai-devpack are recorded here. Versioning follows
   Tightened `test_lock.py` so protected test files allow no insertions, deletions, or modifications unless named in `DEVPACK_DEVIATIONS`, and updated eval tasks that add tests to target dedicated new tests/test_*.cpp files registered via `REGISTER_TEST_SUITE(...)`.
 - **Untracked enumeration without `--exclude-standard` (`enforcement/checks/scope_check.py`)**:
   Stopped passing `--exclude-standard` to `git ls-files --others`, applying only base-commit `.gitignore` snapshots, build directories, and pack excludes, while flagging any `.gitignore` edit/creation as `gate-touched`.
-- **Docker grader isolation & wrapper-nonce harness errors (`eval/run_eval.py`)**:
-  Executed task, memory, and orchestrator graders inside Docker isolation (`--network=none`, read-only pack mount, no credentials) by default, ran lint and `cppcheck` before any worker code executes, and keyed `harness_error` classification strictly on grader-wrapper exit code `2` verified against a per-run out-of-workdir nonce.
+- **Docker grader isolation & wrapper-nonce harness errors (`eval/run_eval.py`, `skilltest/skilltest.py`)**:
+  Executed task, memory, orchestrator, and skill graders inside Docker isolation (`--network=none`, read-only pack mount, no credentials) by default, ran lint and `cppcheck` before any worker code executes, and keyed `harness_error` classification strictly on grader-wrapper exit code `2` verified against a per-run out-of-workdir nonce. Skill grading preserves configured command arguments and expectations, records the isolation mode, and requires explicit local opt-in.
 - **Memory note fencing & normalized lexicon (`runner/memory.py`)**:
   Rendered auto-accepted `handoff`/`known-gap` notes inside verbatim fenced ```` ```text ```` blocks with backticks and headings escaped, and extended policy-changing lexicon detection with Unicode NFKC normalization and zero-width character stripping.
 

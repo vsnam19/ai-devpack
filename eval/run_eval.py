@@ -1151,8 +1151,14 @@ def build_docker_grader_invocation(
     *,
     docker_bin: str = "docker",
     image_tag: str = DOCKER_IMAGE_TAG,
+    grader_command: list[str] | None = None,
+    grader_env: dict[str, str] | None = None,
 ) -> list[str]:
-    """Build an isolated ``docker run --network=none`` command for a grader script (no credentials)."""
+    """Build a network-free grader container with read-only trusted grader material.
+
+    Skill commands run from the grader directory and receive the candidate path as
+    their final argument; eval scripts receive the usual ``--workdir`` pair.
+    """
     resolved_work = work_dir.resolve()
     resolved_pack = REPO_ROOT.resolve()
     resolved_check = check_sh.resolve()
@@ -1172,6 +1178,11 @@ def build_docker_grader_invocation(
         mounts.extend(["-v", f"{resolved_check.parent}:/workspace/grader:ro"])
         container_check = f"/workspace/grader/{resolved_check.name}"
 
+    container_cwd = str(Path(container_check).parent) if grader_command is not None else DOCKER_TASK_DIR
+    command = [*grader_command, DOCKER_TASK_DIR] if grader_command is not None else [
+        "bash", container_check, "--workdir", DOCKER_TASK_DIR,
+    ]
+    extra_env = [arg for key, value in (grader_env or {}).items() for arg in ("-e", f"{key}={value}")]
     return [
         docker_bin,
         "run",
@@ -1180,7 +1191,7 @@ def build_docker_grader_invocation(
         "--user",
         f"{os.getuid()}:{os.getgid()}",
         "--workdir",
-        DOCKER_TASK_DIR,
+        container_cwd,
         *mounts,
         "-e",
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -1196,11 +1207,9 @@ def build_docker_grader_invocation(
         "LANG=C.UTF-8",
         "-e",
         "LC_ALL=C.UTF-8",
+        *extra_env,
         image_tag,
-        "bash",
-        container_check,
-        "--workdir",
-        DOCKER_TASK_DIR,
+        *command,
     ]
 
 
@@ -1217,8 +1226,15 @@ def _run_check_script(
     allow_unsandboxed_local: bool = False,
     docker_bin: str | None = None,
     image_tag: str = DOCKER_IMAGE_TAG,
+    grader_command: list[str] | None = None,
+    grader_env: dict[str, str] | None = None,
 ) -> tuple[int, str, bool]:
-    """Execute ``check_sh --workdir <work_dir>`` under isolation and confirm exit-2 errors via wrapper nonce."""
+    """Run an eval script or skill command and authenticate exit-2 wrapper errors.
+
+    Eval scripts require an external baseline SHA. Skill commands do not use a
+    git baseline and run from ``check_sh.parent`` with a final candidate argument.
+    Only trusted configuration may supply ``grader_command`` and ``grader_env``.
+    """
     if isolation not in ("local", "docker"):
         raise ValueError(f"Unsupported grader isolation mode: {isolation}")
     if isolation == "local" and not allow_unsandboxed_local:
@@ -1233,7 +1249,7 @@ def _run_check_script(
             resolved_sha = bfile.read_text(encoding="utf-8").strip().splitlines()[0].strip()
     if not resolved_sha:
         resolved_sha = os.environ.get("DEVPACK_BASELINE_SHA", "").strip()
-    if not resolved_sha:
+    if not resolved_sha and grader_command is None:
         return 2, "GRADER_MISCONFIGURED: missing external DEVPACK_BASELINE_SHA / baseline.sha", True
 
     if isolation == "docker":
@@ -1248,6 +1264,8 @@ def _run_check_script(
             resolved_sha,
             docker_bin=resolved_docker,
             image_tag=image_tag,
+            grader_command=grader_command,
+            grader_env=grader_env,
         )
         wrapper_env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -1257,7 +1275,8 @@ def _run_check_script(
             "LC_ALL": "C.UTF-8",
         }
     else:
-        grader_cmd = ["bash", str(check_sh), "--workdir", str(work_dir)]
+        grader_cmd = ([*grader_command, str(work_dir)] if grader_command is not None
+                      else ["bash", str(check_sh), "--workdir", str(work_dir)])
         wrapper_env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(home_dir),
@@ -1267,6 +1286,7 @@ def _run_check_script(
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
         }
+        wrapper_env.update(grader_env or {})
         if trial_dir is not None:
             wrapper_env["TRIAL_DIR"] = str(trial_dir)
 
@@ -1291,7 +1311,7 @@ def _run_check_script(
         try:
             check_proc = subprocess.run(
                 ["bash", str(wrapper_sh)],
-                cwd=str(work_dir),
+                cwd=str(check_sh.parent if grader_command is not None else work_dir),
                 env=wrapper_env,
                 capture_output=True,
                 text=True,

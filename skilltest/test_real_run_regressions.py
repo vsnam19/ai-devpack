@@ -77,7 +77,7 @@ class RealRunTests(unittest.TestCase):
             stream.write_text('')
             with patch.object(harness, 'run_agent', return_value=AgentResult(transcript_path=stream)):
                 _, passed, telemetry = harness._execute_trial(SKILL, 'haiku', 'document', False,
-                    root / 'run', None, 'unused', 'local', 'bash check.sh', grader)
+                    root / 'run', None, 'unused', 'local', 'bash check.sh', grader, allow_unsandboxed_local=True)
             self.assertFalse(passed)
             self.assertEqual(telemetry['reason'], 'FAIL: missing tags')
             evidence = (root / 'run/steps/02-grader.txt').read_text()

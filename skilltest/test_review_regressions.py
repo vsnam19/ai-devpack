@@ -45,7 +45,8 @@ class ReviewRegressionTests(unittest.TestCase):
 
             with patch.object(harness, 'run_agent', side_effect=agent):
                 _, passed, _ = harness._execute_trial(skill, 'haiku', 'repair', True,
-                    root / 'run', None, 'unused', 'local', 'bash check.sh ignored-option', grader)
+                    root / 'run', None, 'unused', 'local', 'bash check.sh ignored-option', grader,
+                    allow_unsandboxed_local=True)
             self.assertTrue(passed)
 
     def test_lint_checks_cases_without_input_directories(self):
@@ -144,7 +145,8 @@ class ReviewRegressionTests(unittest.TestCase):
 
             with patch.object(harness, 'run_agent', side_effect=agent):
                 status = harness.main(['run', str(SKILLS / 'doxygen-naming'), '--engines', 'local',
-                    '--engines-config', str(config), '--k', '1', '--results-root', str(root / 'results')])
+                    '--engines-config', str(config), '--k', '1', '--results-root', str(root / 'results'),
+                    '--isolation', 'local', '--allow-unsandboxed-local'])
             self.assertEqual(status, 0)
             self.assertEqual(len(seen), 8)
             for engine in seen:
