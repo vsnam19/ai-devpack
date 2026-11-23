@@ -366,6 +366,62 @@ class CppcheckPathResolutionTests(unittest.TestCase):
                 )
                 self.assertIn(f"--suppressions-list={(repo / 'suppr.txt').resolve()}", calls[1])
 
+    def test_trusted_suppressions_dir_never_reads_working_tree_copy(self) -> None:
+        """With a trusted snapshot dir, relative suppressions_file resolves only inside that snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            snap = base / "snapshot"
+            repo = base / "repo"
+            snap.mkdir()
+            (repo / "src").mkdir(parents=True)
+            (repo / "src" / "ok.cpp").write_text("int ok() { return 1; }\n", encoding="utf-8")
+            (repo / "suppr.txt").write_text("# worker-edited working-tree copy\n", encoding="utf-8")
+            cfg = snap / "preflight.toml"
+            cfg.write_text('[cppcheck]\nsuppressions_file = "suppr.txt"\n', encoding="utf-8")
+
+            calls: list[list[str]] = []
+            cwds: list[str] = []
+            with mock.patch.object(
+                cppcheck_check.subprocess,
+                "run",
+                side_effect=_recording_subprocess_run(calls, cwds),
+            ):
+                with self.assertRaisesRegex(ValueError, "suppressions file does not exist"):
+                    cppcheck_check.run_cppcheck_check(
+                        targets=["src/ok.cpp"],
+                        repo_root=repo,
+                        config_path=cfg,
+                        cppcheck_bin=sys.executable,
+                        trusted_suppressions_dir=snap,
+                    )
+                self.assertEqual([], calls)
+
+                (snap / "suppr.txt").write_text("# trusted snapshot\n", encoding="utf-8")
+                cppcheck_check.run_cppcheck_check(
+                    targets=["src/ok.cpp"],
+                    repo_root=repo,
+                    config_path=cfg,
+                    cppcheck_bin=sys.executable,
+                    trusted_suppressions_dir=snap,
+                )
+                self.assertIn(f"--suppressions-list={(snap / 'suppr.txt').resolve()}", calls[0])
+                self.assertFalse(any(str(repo) in arg and "--suppressions-list=" in arg for arg in calls[0]))
+
+    def test_trusted_suppressions_dir_rejects_absolute_and_escaping_paths(self) -> None:
+        """Trusted-mode resolution refuses absolute paths and paths that escape the snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            snap = base / "snapshot"
+            snap.mkdir()
+            repo = base / "repo"
+            repo.mkdir()
+            with self.assertRaisesRegex(ValueError, "must be relative"):
+                cppcheck_check._resolve_suppressions_file(
+                    str(base / "x.txt"), snap, repo, trusted_dir=snap
+                )
+            with self.assertRaisesRegex(ValueError, "outside the trusted snapshot"):
+                cppcheck_check._resolve_suppressions_file("../x.txt", snap, repo, trusted_dir=snap)
+
     def test_real_cppcheck_reads_repo_header_not_config_dir_header(self) -> None:
         """Real cppcheck reports a defect visible only through the analysed repo's header, not the pack copy."""
         if shutil.which("cppcheck") is None:
@@ -529,6 +585,176 @@ class CppcheckPathResolutionTests(unittest.TestCase):
                     {"meta-org/src/ipc_bus/src/unindexed.cpp"},
                     {f.file for f in real_res.blocking_findings},
                 )
+
+    def test_extra_args_allowlist_and_fail_on_validation(self) -> None:
+        """Disallowed extra_args and empty/unknown fail_on exit 2 without executing cppcheck; allowed extra_args pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "src").mkdir()
+            (repo / "src" / "ok.cpp").write_text("int ok() { return 1; }\n", encoding="utf-8")
+
+            calls: list[list[str]] = []
+            cwds: list[str] = []
+
+            # 1. Disallowed extra_args in config -> exit 2 and nothing executed
+            for bad_arg in (
+                "--addon=x.py",
+                "--addon",
+                "--rule-file=rules.xml",
+                "--rule=foo",
+                "--output-file=out.txt",
+                "--dump",
+                "--plist-output=out_plist",
+                "--cppcheck-build-dir=build",
+                "--project=other.json",
+                "--library=/tmp/evil.cfg",
+                "--suppressions-list=/etc/passwd",
+                "--platform=/tmp/evil.xml",
+                "--suppress=*",
+            ):
+                cfg = repo / "preflight.toml"
+                cfg.write_text(f'[cppcheck]\nextra_args = [{json.dumps(bad_arg)}]\n', encoding="utf-8")
+                with mock.patch.object(
+                    cppcheck_check.subprocess,
+                    "run",
+                    side_effect=_recording_subprocess_run(calls, cwds),
+                ):
+                    err_buf = io.StringIO()
+                    with contextlib.redirect_stderr(err_buf):
+                        rc = cppcheck_check.main(
+                            ["--repo-root", str(repo), "--config", str(cfg), "src/ok.cpp"]
+                        )
+                self.assertEqual(2, rc, bad_arg)
+                self.assertEqual([], calls, f"subprocess executed for disallowed arg {bad_arg}")
+
+            # 2. Empty or unknown fail_on -> exit 2 and nothing executed
+            for bad_fail_on in ("fail_on = []", 'fail_on = ["bogus"]'):
+                cfg = repo / "preflight.toml"
+                cfg.write_text(f"[cppcheck]\n{bad_fail_on}\n", encoding="utf-8")
+                with mock.patch.object(
+                    cppcheck_check.subprocess,
+                    "run",
+                    side_effect=_recording_subprocess_run(calls, cwds),
+                ):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        rc = cppcheck_check.main(
+                            ["--repo-root", str(repo), "--config", str(cfg), "src/ok.cpp"]
+                        )
+                self.assertEqual(2, rc, bad_fail_on)
+                self.assertEqual([], calls)
+
+            # 3. Escaping suppressions_file -> exit 2 and nothing executed
+            (repo / "preflight.toml").write_text(
+                '[cppcheck]\nsuppressions_file = "../outside_suppr.txt"\n', encoding="utf-8"
+            )
+            with mock.patch.object(
+                cppcheck_check.subprocess,
+                "run",
+                side_effect=_recording_subprocess_run(calls, cwds),
+            ):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rc = cppcheck_check.main(["--repo-root", str(repo), "src/ok.cpp"])
+            self.assertEqual(2, rc)
+            self.assertEqual([], calls)
+
+            # 4. Allowlisted extra_args are accepted and forwarded
+            allowed = [
+                "--inline-suppr",
+                "--check-level=exhaustive",
+                "--suppress=nullPointer",
+                "--suppress=uninitvar:src/ok.cpp",
+                "--std=c++20",
+                "-DENABLE_DIAG",
+                "-DMAX_COUNT=16",
+                "-ULEGACY_MODE",
+                "--platform=unix64",
+                "--max-ctu-depth=4",
+            ]
+            (repo / "preflight.toml").write_text(
+                f"[cppcheck]\nextra_args = {json.dumps(allowed)}\nfail_on = [\"error\", \"warning\"]\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                cppcheck_check.subprocess,
+                "run",
+                side_effect=_recording_subprocess_run(calls, cwds),
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_ok = cppcheck_check.main(
+                        ["--repo-root", str(repo), "--cppcheck-bin", sys.executable, "src/ok.cpp"]
+                    )
+            self.assertEqual(0, rc_ok)
+            self.assertEqual(1, len(calls))
+            for flag in allowed:
+                self.assertIn(flag, calls[0])
+
+    def test_directory_target_restricts_compile_db_and_rejects_escaping_compile_db_symlink(self) -> None:
+        """Directory targets filter compile_commands entries to requested directory, and escaping symlinks in compile_commands fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            ws = repo / "ws"
+            sub_a = ws / "comp" / "sub_a"
+            sub_b = ws / "comp" / "sub_b"
+            build_dir = repo / "build"
+            outside_file = base / "outside.cpp"
+            outside_file.write_text("int outside() { return 0; }\n", encoding="utf-8")
+            for d in (sub_a, sub_b, build_dir, repo / ".devpack"):
+                d.mkdir(parents=True)
+            (repo / ".devpack" / "project.toml").write_text(
+                '[workspace]\nroot = "ws"\n\n'
+                '[[component]]\nname = "comp"\npath = "comp"\n'
+                'compile_commands = "build/compile_commands.json"\n',
+                encoding="utf-8",
+            )
+            (sub_a / "a.cpp").write_text("int fnA() { return 1; }\n", encoding="utf-8")
+            (sub_b / "sibling.cpp").write_text("int fnB() { int *p = nullptr; return *p; }\n", encoding="utf-8")
+            (build_dir / "compile_commands.json").write_text(
+                json.dumps(
+                    [
+                        {"directory": ".", "command": "g++ -c ws/comp/sub_a/a.cpp", "file": "ws/comp/sub_a/a.cpp"},
+                        {"directory": ".", "command": "g++ -c ws/comp/sub_b/sibling.cpp", "file": "ws/comp/sub_b/sibling.cpp"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            calls: list[list[str]] = []
+            captured_dbs: list[list[dict[str, object]]] = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                for arg in cmd:
+                    if arg.startswith("--project="):
+                        db_path = Path(arg.split("=", 1)[1])
+                        captured_dbs.append(json.loads(db_path.read_text(encoding="utf-8")))
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr=EMPTY_RESULTS_XML)
+
+            with mock.patch.object(cppcheck_check.subprocess, "run", side_effect=fake_run):
+                res = cppcheck_check.run_cppcheck_check(
+                    targets=["ws/comp/sub_a"],
+                    repo_root=repo,
+                    cppcheck_bin=sys.executable,
+                )
+            self.assertEqual(0, res.exit_code)
+            self.assertEqual(1, len(captured_dbs))
+            self.assertEqual(["ws/comp/sub_a/a.cpp"], [e["file"] for e in captured_dbs[0]])
+
+            # Symlink inside workspace escaping outside repo/workspace in compile_commands.json -> error exit 2
+            (sub_a / "escape.cpp").symlink_to(outside_file)
+            (build_dir / "compile_commands.json").write_text(
+                json.dumps(
+                    [
+                        {"directory": ".", "command": "g++ -c ws/comp/sub_a/escape.cpp", "file": "ws/comp/sub_a/escape.cpp"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc_esc = cppcheck_check.main(
+                    ["--repo-root", str(repo), "--cppcheck-bin", sys.executable, "ws/comp/sub_a"]
+                )
+            self.assertEqual(2, rc_esc)
 
 
 if __name__ == "__main__":

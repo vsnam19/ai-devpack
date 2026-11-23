@@ -31,7 +31,7 @@ for _p in (str(PACK_ROOT), str(RUNNER_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from runner.workspace_scope import WorkspaceScope, resolve_workspace_scope  # noqa: E402
+from runner.workspace_scope import WorkspaceScope, resolve_workspace_scope, validate_path_contained  # noqa: E402
 
 DEFAULT_BUDGET_TOKENS = 1500
 
@@ -697,15 +697,40 @@ def discover_repo_files(
     scope: WorkspaceScope | None = None,
 ) -> tuple[list[str], list[str]]:
     """Return deterministic sorted ``(all_files, cpp_files)`` relative to ``repo_root``."""
+    repo_res = repo_root.resolve()
     all_files: list[str] = []
     cpp_files: list[str] = []
     if scope is not None and scope.configured:
+        ws_res = validate_path_contained(
+            scope.workspace_root,
+            repo_res,
+            label="workspace root",
+        )
         seen: set[str] = set()
         for comp_dir in scope.target_dirs():
-            for path in sorted(comp_dir.rglob("*")):
+            comp_res = validate_path_contained(
+                comp_dir,
+                repo_res,
+                workspace_root=ws_res,
+                label="component directory",
+            )
+            for path in sorted(comp_res.rglob("*")):
+                if path.is_symlink():
+                    validate_path_contained(
+                        path,
+                        repo_res,
+                        workspace_root=ws_res,
+                        label="workspace symlink",
+                    )
                 if not path.is_file():
                     continue
-                rel = path.relative_to(repo_root)
+                path_res = validate_path_contained(
+                    path,
+                    repo_res,
+                    workspace_root=ws_res,
+                    label="component file",
+                )
+                rel = path_res.relative_to(repo_res)
                 if any(part in _SKIP_DIRS for part in rel.parts):
                     continue
                 rel_str = rel.as_posix()
@@ -715,16 +740,16 @@ def discover_repo_files(
                     continue
                 seen.add(rel_str)
                 all_files.append(rel_str)
-                if path.suffix.lower() in _CPP_EXTS:
+                if path_res.suffix.lower() in _CPP_EXTS:
                     cpp_files.append(rel_str)
         all_files.sort()
         cpp_files.sort()
         return all_files, cpp_files
 
-    for path in sorted(repo_root.rglob("*")):
+    for path in sorted(repo_res.rglob("*")):
         if not path.is_file():
             continue
-        rel = path.relative_to(repo_root)
+        rel = path.relative_to(repo_res)
         if any(part in _SKIP_DIRS for part in rel.parts):
             continue
         rel_str = rel.as_posix()

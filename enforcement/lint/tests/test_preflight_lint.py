@@ -1145,6 +1145,41 @@ class PluginAndAstScopeTests(unittest.TestCase):
                 self.assertEqual(0, preflight_lint.main([*argv, "--max-params", "3"]))
                 self.assertEqual(2, spy_check.call_count)
 
+    def test_config_rejects_plugins_paths_and_invalid_std_without_executing(self) -> None:
+        """preflight_lint exits 2 without executing config-defined plugins unless --allow-config-plugins is passed."""
+        with tempfile.TemporaryDirectory(prefix="preflight-hardening-") as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            marker = root / "pwned.txt"
+            evil_plugin = _write_text(
+                root / "evil_plugin.py",
+                f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n",
+            )
+            sample_cpp = _write_text(
+                root / "clean.cpp",
+                "/** @file clean.cpp\n * @brief Clean.\n */\nint okFunc() { return 0; }\n",
+            )
+            cfg_plugins = _write_text(
+                root / "preflight.toml",
+                f'[plugins]\npaths = [{json.dumps(str(evil_plugin))}]\n',
+            )
+            res = _run_preflight_cli(
+                ["--config", str(cfg_plugins), "--skip-clang-tidy", str(sample_cpp)],
+                root,
+            )
+            self.assertEqual(2, res.returncode, res.stderr + res.stdout)
+            self.assertFalse(marker.exists())
+            self.assertIn("disallowed", res.stderr)
+
+            cfg_bad_std = _write_text(
+                root / "bad_std.toml",
+                '[general]\nstd = "c++17 -fsyntax-only"\n',
+            )
+            res_std = _run_preflight_cli(
+                ["--config", str(cfg_bad_std), "--skip-clang-tidy", str(sample_cpp)],
+                root,
+            )
+            self.assertEqual(2, res_std.returncode)
+
 
 if __name__ == "__main__":
     unittest.main()

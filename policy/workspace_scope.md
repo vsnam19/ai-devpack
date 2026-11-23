@@ -64,7 +64,13 @@ When `[workspace]` is configured with no `[[component]]` tables, direct subdirec
   `**/generated/**`) are excluded even inside active components.
 - `runner/brief_lint.py` errors on `Files allowed` globs outside `workspace.root`.
 - `enforcement/checks/scope_check.py` and `runner/devpack_dispatch.py` refuse any worker
-  edit outside `workspace.root` regardless of `--allow` globs.
+  edit outside `workspace.root` regardless of `--allow` globs, and refuse any worker edit
+  to `preflight.toml`, `.devpack/**`, or gate/lint config files as `gate-touched`.
+- `runner/workspace_scope.py`, `runner/repomap.py`, and `enforcement/static/cppcheck_check.py`
+  resolve workspace root, component directories, and `compile_commands.json` entries and
+  fail closed if any symlink or path escapes the repository or workspace root.
+- An explicitly requested `--project-config` or broker-provided config that is missing or
+  unparsable fails with exit code `2` (never falling back to legacy whole-repo scope).
 - `runner/devpack_dispatch.py` further bounds worker edits to the active component set
   (the union of selected components and components explicitly named by `--allow` globs).
   Any changed file dropped by component/exclude filtering is recorded in `run.json` as

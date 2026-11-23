@@ -38,11 +38,22 @@ extra_args = ["--inline-suppr"]
 fail_on = ["error", "warning"]
 ```
 
-- Findings whose severity is in `fail_on` (default `error`, `warning`) fail the check
-  (exit `1`) and are pasted verbatim into the fixer prompt alongside `preflight_lint.py`
-  findings.
+- Findings whose severity is in `fail_on` (default `error`, `warning`; must be non-empty
+  and contain only known cppcheck severities) fail the check (exit `1`) and are pasted
+  verbatim into the fixer prompt alongside `preflight_lint.py` findings.
 - `style`, `performance`, and `portability` findings are reported in output and JSON
   (`"blocking": false`) but do not block unless added to `fail_on`.
+- `[cppcheck].extra_args` and `--extra-arg` are validated against a strict allowlist
+  (`--inline-suppr`, `--check-level=normal|exhaustive`, `--suppress=<id>[:path]`,
+  `--std=c++NN`, `-D<NAME>[=value]`, `-U<NAME>`, `--platform=<name>`,
+  `--max-ctu-depth=<n>`); disallowed flags (such as `--addon*`, `--rule-file*`,
+  `--output-file*`, `--dump`, `--project*`, `--library=`, or escaping
+  `--suppressions-list`) fail with exit code `2` before launching `cppcheck`.
+- When invoked by `runner/devpack_dispatch.py` or `runner/devpack_run.py`, gate config is
+  snapshotted from the base commit (`git show <base>:preflight.toml`) or pack/broker
+  project config outside the worker tree, never read from the post-run working tree;
+  worker edits to `preflight.toml`, `.devpack/**`, or `[cppcheck]`/lint config files are
+  rejected as `gate-touched` scope violations.
 - Missing `cppcheck` on `PATH` fails closed with exit code `3` (`TOOL_MISSING`), never
   silently passing. In `eval/tasks/v2_check.sh`, `TOOL_MISSING` maps to
   `GRADER_MISCONFIGURED` (exit `2`).

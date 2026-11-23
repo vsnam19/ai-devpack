@@ -29,7 +29,7 @@ if str(PACK_ROOT) not in sys.path:
 from runner.agent_exec import DOCKER_IMAGE_TAG, check_data_class_allowed, load_engines, load_project_config, new_run_dir, redact_sensitive_text, update_run_json
 from runner.brief_lint import has_errors as brief_has_errors, lint_brief_text
 from runner.devpack_dispatch import dispatch_job, _render_run_dir_quietly
-from runner.workspace_scope import load_workspace_config
+from runner.workspace_scope import load_workspace_config, parse_toml_with_arrays
 
 CLIENT_SOURCE = Path(__file__).with_name('devpack_submit.py')
 CLIENT_RELATIVE = Path('.devpack/pack/runner/devpack_dispatch.py')
@@ -134,8 +134,15 @@ def _format_toml_value(value):
 
 
 def _build_sandbox_project_toml(project_cfg):
-    """Render trusted data_class and workspace/component/scan tables for the sandbox."""
+    """Render trusted data_class, workspace/component/scan, and gate/lint tables for the sandbox."""
     lines = ['data_class = ' + json.dumps(project_cfg['data_class'])]
+    for section in ('general', 'doxygen', 'naming', 'cppcheck'):
+        tbl = project_cfg.get(section)
+        if isinstance(tbl, dict) and tbl:
+            lines.extend(['', f'[{section}]'])
+            for key, value in tbl.items():
+                if isinstance(value, (bool, int, str, list, tuple)):
+                    lines.append(f'{key} = {_format_toml_value(value)}')
     workspace = project_cfg.get('workspace')
     if isinstance(workspace, dict) and workspace:
         lines.extend(['', '[workspace]'])
@@ -182,6 +189,13 @@ class Broker:
         if (control / 'project.toml').is_symlink():
             raise ValueError('project config must not be a symlink')
         self.project = load_project_config(self.workdir)
+        host_project_toml = control / 'project.toml'
+        if host_project_toml.is_file():
+            raw_project = parse_toml_with_arrays(host_project_toml.read_text(encoding='utf-8'))
+            for section in ('general', 'doxygen', 'naming', 'cppcheck'):
+                sec_val = raw_project.get(section)
+                if isinstance(sec_val, dict):
+                    self.project[section] = dict(sec_val)
         self.workspace_config = load_workspace_config(self.workdir)
         self.isolation = isolation
         self.allow_local = allow_unsandboxed_local

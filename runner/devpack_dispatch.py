@@ -29,15 +29,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+from dataclasses import dataclass
 import hashlib
 from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Sequence
 
@@ -60,7 +64,11 @@ for _p in (str(PACK_ROOT), str(RUNNER_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from enforcement.checks.scope_check import get_changed_files  # noqa: E402
+from enforcement.checks.scope_check import (  # noqa: E402
+    get_changed_files,
+    is_gate_protected_path,
+    normalize_rel_posix_path,
+)
 from runner import agent_exec  # noqa: E402
 from runner.agent_exec import (  # noqa: E402
     AgentRequest,
@@ -85,13 +93,240 @@ from runner.agent_exec import (  # noqa: E402
 from runner.brief_lint import lint_brief_text  # noqa: E402
 from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
-from runner.workspace_scope import WorkspaceScope, resolve_workspace_scope  # noqa: E402
+from runner.workspace_scope import WorkspaceScope, parse_toml_with_arrays, resolve_workspace_scope  # noqa: E402
 
 CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
 _LINT_SUMMARY_RE = re.compile(r"Summary:\s+\d+\s+file\(s\)\s+checked,\s+(\d+)\s+finding\(s\)\.")
 _CPPCHECK_SUMMARY_RE = re.compile(
     r"Summary:\s+\d+\s+file\(s\)\s+checked,\s+\d+\s+finding\(s\)\s+\((\d+)\s+blocking"
 )
+DEFAULT_TRUSTED_GATE_TOML = (
+    '[general]\nstd = "c++17"\n\n'
+    '[cppcheck]\nenable = ["warning", "style", "performance", "portability"]\n'
+    'std = "c++17"\ninclude_dirs = ["include"]\nextra_args = ["--inline-suppr"]\n'
+    'fail_on = ["error", "warning"]\n'
+)
+
+
+@dataclass(frozen=True)
+class TrustedGateConfig:
+    """Immutable gate configuration snapshot stored outside the worker's directory."""
+
+    config_path: Path
+    source: str
+    sha256: str
+    protected_rel_paths: tuple[str, ...] = ()
+    gate_toml_path: Path | None = None
+    suppressions_rel_path: str | None = None
+    suppressions_sha256: str | None = None
+
+
+def _git_show_regular_blob(workdir: Path, ref: str, rel_path: str) -> bytes | None:
+    """Return raw bytes for ``ref:rel_path`` in ``workdir`` if it is a regular git blob."""
+    if not ref or not (workdir / ".git").exists():
+        return None
+    ls_proc = subprocess.run(
+        ["git", "-C", str(workdir), "ls-tree", ref, "--", rel_path],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if ls_proc.returncode != 0 or not ls_proc.stdout.strip():
+        return None
+    first_line = ls_proc.stdout.splitlines()[0].strip()
+    mode = first_line.split(None, 1)[0]
+    if mode == "120000":
+        raise ValueError(f"{rel_path} in base commit {ref} must not be a symlink")
+    show_proc = subprocess.run(
+        ["git", "-C", str(workdir), "show", f"{ref}:{rel_path}"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if show_proc.returncode != 0:
+        return None
+    return show_proc.stdout
+
+
+def _cppcheck_suppressions_ref(cfg_bytes: bytes) -> str | None:
+    """Return the normalised relative ``[cppcheck].suppressions_file`` from TOML bytes, or None.
+
+    Absolute paths and paths that escape the config directory are rejected (None).
+    """
+    try:
+        parsed = parse_toml_with_arrays(cfg_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    cpp_tbl = parsed.get("cppcheck")
+    if not isinstance(cpp_tbl, dict):
+        return None
+    raw = cpp_tbl.get("suppressions_file")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    raw = raw.strip()
+    if raw.startswith(("/", "\\")) or Path(raw).is_absolute():
+        return None
+    norm = normalize_rel_posix_path(raw)
+    if not norm or ".." in PurePosixPath(norm).parts:
+        return None
+    return norm
+
+
+def _extract_referenced_config_paths(cfg_bytes: bytes) -> tuple[str, ...]:
+    """Extract repo-relative suppressions/plugin paths from TOML bytes for gate-touched protection."""
+    refs: list[str] = []
+    suppr = _cppcheck_suppressions_ref(cfg_bytes)
+    if suppr is not None:
+        refs.append(suppr)
+    try:
+        parsed = parse_toml_with_arrays(cfg_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        return tuple(refs)
+    plugins_tbl = parsed.get("plugins")
+    if isinstance(plugins_tbl, dict) and isinstance(plugins_tbl.get("paths"), list):
+        for item in plugins_tbl["paths"]:
+            if isinstance(item, str) and item.strip() and not Path(item.strip()).is_absolute():
+                norm = normalize_rel_posix_path(item)
+                if norm:
+                    refs.append(norm)
+    return tuple(dict.fromkeys(refs))
+
+
+def _read_trusted_sibling(
+    workdir: Path,
+    base_ref: str,
+    source: str,
+    source_fs_dir: Path | None,
+    rel_ref: str,
+) -> bytes | None:
+    """Read ``rel_ref`` from trusted sources only, in the order ``_resolve_suppressions_file`` uses.
+
+    Repo root first: the git blob at ``rel_ref`` from the repository root in ``base_ref``.
+    Then the config's own directory: ``base:<path>`` sources read the blob beside the config in
+    ``base_ref``; external project configs and pack configs read beside the file in their trusted
+    directory. The working tree is never read. Returns None when no trusted copy exists (including
+    pre-run snapshots, which hold no copy).
+    """
+    if base_ref:
+        root_bytes = _git_show_regular_blob(workdir, base_ref, posixpath.normpath(rel_ref))
+        if root_bytes is not None:
+            return root_bytes
+    if source.startswith("base:") and base_ref:
+        cfg_dir = posixpath.dirname(source[len("base:"):])
+        return _git_show_regular_blob(workdir, base_ref, posixpath.normpath(posixpath.join(cfg_dir, rel_ref)))
+    if source_fs_dir is not None:
+        candidate = source_fs_dir / rel_ref
+        if candidate.is_file() and not candidate.is_symlink():
+            return candidate.read_bytes()
+    return None
+
+
+def resolve_trusted_gate_config(
+    workdir: Path,
+    temp_dir: Path,
+    *,
+    base_ref: str = "",
+    project_config_path: Path | None = None,
+    pack_root: Path = PACK_ROOT,
+    pre_run_project_bytes: bytes | None = None,
+) -> TrustedGateConfig:
+    """Resolve lint/cppcheck gate config from a trusted source outside the agent's working tree."""
+    wd_res = workdir.resolve()
+    eff_base = base_ref.strip() or (_resolve_git_head(wd_res) or "")
+
+    cfg_bytes: bytes | None = None
+    source = ""
+    source_fs_dir: Path | None = None
+    out_name = "preflight.toml"
+
+    if eff_base:
+        base_preflight = _git_show_regular_blob(wd_res, eff_base, "preflight.toml")
+        if base_preflight is not None:
+            cfg_bytes = base_preflight
+            source = "base:preflight.toml"
+            out_name = "preflight.toml"
+
+    if cfg_bytes is None and project_config_path is not None:
+        p_cfg = Path(project_config_path)
+        if not p_cfg.is_file():
+            raise ValueError(f"Requested project config does not exist: {p_cfg}")
+        p_res = p_cfg.resolve()
+        if not p_res.is_relative_to(wd_res):
+            cfg_bytes = p_res.read_bytes()
+            source = "project_config"
+            source_fs_dir = p_res.parent
+            out_name = "project.toml"
+        else:
+            rel_proj = p_res.relative_to(wd_res).as_posix()
+            if eff_base:
+                base_proj = _git_show_regular_blob(wd_res, eff_base, rel_proj)
+                if base_proj is not None:
+                    cfg_bytes = base_proj
+                    source = f"base:{rel_proj}"
+                    out_name = "project.toml"
+            if cfg_bytes is None and pre_run_project_bytes is not None:
+                cfg_bytes = pre_run_project_bytes
+                source = f"pre_run:{rel_proj}"
+                out_name = "project.toml"
+
+    if cfg_bytes is None and eff_base:
+        base_proj = _git_show_regular_blob(wd_res, eff_base, ".devpack/project.toml")
+        if base_proj is not None:
+            cfg_bytes = base_proj
+            source = "base:.devpack/project.toml"
+            out_name = "project.toml"
+
+    if cfg_bytes is None and pre_run_project_bytes is not None:
+        cfg_bytes = pre_run_project_bytes
+        source = "pre_run:.devpack/project.toml"
+        out_name = "project.toml"
+
+    if cfg_bytes is None:
+        pack_example = pack_root / ".devpack" / "project.example.toml"
+        if pack_example.is_file():
+            cfg_bytes = pack_example.read_bytes()
+            source = "pack:.devpack/project.example.toml"
+            source_fs_dir = pack_example.parent
+            out_name = "project.example.toml"
+        else:
+            cfg_bytes = DEFAULT_TRUSTED_GATE_TOML.encode("utf-8")
+            source = "pack:default"
+            out_name = "default_preflight.toml"
+
+    out_path = temp_dir / out_name
+    out_path.write_bytes(cfg_bytes)
+    sha256 = hashlib.sha256(cfg_bytes).hexdigest()
+    protected = _extract_referenced_config_paths(cfg_bytes)
+
+    suppr_rel = _cppcheck_suppressions_ref(cfg_bytes)
+    suppr_sha: str | None = None
+    if suppr_rel is not None:
+        suppr_bytes = _read_trusted_sibling(wd_res, eff_base, source, source_fs_dir, suppr_rel)
+        if suppr_bytes is not None:
+            suppr_dest = temp_dir / suppr_rel
+            suppr_dest.parent.mkdir(parents=True, exist_ok=True)
+            suppr_dest.write_bytes(suppr_bytes)
+            suppr_sha = hashlib.sha256(suppr_bytes).hexdigest()
+
+    gate_toml_path: Path | None = None
+    if eff_base:
+        base_gate = _git_show_regular_blob(wd_res, eff_base, "gate.toml")
+        if base_gate is not None:
+            gate_toml_path = temp_dir / "gate.toml"
+            gate_toml_path.write_bytes(base_gate)
+
+    return TrustedGateConfig(
+        config_path=out_path,
+        source=source,
+        sha256=sha256,
+        protected_rel_paths=protected,
+        gate_toml_path=gate_toml_path,
+        suppressions_rel_path=suppr_rel,
+        suppressions_sha256=suppr_sha,
+    )
 
 
 def _run_subprocess(cmd: Sequence[str], cwd: Path, timeout_s: int = 300) -> tuple[int, str, str]:
@@ -142,6 +377,8 @@ def run_preflight_lint_on_changed(
     all_components: bool = False,
     project_config_path: Path | None = None,
     scope: WorkspaceScope | None = None,
+    config_path: Path | None = None,
+    base_ref: str = "",
 ) -> tuple[bool, int, str]:
     """Run ``preflight_lint.py`` on changed C/C++ files inside ``workdir``.
 
@@ -181,26 +418,37 @@ def run_preflight_lint_on_changed(
     if not preflight_script.is_file():
         return False, 1, f"Missing preflight linter: {preflight_script}"
 
-    cmd: list[str] = [
-        "python3",
-        str(preflight_script),
-        "--no-cache",
-        "--repo-root",
-        str(workdir),
-    ]
-    cfg_candidate = workdir / "preflight.toml"
-    if cfg_candidate.is_file():
-        cmd.extend(["--config", str(cfg_candidate)])
-    if project_config_path is not None:
-        cmd.extend(["--project-config", str(project_config_path)])
-    if active_scope.configured:
-        if active_scope.scan_mode == "all":
-            cmd.append("--all-components")
-        elif active_scope.active_components:
-            cmd.extend(["--components", ",".join(c.name for c in active_scope.active_components)])
-    cmd.extend(lint_targets)
+    with contextlib.ExitStack() as stack:
+        effective_cfg = config_path
+        if effective_cfg is None:
+            tmp_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="devpack-lint-cfg-")))
+            effective_cfg = resolve_trusted_gate_config(
+                workdir,
+                tmp_dir,
+                base_ref=base_ref,
+                project_config_path=project_config_path,
+                pack_root=pack_root,
+            ).config_path
 
-    rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
+        cmd: list[str] = [
+            "python3",
+            str(preflight_script),
+            "--no-cache",
+            "--repo-root",
+            str(workdir),
+            "--config",
+            str(effective_cfg),
+        ]
+        if project_config_path is not None:
+            cmd.extend(["--project-config", str(project_config_path)])
+        if active_scope.configured:
+            if active_scope.scan_mode == "all":
+                cmd.append("--all-components")
+            elif active_scope.active_components:
+                cmd.extend(["--components", ",".join(c.name for c in active_scope.active_components)])
+        cmd.extend(lint_targets)
+
+        rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
     combined = "\n".join(part for part in (out.strip(), err.strip()) if part).strip()
     findings = parse_lint_finding_count(combined, rc)
     if dropped:
@@ -229,8 +477,15 @@ def run_cppcheck_on_changed(
     all_components: bool = False,
     project_config_path: Path | None = None,
     scope: WorkspaceScope | None = None,
+    config_path: Path | None = None,
+    base_ref: str = "",
+    trusted_snapshot_dir: Path | None = None,
 ) -> tuple[bool, int, str]:
     """Run ``cppcheck_check.py`` on changed C/C++ files inside ``workdir``.
+
+    ``trusted_snapshot_dir`` is the directory holding the trusted config snapshot; relative
+    ``suppressions_file`` entries are resolved only there. When ``config_path`` is None the
+    temporary snapshot directory is used.
 
     Returns ``(passed, blocking_finding_count, combined_output)``.
     """
@@ -268,25 +523,40 @@ def run_cppcheck_on_changed(
     if not cppcheck_script.is_file():
         return False, 1, f"Missing cppcheck static analyzer: {cppcheck_script}"
 
-    cmd: list[str] = [
-        "python3",
-        str(cppcheck_script),
-        "--repo-root",
-        str(workdir),
-    ]
-    cfg_candidate = workdir / "preflight.toml"
-    if cfg_candidate.is_file():
-        cmd.extend(["--config", str(cfg_candidate)])
-    if project_config_path is not None:
-        cmd.extend(["--project-config", str(project_config_path)])
-    if active_scope.configured:
-        if active_scope.scan_mode == "all":
-            cmd.append("--all-components")
-        elif active_scope.active_components:
-            cmd.extend(["--components", ",".join(c.name for c in active_scope.active_components)])
-    cmd.extend(static_targets)
+    with contextlib.ExitStack() as stack:
+        effective_cfg = config_path
+        snapshot_dir = trusted_snapshot_dir
+        if effective_cfg is None:
+            tmp_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="devpack-cppcheck-cfg-")))
+            effective_cfg = resolve_trusted_gate_config(
+                workdir,
+                tmp_dir,
+                base_ref=base_ref,
+                project_config_path=project_config_path,
+                pack_root=pack_root,
+            ).config_path
+            snapshot_dir = tmp_dir
 
-    rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
+        cmd: list[str] = [
+            "python3",
+            str(cppcheck_script),
+            "--repo-root",
+            str(workdir),
+            "--config",
+            str(effective_cfg),
+        ]
+        if snapshot_dir is not None:
+            cmd.extend(["--trusted-suppressions-dir", str(snapshot_dir)])
+        if project_config_path is not None:
+            cmd.extend(["--project-config", str(project_config_path)])
+        if active_scope.configured:
+            if active_scope.scan_mode == "all":
+                cmd.append("--all-components")
+            elif active_scope.active_components:
+                cmd.extend(["--components", ",".join(c.name for c in active_scope.active_components)])
+        cmd.extend(static_targets)
+
+        rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
     combined = "\n".join(part for part in (out.strip(), err.strip()) if part).strip()
     blocking = parse_cppcheck_blocking_count(combined, rc)
     if dropped:
@@ -314,19 +584,19 @@ def _resolve_gate_command(
     workdir: Path,
     run_dir: Path,
     pack_root: Path = PACK_ROOT,
+    trusted_gate_toml: Path | None = None,
 ) -> tuple[list[str] | None, int]:
     """Determine the deterministic gate command and timeout for ``workdir``."""
     timeout_s = engines_cfg.gate_timeout_s if engines_cfg is not None else 300
     if explicit_gate_cmd.strip():
         return shlex.split(explicit_gate_cmd), timeout_s
 
-    local_gate_toml = workdir / "gate.toml"
-    if local_gate_toml.is_file():
+    if trusted_gate_toml is not None and trusted_gate_toml.is_file():
         return [
             "python3",
             str(pack_root / "enforcement" / "gate" / "gate.py"),
             "--config",
-            str(local_gate_toml),
+            str(trusted_gate_toml),
             "--repo",
             str(workdir),
             "--receipt",
@@ -509,6 +779,8 @@ def dispatch_job(
     cleaned_deviation = deviation_id.strip()
     if allow_unqualified and not cleaned_deviation:
         raise ValueError("--allow-unqualified requires --deviation <ID>")
+    if project_config_path is not None and not Path(project_config_path).is_file():
+        raise ValueError(f"Requested project config does not exist: {project_config_path}")
 
     project_cfg = load_project_config(workdir, project_config_path)
     ws_scope = resolve_workspace_scope(
@@ -585,6 +857,116 @@ def dispatch_job(
             f"WARNING: deviation {cleaned_deviation}: allowing unqualified engine '{engine.name}': {qual_reason}\n"
         )
 
+    pre_run_project_bytes: bytes | None = None
+    default_proj = workdir / ".devpack" / "project.toml"
+    if project_config_path is None and default_proj.is_file() and not default_proj.is_symlink():
+        pre_run_project_bytes = default_proj.read_bytes()
+
+    with tempfile.TemporaryDirectory(prefix="devpack-gate-cfg-") as gate_cfg_tmp:
+        trusted_cfg = resolve_trusted_gate_config(
+            workdir,
+            Path(gate_cfg_tmp),
+            base_ref=effective_base,
+            project_config_path=project_config_path,
+            pack_root=pack_root,
+            pre_run_project_bytes=pre_run_project_bytes,
+        )
+        return _dispatch_job_with_trusted_cfg(
+            trusted_cfg=trusted_cfg,
+            engine=engine,
+            engines_cfg=engines_cfg,
+            project_cfg=project_cfg,
+            ws_scope=ws_scope,
+            active_component_names=active_component_names,
+            effective_runs_root=effective_runs_root,
+            effective_base=effective_base,
+            brief_path=brief_path,
+            brief_raw=brief_raw,
+            effective_brief_lint=effective_brief_lint,
+            prompt_text=prompt_text,
+            resolved_profile=resolved_profile,
+            qual_path=qual_path,
+            enforce_qual=enforce_qual,
+            engine_cfg_hash=engine_cfg_hash,
+            data_ok=data_ok,
+            data_reason=data_reason,
+            iso_ok=iso_ok,
+            iso_msg=iso_msg,
+            qual_ok=qual_ok,
+            qual_reason=qual_reason,
+            qual_deviation_logged=qual_deviation_logged,
+            cleaned_deviation=cleaned_deviation,
+            allow_unqualified=allow_unqualified,
+            dry_run=dry_run,
+            workdir=workdir,
+            allow_globs=allow_globs,
+            protected_globs=protected_globs,
+            gate_cmd=gate_cmd,
+            no_gate=no_gate,
+            project_config_path=project_config_path,
+            isolation=isolation,
+            allow_unsandboxed_local=allow_unsandboxed_local,
+            credentials_path=credentials_path,
+            agent_bin=agent_bin,
+            docker_bin=docker_bin,
+            image_tag=image_tag,
+            role=role,
+            pack_root=pack_root,
+            memory_root=memory_root,
+            memory_enabled=memory_enabled,
+            memory_top_k=memory_top_k,
+            memory_budget_tokens=memory_budget_tokens,
+        )
+
+
+def _dispatch_job_with_trusted_cfg(
+    *,
+    trusted_cfg: TrustedGateConfig,
+    engine: EngineConfig,
+    engines_cfg: EnginesConfig | None,
+    project_cfg: dict[str, Any],
+    ws_scope: WorkspaceScope,
+    active_component_names: list[str],
+    effective_runs_root: Path,
+    effective_base: str,
+    brief_path: Path,
+    brief_raw: str,
+    effective_brief_lint: list[dict[str, Any]],
+    prompt_text: str,
+    resolved_profile: Path | None,
+    qual_path: Path,
+    enforce_qual: bool,
+    engine_cfg_hash: str,
+    data_ok: bool,
+    data_reason: str,
+    iso_ok: bool,
+    iso_msg: str,
+    qual_ok: bool,
+    qual_reason: str,
+    qual_deviation_logged: bool,
+    cleaned_deviation: str,
+    allow_unqualified: bool,
+    dry_run: bool,
+    workdir: Path,
+    allow_globs: Sequence[str],
+    protected_globs: Sequence[str],
+    gate_cmd: str,
+    no_gate: bool,
+    project_config_path: Path | None,
+    isolation: str,
+    allow_unsandboxed_local: bool,
+    credentials_path: Path | None,
+    agent_bin: str,
+    docker_bin: str,
+    image_tag: str,
+    role: str,
+    pack_root: Path,
+    memory_root: Path | None,
+    memory_enabled: bool | None,
+    memory_top_k: int | None,
+    memory_budget_tokens: int | None,
+) -> tuple[int, dict[str, Any]]:
+    """Run one dispatched worker job using the pre-snapshotted ``trusted_cfg``."""
     if dry_run:
         if not data_ok:
             sys.stderr.write(data_reason + "\n")
@@ -817,6 +1199,19 @@ def dispatch_job(
         changed_files = []
 
     changed_files = sorted(set(changed_files) | set(control_changes))
+    gate_touched = sorted(
+        {
+            name
+            for name in changed_files
+            if not (name == ".devpack" or name.startswith(".devpack/"))
+            and is_gate_protected_path(name, trusted_cfg.protected_rel_paths)
+        }
+        | {
+            name
+            for name in control_changes
+            if is_gate_protected_path(name, trusted_cfg.protected_rel_paths)
+        }
+    )
     out_of_scope_changes: list[str] = []
     scoped_changed_files: list[str] = list(changed_files)
     if ws_scope.configured:
@@ -826,11 +1221,18 @@ def dispatch_job(
 
     # Scope check
     scope_status = "ok"
-    scope_out = ""
+    scope_msgs: list[str] = []
     if changed_err:
         scope_status = "violation"
-        scope_out = f"SCOPE_ERROR: {changed_err}"
+        scope_msgs.append(f"SCOPE_ERROR: {changed_err}")
     else:
+        if gate_touched:
+            scope_status = "violation"
+            for name in gate_touched:
+                scope_msgs.append(
+                    f"SCOPE_VIOLATION: {name} is gate-touched "
+                    "(gate/lint/cppcheck configuration cannot be modified by workers)"
+                )
         if ws_scope.configured:
             outside_ws = [p for p in changed_files if ws_scope.outside_workspace(p)]
             outside_active = [
@@ -840,16 +1242,15 @@ def dispatch_job(
             ]
             if outside_ws or outside_active:
                 scope_status = "violation"
-                msgs = [
-                    f"SCOPE_VIOLATION: {name} is outside workspace root ({ws_scope.workspace_root_rel})"
-                    for name in outside_ws
-                ]
+                for name in outside_ws:
+                    scope_msgs.append(
+                        f"SCOPE_VIOLATION: {name} is outside workspace root ({ws_scope.workspace_root_rel})"
+                    )
                 active_label = ", ".join(active_component_names) if active_component_names else "(none)"
-                msgs.extend(
-                    f"SCOPE_VIOLATION: {name} is outside active components ({active_label})"
-                    for name in outside_active
-                )
-                scope_out = "\n".join(msgs)
+                for name in outside_active:
+                    scope_msgs.append(
+                        f"SCOPE_VIOLATION: {name} is outside active components ({active_label})"
+                    )
         if scope_status == "ok" and allow_globs:
             scope_script = pack_root / "enforcement" / "checks" / "scope_check.py"
             scope_cmd = [
@@ -862,6 +1263,8 @@ def dispatch_job(
                 "--allow",
                 *allow_globs,
             ]
+            for extra_gate in trusted_cfg.protected_rel_paths:
+                scope_cmd.extend(["--gate-config-file", extra_gate])
             if project_config_path is not None:
                 scope_cmd.extend(["--project-config", str(project_config_path)])
             s_rc, s_out, s_err = _run_subprocess(
@@ -869,13 +1272,19 @@ def dispatch_job(
                 workdir,
                 timeout_s=60,
             )
-            scope_out = (s_out + "\n" + s_err).strip()
+            s_combined = (s_out + "\n" + s_err).strip()
+            if s_combined:
+                scope_msgs.append(s_combined)
             if s_rc != 0:
                 scope_status = "violation"
 
-    if control_changes:
+    if control_changes and not any(
+        name == ".devpack" or name.startswith(".devpack/") for name in gate_touched
+    ):
         scope_status = "violation"
-        scope_out = "\n".join(f"SCOPE_VIOLATION: {name} is broker control data" for name in control_changes)
+        for name in control_changes:
+            scope_msgs.append(f"SCOPE_VIOLATION: {name} is broker control data")
+    scope_out = "\n".join(part for part in scope_msgs if part).strip()
 
     # Gate + test_lock + preflight_lint + cppcheck
     gate_status = "skipped"
@@ -926,26 +1335,31 @@ def dispatch_job(
                 else:
                     test_lock_status = "ok"
 
-            # 2. Preflight lint on changed C/C++ files
+            # 2. Preflight lint on changed C/C++ files (using trusted pre-run config)
             lint_ok, lint_findings, lint_out = run_preflight_lint_on_changed(
                 workdir,
                 scoped_changed_files,
                 pack_root=pack_root,
                 project_config_path=project_config_path,
                 scope=ws_scope,
+                config_path=trusted_cfg.config_path,
+                base_ref=effective_base,
             )
             if lint_out:
                 gate_logs.append(f"[preflight_lint]\n{lint_out}")
             if not lint_ok:
                 gate_ok = False
 
-            # 2b. Static analysis (cppcheck) on changed C/C++ files
+            # 2b. Static analysis (cppcheck) on changed C/C++ files (using trusted pre-run config)
             static_clean, static_findings, static_out = run_cppcheck_on_changed(
                 workdir,
                 scoped_changed_files,
                 pack_root=pack_root,
                 project_config_path=project_config_path,
                 scope=ws_scope,
+                config_path=trusted_cfg.config_path,
+                base_ref=effective_base,
+                trusted_snapshot_dir=trusted_cfg.config_path.parent,
             )
             if static_out:
                 gate_logs.append(f"[cppcheck]\n{static_out}")
@@ -954,7 +1368,12 @@ def dispatch_job(
 
             # 3. Configured gate command (if any)
             resolved_gate_cmd, gate_timeout_s = _resolve_gate_command(
-                gate_cmd, engines_cfg, workdir, run_dir, pack_root=pack_root
+                gate_cmd,
+                engines_cfg,
+                workdir,
+                run_dir,
+                pack_root=pack_root,
+                trusted_gate_toml=trusted_cfg.gate_toml_path,
             )
             if resolved_gate_cmd is not None:
                 g_rc, g_out, g_err = _run_subprocess(resolved_gate_cmd, workdir, timeout_s=gate_timeout_s)
@@ -994,9 +1413,15 @@ def dispatch_job(
         mem_proposal_summary = prop_res.to_dict()
 
     outcome = "pass" if passed else ("timeout" if agent_res.status == "timeout" else "fail")
+    suppressions_meta: dict[str, Any] = {}
+    if trusted_cfg.suppressions_rel_path is not None:
+        suppressions_meta["gate_suppressions_path"] = trusted_cfg.suppressions_rel_path
+        suppressions_meta["gate_suppressions_sha256"] = trusted_cfg.suppressions_sha256
     run_extra: dict[str, Any] = {}
     if ws_scope.configured or out_of_scope_changes:
         run_extra["out_of_scope_changes"] = out_of_scope_changes
+    if gate_touched:
+        run_extra["gate_touched"] = gate_touched
     update_run_json(
         run_dir,
         task=brief_path.stem,
@@ -1016,6 +1441,9 @@ def dispatch_job(
         memory_proposals=mem_proposal_summary,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
+        gate_config_source=trusted_cfg.source,
+        gate_config_sha256=trusted_cfg.sha256,
+        **suppressions_meta,
         finished=datetime.now(timezone.utc).isoformat(),
         **run_extra,
     )
@@ -1043,9 +1471,14 @@ def dispatch_job(
         "memory_tokens": int(agent_res.memory_tokens),
         "components": active_component_names,
         "scan_mode": ws_scope.scan_mode,
+        "gate_config_source": trusted_cfg.source,
+        "gate_config_sha256": trusted_cfg.sha256,
+        **suppressions_meta,
     }
     if ws_scope.configured or out_of_scope_changes:
         payload["out_of_scope_changes"] = out_of_scope_changes
+    if gate_touched:
+        payload["gate_touched"] = gate_touched
     if any(mem_proposal_summary.values()):
         payload["memory_proposals"] = mem_proposal_summary
     if agent_res.error:

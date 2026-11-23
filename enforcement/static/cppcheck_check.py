@@ -61,9 +61,79 @@ DEFAULT_FAIL_ON = ("error", "warning")
 DEFAULT_INCLUDE_DIRS = ("include",)
 DEFAULT_EXTRA_ARGS = ("--inline-suppr",)
 BASELINE_SCHEMA_VERSION = 1
+KNOWN_FAIL_ON_SEVERITIES: frozenset[str] = frozenset(
+    {"error", "warning", "style", "performance", "portability", "information"}
+)
+
+_SUPPRESS_ARG_RE = re.compile(r"^--suppress=([A-Za-z0-9_]+)(?::(.+))?$")
+_STD_ARG_RE = re.compile(r"^--std=c\+\+\d{2}$")
+_DEFINE_ARG_RE = re.compile(r"^-D[A-Za-z_][A-Za-z0-9_]*(?:=[^\r\n\x00]*)?$")
+_UNDEF_ARG_RE = re.compile(r"^-U[A-Za-z_][A-Za-z0-9_]*$")
+_PLATFORM_ARG_RE = re.compile(r"^--platform=[A-Za-z0-9_-]+$")
+_CTU_DEPTH_ARG_RE = re.compile(r"^--max-ctu-depth=[0-9]+$")
+_SUPPRESS_PATH_RE = re.compile(r"^[A-Za-z0-9_./*-]+(?::\d+)?$")
 
 _TEMPLATE_5_RE = re.compile(r"^(.+?):(\d+):([^:]+):([^:]+):(.*)$")
 _TEMPLATE_6_RE = re.compile(r"^(.+?):(\d+):(\d+):([^:]+):([^:]+):(.*)$")
+
+
+def validate_fail_on(fail_on: Sequence[str]) -> tuple[str, ...]:
+    """Validate that ``fail_on`` is non-empty and contains only known cppcheck severities."""
+    normalized = tuple(item.strip().lower() for item in fail_on if str(item).strip())
+    if not normalized:
+        raise ValueError("[cppcheck].fail_on must be non-empty")
+    unknown = [item for item in normalized if item not in KNOWN_FAIL_ON_SEVERITIES]
+    if unknown:
+        allowed = ", ".join(sorted(KNOWN_FAIL_ON_SEVERITIES))
+        raise ValueError(
+            f"[cppcheck].fail_on contains unknown severity {unknown[0]!r}; expected one of: {allowed}"
+        )
+    return normalized
+
+
+def _is_valid_suppress_arg(arg: str) -> bool:
+    """Return True if ``arg`` matches ``--suppress=<id>`` with optional relative ``:path``."""
+    match = _SUPPRESS_ARG_RE.match(arg)
+    if not match:
+        return False
+    raw_path = match.group(2)
+    if raw_path is None:
+        return True
+    if not raw_path or raw_path.startswith("/") or "\\" in raw_path or "\x00" in raw_path:
+        return False
+    if not _SUPPRESS_PATH_RE.match(raw_path):
+        return False
+    path_only = raw_path.rsplit(":", 1)[0] if re.search(r":\d+$", raw_path) else raw_path
+    parts = path_only.split("/")
+    return ".." not in parts
+
+
+def validate_extra_args(extra_args: Sequence[str]) -> tuple[str, ...]:
+    """Validate ``cppcheck`` extra arguments against a strict safety allowlist."""
+    validated: list[str] = []
+    for raw_arg in extra_args:
+        arg = str(raw_arg).strip()
+        if not arg:
+            raise ValueError("[cppcheck].extra_args must not contain empty arguments")
+        if (
+            arg == "--inline-suppr"
+            or arg in ("--check-level=normal", "--check-level=exhaustive")
+            or _is_valid_suppress_arg(arg)
+            or _STD_ARG_RE.match(arg)
+            or _DEFINE_ARG_RE.match(arg)
+            or _UNDEF_ARG_RE.match(arg)
+            or _PLATFORM_ARG_RE.match(arg)
+            or _CTU_DEPTH_ARG_RE.match(arg)
+        ):
+            validated.append(arg)
+            continue
+        raise ValueError(
+            f"disallowed cppcheck extra_arg {arg!r}; only allowlisted flags "
+            "(--inline-suppr, --check-level=normal|exhaustive, --suppress=<id>[:path], "
+            "--std=c++NN, -D<NAME>[=value], -U<NAME>, --platform=<name>, "
+            "--max-ctu-depth=<n>) are permitted"
+        )
+    return tuple(validated)
 
 
 def _strip_toml_comment(line: str) -> str:
@@ -321,11 +391,15 @@ def load_cppcheck_config(
                 raise ValueError(f"[cppcheck].suppressions_file in {resolved_cfg} must be a string")
             cfg.suppressions_file = suppr.strip()
         if "extra_args" in cppcheck_tbl:
-            cfg.extra_args = _coerce_str_list(cppcheck_tbl["extra_args"], "extra_args")
+            cfg.extra_args = validate_extra_args(
+                _coerce_str_list(cppcheck_tbl["extra_args"], "extra_args")
+            )
         if "fail_on" in cppcheck_tbl:
             raw_fail = _coerce_str_list(cppcheck_tbl["fail_on"], "fail_on", allow_csv=True)
-            cfg.fail_on = tuple(item.lower() for item in raw_fail)
+            cfg.fail_on = validate_fail_on(raw_fail)
 
+    cfg.extra_args = validate_extra_args(cfg.extra_args)
+    cfg.fail_on = validate_fail_on(cfg.fail_on)
     return cfg, resolved_cfg
 
 
@@ -618,19 +692,49 @@ def _resolve_within_repo(raw_path: str, repo_root: Path) -> Path:
     return candidate
 
 
-def _resolve_suppressions_file(raw_path: str, config_dir: Path, repo_root: Path) -> Path:
+def _resolve_suppressions_file(
+    raw_path: str,
+    config_dir: Path,
+    repo_root: Path,
+    trusted_dir: Path | None = None,
+) -> Path:
     """Resolve ``suppressions_file``: repo root first, then the config directory (pack-provided lists).
 
-    Absolute paths must lie inside ``repo_root``. A missing file is returned as the repo-root candidate
-    so the caller reports it.
+    Absolute paths must lie inside ``repo_root``; relative paths must not escape ``repo_root``
+    or ``config_dir``. A missing file is returned as the repo-root candidate so the caller
+    reports it.
+
+    When ``trusted_dir`` is given (a trusted snapshot prepared by the dispatcher), the path
+    must be relative and is resolved ONLY inside that directory; the working tree is never
+    consulted. A missing file is returned as the trusted-dir candidate so the caller reports it.
     """
     p = Path(raw_path)
+    repo_res = repo_root.resolve()
+    if trusted_dir is not None:
+        if p.is_absolute():
+            raise ValueError(f"suppressions_file '{raw_path}' must be relative to the trusted snapshot")
+        trusted_res = trusted_dir.resolve()
+        trusted_candidate = (trusted_res / p).resolve()
+        if not trusted_candidate.is_relative_to(trusted_res):
+            raise ValueError(
+                f"suppressions_file '{raw_path}' resolves outside the trusted snapshot {trusted_res}"
+            )
+        return trusted_candidate
+    cfg_res = config_dir.resolve()
     if p.is_absolute():
-        return _resolve_within_repo(raw_path, repo_root)
-    repo_candidate = (repo_root / p).resolve()
-    if repo_candidate.is_relative_to(repo_root) and repo_candidate.is_file():
+        return _resolve_within_repo(raw_path, repo_res)
+    repo_candidate = (repo_res / p).resolve()
+    if not repo_candidate.is_relative_to(repo_res):
+        raise ValueError(
+            f"suppressions_file '{raw_path}' resolves outside the analysed repo root {repo_res}"
+        )
+    if repo_candidate.is_file():
         return repo_candidate
-    config_candidate = (config_dir / p).resolve()
+    config_candidate = (cfg_res / p).resolve()
+    if not config_candidate.is_relative_to(cfg_res):
+        raise ValueError(
+            f"suppressions_file '{raw_path}' resolves outside configuration directory {cfg_res}"
+        )
     if config_candidate.is_file():
         return config_candidate
     return repo_candidate
@@ -661,39 +765,101 @@ def _resolve_compile_db_entry_path(
     entry: dict[str, Any],
     cc_path: Path,
     repo_root: Path,
+    ws_scope: WorkspaceScope | None = None,
 ) -> tuple[Path | None, dict[str, Any]]:
-    """Resolve an entry's source file path and return ``(resolved_path, normalized_entry)``."""
+    """Resolve an entry's source file path and enforce repository/workspace containment."""
     raw_file = str(entry.get("file", "") or "").strip()
     if not raw_file:
         return None, entry
+    repo_res = repo_root.resolve()
+    ws_res = ws_scope.workspace_root.resolve() if (ws_scope is not None and ws_scope.configured) else None
     fp = Path(raw_file)
     copied = dict(entry)
-    if fp.is_absolute():
-        return fp.resolve(), copied
-
     raw_dir = str(entry.get("directory", "") or "").strip()
+
+    if fp.is_absolute():
+        resolved_fp = fp.resolve()
+        if not resolved_fp.is_relative_to(repo_res):
+            raise ValueError(
+                f"compile_commands entry '{raw_file}' resolves outside repository root {repo_res}"
+            )
+        if ws_res is not None:
+            # Reject symlinks whose lexical path sits inside workspace_root but target escapes it
+            try:
+                fp.relative_to(ws_res)
+                in_ws_lexically = True
+            except ValueError:
+                in_ws_lexically = False
+            if in_ws_lexically and not resolved_fp.is_relative_to(ws_res):
+                raise ValueError(
+                    f"compile_commands entry '{raw_file}' escapes workspace root {ws_res} via symlink"
+                )
+        return resolved_fp, copied
+
     if raw_dir:
         dir_path = Path(raw_dir)
         if dir_path.is_absolute():
-            return (dir_path / fp).resolve(), copied
-        repo_cand = (repo_root / dir_path / fp).resolve()
-        if repo_cand.exists():
-            return repo_cand, copied
-        cc_cand = (cc_path.parent / dir_path / fp).resolve()
-        if cc_cand.exists():
-            copied["directory"] = str((cc_path.parent / dir_path).resolve())
-            return cc_cand, copied
-        return repo_cand, copied
+            dir_res = dir_path.resolve()
+            if not dir_res.is_relative_to(repo_res):
+                raise ValueError(
+                    f"compile_commands directory '{raw_dir}' resolves outside repository root {repo_res}"
+                )
+            unresolved_fp = dir_path / fp
+            resolved_fp = unresolved_fp.resolve()
+        else:
+            repo_dir_res = (repo_res / dir_path).resolve()
+            cc_dir_res = (cc_path.parent / dir_path).resolve()
+            repo_cand = (repo_res / dir_path / fp).resolve()
+            cc_cand = (cc_path.parent / dir_path / fp).resolve()
+            if (repo_res / dir_path / fp).is_symlink() or repo_cand.exists():
+                unresolved_fp = repo_res / dir_path / fp
+                resolved_fp = repo_cand
+                if not repo_dir_res.is_relative_to(repo_res):
+                    raise ValueError(
+                        f"compile_commands directory '{raw_dir}' escapes repository root {repo_res}"
+                    )
+            elif (cc_path.parent / dir_path / fp).is_symlink() or cc_cand.exists():
+                unresolved_fp = cc_path.parent / dir_path / fp
+                resolved_fp = cc_cand
+                if not cc_dir_res.is_relative_to(repo_res):
+                    raise ValueError(
+                        f"compile_commands directory '{raw_dir}' escapes repository root {repo_res}"
+                    )
+                copied["directory"] = str(cc_dir_res)
+            else:
+                unresolved_fp = repo_res / dir_path / fp
+                resolved_fp = repo_cand
+    else:
+        repo_cand = (repo_res / fp).resolve()
+        cc_cand = (cc_path.parent / fp).resolve()
+        if (repo_res / fp).is_symlink() or repo_cand.exists():
+            unresolved_fp = repo_res / fp
+            resolved_fp = repo_cand
+            copied["directory"] = str(repo_res)
+        elif (cc_path.parent / fp).is_symlink() or cc_cand.exists():
+            unresolved_fp = cc_path.parent / fp
+            resolved_fp = cc_cand
+            copied["directory"] = str(cc_path.parent.resolve())
+        else:
+            unresolved_fp = repo_res / fp
+            resolved_fp = repo_cand
 
-    repo_cand = (repo_root / fp).resolve()
-    if repo_cand.exists():
-        copied["directory"] = str(repo_root)
-        return repo_cand, copied
-    cc_cand = (cc_path.parent / fp).resolve()
-    if cc_cand.exists():
-        copied["directory"] = str(cc_path.parent)
-        return cc_cand, copied
-    return repo_cand, copied
+    if not resolved_fp.is_relative_to(repo_res):
+        raise ValueError(
+            f"compile_commands entry '{raw_file}' resolves outside repository root {repo_res}"
+        )
+    if ws_res is not None:
+        norm_unresolved = Path(os.path.normpath(str(unresolved_fp)))
+        try:
+            norm_unresolved.relative_to(ws_res)
+            in_ws_lexically = True
+        except ValueError:
+            in_ws_lexically = False
+        if in_ws_lexically and not resolved_fp.is_relative_to(ws_res):
+            raise ValueError(
+                f"compile_commands entry '{raw_file}' escapes workspace root {ws_res} via symlink"
+            )
+    return resolved_fp, copied
 
 
 def _load_compile_commands_tus(cc_path: Path, repo_root: Path) -> set[Path]:
@@ -735,7 +901,9 @@ def _build_filtered_compile_db(
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        resolved_fp, normalized_entry = _resolve_compile_db_entry_path(entry, cc_path, repo_root)
+        resolved_fp, normalized_entry = _resolve_compile_db_entry_path(
+            entry, cc_path, repo_root, ws_scope=ws_scope
+        )
         if resolved_fp is None:
             continue
         if ws_scope.outside_workspace(resolved_fp) or ws_scope.is_excluded(resolved_fp):
@@ -873,8 +1041,13 @@ def run_cppcheck_check(
     components: str | Sequence[str] | None = None,
     all_components: bool = False,
     project_config_path: Path | None = None,
+    trusted_suppressions_dir: Path | None = None,
 ) -> CppcheckRunResult:
-    """Run cppcheck on ``targets`` or git-changed files since ``base_ref``."""
+    """Run cppcheck on ``targets`` or git-changed files since ``base_ref``.
+
+    ``trusted_suppressions_dir`` pins relative ``suppressions_file`` resolution to a trusted
+    snapshot directory (see ``_resolve_suppressions_file``).
+    """
     effective_root = (repo_root or Path.cwd()).resolve()
     config, resolved_cfg_path = load_cppcheck_config(config_path, effective_root)
     ws_scope = resolve_workspace_scope(
@@ -889,13 +1062,16 @@ def run_cppcheck_check(
     if std_override is not None:
         config.std = std_override
     if fail_on_override is not None:
-        config.fail_on = tuple(item.lower() for item in fail_on_override)
+        config.fail_on = validate_fail_on(fail_on_override)
     if extra_include_dirs:
         config.include_dirs = (*config.include_dirs, *tuple(extra_include_dirs))
     if suppressions_override is not None:
         config.suppressions_file = suppressions_override
     if extra_args_override:
-        config.extra_args = (*config.extra_args, *tuple(extra_args_override))
+        config.extra_args = validate_extra_args((*config.extra_args, *tuple(extra_args_override)))
+    else:
+        config.extra_args = validate_extra_args(config.extra_args)
+    config.fail_on = validate_fail_on(config.fail_on)
 
     if not targets and not base_ref.strip() and not ws_scope.configured:
         raise ValueError("provide one or more target paths or --base <ref>")
@@ -962,7 +1138,10 @@ def run_cppcheck_check(
         cmd.extend(["--xml", "--xml-version=2"])
         if config.suppressions_file:
             suppr_path = _resolve_suppressions_file(
-                config.suppressions_file, cfg_base_dir, effective_root
+                config.suppressions_file,
+                cfg_base_dir,
+                effective_root,
+                trusted_dir=trusted_suppressions_dir,
             )
             if not suppr_path.is_file():
                 raise ValueError(
@@ -972,8 +1151,6 @@ def run_cppcheck_check(
         if ws_scope.configured and "--suppress=missingIncludeSystem" not in config.extra_args:
             cmd.append("--suppress=missingIncludeSystem")
         for arg in config.extra_args:
-            if arg in ("--xml", "--xml-version=2") or arg.startswith("--template"):
-                continue
             if arg not in cmd:
                 cmd.append(arg)
         return cmd
@@ -1001,6 +1178,7 @@ def run_cppcheck_check(
 
         target_rel_set = {_rel_str(fp) for fp in target_files}
         subset_scan = bool(base_ref.strip()) or has_explicit_file_target
+        restrict_compile_db = bool(base_ref.strip()) or bool(targets)
 
         for comp, comp_files in grouped.values():
             cc_path: Path | None = None
@@ -1010,7 +1188,7 @@ def run_cppcheck_check(
                     cc_path = cand_cc
 
             if cc_path is not None:
-                allowed_set = {fp.resolve() for fp in comp_files} if subset_scan else None
+                allowed_set = {fp.resolve() for fp in comp_files} if restrict_compile_db else None
                 filtered_entries, cc_tus = _build_filtered_compile_db(
                     cc_path,
                     effective_root,
@@ -1034,7 +1212,7 @@ def run_cppcheck_check(
                             not ws_scope.outside_workspace(f.file)
                             and not ws_scope.is_excluded(f.file)
                             and ws_scope.component_for_path(f.file) == comp
-                            and (not subset_scan or f.file in target_rel_set)
+                            and (not restrict_compile_db or f.file in target_rel_set)
                         ):
                             parsed.append(f)
 
@@ -1259,6 +1437,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional cppcheck suppressions file",
     )
     parser.add_argument(
+        "--trusted-suppressions-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Trusted snapshot directory: relative suppressions_file is resolved only inside it "
+            "(never from the working tree)"
+        ),
+    )
+    parser.add_argument(
         "--extra-arg",
         action="append",
         dest="extra_args",
@@ -1335,6 +1522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             components=args.components,
             all_components=bool(args.all_components),
             project_config_path=args.project_config,
+            trusted_suppressions_dir=args.trusted_suppressions_dir,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
