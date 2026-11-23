@@ -159,13 +159,9 @@ if find "$WORKDIR" -name '.eval_v2_*' -print -quit | grep -q .; then
     exit 1
 fi
 
-# Resolve post-setup baseline commit (supports committed or uncommitted agent changes)
-BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
-if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
-fi
-if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="HEAD"
+# Resolve post-setup baseline commit recorded externally by the harness (Item 8).
+if ! BASE_REF="$(require_baseline_sha "$WORKDIR" "${TRIAL_DIR:-}")"; then
+    exit 2
 fi
 
 # 1. Verify scope against Files allowed
@@ -221,7 +217,9 @@ compile_and_run_hidden() {
         "${fixture_srcs[@]}" \
         "${copied_hidden_srcs[@]}" \
         -o "$tmp_grade_dir/hidden_test"
-    "$tmp_grade_dir/hidden_test" >/dev/null
+    local expected_hidden
+    expected_hidden="$(count_expected_checks "${copied_hidden_srcs[@]}")"
+    run_verified_test_binary "hidden_test ($task_id)" "$expected_hidden" "$tmp_grade_dir/hidden_test"
 }
 
 if [[ "$CATEGORY" == "trap" ]]; then
@@ -259,8 +257,10 @@ else
         fi
     fi
 
-    # 3. Run visible fixture test suite
-    bash "$WORKDIR/build_and_test.sh" --no-cmake >/dev/null
+    # 3. Run visible fixture test suite and verify DEVPACK_TESTS_COMPLETED proof
+    expected_visible="$(count_expected_checks "$DEVPACK_ROOT/eval/fixture/tests"/*.cpp)"
+    run_verified_test_binary "visible build_and_test ($task_id)" "$expected_visible" \
+        bash "$WORKDIR/build_and_test.sh" --no-cmake
 
     # 4. Apply hidden tests over agent's tree, build with -std=c++17 -Wall -Wextra -Werror, and run
     if [[ "$CATEGORY" != "review" ]]; then

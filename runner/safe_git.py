@@ -57,6 +57,7 @@ SAFE_GIT_ENV_OVERRIDES: dict[str, str] = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
 }
 
 DENYLIST_DESCRIPTION: tuple[str, ...] = (

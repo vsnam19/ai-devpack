@@ -92,8 +92,9 @@ from runner.agent_exec import (  # noqa: E402
     update_run_json,
 )
 from runner.brief_lint import lint_brief_text  # noqa: E402
-from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs  # noqa: E402
+from runner.devpack_logs import load_run_dir, write_rendered_outputs  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
+from runner.redaction import Redactor, collect_credential_secrets  # noqa: E402
 from runner.safe_git import (  # noqa: E402
     GitSecurityError,
     check_git_metadata_unchanged,
@@ -621,10 +622,13 @@ def _resolve_gate_command(
     return None, timeout_s
 
 
-def _render_run_dir_quietly(run_dir: Path) -> None:
+def _render_run_dir_quietly(
+    run_dir: Path,
+    credentials_path: Path | None = None,
+) -> None:
     """Generate ``transcript.md`` and ``index.html`` for ``run_dir`` without failing dispatch."""
     try:
-        redactor = Redactor()
+        redactor = Redactor(credentials_path=credentials_path)
         record = load_run_dir(run_dir, redactor)
         write_rendered_outputs(record, run_dir)
     except (OSError, ValueError):
@@ -779,6 +783,7 @@ def dispatch_job(
     brief_lint_findings: Sequence[dict[str, Any]] | None = None,
     components: str | Sequence[str] | None = None,
     all_components: bool = False,
+    task_id: str = "",
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
@@ -889,6 +894,7 @@ def dispatch_job(
             effective_runs_root=effective_runs_root,
             effective_base=effective_base,
             brief_path=brief_path,
+            task_id=(task_id or brief_path.stem),
             brief_raw=brief_raw,
             effective_brief_lint=effective_brief_lint,
             prompt_text=prompt_text,
@@ -938,6 +944,7 @@ def _dispatch_job_with_trusted_cfg(
     effective_runs_root: Path,
     effective_base: str,
     brief_path: Path,
+    task_id: str,
     brief_raw: str,
     effective_brief_lint: list[dict[str, Any]],
     prompt_text: str,
@@ -1068,7 +1075,7 @@ def _dispatch_job_with_trusted_cfg(
             "cost_usd": None if engine.is_local else 0.0,
             "error": data_reason,
         }
-        _render_run_dir_quietly(run_dir)
+        _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
         _emit_json_line(payload)
         return 1, payload
 
@@ -1094,7 +1101,7 @@ def _dispatch_job_with_trusted_cfg(
             "cost_usd": None if engine.is_local else 0.0,
             "error": iso_msg,
         }
-        _render_run_dir_quietly(run_dir)
+        _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
         _emit_json_line(payload)
         return 1, payload
 
@@ -1125,7 +1132,7 @@ def _dispatch_job_with_trusted_cfg(
             "error": qual_reason,
             "qualification": "unqualified",
         }
-        _render_run_dir_quietly(run_dir)
+        _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
         _emit_json_line(payload)
         return 1, payload
 
@@ -1160,6 +1167,7 @@ def _dispatch_job_with_trusted_cfg(
         memory_budget_tokens=memory_budget_tokens,
         memory_config=engines_cfg.memory if engines_cfg is not None else None,
         memory_task_text=brief_raw,
+        memory_task_id=task_id,
     )
     control_before = _control_snapshot(workdir)
     git_snap = snapshot_git_metadata(workdir)
@@ -1185,7 +1193,7 @@ def _dispatch_job_with_trusted_cfg(
             refusal_reason=git_tamper_reason,
             finished=datetime.now(timezone.utc).isoformat(),
         )
-        _render_run_dir_quietly(run_dir)
+        _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
         cost_val_tamper: float | None = None if engine.is_local else round(float(agent_res.cost_usd or 0.0), 6)
         payload = {
             "run_dir": str(run_dir),
@@ -1243,7 +1251,7 @@ def _dispatch_job_with_trusted_cfg(
                 "model_changed": True,
                 "served_model_id": agent_res.init_model,
             }
-            _render_run_dir_quietly(run_dir)
+            _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
             _emit_json_line(payload)
             return 1, payload
     control_after = _control_snapshot(workdir)
@@ -1365,7 +1373,7 @@ def _dispatch_job_with_trusted_cfg(
                     )
                 )
 
-            # 1. Protected test lock check
+            # 1. Protected test lock check (always --no-deviation for agent-produced commits)
             if protected_globs:
                 tl_script = pack_root / "enforcement" / "checks" / "test_lock.py"
                 tl_rc, tl_out, tl_err = _run_subprocess(
@@ -1376,6 +1384,7 @@ def _dispatch_job_with_trusted_cfg(
                         str(workdir),
                         "--base",
                         effective_base,
+                        "--no-deviation",
                         "--protected",
                         *protected_globs,
                     ],
@@ -1446,7 +1455,12 @@ def _dispatch_job_with_trusted_cfg(
             steps_dir = run_dir / "steps"
             steps_dir.mkdir(parents=True, exist_ok=True)
             gate_text = "\n\n".join(gate_logs).strip() or f"GATE_{gate_status.upper()}"
-            redacted_gate = redact_sensitive_text(gate_text)
+            cred_secrets = collect_credential_secrets(credentials_path)
+            redacted_gate = redact_sensitive_text(
+                gate_text,
+                extra_secrets=cred_secrets,
+                credentials_path=credentials_path,
+            )
             (steps_dir / "02-gate.txt").write_text(redacted_gate + "\n", encoding="utf-8")
 
     passed = agent_res.status == "ok" and gate_status == "ok" and scope_status == "ok"
@@ -1464,6 +1478,7 @@ def _dispatch_job_with_trusted_cfg(
             effective_mem_root,
             agent_res.final_text,
             source=f"run:{run_dir.name}",
+            task_id=task_id,
             stop_report_text=stop_report_text,
         )
         mem_proposal_summary = prop_res.to_dict()
@@ -1503,7 +1518,7 @@ def _dispatch_job_with_trusted_cfg(
         finished=datetime.now(timezone.utc).isoformat(),
         **run_extra,
     )
-    _render_run_dir_quietly(run_dir)
+    _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
 
     cost_val: float | None = None if engine.is_local else round(float(agent_res.cost_usd or 0.0), 6)
     payload: dict[str, Any] = {

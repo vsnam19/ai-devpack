@@ -58,8 +58,30 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 
 try:
     from runner import memory as devpack_memory  # type: ignore[import-not-found]
+    from runner.redaction import (  # type: ignore[import-not-found]
+        NO_OS_IDENTITIES as _NO_OS_IDENTITIES,
+        collect_env_auth_secrets as _collect_env_auth_secrets,
+        collect_os_identities,
+        json_string_leaves,
+        redact_os_identities,
+        redact_sensitive_text,
+        redact_stream_line,
+        redact_structure,
+        redact_value,
+    )
 except ModuleNotFoundError:  # pragma: no cover
     import memory as devpack_memory  # type: ignore[no-redef]
+    from redaction import (  # type: ignore[no-redef]
+        NO_OS_IDENTITIES as _NO_OS_IDENTITIES,
+        collect_env_auth_secrets as _collect_env_auth_secrets,
+        collect_os_identities,
+        json_string_leaves,
+        redact_os_identities,
+        redact_sensitive_text,
+        redact_stream_line,
+        redact_structure,
+        redact_value,
+    )
 
 DEFAULT_CLAUDE_VERSION = "2.1.330"
 DOCKER_IMAGE_TAG = f"devpack-eval:{DEFAULT_CLAUDE_VERSION}"
@@ -98,12 +120,6 @@ WORKDIR_SANDBOX_OPT_OUT_WARNING = (
 )
 OPERATOR_CONFIG_ENV = "DEVPACK_OPERATOR_CONFIG"
 
-# Assemble host-home regex from fragments so forbidden literal substrings never appear.
-_HOME_PREFIX = "/" + "ho" + "me/"
-_HOST_HOME_RE = re.compile(
-    r"(?:" + re.escape(_HOME_PREFIX) + r"[A-Za-z0-9_.-]+|/Users/[A-Za-z0-9_.-]+)"
-)
-
 _STEP_PREFIX_RE = re.compile(r"^\d{2,}-.+")
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _INLINE_JSON_TOOL_RE = re.compile(
@@ -111,7 +127,6 @@ _INLINE_JSON_TOOL_RE = re.compile(
     r"\s*\"(?:arguments|input|parameters|args|params)\"\s*:\s*\{.*?\}\s*\}",
     re.DOTALL,
 )
-_SECRET_ENV_SUFFIXES = ("_AUTH_TOKEN", "_API_KEY", "_SECRET", "_TOKEN", "_PASSWORD")
 _AUTH_FAILURE_PATTERNS = (
     "authentication_error",
     "authentication failed",
@@ -131,53 +146,6 @@ _AUTH_FAILURE_PATTERNS = (
 
 class HarnessError(RuntimeError):
     """Raised when the execution harness or environment configuration cannot launch the agent."""
-
-
-def _get_secret_pii_rules() -> list[tuple[str, re.Pattern[str]]]:
-    """Load built-in and optional external regex rules from secret_pii_check."""
-    begin_word = "-----BEGIN"
-    priv_key_word = "PRIVATE" + " KEY-----"
-    pwd_word = "pass" + "word"
-    passwd_word = "pass" + "wd"
-    aws_sec_word = "aws_secret" + "_access_key"
-    rules: list[tuple[str, re.Pattern[str]]] = [
-        (
-            "private-key-header",
-            re.compile(rf"{begin_word}\s+(?:[A-Z0-9 ]+\s+)?{priv_key_word}"),
-        ),
-        (
-            "aws-access-key-id",
-            re.compile(r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
-        ),
-        (
-            "aws-secret-key",
-            re.compile(rf"(?i)\b{aws_sec_word}\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{{20,}}"),
-        ),
-        (
-            "generic-password",
-            re.compile(
-                rf"(?i)\b(?:{pwd_word}|{passwd_word})\s*=\s*(?!['\"]?\s*(?:$|#))['\"]?[^\s'\";#]+"
-            ),
-        ),
-    ]
-    ext_path_str = os.environ.get("DEVPACK_SECRET_PATTERNS", "").strip()
-    if ext_path_str:
-        ext_path = Path(ext_path_str)
-        if ext_path.is_file():
-            try:
-                for idx, raw_line in enumerate(
-                    ext_path.read_text(encoding="utf-8").splitlines(), start=1
-                ):
-                    stripped = raw_line.strip()
-                    if not stripped or stripped.startswith("#"):
-                        continue
-                    try:
-                        rules.append((f"custom-pattern-{idx}", re.compile(stripped, re.IGNORECASE)))
-                    except re.error:
-                        continue
-            except OSError:
-                pass
-    return rules
 
 
 @dataclass
@@ -1115,6 +1083,7 @@ class AgentRequest:
     memory_budget_tokens: int | None = None
     memory_config: MemoryConfig | None = None
     memory_task_text: str | None = None
+    memory_task_id: str = ""
     code_map: str = ""
     operator_config_path: Path | None = None
 
@@ -1152,6 +1121,7 @@ class AgentRequest:
         memory_budget_tokens: int | None = None,
         memory_config: MemoryConfig | None = None,
         memory_task_text: str | None = None,
+        memory_task_id: str = "",
         code_map: str = "",
         operator_config_path: Path | str | None = None,
         **kwargs: Any,
@@ -1217,6 +1187,7 @@ class AgentRequest:
         )
         self.memory_config = memory_config
         self.memory_task_text = memory_task_text
+        self.memory_task_id = str(memory_task_id or "")
         self.code_map = str(code_map or "")
         self.operator_config_path = (
             Path(operator_config_path)
@@ -1750,475 +1721,8 @@ def build_docker_agent_invocation(
     return cmd, env, paths["work_dir"]
 
 
-def json_string_leaves(value: Any, min_len: int = 8) -> list[str]:
-    """Return every string value (length >= ``min_len``) found inside a JSON structure."""
-    if isinstance(value, str):
-        return [value] if len(value) >= min_len else []
-    if isinstance(value, list):
-        return [leaf for item in value for leaf in json_string_leaves(item, min_len)]
-    if isinstance(value, dict):
-        return [leaf for item in value.values() for leaf in json_string_leaves(item, min_len)]
-    return []
-
-
-def _collect_env_auth_secrets() -> list[str]:
-    """Collect non-empty secret values from auth/token/key environment variables."""
-    secrets: list[str] = []
-    for key, val in os.environ.items():
-        upper = key.upper()
-        if upper in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "DEVPACK_LOCAL_AUTH_TOKEN") or any(
-            upper.endswith(suffix) for suffix in _SECRET_ENV_SUFFIXES
-        ):
-            cleaned = val.strip()
-            if len(cleaned) >= 4:
-                secrets.append(cleaned)
-    return secrets
-
-
-_GENERIC_OS_USERS = frozenset(
-    {"root", "nobody", "daemon", "bin", "sys", "sync", "user", "admin", "runner", "test"}
-)
-_GENERIC_OS_GROUPS = frozenset(
-    {
-        "root",
-        "nobody",
-        "nogroup",
-        "daemon",
-        "bin",
-        "sys",
-        "sync",
-        "users",
-        "staff",
-        "wheel",
-        "docker",
-        "sudo",
-        "adm",
-        "mail",
-        "tty",
-        "disk",
-        "audio",
-        "video",
-        "render",
-        "kvm",
-        "input",
-        "cdrom",
-        "plugdev",
-        "dip",
-        "lpadmin",
-        "netdev",
-        "dialout",
-        "lp",
-        "scanner",
-        "utmp",
-        "shadow",
-        "crontab",
-        "ssh",
-        "systemd-journal",
-        "runner",
-    }
-)
-_GENERIC_OS_HOSTS = frozenset(
-    {
-        "localhost",
-        "localhost.localdomain",
-        "ip6-localhost",
-        "ip6-loopback",
-        "host",
-        "runner",
-        "dev",
-        "tmp",
-        "var",
-        "opt",
-        "etc",
-        "usr",
-        "lib",
-        "bin",
-        "sys",
-        "proc",
-        "run",
-        "mnt",
-        "home",
-        "root",
-    }
-)
-_LS_LONG_LINE_RE = re.compile(
-    r"(^|\n|\\n)([dlcbps-][rwxstST-]{9}[+.@]?\s+\d+\s+)(\S+)(\s+)(\S+)(\s+\d+\b)"
-)
-
-
-def collect_os_identities() -> tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]]:
-    """Collect current OS user, group, and host names for log redaction."""
-    all_users: set[str] = set()
-    if pwd is not None:
-        try:
-            pw_name = pwd.getpwuid(os.getuid()).pw_name.strip()
-            if pw_name and not pw_name.isdigit():
-                all_users.add(pw_name)
-        except (KeyError, OSError):
-            pass
-    try:
-        gu = getpass.getuser().strip()
-        if gu and not gu.isdigit():
-            all_users.add(gu)
-    except Exception:
-        pass
-    for env_key in ("USER", "LOGNAME"):
-        val = os.environ.get(env_key, "").strip()
-        if val and not val.isdigit():
-            all_users.add(val)
-
-    all_groups: set[str] = set()
-    general_groups: set[str] = set()
-    if grp is not None:
-        primary_gid: int | None = None
-        try:
-            primary_gid = os.getgid()
-            gname = grp.getgrgid(primary_gid).gr_name.strip()
-            if gname and not gname.isdigit():
-                all_groups.add(gname)
-                general_groups.add(gname)
-        except (KeyError, OSError):
-            pass
-        try:
-            for gid in os.getgroups():
-                try:
-                    gname = grp.getgrgid(gid).gr_name.strip()
-                except KeyError:
-                    continue
-                if gname and not gname.isdigit():
-                    all_groups.add(gname)
-                    if gid == primary_gid or gid >= 1000:
-                        general_groups.add(gname)
-        except OSError:
-            pass
-
-    raw_hosts: set[str] = set()
-    for getter in (socket.gethostname, platform.node):
-        try:
-            h = getter().strip()
-        except OSError:
-            h = ""
-        if h and not h.isdigit():
-            raw_hosts.add(h)
-            if "." in h:
-                short = h.split(".", 1)[0].strip()
-                if short and not short.isdigit():
-                    raw_hosts.add(short)
-
-    replacements: list[tuple[str, str]] = []
-    for u in all_users:
-        if len(u) >= 2 and u.lower() not in _GENERIC_OS_USERS:
-            replacements.append((u, "[USER]"))
-    for g in general_groups:
-        if len(g) >= 2 and g.lower() not in _GENERIC_OS_GROUPS and g not in all_users:
-            replacements.append((g, "[GROUP]"))
-    for h in raw_hosts:
-        if len(h) >= 3 and h.lower() not in _GENERIC_OS_HOSTS:
-            replacements.append((h, "[HOST]"))
-    replacements.sort(key=lambda item: len(item[0]), reverse=True)
-    return frozenset(all_users), frozenset(all_groups), tuple(replacements)
-
-
-def redact_os_identities(
-    text: str,
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
-) -> str:
-    """Replace current OS user, group, and host names in ``text`` with placeholders."""
-    if not text:
-        return text
-    all_users, all_groups, replacements = (
-        identities if identities is not None else collect_os_identities()
-    )
-
-    def _replace_ls_line(match: re.Match[str]) -> str:
-        """Replace owner and group columns in ``ls -l`` lines when matching current OS IDs."""
-        prefix_nl, perms_links, owner, ws, group, size_tail = match.groups()
-        new_owner = "[USER]" if owner in all_users else owner
-        new_group = "[GROUP]" if group in all_groups else group
-        return f"{prefix_nl}{perms_links}{new_owner}{ws}{new_group}{size_tail}"
-
-    out = _LS_LONG_LINE_RE.sub(_replace_ls_line, text)
-    for token, placeholder in replacements:
-        pattern = re.compile(
-            r"(?:(?<![A-Za-z0-9_])|(?<=\\n)|(?<=\\t)|(?<=\\r))"
-            + re.escape(token)
-            + r"(?![A-Za-z0-9_])"
-        )
-        out = pattern.sub(placeholder, out)
-    return out
-
-
-# Stream-json protocol fields whose scalar values skip OS-identity replacement inside raw
-# agent-CLI stdout lines: rewriting them (e.g. ``"type":"result"`` when the host is named
-# ``result``) breaks stream parsing. Protocol-position values still receive secret, PII,
-# and home-path redaction (see :func:`redact_sensitive_text` with no identities). Exemptions
-# apply ONLY in :func:`redact_stream_line` at exact protocol positions:
-#   event top level:              type, subtype, session_id, uuid, model, stop_reason
-#   event.message:                role, model, id, stop_reason, type
-#   event.message.content[]:      type, id, tool_use_id, and name only when type == "tool_use"
-# Everything else (including block ``input``, ``content``, and non-protocol keys) goes
-# through full redaction (secrets, paths, and OS identities) via the full text function.
-_EVENT_PROTOCOL_KEYS = frozenset({"type", "subtype", "session_id", "uuid", "model", "stop_reason"})
-_EVENT_ENVELOPE_KEYS = _EVENT_PROTOCOL_KEYS | frozenset(
-    {
-        "message",
-        "result",
-        "is_error",
-        "num_turns",
-        "turns",
-        "duration_ms",
-        "duration_s",
-        "total_cost_usd",
-        "cost_usd",
-        "cost",
-        "usage",
-        "modelUsage",
-        "permission_denials",
-        "cwd",
-        "tools",
-        "model_digest",
-        "digest",
-    }
-)
-_MESSAGE_PROTOCOL_KEYS = frozenset({"role", "model", "id", "stop_reason", "type"})
-_MESSAGE_ENVELOPE_KEYS = _MESSAGE_PROTOCOL_KEYS | frozenset({"content", "usage"})
-_CONTENT_BLOCK_PROTOCOL_KEYS = frozenset({"type", "id", "tool_use_id"})
-_CONTENT_BLOCK_ENVELOPE_KEYS = _CONTENT_BLOCK_PROTOCOL_KEYS | frozenset(
-    {"name", "input", "text", "thinking", "content", "is_error"}
-)
-# Identity set with no users, groups, or hosts: applying it skips OS-identity replacement.
-_NO_OS_IDENTITIES: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] = (
-    frozenset(),
-    frozenset(),
-    (),
-)
-
-
-def _protocol_scalar(item: Any, protocol_fn: Callable[[str], str]) -> Any:
-    """Return a protocol-position scalar with secret/PII/path redaction but no OS-identity replacement."""
-    return protocol_fn(item) if isinstance(item, str) else item
-
-
-def _redact_content_block(
-    block: Any,
-    text_fn: Callable[[str], str],
-    protocol_fn: Callable[[str], str],
-) -> Any:
-    """Redact one ``message.content[]`` block; protocol positions skip OS-identity replacement only."""
-    if not isinstance(block, dict):
-        return redact_value(block, _text_fn=text_fn)
-    is_tool_use = block.get("type") == "tool_use"
-    out: dict[str, Any] = {}
-    for key, item in block.items():
-        protocol = (
-            key in _CONTENT_BLOCK_PROTOCOL_KEYS or (key == "name" and is_tool_use)
-        ) and not isinstance(item, (dict, list))
-        out_key = key if key in _CONTENT_BLOCK_ENVELOPE_KEYS else text_fn(str(key))
-        out[out_key] = _protocol_scalar(item, protocol_fn) if protocol else redact_value(item, _text_fn=text_fn)
-    return out
-
-
-def _redact_message(
-    message: dict[str, Any],
-    text_fn: Callable[[str], str],
-    protocol_fn: Callable[[str], str],
-) -> dict[str, Any]:
-    """Redact ``event.message``; protocol fields skip OS-identity replacement, blocks are redacted."""
-    out: dict[str, Any] = {}
-    for key, item in message.items():
-        if key in _MESSAGE_PROTOCOL_KEYS and not isinstance(item, (dict, list)):
-            out[key] = _protocol_scalar(item, protocol_fn)
-        elif key == "content" and isinstance(item, list):
-            out[key] = [_redact_content_block(block, text_fn, protocol_fn) for block in item]
-        else:
-            out_key = key if key in _MESSAGE_ENVELOPE_KEYS else text_fn(str(key))
-            out[out_key] = redact_value(item, _text_fn=text_fn)
-    return out
-
-
-def _redact_stream_event(
-    event: dict[str, Any],
-    text_fn: Callable[[str], str],
-    protocol_fn: Callable[[str], str],
-) -> dict[str, Any]:
-    """Redact one stream-json event; protocol fields skip OS-identity replacement only at their positions.
-
-    ``text_fn`` applies full redaction (secrets, paths, OS identities). ``protocol_fn``
-    applies secret, PII, and path redaction without OS-identity replacement.
-    """
-    out: dict[str, Any] = {}
-    for key, item in event.items():
-        if key in _EVENT_PROTOCOL_KEYS and not isinstance(item, (dict, list)):
-            out[key] = _protocol_scalar(item, protocol_fn)
-        elif key == "message" and isinstance(item, dict):
-            out[key] = _redact_message(item, text_fn, protocol_fn)
-        else:
-            out_key = key if key in _EVENT_ENVELOPE_KEYS else text_fn(str(key))
-            out[out_key] = redact_value(item, _text_fn=text_fn)
-    return out
-
-
-def redact_sensitive_text(
-    text: str,
-    extra_secrets: Sequence[str] = (),
-    path_replacements: Sequence[tuple[str, str]] = (),
-    home_placeholder: str = "~",
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
-) -> str:
-    """Redact credentials, auth env values, secret/PII patterns, host home paths, and OS IDs."""
-    if not text:
-        return text
-    result = text
-
-    all_secrets: list[str] = list(extra_secrets) + _collect_env_auth_secrets()
-    for secret in all_secrets:
-        cleaned = secret.strip()
-        if not cleaned:
-            continue
-        result = result.replace(cleaned, "<REDACTED_CREDENTIALS>")
-        if cleaned.startswith("{") and cleaned.endswith("}"):
-            try:
-                for leaf in json_string_leaves(json.loads(cleaned)):
-                    if leaf:
-                        result = result.replace(leaf, "<REDACTED_CREDENTIALS>")
-            except json.JSONDecodeError:
-                pass
-
-    for rule_id, rx in _get_secret_pii_rules():
-        result = rx.sub(f"<REDACTED:{rule_id}>", result)
-
-    for raw_path, placeholder in path_replacements:
-        if raw_path:
-            result = result.replace(raw_path, placeholder)
-
-    env_home = os.environ.get("HOME", "").strip()
-    if env_home and env_home != "/":
-        result = result.replace(env_home, home_placeholder)
-
-    try:
-        resolved_home = str(Path.home())
-        if resolved_home and resolved_home != "/":
-            result = result.replace(resolved_home, home_placeholder)
-    except RuntimeError:
-        pass
-
-    result = _HOST_HOME_RE.sub(home_placeholder, result)
-    result = redact_os_identities(result, identities)
-    return result
-
-
-def redact_value(
-    value: Any,
-    extra_secrets: Sequence[str] = (),
-    path_replacements: Sequence[tuple[str, str]] = (),
-    home_placeholder: str = "~",
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
-    *,
-    _text_fn: Callable[[str], str] | None = None,
-) -> Any:
-    """Recursively redact sensitive strings and dict keys in a JSON-serializable structure.
-
-    Applies full text redaction (secrets, paths, and OS identities) with no stream-protocol
-    exemptions. Both dict keys and values are redacted.
-    """
-    if _text_fn is None:
-        ids = identities if identities is not None else collect_os_identities()
-
-        def _redact_leaf(text: str) -> str:
-            """Redact one scalar string or dict key using pre-collected OS identities."""
-            return redact_sensitive_text(
-                text,
-                extra_secrets=extra_secrets,
-                path_replacements=path_replacements,
-                home_placeholder=home_placeholder,
-                identities=ids,
-            )
-
-        _text_fn = _redact_leaf
-
-    if isinstance(value, str):
-        return _text_fn(value)
-    if isinstance(value, list):
-        return [redact_value(item, _text_fn=_text_fn) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_value(item, _text_fn=_text_fn) for item in value)
-    if isinstance(value, dict):
-        return {
-            (_text_fn(k) if isinstance(k, str) else k): redact_value(v, _text_fn=_text_fn)
-            for k, v in value.items()
-        }
-    return value
-
-
-def redact_structure(
-    value: Any,
-    extra_secrets: Sequence[str] = (),
-    path_replacements: Sequence[tuple[str, str]] = (),
-    home_placeholder: str = "~",
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
-) -> Any:
-    """Alias for :func:`redact_value` preserving existing callers."""
-    return redact_value(
-        value,
-        extra_secrets=extra_secrets,
-        path_replacements=path_replacements,
-        home_placeholder=home_placeholder,
-        identities=identities,
-    )
-
-
-def redact_stream_line(
-    line: str,
-    extra_secrets: Sequence[str] = (),
-    path_replacements: Sequence[tuple[str, str]] = (),
-    home_placeholder: str = "~",
-    identities: tuple[frozenset[str], frozenset[str], tuple[tuple[str, str], ...]] | None = None,
-) -> str:
-    """Redact one raw agent-CLI stdout line, exempting stream-json protocol fields only.
-
-    Intended solely for raw agent-CLI stdout in ``_read_stdout``. JSON object lines keep
-    scalar values at stream-json protocol positions skip OS-identity replacement but still get
-    secret, PII, and home-path redaction, while all other keys and values (including block
-    ``input`` and ``content``) get full redaction. Non-JSON lines receive full text redaction.
-    """
-    if not line:
-        return line
-    ids = identities if identities is not None else collect_os_identities()
-
-    def _redact_leaf(text: str) -> str:
-        """Redact secrets, paths, and OS identities in one non-protocol string."""
-        return redact_sensitive_text(
-            text,
-            extra_secrets=extra_secrets,
-            path_replacements=path_replacements,
-            home_placeholder=home_placeholder,
-            identities=ids,
-        )
-
-    def _redact_protocol(text: str) -> str:
-        """Redact secrets and paths in one protocol-position string, skipping OS-identity replacement."""
-        return redact_sensitive_text(
-            text,
-            extra_secrets=extra_secrets,
-            path_replacements=path_replacements,
-            home_placeholder=home_placeholder,
-            identities=_NO_OS_IDENTITIES,
-        )
-
-    body = line.rstrip("\r\n")
-    ending = line[len(body):]
-    stripped = body.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        try:
-            parsed = json.loads(stripped)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, dict):
-            redacted_obj = _redact_stream_event(parsed, _redact_leaf, _redact_protocol)
-            # ensure_ascii=True keeps U+2028/U+2029/U+0085 and other control characters escaped,
-            # so the redacted stream line stays one JSONL line under splitlines() readers.
-            return json.dumps(redacted_obj, ensure_ascii=True, separators=(",", ":")) + ending
-    return _redact_leaf(line)
+# Redaction helpers (json_string_leaves, collect_os_identities, redact_os_identities,
+# redact_sensitive_text, redact_value, redact_structure, redact_stream_line) live in runner/redaction.py.
 
 
 def cleanup_cfg_dir(cfg_dir: Path) -> None:
@@ -2704,6 +2208,7 @@ def run_agent(request: AgentRequest) -> AgentResult:
     if (
         effective_mem_enabled
         and mem_root.is_dir()
+        and devpack_memory.INJECTED_MEMORY_HEADING not in effective_prompt
         and "## Relevant project memory" not in effective_prompt
     ):
         q_res = devpack_memory.retrieve_memory(
@@ -2715,6 +2220,7 @@ def run_agent(request: AgentRequest) -> AgentResult:
             budget_tokens=effective_budget_tokens,
             reviewer_sees_handoffs=bool(mem_cfg.reviewer_sees_handoffs),
             role_scopes=mem_cfg.role_scopes,
+            task_id=request.memory_task_id or None,
         )
         if q_res.formatted_prompt:
             effective_prompt = (
@@ -2766,6 +2272,7 @@ def run_agent(request: AgentRequest) -> AgentResult:
             path_replacements=request.path_replacements,
             home_placeholder=request.home_placeholder,
             identities=os_identities,
+            credentials_path=cred_path,
         )
 
     prompt_path.write_text(_redact(effective_prompt), encoding="utf-8")
@@ -2794,6 +2301,7 @@ def run_agent(request: AgentRequest) -> AgentResult:
             path_replacements=request.path_replacements,
             home_placeholder=request.home_placeholder,
             identities=os_identities,
+            credentials_path=cred_path,
         )
         meta_payload = redact_value(
             res.to_dict(),
@@ -2801,6 +2309,7 @@ def run_agent(request: AgentRequest) -> AgentResult:
             path_replacements=request.path_replacements,
             home_placeholder=request.home_placeholder,
             identities=os_identities,
+            credentials_path=cred_path,
         )
         meta_path.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
         return res
@@ -2947,6 +2456,7 @@ def run_agent(request: AgentRequest) -> AgentResult:
                             path_replacements=request.path_replacements,
                             home_placeholder=request.home_placeholder,
                             identities=os_identities,
+                            credentials_path=cred_path,
                         )
                         stdout_lines.append(redacted_line)
                         jsonl_fh.write(redacted_line)

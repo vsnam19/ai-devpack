@@ -131,7 +131,7 @@ class MemoryEvalTests(unittest.TestCase):
                 "prompt = sys.argv[-1]\n"
                 "if 'Step 1' in prompt:\n"
                 "    out = ('Step 1 done.\\n\\n## Memory proposals\\n'\n"
-                "           '- type: handoff\\n  id: mem-step1-key\\n  scope: project\\n'\n"
+                "           '- type: handoff\\n  id: mem-step1-key\\n  scope: task:01-recall-seq\\n'\n"
                 "           '  tags: REQ-MEM-1, val.txt\\n'\n"
                 "           '  summary: Write MAGIC_99 in Step 2.\\n')\n"
                 "else:\n"

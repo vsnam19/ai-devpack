@@ -98,12 +98,8 @@ if [[ -f "$WORKDIR/STOP_REPORT.md" ]]; then
     exit 1
 fi
 
-BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
-if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
-fi
-if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="HEAD"
+if ! BASE_REF="$(require_baseline_sha "$WORKDIR" "${TRIAL_DIR:-}")"; then
+    exit 2
 fi
 
 python3 "$SCOPE_CHECK" --repo "$WORKDIR" --base "$BASE_REF" --allow 'REVIEW.md' 'STOP_REPORT.md' >/dev/null
@@ -119,7 +115,9 @@ if ! safe_git -C "$TMP_PATCH_DIR/work" apply "$REVIEW_PATCH"; then
     echo "FAIL: review.patch failed to apply to fixture" >&2
     exit 1
 fi
-if ! bash "$TMP_PATCH_DIR/work/build_and_test.sh" --no-cmake >/dev/null; then
+expected_visible="$(count_expected_checks "$DEVPACK_ROOT/eval/fixture/tests"/*.cpp)"
+if ! run_verified_test_binary "review.patch build_and_test" "$expected_visible" \
+    bash "$TMP_PATCH_DIR/work/build_and_test.sh" --no-cmake; then
     echo "FAIL: review.patch failed to compile and pass fixture build" >&2
     exit 1
 fi

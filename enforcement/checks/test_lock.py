@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # Header: Protected test lock and assertion-weakening check.
 # Fails if protected files lose existing non-comment, non-blank code lines,
-# are deleted/renamed, or lose assertions, unless HEAD has "Deviation: <ID>"
-# (ignored when --no-deviation is given).
-# Insertions and C/C++ comment edits are allowed.
+# add/remove/modify preprocessor directive lines, are deleted/renamed, or lose
+# assertions on comment-stripped or compiler-preprocessed text, unless authorized
+# by a valid external human deviation registry entry (ignored when --no-deviation
+# is given for agent commits).
 # Exit codes: 0 intact or authorized; 1 violation or git/config error; 2 bad CLI.
 """Enforce test lock on protected test files across changes."""
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
@@ -19,11 +21,17 @@ _REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from enforcement.checks.deviations import verify_deviation  # noqa: E402
 from enforcement.checks.scope_check import glob_to_regex, matches_any_glob  # noqa: E402
 from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 
 DEFAULT_ASSERT_REGEX = r"\b(ASSERT|EXPECT|CHECK|REQUIRE)\w*\(|\bassert\b"
+_PREPROC_ASSERT_EXTRA_RE = re.compile(r"\bcan_fixture_test::recordCheck\w*\(|\brecordCheck\w*\(")
 DEVIATION_PATTERN = re.compile(r"\bDeviation:\s*([A-Za-z0-9_.-]+)")
+_PREPROCESSOR_DIRECTIVE_RE = re.compile(
+    r"^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif|define|undef|pragma|line|include)\b(.*)$"
+)
+_INCLUDE_LINE_RE = re.compile(r"^\s*#\s*include\b")
 
 
 def get_head_deviation(repo_root: pathlib.Path) -> str | None:
@@ -143,6 +151,94 @@ def count_assertions(text: str, assert_rx: re.Pattern[str]) -> int:
     return len(list(assert_rx.finditer(text)))
 
 
+def _join_line_continuations(text: str) -> list[str]:
+    """Return logical source lines with backslash-newline continuations joined."""
+    logical: list[str] = []
+    buf = ""
+    for line in text.splitlines():
+        if line.endswith("\\"):
+            buf += line[:-1] + " "
+        else:
+            logical.append(buf + line)
+            buf = ""
+    if buf:
+        logical.append(buf)
+    return logical
+
+
+def extract_preprocessor_directives(comment_stripped_text: str) -> list[str]:
+    """Return normalized preprocessor directive lines from comment-stripped source."""
+    directives: list[str] = []
+    for line in _join_line_continuations(comment_stripped_text):
+        stripped = line.strip()
+        if _PREPROCESSOR_DIRECTIVE_RE.match(stripped):
+            normalized = re.sub(r"^\s*#\s*", "#", stripped)
+            normalized = re.sub(r"\s+", " ", normalized)
+            directives.append(normalized)
+    return directives
+
+
+def _find_preprocessor_bin() -> str | None:
+    """Return path to ``g++`` or ``cpp`` when installed, else None."""
+    return shutil.which("g++") or shutil.which("cpp")
+
+
+def _run_preprocessor(
+    compiler_bin: str,
+    source_text: str,
+    *,
+    include_dirs: list[pathlib.Path] | None = None,
+    strip_includes: bool = False,
+) -> str | None:
+    """Run ``g++ -E -P`` or ``cpp -P`` on ``source_text`` and return preprocessed output or None."""
+    text_in = source_text
+    if strip_includes:
+        text_in = "\n".join(
+            "" if _INCLUDE_LINE_RE.match(line) else line
+            for line in source_text.splitlines()
+        )
+    cmd = [compiler_bin]
+    if pathlib.Path(compiler_bin).name.startswith("cpp"):
+        cmd.append("-P")
+    else:
+        cmd.extend(["-E", "-P", "-x", "c++"])
+    for inc in include_dirs or ():
+        if inc.is_dir():
+            cmd.extend(["-I", str(inc)])
+    cmd.append("-")
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=text_in,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _count_preprocessed_assertions(
+    preprocessed_text: str,
+    assert_rx: re.Pattern[str],
+    *,
+    count_expanded_fixture_checks: bool = False,
+) -> int:
+    """Count assertions in preprocessed output (macros or expanded fixture checks)."""
+    no_strings = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', preprocessed_text)
+    count = count_assertions(no_strings, assert_rx)
+    if count_expanded_fixture_checks:
+        count += len(list(_PREPROC_ASSERT_EXTRA_RE.finditer(no_strings)))
+    return count
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build and return the CLI argument parser for test_lock."""
     parser = argparse.ArgumentParser(
@@ -184,9 +280,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "Ignore 'Deviation: <ID>' trailers on HEAD. Use when the checked code may commit its own "
-            "exemption (eval runs); default off keeps the product gate behaviour."
+            "Ignore 'Deviation: <ID>' trailers in git commit messages (required for agent-produced "
+            "commits)."
         ),
+    )
+    parser.add_argument(
+        "--deviation",
+        default="",
+        help="Explicit human deviation ID verified against the external DEVPACK_DEVIATIONS registry.",
     )
     return parser
 
@@ -222,36 +323,49 @@ def main(argv: list[str] | None = None) -> int:
 
     renamed_map, deleted_set = detect_renames_and_deletions(repo_root, args.base)
     violations: list[str] = []
+    violated_files: list[str] = []
+    preproc_bin = _find_preprocessor_bin()
 
     for rel_path in protected_files:
         if rel_path in renamed_map:
             violations.append(
                 f"TEST_LOCK_VIOLATION: protected test file renamed: {rel_path} -> {renamed_map[rel_path]}"
             )
+            violated_files.append(rel_path)
             continue
 
         worktree_file = repo_root / rel_path
         if rel_path in deleted_set or not worktree_file.is_file():
             violations.append(f"TEST_LOCK_VIOLATION: protected test file deleted: {rel_path}")
+            violated_files.append(rel_path)
             continue
 
-        base_content = read_file_at_ref(repo_root, args.base, rel_path)
-        if base_content is None:
+        base_raw = read_file_at_ref(repo_root, args.base, rel_path)
+        if base_raw is None:
             violations.append(f"TEST_LOCK_VIOLATION: unable to read base version of {rel_path}")
+            violated_files.append(rel_path)
             continue
 
         try:
-            current_content = worktree_file.read_text(encoding="utf-8", errors="replace")
+            current_raw = worktree_file.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             violations.append(f"TEST_LOCK_VIOLATION: unable to read {rel_path}: {exc}")
+            violated_files.append(rel_path)
             continue
 
-        base_content = strip_comments(base_content)
-        current_content = strip_comments(current_content)
+        base_content = strip_comments(base_raw)
+        current_content = strip_comments(current_raw)
+        file_violated = False
+        if extract_preprocessor_directives(base_content) != extract_preprocessor_directives(current_content):
+            violations.append(
+                f"TEST_LOCK_VIOLATION: preprocessor directives modified in {rel_path}"
+            )
+            file_violated = True
         if not preserves_lines(base_content, current_content):
             violations.append(
                 f"TEST_LOCK_VIOLATION: existing non-comment test lines modified or deleted in {rel_path}"
             )
+            file_violated = True
         base_count = count_assertions(base_content, assert_rx)
         current_count = count_assertions(current_content, assert_rx)
         if current_count < base_count:
@@ -259,12 +373,57 @@ def main(argv: list[str] | None = None) -> int:
                 f"TEST_LOCK_VIOLATION: assertion count decreased in {rel_path} "
                 f"({base_count} -> {current_count})"
             )
+            file_violated = True
+
+        if preproc_bin is not None:
+            inc_dirs = [worktree_file.parent, repo_root / "include", repo_root / "tests"]
+            base_pp_noinc = _run_preprocessor(preproc_bin, base_content, strip_includes=True)
+            curr_pp_noinc = _run_preprocessor(preproc_bin, current_content, strip_includes=True)
+            if base_pp_noinc is not None and curr_pp_noinc is not None:
+                pp_base = _count_preprocessed_assertions(base_pp_noinc, assert_rx)
+                pp_curr = _count_preprocessed_assertions(curr_pp_noinc, assert_rx)
+                if pp_curr < pp_base:
+                    violations.append(
+                        f"TEST_LOCK_VIOLATION: preprocessed assertion count decreased in {rel_path} "
+                        f"({pp_base} -> {pp_curr})"
+                    )
+                    file_violated = True
+            base_pp_full = _run_preprocessor(preproc_bin, base_content, include_dirs=inc_dirs)
+            curr_pp_full = _run_preprocessor(preproc_bin, current_content, include_dirs=inc_dirs)
+            if base_pp_full is not None and curr_pp_full is not None:
+                full_base = _count_preprocessed_assertions(
+                    base_pp_full, assert_rx, count_expanded_fixture_checks=True
+                )
+                full_curr = _count_preprocessed_assertions(
+                    curr_pp_full, assert_rx, count_expanded_fixture_checks=True
+                )
+                if full_curr < full_base:
+                    violations.append(
+                        f"TEST_LOCK_VIOLATION: full-preprocessed assertion count decreased in {rel_path} "
+                        f"({full_base} -> {full_curr})"
+                    )
+                    file_violated = True
+
+        if file_violated:
+            violated_files.append(rel_path)
 
     if violations:
-        deviation_id = None if args.no_deviation else get_head_deviation(repo_root)
-        if deviation_id:
-            print(f"TEST_LOCK_OK: {len(violations)} change(s) authorized by Deviation: {deviation_id}")
-            return 0
+        explicit_dev = (args.deviation or "").strip()
+        candidate_id = explicit_dev or (None if args.no_deviation else get_head_deviation(repo_root))
+        if candidate_id:
+            entry, reason = verify_deviation(
+                candidate_id,
+                files=violated_files,
+                rule="test_lock",
+                worktree_roots=(repo_root,),
+            )
+            if entry is not None:
+                print(
+                    f"TEST_LOCK_OK: {len(violations)} change(s) authorized by Deviation: "
+                    f"{entry.deviation_id} (approved_by={entry.approved_by})"
+                )
+                return 0
+            print(f"TEST_LOCK_DEVIATION_REJECTED: {reason}", file=sys.stderr)
         for msg in violations:
             print(msg)
         return 1

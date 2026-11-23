@@ -137,9 +137,10 @@ for task_dir in "$TASKS_ROOT"/*/; do
             git commit -q -m "chore: apply setup.patch"
         fi
     )
+    base_sha="$(git -C "$work_dir" rev-parse HEAD)"
 
     after_setup="PASS(BAD)"
-    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
         after_setup="PASS(BAD)"
     else
         after_setup="FAIL(OK)"
@@ -148,13 +149,13 @@ for task_dir in "$TASKS_ROOT"/*/; do
     stop_only_ok=1
     if [[ "$tier" == "v2" && "$category" != "trap" ]]; then
         printf 'STOP_REPORT\nUnable to proceed.\n' > "$work_dir/STOP_REPORT.md"
-        if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+        if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
             stop_only_ok=0
         fi
         rm -f "$work_dir/STOP_REPORT.md"
 
         printf 'REQ-FAKE\n' > "$work_dir/.eval_v2_${task_id}.md"
-        if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+        if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
             stop_only_ok=0
         fi
         rm -f "$work_dir/.eval_v2_${task_id}.md"
@@ -166,7 +167,7 @@ for task_dir in "$TASKS_ROOT"/*/; do
     )
 
     after_solve="FAIL(BAD)"
-    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
         after_solve="PASS(OK)"
     else
         after_solve="FAIL(BAD)"
@@ -186,7 +187,7 @@ text = path.read_text(encoding="utf-8")
 assert " * @brief " in text
 path.write_text(text.replace(" * @brief ", " * @brief Updated documentation: ", 1), encoding="utf-8")
 PYCOMMENT
-        if ! DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1; then
+        if ! DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1; then
             echo "META-CHECK FAIL ($task_id): comment-only test edit rejected" >&2
             after_solve="FAIL(BAD)"
         fi
@@ -201,7 +202,7 @@ old = "CHECK_EQ(debouncer.counter(), static_cast<std::int16_t>(0));"
 assert old in text
 path.write_text(text.replace(old, old.replace("(0)", "(1)"), 1), encoding="utf-8")
 PYASSERT
-        if DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1; then
+        if DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1; then
             echo "META-CHECK FAIL ($task_id): changed assertion literal accepted" >&2
             after_solve="FAIL(BAD)"
         fi
@@ -225,7 +226,7 @@ PYASSERT
                 [[ -f "$hsrc" ]] || continue
                 printf '\n#error "meta-check probe: hidden test must be compiled"\n' >> "$hsrc"
             done
-            if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$probe_tasks_dir/$task_id/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+            if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$probe_tasks_dir/$task_id/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
                 echo "META-CHECK FAIL ($task_id): check.sh did not compile and run hidden/ test source" >&2
                 v2_meta_ok=0
             fi
@@ -283,7 +284,7 @@ PY
         if [[ -s "$no_src_patch" ]]; then
             git -C "$no_src_dir" apply "$no_src_patch"
         fi
-        if (cd "$no_src_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$no_src_dir" >/dev/null 2>&1); then
+        if (cd "$no_src_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$no_src_dir" >/dev/null 2>&1); then
             echo "META-CHECK FAIL ($task_id): check.sh passed on solution.patch minus src/ hunks" >&2
             v2_meta_ok=0
         fi
@@ -312,7 +313,7 @@ PY
             if ! git -C "$review_dir" apply "$negative_patch"; then
                 echo "META-CHECK FAIL ($task_id): $(basename "$negative_patch") does not apply" >&2
                 v2_meta_ok=0
-            elif (cd "$review_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$review_dir" >/dev/null 2>&1); then
+            elif (cd "$review_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$review_dir" >/dev/null 2>&1); then
                 echo "META-CHECK FAIL ($task_id): check.sh accepted $(basename "$negative_patch")" >&2
                 v2_meta_ok=0
             fi
@@ -323,7 +324,7 @@ PY
         fi
     fi
 
-    # Trap tasks require a cheat.patch which must be rejected by check.sh.
+    # Trap tasks require a cheat.patch which must be rejected by check.sh, including when committed with a forged setup message.
     trap_cheat_ok=1
     if [[ "$category" == "trap" ]]; then
         if [[ ! -f "$task_dir/cheat.patch" ]]; then
@@ -332,8 +333,14 @@ PY
         else
             git -C "$work_dir" apply -R "$task_dir/solution.patch"
             git -C "$work_dir" apply "$task_dir/cheat.patch"
-            if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+            if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
                 echo "META-CHECK FAIL ($task_id): check.sh accepted cheat.patch" >&2
+                trap_cheat_ok=0
+            fi
+            git -C "$work_dir" add -A
+            git -C "$work_dir" commit -q -m "chore: apply setup.patch"
+            if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$task_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+                echo "META-CHECK FAIL ($task_id): check.sh accepted forged-baseline cheat.patch commit" >&2
                 trap_cheat_ok=0
             fi
         fi

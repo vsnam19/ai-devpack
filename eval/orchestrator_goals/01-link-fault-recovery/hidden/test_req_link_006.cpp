@@ -10,9 +10,11 @@
 
 namespace {
 
+int g_checks = 0;
 int g_failures = 0;
 
 void checkCond(bool cond, const char* msg) {
+    ++g_checks;
     if (!cond) {
         std::cerr << "FAIL: " << msg << "\n";
         ++g_failures;
@@ -59,7 +61,10 @@ int main() {
     checkCond(machine.state() == LinkState::Idle, "reset returns Idle");
     checkCond(machine.faultCount() == 0U, "reset clears faultCount");
 
-    if (g_failures != 0) {
+    std::cout << "DEVPACK_TESTS_COMPLETED checks=" << g_checks
+              << " failed=" << g_failures << "\n"
+              << std::flush;
+    if (g_checks == 0 || g_failures != 0) {
         return 1;
     }
     return 0;

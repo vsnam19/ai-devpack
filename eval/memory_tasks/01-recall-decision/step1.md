@@ -8,7 +8,7 @@ in `include/dtc_debouncer.hpp` and `src/dtc_debouncer.cpp` for `REQ-DTC-005`:
 return `0xA5U` when `isConfirmed()` is true, and `0x00U` otherwise.
 
 In your final response, include a `## Memory proposals` block with a `handoff`
-entry scoped to `module:src/dtc_debouncer.cpp` and tagged
+entry scoped to `task:01-recall-decision` and tagged
 `REQ-DTC-005, dtc_debouncer, freezeSentinelCode, isFreezeSentinelMatch`
 recording that the active freeze sentinel code is `0xA5U`.
 

@@ -59,6 +59,7 @@ _REPO_ROOT_STR = str(pathlib.Path(__file__).resolve().parents[2])
 if _REPO_ROOT_STR not in sys.path:
     sys.path.insert(0, _REPO_ROOT_STR)
 
+from enforcement.checks.deviations import verify_deviation  # noqa: E402
 from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 
 from runner.workspace_scope import WorkspaceScope, resolve_workspace_scope  # noqa: E402
@@ -256,6 +257,7 @@ class LintConfig:
     require_param_direction: bool = True
     naming: NamingConfig = field(default_factory=NamingConfig)
     plugin_paths: tuple[str, ...] = ()
+    deviation_id: str = ""
 
 
 @dataclass
@@ -2555,6 +2557,61 @@ def _run_structural_lexical_checks(
                                 )
 
 
+_PROCESS_TERMINATION_CALL_RE = re.compile(
+    r"(?<![.\w>])(?:std::)?(?:_Exit|quick_exit|exit|abort|atexit|at_quick_exit"
+    r"|system|popen|fork|exec(?:l|le|lp|v|ve|vp|vpe))\s*\("
+)
+_PROCESS_TERMINATION_IDENT_RE = re.compile(
+    r"(?<![.\w>])(?:std::)?(?:_Exit|quick_exit|atexit|at_quick_exit)\b|\bstd::terminate\b"
+)
+_ATTR_CTOR_DTOR_RE = re.compile(r"__attribute__\s*\(\s*\(\s*(?:constructor|destructor)\b")
+_LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"')
+
+
+def _is_test_code_path(path: pathlib.Path, repository_root: pathlib.Path | None) -> bool:
+    """Return True when ``path`` sits in a unit/hidden test directory rather than worker code."""
+    try:
+        rel = path.resolve().relative_to(repository_root.resolve()) if repository_root else path
+        parts = rel.parts[:-1]
+    except ValueError:
+        parts = path.parts[:-1]
+    return any(p in ("tests", "test", "hidden", "hidden_tests") for p in parts)
+
+
+def _line_has_process_termination(line_text: str) -> bool:
+    """Return True if a comment/string-stripped line invokes process-termination/exec/ctor primitives."""
+    return bool(
+        _PROCESS_TERMINATION_CALL_RE.search(line_text)
+        or _PROCESS_TERMINATION_IDENT_RE.search(line_text)
+        or _ATTR_CTOR_DTOR_RE.search(line_text)
+    )
+
+
+def _has_process_termination_deviation(
+    path: pathlib.Path,
+    repository_root: pathlib.Path | None,
+    deviation_id: str,
+) -> bool:
+    """Return True only if ``deviation_id`` validates in DEVPACK_DEVIATIONS for this file."""
+    clean_id = (deviation_id or "").strip()
+    if not clean_id:
+        return False
+    rel_file = str(path.name)
+    if repository_root is not None:
+        try:
+            rel_file = path.resolve().relative_to(repository_root.resolve()).as_posix()
+        except ValueError:
+            rel_file = path.as_posix()
+    roots = (repository_root,) if repository_root is not None else ()
+    entry, _reason = verify_deviation(
+        clean_id,
+        files=(rel_file,),
+        rule="PROCESS-TERMINATION",
+        worktree_roots=roots,
+    )
+    return entry is not None
+
+
 def check_c_or_cpp_file(
     path: pathlib.Path,
     compile_commands: pathlib.Path | None,
@@ -2686,6 +2743,21 @@ def check_c_or_cpp_file(
                 "error",
                 "Process-terminating / shell functions (abort/exit/system) forbidden",
             )
+        if not _is_test_code_path(path, repository_root) and _line_has_process_termination(line_text):
+            if not _has_process_termination_deviation(path, repository_root, cfg.deviation_id):
+                finding = Finding(
+                    str(path),
+                    idx,
+                    "PROCESS-TERMINATION",
+                    "error",
+                    "Process-terminating, exec/spawn, or constructor/destructor attribute forbidden in worker code",
+                )
+                report.findings.append(finding)
+                if contexts is not None:
+                    contexts[id(finding)] = FingerprintContext(
+                        tokens=_extract_statement_tokens(raw_text, idx),
+                        extra_roots=extra_roots,
+                    )
         if re.search(r"(?<![.\w>:])\b(strcpy|strcat|sprintf|vsprintf|gets)\s*\(", line_text):
             rule = "MISRA-C-21.17" if is_c else "MISRA-STR-BOUND"
             _add_lexical_finding(
@@ -2699,6 +2771,37 @@ def check_c_or_cpp_file(
             line_text,
         ):
             _add_lexical_finding(idx, "MISRA-C-20.4", "error", "Macro shall not redefine a C/C++ keyword")
+
+    # Scan non-standard locally #included fragments (e.g. .inc/.inl) within repo for PROCESS-TERMINATION
+    if not _is_test_code_path(path, repository_root):
+        for idx, raw_line in enumerate(raw_text.splitlines(), start=1):
+            inc_match = _LOCAL_INCLUDE_RE.match(raw_line)
+            if not inc_match:
+                continue
+            inc_rel = inc_match.group(1)
+            for base_dir in (path.parent, *( [repository_root / "src", repository_root / "include"] if repository_root else [] )):
+                cand = (base_dir / inc_rel).resolve()
+                if cand.is_file() and cand.suffix not in (C_EXTS | CPP_EXTS):
+                    if repository_root is not None:
+                        try:
+                            cand.relative_to(repository_root.resolve())
+                        except ValueError:
+                            continue
+                    inc_stripped = strip_comments_and_strings(cand.read_text(encoding="utf-8", errors="replace"))
+                    for inc_ln, inc_text in enumerate(inc_stripped.splitlines(), start=1):
+                        if _line_has_process_termination(inc_text) and not _has_process_termination_deviation(
+                            cand, repository_root, cfg.deviation_id
+                        ):
+                            finding = Finding(
+                                str(cand),
+                                inc_ln,
+                                "PROCESS-TERMINATION",
+                                "error",
+                                f"Process-terminating or constructor/destructor attribute forbidden in included fragment (from {path.name}:{idx})",
+                            )
+                            report.findings.append(finding)
+                            break
+                    break
 
     # 3. Compiler syntax & warning check + 4. Clang AST JSON check
     if tool_env is not None:
@@ -4141,6 +4244,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to project.toml (default: <repo-root>/.devpack/project.toml)",
     )
+    parser.add_argument(
+        "--deviation",
+        default="",
+        help="Human deviation ID verified against DEVPACK_DEVIATIONS (e.g. for PROCESS-TERMINATION)",
+    )
     return parser
 
 
@@ -4203,6 +4311,7 @@ def _resolve_config_from_args(
         if val is not None:
             setattr(config.naming, naming_attr, val)
     config.naming.validate()
+    config.deviation_id = str(getattr(args, "deviation", "") or "").strip()
     return config
 
 

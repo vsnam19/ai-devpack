@@ -150,3 +150,31 @@ discipline and needs a mechanism later. Mechanism paths are relative to the pack
 - **Rule:** Mount `.git` (and any worktree `gitdir`) read-only for every role in Docker isolation; run all host-side git invocations through `runner/safe_git.py` (or `eval/lib/safe_git.sh`) with hardened `-c` overrides, isolated env, `--no-ext-diff`/`--no-textconv`, a `.git/config` denylist check, and pre/post-agent `.git/config` + hooks snapshots (`git_metadata_tampered` scope violation); and honour `allow_unsandboxed_local` only from explicit CLI/API flags or operator-owned `DEVPACK_OPERATOR_CONFIG` outside the workdir, ignoring workdir `project.toml` opt-outs with a warning in `run.json`.
 - **Enforced by:** `runner/agent_exec.py`, `runner/safe_git.py`, `runner/devpack_dispatch.py`, `runner/devpack_run.py`, `runner/devpack_broker.py`, `enforcement/checks/scope_check.py`, `enforcement/checks/test_lock.py`, `enforcement/checks/secret_pii_check.py`, `enforcement/static/cppcheck_check.py`, `enforcement/evidence/collect.py`, `enforcement/gate/gate.py`, `eval/run_eval.py`, `eval/lib/safe_git.sh`
 - **Status:** enforced
+
+## LSN-022 Require positive test-run completion proof and forbid process termination in worker code
+- **ID:** LSN-022
+- **Incident:** A worker could plant a static global initializer calling `std::_Exit(EXIT_SUCCESS)` or `std::system(...)` in C++ source code, causing test binaries to exit 0 before executing any assertions while task graders reported `PASS`.
+- **Rule:** Every test binary must print `DEVPACK_TESTS_COMPLETED checks=<n> failed=<m>` from `main` after all checks complete, and every build/grader harness must require `failed=0` and `checks >= expected` alongside exit 0; worker code in `src/`/`include/` (and local included fragments) must pass `PROCESS-TERMINATION` error checks (`_Exit`, `quick_exit`, `exit(`, `abort(`, `atexit`, `at_quick_exit`, `std::terminate`, `__attribute__((constructor|destructor))`, `system(`, `popen(`, `exec*`, `fork(`) unless authorized by a human registry deviation.
+- **Enforced by:** `eval/fixture/tests/test_framework.hpp`, `eval/fixture/build_and_test.sh`, `eval/lib/safe_git.sh`, `eval/tasks/*/check.sh`, `eval/tasks/v2_check.sh`, `eval/memory_tasks/*/check.sh`, `eval/orchestrator_goals/01-link-fault-recovery/check.sh`, `enforcement/lint/preflight_lint.py`
+- **Status:** enforced
+
+## LSN-023 Test lock must verify preprocessor directives and compiler-preprocessed assertion counts
+- **ID:** LSN-023
+- **Incident:** Source-line-only comparison allowed wrapping protected assertions in `#if 0 ... #endif` or neutralizing assertion macros (`#undef CHECK_EQ` / `#define CHECK_EQ(a,b) static_cast<void>(0)`) while keeping every original line and token unchanged.
+- **Rule:** Protected test files must fail on any added, removed, or modified preprocessor directive line, and assertion counts must be compared on both comment-stripped source and compiler-preprocessed output (`g++ -E -P` / `cpp`) when available.
+- **Enforced by:** `enforcement/checks/test_lock.py`
+- **Status:** enforced
+
+## LSN-024 Agent-authored exemptions, baselines, and memory proposals are untrusted
+- **ID:** LSN-024
+- **Incident:** Agents could self-authorize protected-test edits via `Deviation:` commit trailers, forge baseline commits with `chore: apply setup.patch`, or plant policy-overriding rules via auto-accepted `handoff` memory proposals into downstream agents.
+- **Rule:** Runners must always pass `--no-deviation` for agent commits and run `scope_check` and `test_lock` after every implementer/fixer step; fix rounds are hard-capped at 2 unless authorized by an external human deviation registry (`DEVPACK_DEVIATIONS`); eval harnesses must record and pass `DEVPACK_BASELINE_SHA` / `baseline.sha` externally (never grepping commit messages); and worker memory proposals remain `pending` unless `handoff`/`known-gap` for same-task `task:<id>` without policy-changing language, with injected notes quarantined under an explicit untrusted heading.
+- **Enforced by:** `enforcement/checks/deviations.py`, `enforcement/checks/test_lock.py`, `runner/devpack_dispatch.py`, `runner/devpack_run.py`, `runner/memory.py`, `eval/run_eval.py`, `eval/tasks/verify_tasks.sh`
+- **Status:** enforced
+
+## LSN-025 Centralize redaction in a single module applied at record time and across all log surfaces
+- **ID:** LSN-025
+- **Incident:** Separate redaction implementations in `agent_exec.py`, `devpack_logs.py`, `memory.py`, and ad-hoc `_redact` closures in `eval/run_eval.py` drifted so prefixed API tokens, Bearer tokens, and credential assignments leaked into raw `steps/*.jsonl` and gate logs.
+- **Rule:** Route all log, stream-json, gate output, metadata, evaluation, and memory secret checks through `runner/redaction.py` so every consumer enforces the same union of secret, credential-file, token, home-path, and OS-identity rules at record time.
+- **Enforced by:** `runner/redaction.py`, `runner/agent_exec.py`, `runner/devpack_logs.py`, `runner/memory.py`, `runner/devpack_dispatch.py`, `runner/devpack_run.py`, `eval/run_eval.py`
+- **Status:** enforced
