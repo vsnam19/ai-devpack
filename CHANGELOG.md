@@ -5,6 +5,13 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Adoption
+- Protect nested and component-specific tests; expose runner protection flags and scope/test-lock plans.
+- Require explicit empty-diff and unowned-file exceptions; diagnose missing or shallow CI baselines.
+- Load component-specific coding conventions and remove brief creation-symbol false positives.
+- Skip deprecated skills during installation and share expanded credential rules with the pre-commit scanner.
+- Correct installed-project quickstart paths, generated-file ignore guidance, layout, and release notes.
+
 ### Security
 - **Docker `.git` mount sources no longer chosen by repository content (`runner/agent_exec.py`, `runner/tests/test_docker_git_mounts.py`)**:
   A `.git` symlink is refused, a real `.git` directory is mounted read-only, and a worktree `.git`
@@ -18,6 +25,10 @@ All notable changes to ai-devpack are recorded here. Versioning follows
   Replaced `assert()` with grader-owned `GRADER_CHECK` and rejected `NDEBUG`, diagnostic pragmas, and grader macro tampering in `automotive-cpp` graders; added `modernize-use-auto` (`const auto` cast initialization) and `clang-tidy` enforcement notes to `automotive-cpp/SKILL.md`. Tightened `requirements-analysis/tests/grade_findings.py` with verbatim section quote checks, checklist vocabulary validation, number-word detection, clean-requirement coverage (`>= 2` clean IDs per case), and open-question/ID-link enforcement on derived test ideas. Hardened `08-doxygen-naming-codec` and `09-doxygen-naming-link` nearest-block Doxygen/parameter checks, `18-review-fault-recovery` range/evidence/extra-blocker checks, `10-trap-contradictory-test` `file:line` and unmodified-`src/` checks, `04-add-test-codec-bounds` baseline-relative assertion count and null-pointer guard mutants, and `01-recall-decision` Step 2 baseline reset so Step 2 requires recalled memory.
 - **Metric accounting (`eval/run_eval.py`, `skilltest/skilltest.py`)**:
   Reported `pass^k` only when `valid_runs == k` (else `n/a (n<k)`), replaced `pass_pow_k` with unbiased `pass^k_unbiased` and `pass@k_unbiased` estimators, renamed single-mode lint count to `lint_findings_final` while recording per-gate lint counts in runner mode, counted `rounds_to_clean` failures/timeouts as `max + 1` with fail share, excluded no-C/C++-change trials from lint rates (reported separately), and counted timeouts as not clean. In `skilltest/skilltest.py`, excluded errored trials from rates while reporting error counts, required `k >= 3` per arm with Newcombe-Wilson 95% delta CI (`benefit` / `inconclusive` / `ceiling`), installed all non-deprecated sibling skills in trigger trials, and switched `Skill` trigger detection to exact name equality.
+
+## [0.2.1] - 2026-11-23
+
+### Fixed
 - Fail closed on unexpectedly empty scans and explicit out-of-scope files; discover
   nested components recursively and merge explicit metadata with discovery.
 - Warn about unscanned components and record coverage in run and gate receipts.
@@ -27,8 +38,6 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 - Document external broker and CI-only vendored installations, project gates,
   coding-rule adaptation, and full CI coverage with supported command flags.
 - Isolate pack skill self-tests from host-project scope and validate documented flags.
-
-## [0.2.1] - 2026-11-23
 
 ### Security
 - **Test-run completion proof & `PROCESS-TERMINATION` lint (`eval/fixture/tests/test_framework.hpp`, `eval/fixture/build_and_test.sh`, `eval/lib/safe_git.sh`, `eval/tasks/**/check.sh`, `eval/memory_tasks/*/check.sh`, `eval/orchestrator_goals/01-link-fault-recovery/`, `enforcement/lint/preflight_lint.py`)**:

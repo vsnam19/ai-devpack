@@ -21,7 +21,7 @@ internally.
 | `knowledge/` | `lessons.md` (versioned lesson IDs), `context_template/AGENTS.md`, `skills/` (`automotive-cpp`, `review-taxonomy`, `skill-authoring`, `requirements-analysis`; deprecated: `misra-cpp-2023`, `doxygen-naming`), `engine_profiles/` |
 | `workflow/templates/` | brief (implement, fix, review), task plan and ADR templates |
 | `workflow/ci/` | `pipeline.md` and examples (`examples/gitlab-ci.yml`, `examples/Jenkinsfile`) |
-| `runner/` | `agent_exec.py` (single executor + v2 engine loader), `workspace_scope.py` (Yocto component scope), `brief_lint.py` (pre-dispatch brief linter), `devpack_run.py`, `devpack_dispatch.py`, `devpack_broker.py`, `devpack_logs.py`, `memory.py`, `devpack_memory.py`, `engines.example.toml`, `quality_checklist.md` |
+| `runner/` | `agent_exec.py` (single executor + v2 engine loader), `workspace_scope.py` (Yocto component scope), `brief_lint.py` (pre-dispatch brief linter), `repomap.py` (code index), `devpack_submit.py` (submission checks), `redaction.py` (shared secret rules), `safe_git.py` (hardened git access), `devpack_run.py`, `devpack_dispatch.py`, `devpack_broker.py`, `devpack_logs.py`, `memory.py`, `devpack_memory.py`, `engines.example.toml`, `quality_checklist.md` |
 | `orchestrator/` | drop-in Sonnet orchestrator config (`orchestrator/CLAUDE.md`, `orchestrator/README.md`, `orchestrator/briefs/`) |
 | `skilltest/` | `skilltest.py` (`lint`, `run`, `report`) for deterministic skill linting and A/B experiments |
 | `learning/` | `harvest.py`, `propose.py`, `validate.py` for mining run logs and validating bounded engine profiles |
@@ -145,6 +145,8 @@ qualified engine fails re-qualification.
    and the repository data class. These config paths resolve relative to the project
    config file; pack-relative defaults resolve against the installed pack. Do not
    edit the pack's engine example or reuse its self-test `gate.example.toml` for a product.
+   Add `/gate_receipt.json` and `/runs/` (or your configured runs directory) to the
+   product repository's `.gitignore` before running the gate.
 4. Configure `[workspace]` and component build/test commands as described in
    `policy/workspace_scope.md`. Discovery is recursive (default depth 4) and merges
    explicit component metadata. Set `[scan] default = "all"` for team adoption;
@@ -161,9 +163,15 @@ qualified engine fails re-qualification.
    variables and complete qualification in `policy/local_models.md`.
 7. Wire CI using `workflow/ci/pipeline.md` and its examples. The project gate template
    lints and analyzes changed C/C++ files, then runs active components' build/test
-   commands. Set its base ref to the CI merge base. Missing commands and unexpectedly
+   commands. Set `DEVPACK_BASE` to the trusted CI merge-base commit (for example,
+   `export DEVPACK_BASE=$(git merge-base HEAD origin/main)` after fetching the target).
+   CI rejects an unset base or a base resolving to HEAD. For a shallow clone, fetch
+   sufficient history with `git fetch --depth=100 origin main` and increase depth
+   until the merge base resolves. Missing commands and unexpectedly
    empty scans fail closed. Only legitimately empty changed-file sets may use
-   `--allow-empty`; they print `SKIP: no C/C++ changes`.
+   `--allow-empty`; they print `SKIP: no C/C++ changes`. Changed workspace C/C++ files
+   outside every component fail with a path list: increase `discovery_depth`, declare
+   the components, or explicitly use `--allow-unowned` to acknowledge the omission.
 
 ### Adapting the coding rules
 
@@ -184,33 +192,63 @@ names, Doxygen checks, and compiler/static-analysis checks. Adjust `[naming]` re
 requirements; exceptions need the project's documented deviation policy. See
 `enforcement/lint/README.md` for all options and portable baseline workflows.
 
+For mixed conventions, retain camelCase defaults for one component and select the
+snake_case configuration for another in `.devpack/project.toml`:
+
+```toml
+[[component]]
+name = "libcore"
+path = "libcore"
+# camelCase: addValues(), default rules
+
+[[component]]
+name = "sensor_hub"
+path = "apps/sensor_hub"
+preflight_config = "config/sensor_preflight.toml"
+# snake_case: add_values(); copy the snake_case example to this config path
+```
+
+`preflight_config` paths resolve relative to the product repository root. Without
+that setting, a component's own `preflight.toml` is used when present; otherwise the
+repository-root config or strict defaults apply. An explicit lint `--config` overrides
+component selection; CLI rule overrides apply to every component.
+
+Protected tests always include `tests/**`, `**/tests/**`, `**/test/**`, `**/*_test.cpp`,
+and `**/test_*.cpp`. Add repository-relative patterns with top-level
+`protected_test_globs = ["checks/**"]` in project TOML (before any table), or
+component-relative `test_globs = ["specs/**"]` inside `[[component]]`. Both runners'
+`--protected` flags add patterns; defaults remain protected.
+
 ## Quickstart
 
+Run these from the installed product repository root after the install steps above.
+Set `DEVPACK_ROOT` to your trusted pack location (`/opt/devpack` for topology A,
+`$PWD/devpack` for topology B's CI checks).
+
 ```bash
-# install the pre-commit hook into a git repository (default: current directory)
-bash enforcement/hooks/install.sh --repo /path/to/project
+export DEVPACK_ROOT=/opt/devpack
 
-# run all pack unit tests (fails if a test directory runs 0 tests)
-bash tests/run_all.sh
+# Install the hook into this project.
+bash "$DEVPACK_ROOT/enforcement/hooks/install.sh" --repo "$PWD"
 
-# run the offline pack gate (expect GATE_OK); the receipt is a JSON file
-python3 enforcement/gate/gate.py --config enforcement/gate/gate.example.toml --receipt /tmp/devpack_receipt.json
+# Verify the installed pack itself offline.
+(cd "$DEVPACK_ROOT" && bash tests/run_all.sh)
+(cd "$DEVPACK_ROOT" && python3 enforcement/gate/gate.py \
+  --config enforcement/gate/gate.example.toml --receipt /tmp/devpack_receipt.json)
 
-# run one task through the local runner (implement -> scope/test_lock -> gate -> review -> fix, max 2 rounds)
-python3 runner/devpack_run.py --config runner/engines.example.toml --task-id task-001 \
-  --title "Short title" --goal "One-paragraph goal" --allowed-files "src/*.cpp" --gate-config .devpack/gate.toml --dry-run
+# Plan a task; engines and gate paths come from this project's .devpack/project.toml.
+python3 "$DEVPACK_ROOT/runner/devpack_run.py" --task-id task-001 \
+  --title "Short title" --goal "One-paragraph goal" --allowed-files "src/*.cpp" --dry-run
 
-# governed paths enforced automatically after every implementer/fixer step in both
-# devpack_run.py and devpack_dispatch.py:
-#   - Allowed edits: --allow / --allowed-files (checked via enforcement/checks/scope_check.py)
-#   - Protected tests: tests/** (checked via enforcement/checks/test_lock.py --no-deviation)
-#   - Gate-protected config/control files: .devpack/**, enforcement/**, preflight.toml, .clang-tidy, gate*.toml
+# Both runners check allowed scope, protected nested tests (--no-deviation),
+# and gate-protected control files after each implementer/fixer step.
+# --protected adds project-specific test patterns.
 
-# evaluation dry-runs (no model calls)
-python3 eval/run_eval.py --dry-run --mode single --tier all --engines sonnet,haiku --k 1
-python3 eval/run_eval.py --dry-run --mode runner --pairs haiku:sonnet --tier all --k 1
-python3 eval/run_eval.py --dry-run --mode orchestrator --orchestrator sonnet --workers haiku --k 1
-python3 eval/run_eval.py --dry-run --mode memory --engines haiku --k 1
+# Evaluation plans use the pack's fixtures (no model calls).
+(cd "$DEVPACK_ROOT" && python3 eval/run_eval.py --dry-run --mode single --tier all --engines sonnet,haiku --k 1)
+(cd "$DEVPACK_ROOT" && python3 eval/run_eval.py --dry-run --mode runner --pairs haiku:sonnet --tier all --k 1)
+(cd "$DEVPACK_ROOT" && python3 eval/run_eval.py --dry-run --mode orchestrator --orchestrator sonnet --workers haiku --k 1)
+(cd "$DEVPACK_ROOT" && python3 eval/run_eval.py --dry-run --mode memory --engines haiku --k 1)
 ```
 
 Write a brief from `workflow/templates/brief_implement.md` (the tech lead approves it), run

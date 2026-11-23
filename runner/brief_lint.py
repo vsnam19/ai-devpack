@@ -612,7 +612,7 @@ def lint_brief_text(
         return line_count_cache[path]
 
     # 4 & 5. BRIEF-PATH-MISSING and BRIEF-LINE-OUT-OF-RANGE
-    seen_missing_paths: set[tuple[int, str]] = set()
+    seen_missing_paths: dict[str, dict[str, Any]] = {}
     seen_oob: set[tuple[int, str, int]] = set()
     last_existing_file: Path | None = None
     expected_paths = _collect_expected_output_paths(sections, repo, top_dirs)
@@ -666,16 +666,17 @@ def lint_brief_text(
                 # output does not. Mentions elsewhere (Expected output, Files allowed, Gate, ...)
                 # are warnings, because they may describe files the work is meant to create.
                 blocking = sec_canon in ("Goal", "Input") and rel_path not in expected_paths
-                if (lineno, rel_path) not in seen_missing_paths:
-                    seen_missing_paths.add((lineno, rel_path))
-                    findings.append(
-                        {
-                            "rule": "BRIEF-PATH-MISSING",
-                            "severity": err_sev if blocking else "warning",
-                            "line": lineno,
-                            "message": f"Referenced path '{rel_path}' does not exist in repository.",
-                        }
-                    )
+                if rel_path not in seen_missing_paths:
+                    finding = {
+                        "rule": "BRIEF-PATH-MISSING",
+                        "severity": err_sev if blocking else "warning",
+                        "line": lineno,
+                        "message": f"Referenced path '{rel_path}' does not exist in repository.",
+                    }
+                    seen_missing_paths[rel_path] = finding
+                    findings.append(finding)
+                elif blocking and seen_missing_paths[rel_path]["severity"] != err_sev:
+                    seen_missing_paths[rel_path].update(severity=err_sev, line=lineno)
 
             # "around line N" / "line N" references
             target_for_around = line_files[0] if len(line_files) == 1 else last_existing_file
@@ -706,10 +707,10 @@ def lint_brief_text(
     )
     created_symbols: set[str] = set()
     for sec in sections:
-        if _effective_canonical_section(sec) == "Expected output":
-            for _, line in sec["body_lines"]:
-                if re.search(r"\b(create|add|new)\b", line, re.IGNORECASE):
-                    created_symbols.update(re.findall(r"\b[A-Za-z_]\w*\b", line))
+        for _, line in sec["body_lines"]:
+            if (_effective_canonical_section(sec) == "Goal" or
+                    re.search(r"\b(create|add|new|implement|declare|define|introduce)\b", line, re.IGNORECASE)):
+                created_symbols.update(re.findall(r"\b[A-Za-z_]\w*\b", line))
     seen_missing_syms: set[tuple[int, str]] = set()
     for sec in sections:
         in_fence = False

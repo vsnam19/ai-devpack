@@ -2764,6 +2764,9 @@ def install_project_skills(workdir: Path) -> list[str]:
     for skill in sorted(source.iterdir()):
         if not (skill / "SKILL.md").is_file():
             continue
+        if re.search(r"(?im)^\s*(?:[>#*]+\s*)?deprecated\s*:",
+                     (skill / "SKILL.md").read_text(encoding="utf-8")):
+            continue
         destination = skills_root / skill.name
         if destination.exists() or destination.is_symlink():
             if destination.is_symlink() or not destination.is_dir():

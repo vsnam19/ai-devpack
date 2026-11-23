@@ -309,6 +309,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run workspace-aware checks across all components (sets DEVPACK_COMPONENTS=all).",
     )
+    parser.add_argument("--allow-unowned", action="store_true", help="Allow changed workspace files outside all components in project checks.")
     parser.add_argument("--allow-empty", action="store_true", help="Allow an explicitly empty C/C++ change set.")
     parser.add_argument(
         "--project-config",
@@ -489,6 +490,13 @@ def main(argv: list[str] | None = None) -> int:
         }:
             check_env = dict(os.environ) if child_env is None else dict(child_env)
             check_env["DEVPACK_PROJECT_CONFIG"] = "none"
+        if any(pathlib.Path(str(arg)).name == "project_checks.py" for arg in check["cmd"]):
+            check = dict(check)
+            check["cmd"] = list(check["cmd"])
+            if args.allow_empty:
+                check["cmd"].append("--allow-empty")
+            if args.allow_unowned:
+                check["cmd"].append("--allow-unowned")
         result = run_single_check(check, repo_root, env=check_env)
         results.append(result)
         if result.get("output_tail"):

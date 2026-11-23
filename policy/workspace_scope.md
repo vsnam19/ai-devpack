@@ -8,7 +8,9 @@ much larger repository containing upstream layers (`poky/`), third-party BSP lay
 `runner/workspace_scope.py` bounds every `ai-devpack` check, symbol index, brief
 validation, and worker edit to the configured `[workspace]` root and the active set of
 components. When `[workspace]` is omitted from `.devpack/project.toml`, the entire
-repository is treated as a single implicit component (legacy behaviour).
+repository is treated as a single implicit component by standalone tools (legacy
+behaviour). The installed project gate template requires an explicit `[workspace]`
+and active components; legacy mode does not apply to `project_checks.py`.
 
 ## Yocto layout and `.devpack/project.toml`
 
