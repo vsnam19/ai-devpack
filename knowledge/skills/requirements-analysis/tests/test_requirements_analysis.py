@@ -112,7 +112,7 @@ class RequirementsAnalysisSkillTests(unittest.TestCase):
             shutil.copytree(TESTS_DIR / "expected" / "protocol-timing", candidate)
             findings = candidate / "review" / "findings.md"
             original = findings.read_text(encoding="utf-8")
-            blocked_line = "- `REQ-COM-002`: blocked — waiting on `REQ-COM-002` stakeholder answers."
+            blocked_line = "- REQ-COM-002: BLOCKED (open question) — see findings row REQ-COM-002"
             self.assertIn(blocked_line, original)
 
             # Uses only numbers that appear in the source, so only the open-question rule can fire.
@@ -127,6 +127,87 @@ class RequirementsAnalysisSkillTests(unittest.TestCase):
                 failures,
             )
             self.assertFalse(any("invented numeric value" in item for item in failures), failures)
+
+    def _copy_expected(self, temp: str, case_name: str) -> Path:
+        """Copy one expected candidate into a temporary directory and return its path."""
+        candidate = Path(temp) / "cand"
+        shutil.copytree(TESTS_DIR / "expected" / case_name, candidate)
+        return candidate
+
+    def test_star_bullet_with_invented_number_fails(self) -> None:
+        """A `*` bullet in the test ideas section is graded and its invented number fails."""
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = self._copy_expected(temp, "protocol-timing")
+            findings = candidate / "review" / "findings.md"
+            original = findings.read_text(encoding="utf-8")
+            findings.write_text(
+                original + "* `REQ-COM-001`: verify the handshake completes within 25 ms.\n",
+                encoding="utf-8",
+            )
+            failures = grade_findings.grade_candidate("protocol-timing", candidate)
+            self.assertTrue(
+                any("Test idea" in item and item.endswith("not in source: 25") for item in failures),
+                failures,
+            )
+
+    def test_numbered_list_items_are_parsed_as_ideas(self) -> None:
+        """Numbered items (`1.`, `2)`), bullets and plain lines are each parsed, marker removed."""
+        markdown = "## Derived test ideas\n\n1. first idea\n2) second idea\n- third idea\nfourth idea\n"
+        ideas = grade_findings.parse_test_ideas(markdown)
+        self.assertEqual([idea.text for idea in ideas], ["first idea", "second idea", "third idea", "fourth idea"])
+        self.assertFalse(any(idea.blocked for idea in ideas))
+
+    def test_numbered_item_with_invented_number_fails(self) -> None:
+        """A numbered item is graded: its invented number fails, while its `1.` marker is ignored."""
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = self._copy_expected(temp, "protocol-timing")
+            findings = candidate / "review" / "findings.md"
+            original = findings.read_text(encoding="utf-8")
+            findings.write_text(
+                original + "1. `REQ-COM-001`: verify the handshake completes within 25 ms.\n",
+                encoding="utf-8",
+            )
+            failures = grade_findings.grade_candidate("protocol-timing", candidate)
+            invented = [item for item in failures if "invented numeric value" in item]
+            self.assertEqual(len(invented), 1, failures)
+            self.assertTrue(invented[0].endswith("not in source: 25"), invented)
+
+    def test_blocked_with_extra_text_fails(self) -> None:
+        """A blocked line with prose and a number is not the exact blocked form and fails."""
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = self._copy_expected(temp, "protocol-timing")
+            findings = candidate / "review" / "findings.md"
+            original = findings.read_text(encoding="utf-8")
+            blocked_line = "- REQ-COM-002: BLOCKED (open question) — see findings row REQ-COM-002"
+            self.assertIn(blocked_line, original)
+            findings.write_text(
+                original.replace(
+                    blocked_line,
+                    "- REQ-COM-002: blocked — waiting on answers; meanwhile verify the handshake within 10 ms.",
+                ),
+                encoding="utf-8",
+            )
+            failures = grade_findings.grade_candidate("protocol-timing", candidate)
+            self.assertTrue(
+                any("REQ-COM-002" in item and "open question" in item for item in failures),
+                failures,
+            )
+
+    def test_exact_blocked_format_passes(self) -> None:
+        """The exact blocked form, with or without the finding-row reference, passes the grader."""
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = self._copy_expected(temp, "protocol-timing")
+            findings = candidate / "review" / "findings.md"
+            original = findings.read_text(encoding="utf-8")
+            self.assertEqual(grade_findings.grade_candidate("protocol-timing", candidate), [])
+
+            bare = original.replace(
+                "- REQ-COM-002: BLOCKED (open question) — see findings row REQ-COM-002",
+                "- REQ-COM-002: BLOCKED (open question)",
+            )
+            self.assertNotEqual(bare, original)
+            findings.write_text(bare, encoding="utf-8")
+            self.assertEqual(grade_findings.grade_candidate("protocol-timing", candidate), [])
 
     def test_grader_rejects_low_recall(self) -> None:
         """Grader fails when too few seeded defect IDs appear in the findings table."""

@@ -48,7 +48,9 @@ Use when reviewing system or software requirements (for example CAN, protocol, o
    - `## Open questions` (numbered list for stakeholder sign-off).
    - `## Derived test ideas` (next step).
 
-5. **List derived test ideas** (equivalence classes, boundary values, state transitions, timing, error injection) **only for requirements with no open questions**. For any requirement with open findings or missing values, record `blocked — waiting on <ID> question` instead of inventing test values.
+5. **List derived test ideas** (equivalence classes, boundary values, state transitions, timing, error injection) **only for requirements with no open questions**. Every non-empty line under `## Derived test ideas` is checked as an idea, whatever its list marker. For any requirement with open findings or missing values, write exactly one line in this form instead of inventing test values:
+   `- <ID>: BLOCKED (open question) — see findings row <ID>`
+   The blocked line must contain no other text or digits. Any other line that names a requirement with an open question fails the check.
 
 ## Stop rules
 
@@ -69,7 +71,7 @@ Findings row:
 ```
 
 Derived test ideas entry:
-`- REQ-EX-01: blocked — waiting on REQ-EX-01 stakeholder answers (missing timeout and fault state).`
+`- REQ-EX-01: BLOCKED (open question) — see findings row REQ-EX-01`
 
 ## References
 

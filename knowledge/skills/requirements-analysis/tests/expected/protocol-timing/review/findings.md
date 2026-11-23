@@ -27,6 +27,6 @@ Requirements inventoried: `REQ-COM-001`, `REQ-COM-002`, `REQ-COM-003`, `REQ-COM-
 - `REQ-COM-001` (ready):
   - Equivalence/transition: call `startConnect(nowMs)` in `LinkState::Idle` with `isConfigValid() == true`; verify `state() == LinkState::Connecting`, `retryCount() == 0`, `lastTimestampMs() == nowMs`, and completion within `1` cycle (`<= 10` ms).
   - Boundary/invalid: call `startConnect(nowMs)` with `isConfigValid() == false` or from non-`Idle` states (flag expected rejection behaviour with stakeholder if unspecified).
-- `REQ-COM-002`: blocked — waiting on `REQ-COM-002` stakeholder answers.
-- `REQ-COM-003`: blocked — waiting on `REQ-COM-003` stakeholder answers.
-- `REQ-COM-004`: blocked — waiting on `REQ-COM-004` stakeholder answers.
+- REQ-COM-002: BLOCKED (open question) — see findings row REQ-COM-002
+- REQ-COM-003: BLOCKED (open question) — see findings row REQ-COM-003
+- REQ-COM-004: BLOCKED (open question) — see findings row REQ-COM-004

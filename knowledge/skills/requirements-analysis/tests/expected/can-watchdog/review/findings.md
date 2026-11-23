@@ -26,6 +26,6 @@ Requirements inventoried: `REQ-CAN-020`, `REQ-CAN-021`, `REQ-CAN-022`, `TMP-1` (
 
 - `REQ-CAN-020` (ready):
   - Boundary/error injection: call `packRaw()` with `frameBytes == nullptr` (length `8`) and with non-null buffer at boundary lengths `frameLength = 0` and `frameLength = 7`; verify return value `false` and unchanged buffer bytes.
-- `REQ-CAN-021`: blocked — waiting on `REQ-CAN-021` stakeholder answers.
-- `REQ-CAN-022`: blocked — waiting on `REQ-CAN-022` stakeholder answers.
-- `TMP-1`: blocked — waiting on `TMP-1` stakeholder answers.
+- REQ-CAN-021: BLOCKED (open question) — see findings row REQ-CAN-021
+- REQ-CAN-022: BLOCKED (open question) — see findings row REQ-CAN-022
+- TMP-1: BLOCKED (open question) — see findings row TMP-1

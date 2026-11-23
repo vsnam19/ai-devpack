@@ -26,6 +26,6 @@ Requirements inventoried: `REQ-DTC-010`, `REQ-DTC-011`, `REQ-DTC-012`, `REQ-DTC-
 
 - `REQ-DTC-010` (ready):
   - State transition: call `reset()` from `DtcState::Pending`, `DtcState::Confirmed`, and `DtcState::Healing`; assert `state() == DtcState::Inactive`, `counter() == 0`, `healingCounter() == 0`, and `isConfirmed() == false`.
-- `REQ-DTC-011`: blocked — waiting on `REQ-DTC-011` / `REQ-DTC-012` conflict resolution.
-- `REQ-DTC-012`: blocked — waiting on `REQ-DTC-011` / `REQ-DTC-012` conflict resolution.
-- `REQ-DTC-013`: blocked — waiting on `REQ-DTC-013` stakeholder answers.
+- REQ-DTC-011: BLOCKED (open question) — see findings row REQ-DTC-011
+- REQ-DTC-012: BLOCKED (open question) — see findings row REQ-DTC-012
+- REQ-DTC-013: BLOCKED (open question) — see findings row REQ-DTC-013

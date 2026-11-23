@@ -61,12 +61,16 @@ HEX_NUMBER_PATTERN = re.compile(r"\b0x[0-9a-fA-F]+\b")
 DEC_NUMBER_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\b")
 SEPARATOR_CELL_PATTERN = re.compile(r"^:?-{2,}:?$")
 TEST_IDEAS_HEADING = "## Derived test ideas"
-BLOCKED_PATTERN = re.compile(r"\bblocked\b\s*(?:—|--?)\s*waiting on\b", re.IGNORECASE)
+LIST_MARKER_PATTERN = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+BLOCKED_ENTRY_PATTERN = re.compile(
+    r"(?P<id>(?:REQ|SYS|SWR|TC|TMP)(?:-[A-Z0-9]+)+): BLOCKED \(open question\)"
+    r"(?: — see findings row (?P=id))?"
+)
 
 
 @dataclass(frozen=True)
 class TestIdea:
-    """One top-level bullet of the derived test ideas section with its nested lines."""
+    """One non-empty line of the derived test ideas section, with its list marker removed."""
 
     text: str
     blocked: bool
@@ -145,10 +149,12 @@ def parse_findings_table(markdown_text: str) -> list[dict[str, str]]:
 
 
 def parse_test_ideas(markdown_text: str) -> list[TestIdea]:
-    """Extract the bullets of the `## Derived test ideas` section, each with its nested lines.
+    """Return one TestIdea per non-empty, non-heading line of the `## Derived test ideas` section.
 
-    A top-level bullet whose only line states `blocked — waiting on ...` is marked blocked;
-    every other bullet is a test idea that must obey the number and open-question rules.
+    The list marker (`-`, `*`, `+`, `1.`, `1)`) is removed before the content is checked, so
+    numbers in the marker never count as values. A line is blocked only when its content matches
+    exactly `<ID>: BLOCKED (open question)`, optionally followed by ` — see findings row <ID>`.
+    Every other line is a test idea that must obey the number and open-question rules.
     """
     lines = markdown_text.splitlines()
     start = None
@@ -158,21 +164,23 @@ def parse_test_ideas(markdown_text: str) -> list[TestIdea]:
             break
     if start is None:
         raise ValueError(f"Missing '{TEST_IDEAS_HEADING}' section")
-    entries: list[list[str]] = []
+    ideas: list[TestIdea] = []
     for line in lines[start:]:
         if line.startswith("## "):
             break
-        if line.startswith("- "):
-            entries.append([line])
-        elif line.strip() and entries:
-            entries[-1].append(line)
-    return [
-        TestIdea(
-            text="\n".join(entry),
-            blocked=len(entry) == 1 and bool(BLOCKED_PATTERN.search(entry[0])),
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        content = LIST_MARKER_PATTERN.sub("", line, count=1).strip()
+        if not content:
+            continue
+        ideas.append(
+            TestIdea(
+                text=content,
+                blocked=BLOCKED_ENTRY_PATTERN.fullmatch(content) is not None,
+            )
         )
-        for entry in entries
-    ]
+    return ideas
 
 
 def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
@@ -250,7 +258,8 @@ def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
             continue
         for ref in sorted(set(ID_TOKEN_PATTERN.findall(idea.text)) & open_ids):
             failures.append(
-                f"Test idea {idea_index} references {ref}, which has an open question; use a blocked entry instead"
+                f"Test idea {idea_index} references {ref}, which has an open question; "
+                f"use the exact blocked entry '{ref}: BLOCKED (open question)' instead"
             )
 
     lowered = findings_text.lower()
