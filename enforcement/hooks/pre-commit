@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Header: Git pre-commit hook invoking secret_pii_check.py on staged changes.
+# Header: Git pre-commit hook invoking the high-confidence secret scanner on staged changes.
 #
 # Usage:
-#   enforcement/hooks/pre-commit [--help] [extra secret_pii_check args...]
+#   enforcement/hooks/pre-commit [--help] [extra precommit_scan args...]
 #
 # Exit codes:
 #   0 - Staged files passed secret and PII checks.
@@ -12,10 +12,10 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: pre-commit [--help] [--patterns FILE]
+Usage: pre-commit [--help] [--patterns FILE] [--vendor-dir NAME]
 
 Git pre-commit hook that scans staged changes for secrets and PII using
-enforcement/checks/secret_pii_check.py --staged.
+runner/precommit_scan.py --staged (high-confidence rules; vendored pack excluded).
 
 Exit codes:
   0  No secrets or PII detected in staged files.
@@ -41,12 +41,15 @@ else
   REPO_ROOT="$(pwd)"
 fi
 
-if [ -f "${REPO_ROOT}/enforcement/checks/secret_pii_check.py" ]; then
-  CHECK_SCRIPT="${REPO_ROOT}/enforcement/checks/secret_pii_check.py"
-elif [ -f "${SCRIPT_DIR}/../checks/secret_pii_check.py" ]; then
-  CHECK_SCRIPT="${SCRIPT_DIR}/../checks/secret_pii_check.py"
+# The source scan uses the high-confidence rule set (runner/precommit_scan.py), which
+# excludes the vendored pack directory (DEVPACK_VENDOR_DIR, default devpack). Log
+# redaction keeps the broader rules and is not used here.
+if [ -f "${REPO_ROOT}/runner/precommit_scan.py" ]; then
+  CHECK_SCRIPT="${REPO_ROOT}/runner/precommit_scan.py"
+elif [ -f "${SCRIPT_DIR}/../../runner/precommit_scan.py" ]; then
+  CHECK_SCRIPT="${SCRIPT_DIR}/../../runner/precommit_scan.py"
 else
-  echo "PRE_COMMIT_ERROR: secret_pii_check.py not found" >&2
+  echo "PRE_COMMIT_ERROR: precommit_scan.py not found" >&2
   exit 1
 fi
 

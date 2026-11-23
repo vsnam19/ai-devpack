@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import getpass
 import json
 import os
@@ -76,6 +78,32 @@ _JSON_CRED_RE = re.compile(
     rf"{_NOT_ALREADY_REDACTED}([^'\"\s]{{6,}})(['\"])"
 )
 _PII_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+
+# Pre-commit (source scanning) rule: a credential-looking name assigned a quoted,
+# high-entropy literal. Requires quotes, >= 20 value characters, and both a letter and
+# a digit. Identifiers and numeric right-hand sides (``token = secretIndex + 1U;``,
+# ``secret = computeSeed(level);``, ``int passwd = 3;``) do not match.
+_CREDENTIAL_NAMES = (
+    r"(?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|client[_-]?secret"
+    r"|secret[_-]?key|private[_-]?key|bearer[_-]?token|secret|token|passw(?:or)?d)"
+)
+_HIGH_ENTROPY_ASSIGN_RE = re.compile(
+    # Quoted literal in source or config: name = "value" or "name": "value" (>= 20 characters).
+    rf"\b(?:[a-z0-9]+[_-])*{_CREDENTIAL_NAMES}"
+    # The name may be quoted (JSON/YAML keys: "client_secret": "value").
+    r"['\"]?\s*[:=]\s*(?P<q>['\"])(?=[^'\"]*[A-Za-z])(?=[^'\"]*[0-9])[A-Za-z0-9._~+/=-]{20,}(?P=q)"
+    r"|"
+    # Whole-line config assignment: name=value or name: value with no operators or ';'.
+    # Excludes source expressions such as ``token = secretIndex + 1U;``.
+    rf"^\s*(?:[a-z0-9]+[_.-])*{_CREDENTIAL_NAMES}"
+    r"\s*[:=]\s*(?=[^\s'\";]*[A-Za-z])(?=[^\s'\";]*[0-9])[A-Za-z0-9._~+/=-]{8,}\s*$",
+    re.IGNORECASE,
+)
+
+# base64 runs long enough to hold an encoded ``sk-ant-`` key; decoded at 4 alignments.
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+_BASE64_WRAPPED_MARKER = b"sk-ant-"
+_BASE64_WRAPPED_RULE = "base64-wrapped-api-token"
 
 _DEFAULT_AUTH_ENV_NAMES = (
     "ANTHROPIC_API_KEY",
@@ -267,6 +295,62 @@ def get_builtin_secret_rules() -> list[tuple[str, re.Pattern[str]]]:
     return rules
 
 
+def get_precommit_secret_rules() -> list[tuple[str, re.Pattern[str]]]:
+    """Return the high-confidence rule set used to scan source before commit.
+
+    Only key formats with a distinctive prefix or shape, PEM private key blocks, and
+    high-entropy quoted literals assigned to credential-like names are included. Bare
+    identifiers on the right-hand side of ``token``/``secret``/``passwd`` assignments
+    are not. Log redaction keeps the broader :func:`get_builtin_secret_rules` set.
+    """
+    begin_word = "-----BEGIN"
+    priv_key_word = "PRIVATE" + " KEY-----"
+    return [
+        (
+            "private-key-header",
+            re.compile(rf"{begin_word}\s+(?:[A-Z0-9 ]+\s+)?{priv_key_word}"),
+        ),
+        ("aws-access-key-id", re.compile(r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b")),
+        ("prefixed-api-token", _PREFIXED_TOKEN_RE),
+        ("google-api-key", re.compile(r"\bAIza[A-Za-z0-9_-]{35}\b")),
+        ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")),
+        ("high-entropy-assignment", _HIGH_ENTROPY_ASSIGN_RE),
+    ]
+
+
+def _decode_base64_candidate(run: str) -> bytes | None:
+    """Decode ``run`` as base64 after trimming padding, or return None if it is not decodable."""
+    body = run.rstrip("=")
+    if len(body) % 4 == 1:
+        return None
+    padded = body + "=" * (-len(body) % 4)
+    try:
+        return base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def find_base64_wrapped_api_keys(text: str) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` spans of base64 runs whose decoding contains an ``sk-ant-`` marker.
+
+    A run is tried at every alignment (offsets 0-3) because the encoded key can start
+    mid-run. Matched values are never returned, only their positions.
+    """
+    spans: list[tuple[int, int]] = []
+    if not text:
+        return spans
+    for match in _BASE64_RUN_RE.finditer(text):
+        run = match.group(0)
+        for offset in range(4):
+            if len(run) - offset < 8:
+                break
+            decoded = _decode_base64_candidate(run[offset:])
+            if decoded and _BASE64_WRAPPED_MARKER in decoded:
+                spans.append((match.start(), match.end()))
+                break
+    return spans
+
+
 def get_secret_pii_rules(
     *,
     patterns_file: Path | str | None = None,
@@ -337,6 +421,8 @@ def find_secret_pii_violations(
             if rx.search(line):
                 _add(rule_id)
                 break
+    if find_base64_wrapped_api_keys(text):
+        _add(_BASE64_WRAPPED_RULE)
     return violations
 
 
@@ -494,6 +580,9 @@ def _apply_redaction(
             result = rx.sub(lambda m, p=ph: f"{m.group(1)}{m.group(2)}{p}{m.group(4)}", result)
         else:
             result = rx.sub(ph, result)
+
+    for start, end in reversed(find_base64_wrapped_api_keys(result)):
+        result = result[:start] + rule_placeholder_fn(_BASE64_WRAPPED_RULE) + result[end:]
 
     for raw_path, placeholder in path_replacements:
         if raw_path:

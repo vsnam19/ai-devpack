@@ -30,7 +30,7 @@ python3 <pack>/enforcement/static/cppcheck_check.py --repo-root . <changed files
 ```
 
 - Exit `0`: clean. Exit `1`: blocking findings (severities in `fail_on`, default `error` and `warning`). Fix every blocking finding, then rerun. `style`, `performance`, and `portability` findings are reported but do not block; fix them when the change touches that code.
-- Exit `2`: usage or configuration error. Correct the invocation; do not edit `preflight.toml` or other gate configuration to pass.
+- Exit `2`: usage/configuration error OR timeout/internal error (including launch failure, missing XML, or invalid XML). Stop and report a `TOOL` failure with the diagnostic; do not keep retrying the command or edit gate configuration. Source: `enforcement/static/cppcheck_check.py` [verify].
 - Exit `3` (`TOOL_MISSING`): cppcheck is not installed. **Stop and report**; do not skip the step and do not claim the file passed.
 - Fix the code. Do not add a suppression unless a Deviation ID already exists. The only suppression form is `// cppcheck-suppress <id> -- DEV-<nnn>: <justification>`. Never invent a `DEV-<nnn>`; if no approved ID exists, leave the finding in place and describe the proposed suppression in the escalation note.
 - Common IDs and fix patterns: [cppcheck findings](references/rules.md#4-cppcheck-findings-in-embedded-c).

@@ -1,0 +1,13 @@
+link
+state
+fault
+retry
+timeout
+handshake
+heartbeat
+config
+now
+elapsed
+timestamp
+count
+valid

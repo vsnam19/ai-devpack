@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Header: Trusted memory proposal build gate; invoked through the isolated grader wrapper.
 # Usage: check_memory_step.sh --workdir DIR | --help
-# Exit codes: 0 lint and gcov tests passed; 1 worker failure; 2 usage/tool error.
+# Exit codes: 0 lint and gcov tests passed; 1 worker failure (including a build timeout,
+# which the caller records as a timeout); 2 usage/tool error (a harness error only with a
+# valid harness_error.json marker written by the wrapper's contract).
 set -euo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     sed -n '2,4p' "$0" | sed 's/^# //'

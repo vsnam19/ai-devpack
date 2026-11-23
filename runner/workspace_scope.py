@@ -1003,6 +1003,53 @@ def resolve_workspace_scope(
     )
 
 
+def partition_outside_workspace(paths: Iterable[str], scope: "WorkspaceScope") -> tuple[list[str], list[str]]:
+    """Split repo-relative ``paths`` into ``(inside, outside)`` the configured workspace root.
+
+    Outside-root files are reported as ``OUT_OF_WORKSPACE`` and are never checked or
+    modified. Callers must not count them as unowned changes or as checkable C/C++ files.
+    """
+    inside: list[str] = []
+    outside: list[str] = []
+    for path in paths:
+        (outside if scope.outside_workspace(path) else inside).append(path)
+    return inside, outside
+
+
+def allowed_glob_warnings(scope: "WorkspaceScope", globs: Sequence[str]) -> list[str]:
+    """Return one warning per allowed glob that cannot match a file inside the workspace root.
+
+    Globs are accepted relative to the workspace root (``src/*.cpp``) or repo-relative
+    (``<root>/src/*.cpp``). Without a configured workspace no warnings are produced.
+    """
+    if not scope.configured:
+        return []
+    prefix = scope.workspace_root_rel
+    warnings: list[str] = []
+    for glob_pattern in globs:
+        raw = glob_pattern.strip().replace("\\", "/")
+        if raw.startswith("./"):
+            raw = raw[2:]
+        if scope.glob_outside_workspace(raw):
+            warnings.append(
+                f"allowed glob '{glob_pattern}' is outside [workspace].root '{prefix}' "
+                "and cannot match files the agent may edit"
+            )
+            continue
+        rel = raw
+        if prefix != "." and rel.startswith(prefix + "/"):
+            rel = rel[len(prefix) + 1:]
+        try:
+            match = next((path for path in scope.workspace_root.glob(rel) if path.is_file()), None)
+        except (ValueError, OSError):
+            match = None
+        if match is None:
+            warnings.append(
+                f"allowed glob '{glob_pattern}' matches no file inside workspace root '{prefix}'"
+            )
+    return warnings
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for ``runner/workspace_scope.py``."""
     parser = argparse.ArgumentParser(

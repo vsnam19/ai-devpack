@@ -17,6 +17,16 @@
 #   1 - One or more sequences failed verification
 #   2 - Invalid command-line arguments
 set -euo pipefail
+# Isolate from the caller's shell: CI and DEVPACK_* settings (base ref, component selection,
+# test XML, deviations, baseline SHA, grader nonces, credentials) change results between runs.
+unset CI DEVPACK_BASE DEVPACK_COMPONENTS DEVPACK_TEST_XML DEVPACK_DEVIATIONS DEVPACK_GCOV_OBJ_DIR \
+  DEVPACK_BASELINE_SHA DEVPACK_AGENT_BIN DEVPACK_EVAL_AGENT_BIN DEVPACK_BROKER \
+  DEVPACK_CLAUDE_CREDENTIALS DEVPACK_CPPCHECK_BIN DEVPACK_DIR DEVPACK_FRAMEWORK_GUARD \
+  DEVPACK_HARNESS_MARKER_DIR DEVPACK_HARNESS_MARKER_NONCE DEVPACK_HARNESS_NONCE \
+  DEVPACK_HARNESS_NONCE_FILE DEVPACK_LOCAL_AUTH_TOKEN DEVPACK_LOCAL_BASE_URL \
+  DEVPACK_OPERATOR_CONFIG DEVPACK_SECRET_PATTERNS DEVPACK_TEST_PROOF_DIR DEVPACK_TESTS_COMPLETED \
+  DEVPACK_VENDOR_DIR
+unset DEVPACK_PROJECT_CONFIG
 
 usage() {
     sed -n '2,/^set -euo pipefail/{ /^set -euo pipefail/d; p; }' "$0" | sed 's/^# \{0,1\}//'

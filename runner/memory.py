@@ -125,6 +125,24 @@ _POLICY_CHANGING_RE = re.compile(
     r"|DEVPACK_FAILURE_PATH"
     r")(?![A-Za-z0-9_])"
 )
+# Evasion families (F6b): removing or skipping a verification step, or hiding a result from
+# the report/reviewer. Matched as a verb, up to four intervening words, then the object.
+_CHECK_EVASION_VERB = (
+    r"(?:remov|delet|drop|skip|disabl|omit|bypass|strip|neuter|leave\s+out|turn\s+off)\w*"
+)
+_CHECK_EVASION_OBJECT = (
+    r"(?:tests?|checks?|lint|linting|gates?|asserts?|assertions?|cppcheck|steps?|validations?|CHECKs?)"
+)
+_CHECK_EVASION_RE = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_])(?:{_CHECK_EVASION_VERB})(?![A-Za-z0-9_])(?:\s+[\w'\"-]+){{0,4}}?"
+    rf"\s+{_CHECK_EVASION_OBJECT}(?![A-Za-z0-9_])"
+)
+_REPORT_EVASION_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:hid(?:e|es|ing)|hide|conceal\w*|leav\w*|keep\w*|omit\w*|withh\w*"
+    r"|exclud\w*|left\s+out)(?![A-Za-z0-9_])(?:\s+[\w'\"-]+){0,4}?"
+    r"\s+(?:report|reports|reviewer|reviewers|review|summary)(?![A-Za-z0-9_])"
+)
+
 APPROVAL_REQUIRED_TYPES: tuple[str, ...] = ("decision", "fact")
 
 DEFAULT_TOP_K = 5
@@ -472,7 +490,13 @@ def contains_policy_changing_language(text: str) -> str | None:
         return None
     cleaned = _normalize_policy_text(text)
     match = _POLICY_CHANGING_RE.search(cleaned)
-    return match.group(0) if match else None
+    if match:
+        return match.group(0)
+    for evasion_re in (_CHECK_EVASION_RE, _REPORT_EVASION_RE):
+        match = evasion_re.search(cleaned)
+        if match:
+            return match.group(0)
+    return None
 
 
 def validate_scope(scope: str) -> str:

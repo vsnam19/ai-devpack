@@ -185,10 +185,16 @@ MAX_LINE_SPAN = 15
 DEFECT_TARGET_RE = re.compile(r"\bm_faultCount\b|\bfaultCount\b|\bfault\s+count\b|\bREQ-LINK-006\b", re.IGNORECASE)
 DEFECT_ACTION_RE = re.compile(
     r"\b(?:reset|resets|resetting|clear|clears|clearing|zero|zeros|zeroed|zeroing|"
-    r"preserv\w*|overwrit\w*|wip\w*|lose|loses|lost|violat\w*|must\s+not|should\s+not|"
+    r"preserv\w*|overwrit\w*|wip\w*|lose|loses|lost|"
     r"not\s+reset|increments?\s+without\s+bound)\b|=\s*0U?\b",
     re.IGNORECASE,
 )
+
+# These are the concrete false explanations from the adversarial review oracle.
+WRONG_CAUSES = (r"\batomic\b", r"\bplain\s+(?:std::)?uint32_t\b")
+if any(re.search(cause, text, re.IGNORECASE) for cause in WRONG_CAUSES):
+    print("FAIL: review asserts a wrong cause (counter type/thread safety)", file=sys.stderr)
+    sys.exit(1)
 
 matched_row_idx = None
 blocker_row_indices = []
