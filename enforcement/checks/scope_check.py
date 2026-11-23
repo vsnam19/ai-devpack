@@ -16,6 +16,12 @@ import re
 import subprocess
 import sys
 
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from runner.workspace_scope import resolve_workspace_scope  # noqa: E402
+
 
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Compile a POSIX path glob pattern (supporting ``*``, ``?``, and ``**``) to a regex."""
@@ -122,6 +128,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="GLOB",
         help="Allowed POSIX path glob pattern(s) (e.g. 'src/**', 'tests/*.cpp').",
     )
+    parser.add_argument(
+        "--project-config",
+        default="",
+        help="Optional path to project.toml for workspace-root boundary checks.",
+    )
     return parser
 
 
@@ -140,11 +151,41 @@ def main(argv: list[str] | None = None) -> int:
         print("SCOPE_ERROR: at least one non-empty --allow glob is required", file=sys.stderr)
         return 1
 
-    compiled_globs = [glob_to_regex(pat) for pat in allow_patterns]
+    proj_cfg = pathlib.Path(args.project_config) if args.project_config else None
+    try:
+        ws_scope = resolve_workspace_scope(repo_root, project_config_path=proj_cfg)
+    except ValueError as exc:
+        print(f"SCOPE_ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    effective_patterns = list(allow_patterns)
+    if ws_scope.configured and ws_scope.workspace_root_rel != ".":
+        for pat in allow_patterns:
+            norm_pat = pat.strip().replace("\\", "/").lstrip("/")
+            if norm_pat.startswith("./"):
+                norm_pat = norm_pat[2:]
+            if (
+                not ws_scope.glob_outside_workspace(norm_pat)
+                and norm_pat != ws_scope.workspace_root_rel
+                and not norm_pat.startswith(ws_scope.workspace_root_rel + "/")
+            ):
+                effective_patterns.append(f"{ws_scope.workspace_root_rel}/{norm_pat}")
+
+    compiled_globs = [glob_to_regex(pat) for pat in effective_patterns]
     changed_files, err = get_changed_files(repo_root, args.base)
     if changed_files is None:
         print(f"SCOPE_ERROR: {err}", file=sys.stderr)
         return 1
+
+    if ws_scope.configured:
+        outside_ws = [path for path in changed_files if ws_scope.outside_workspace(path)]
+        if outside_ws:
+            for path in outside_ws:
+                print(
+                    f"SCOPE_VIOLATION: {path} is outside workspace root "
+                    f"({ws_scope.workspace_root_rel})"
+                )
+            return 1
 
     violations = [path for path in changed_files if not matches_any_glob(path, compiled_globs)]
     if violations:

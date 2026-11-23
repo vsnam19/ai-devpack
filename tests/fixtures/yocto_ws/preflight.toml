@@ -1,0 +1,10 @@
+[general]
+std = "c++17"
+c_std = "c11"
+skip_clang_tidy = true
+allow_missing_tools = true
+
+[cppcheck]
+enable = ["warning", "style", "performance", "portability"]
+std = "c++17"
+fail_on = ["error", "warning"]

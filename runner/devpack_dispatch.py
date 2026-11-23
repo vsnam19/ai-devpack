@@ -85,6 +85,7 @@ from runner.agent_exec import (  # noqa: E402
 from runner.brief_lint import lint_brief_text  # noqa: E402
 from runner.devpack_logs import Redactor, load_run_dir, write_rendered_outputs  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
+from runner.workspace_scope import WorkspaceScope, resolve_workspace_scope  # noqa: E402
 
 CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
 _LINT_SUMMARY_RE = re.compile(r"Summary:\s+\d+\s+file\(s\)\s+checked,\s+(\d+)\s+finding\(s\)\.")
@@ -136,14 +137,31 @@ def run_preflight_lint_on_changed(
     workdir: Path,
     changed_files: Sequence[str],
     pack_root: Path = PACK_ROOT,
+    *,
+    components: str | Sequence[str] | None = None,
+    all_components: bool = False,
+    project_config_path: Path | None = None,
+    scope: WorkspaceScope | None = None,
 ) -> tuple[bool, int, str]:
     """Run ``preflight_lint.py`` on changed C/C++ files inside ``workdir``.
 
     Returns ``(passed, finding_count, combined_output)``.
     """
+    active_scope = scope
+    if active_scope is None:
+        active_scope = resolve_workspace_scope(
+            workdir,
+            project_config_path=project_config_path,
+            components=components,
+            all_components=all_components,
+        )
+
+    scoped_changed = (
+        active_scope.filter(list(changed_files)) if active_scope.configured else list(changed_files)
+    )
     lint_targets = [
         str(workdir / rel)
-        for rel in changed_files
+        for rel in scoped_changed
         if rel.lower().endswith(CPP_SUFFIXES) and (workdir / rel).is_file()
     ]
     if not lint_targets:
@@ -163,6 +181,13 @@ def run_preflight_lint_on_changed(
     cfg_candidate = workdir / "preflight.toml"
     if cfg_candidate.is_file():
         cmd.extend(["--config", str(cfg_candidate)])
+    if project_config_path is not None:
+        cmd.extend(["--project-config", str(project_config_path)])
+    if active_scope.configured:
+        if active_scope.scan_mode == "all":
+            cmd.append("--all-components")
+        elif active_scope.active_components:
+            cmd.extend(["--components", ",".join(c.name for c in active_scope.active_components)])
     cmd.extend(lint_targets)
 
     rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
@@ -183,14 +208,31 @@ def run_cppcheck_on_changed(
     workdir: Path,
     changed_files: Sequence[str],
     pack_root: Path = PACK_ROOT,
+    *,
+    components: str | Sequence[str] | None = None,
+    all_components: bool = False,
+    project_config_path: Path | None = None,
+    scope: WorkspaceScope | None = None,
 ) -> tuple[bool, int, str]:
     """Run ``cppcheck_check.py`` on changed C/C++ files inside ``workdir``.
 
     Returns ``(passed, blocking_finding_count, combined_output)``.
     """
+    active_scope = scope
+    if active_scope is None:
+        active_scope = resolve_workspace_scope(
+            workdir,
+            project_config_path=project_config_path,
+            components=components,
+            all_components=all_components,
+        )
+
+    scoped_changed = (
+        active_scope.filter(list(changed_files)) if active_scope.configured else list(changed_files)
+    )
     static_targets = [
         str(workdir / rel)
-        for rel in changed_files
+        for rel in scoped_changed
         if rel.lower().endswith(CPP_SUFFIXES) and (workdir / rel).is_file()
     ]
     if not static_targets:
@@ -209,6 +251,13 @@ def run_cppcheck_on_changed(
     cfg_candidate = workdir / "preflight.toml"
     if cfg_candidate.is_file():
         cmd.extend(["--config", str(cfg_candidate)])
+    if project_config_path is not None:
+        cmd.extend(["--project-config", str(project_config_path)])
+    if active_scope.configured:
+        if active_scope.scan_mode == "all":
+            cmd.append("--all-components")
+        elif active_scope.active_components:
+            cmd.extend(["--components", ",".join(c.name for c in active_scope.active_components)])
     cmd.extend(static_targets)
 
     rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
@@ -418,6 +467,8 @@ def dispatch_job(
     memory_top_k: int | None = None,
     memory_budget_tokens: int | None = None,
     brief_lint_findings: Sequence[dict[str, Any]] | None = None,
+    components: str | Sequence[str] | None = None,
+    all_components: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
@@ -428,6 +479,13 @@ def dispatch_job(
         raise ValueError("--allow-unqualified requires --deviation <ID>")
 
     project_cfg = load_project_config(workdir, project_config_path)
+    ws_scope = resolve_workspace_scope(
+        workdir,
+        project_config_path=project_config_path,
+        components=components,
+        all_components=all_components,
+    )
+    active_component_names = [c.name for c in ws_scope.active_components]
 
     effective_engines_path = engines_config_path
     if effective_engines_path is None:
@@ -544,6 +602,8 @@ def dispatch_job(
             "protected": list(protected_globs),
             "brief": str(brief_path),
             "profile_path": str(resolved_profile) if resolved_profile else "",
+            "components": active_component_names,
+            "scan_mode": ws_scope.scan_mode,
         }
         if qual_deviation_logged:
             plan["deviation_id"] = cleaned_deviation
@@ -558,7 +618,12 @@ def dispatch_job(
         outcome="running",
     )
 
-    update_run_json(run_dir, isolation=isolation)
+    update_run_json(
+        run_dir,
+        isolation=isolation,
+        components=active_component_names,
+        scan_mode=ws_scope.scan_mode,
+    )
 
     if not data_ok:
         sys.stderr.write(data_reason + "\n")
@@ -725,10 +790,29 @@ def dispatch_job(
     if changed_err:
         scope_status = "violation"
         scope_out = f"SCOPE_ERROR: {changed_err}"
+    elif ws_scope.configured and any(ws_scope.outside_workspace(p) for p in changed_files):
+        outside_paths = [p for p in changed_files if ws_scope.outside_workspace(p)]
+        scope_status = "violation"
+        scope_out = "\n".join(
+            f"SCOPE_VIOLATION: {name} is outside workspace root ({ws_scope.workspace_root_rel})"
+            for name in outside_paths
+        )
     elif allow_globs:
         scope_script = pack_root / "enforcement" / "checks" / "scope_check.py"
+        scope_cmd = [
+            "python3",
+            str(scope_script),
+            "--repo",
+            str(workdir),
+            "--base",
+            effective_base,
+            "--allow",
+            *allow_globs,
+        ]
+        if project_config_path is not None:
+            scope_cmd.extend(["--project-config", str(project_config_path)])
         s_rc, s_out, s_err = _run_subprocess(
-            ["python3", str(scope_script), "--repo", str(workdir), "--base", effective_base, "--allow", *allow_globs],
+            scope_cmd,
             workdir,
             timeout_s=60,
         )
@@ -781,7 +865,11 @@ def dispatch_job(
 
             # 2. Preflight lint on changed C/C++ files
             lint_ok, lint_findings, lint_out = run_preflight_lint_on_changed(
-                workdir, changed_files, pack_root=pack_root
+                workdir,
+                changed_files,
+                pack_root=pack_root,
+                project_config_path=project_config_path,
+                scope=ws_scope,
             )
             if lint_out:
                 gate_logs.append(f"[preflight_lint]\n{lint_out}")
@@ -790,7 +878,11 @@ def dispatch_job(
 
             # 2b. Static analysis (cppcheck) on changed C/C++ files
             static_clean, static_findings, static_out = run_cppcheck_on_changed(
-                workdir, changed_files, pack_root=pack_root
+                workdir,
+                changed_files,
+                pack_root=pack_root,
+                project_config_path=project_config_path,
+                scope=ws_scope,
             )
             if static_out:
                 gate_logs.append(f"[cppcheck]\n{static_out}")
@@ -856,6 +948,8 @@ def dispatch_job(
         memory_hashes=dict(agent_res.memory_hashes),
         memory_tokens=int(agent_res.memory_tokens),
         memory_proposals=mem_proposal_summary,
+        components=active_component_names,
+        scan_mode=ws_scope.scan_mode,
         finished=datetime.now(timezone.utc).isoformat(),
     )
     _render_run_dir_quietly(run_dir)
@@ -880,6 +974,8 @@ def dispatch_job(
         "memory_ids": list(agent_res.memory_ids),
         "memory_hashes": dict(agent_res.memory_hashes),
         "memory_tokens": int(agent_res.memory_tokens),
+        "components": active_component_names,
+        "scan_mode": ws_scope.scan_mode,
     }
     if any(mem_proposal_summary.values()):
         payload["memory_proposals"] = mem_proposal_summary
@@ -1038,6 +1134,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable project memory retrieval and injection for this dispatch",
     )
+    parser.add_argument(
+        "--components",
+        default=None,
+        help="Comma-separated workspace component names to scope checks to",
+    )
+    parser.add_argument(
+        "--all-components",
+        action="store_true",
+        help="Run workspace-scoped checks across all configured/discovered components",
+    )
     return parser
 
 
@@ -1103,6 +1209,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_qualification=args.require_qualification,
             dry_run=args.dry_run,
             memory_enabled=False if args.no_memory else None,
+            components=args.components,
+            all_components=bool(args.all_components),
         )
         return rc
     except ValueError as exc:

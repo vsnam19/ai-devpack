@@ -17,11 +17,11 @@ internally.
 
 | Path | Content |
 |---|---|
-| `policy/` | operating model, ASIL boundaries (company policy, needs safety approval), sandbox, data governance, provenance, failure handling, `policy/failure_attribution.md`, `policy/static_analysis.md`, tool confidence, deviations, `policy/logging.md`, `policy/local_models.md`, `policy/memory.md` |
+| `policy/` | operating model, ASIL boundaries (company policy, needs safety approval), sandbox, data governance, provenance, failure handling, `policy/failure_attribution.md`, `policy/static_analysis.md`, `policy/workspace_scope.md`, tool confidence, deviations, `policy/logging.md`, `policy/local_models.md`, `policy/memory.md` |
 | `knowledge/` | `lessons.md` (LSN-001..LSN-019), `context_template/AGENTS.md`, `skills/` (`automotive-cpp`, `review-taxonomy`, `skill-authoring`, `requirements-analysis`; deprecated: `misra-cpp-2023`, `doxygen-naming`), `engine_profiles/` |
 | `workflow/templates/` | brief (implement, fix, review), task plan and ADR templates |
 | `workflow/ci/` | `pipeline.md` and examples (`examples/gitlab-ci.yml`, `examples/Jenkinsfile`) |
-| `runner/` | `agent_exec.py` (single executor + v2 engine loader), `brief_lint.py` (pre-dispatch brief linter), `devpack_run.py`, `devpack_dispatch.py`, `devpack_broker.py`, `devpack_logs.py`, `memory.py`, `devpack_memory.py`, `engines.example.toml`, `quality_checklist.md` |
+| `runner/` | `agent_exec.py` (single executor + v2 engine loader), `workspace_scope.py` (Yocto component scope), `brief_lint.py` (pre-dispatch brief linter), `devpack_run.py`, `devpack_dispatch.py`, `devpack_broker.py`, `devpack_logs.py`, `memory.py`, `devpack_memory.py`, `engines.example.toml`, `quality_checklist.md` |
 | `orchestrator/` | drop-in Sonnet orchestrator config (`orchestrator/CLAUDE.md`, `orchestrator/README.md`, `orchestrator/briefs/`) |
 | `skilltest/` | `skilltest.py` (`lint`, `run`, `report`) for deterministic skill linting and A/B experiments |
 | `learning/` | `harvest.py`, `propose.py`, `validate.py` for mining run logs and validating bounded engine profiles |

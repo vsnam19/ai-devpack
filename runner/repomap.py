@@ -25,6 +25,14 @@ import subprocess
 import sys
 from typing import Iterable, Sequence
 
+RUNNER_DIR = Path(__file__).resolve().parent
+PACK_ROOT = RUNNER_DIR.parent
+for _p in (str(PACK_ROOT), str(RUNNER_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from runner.workspace_scope import WorkspaceScope, resolve_workspace_scope  # noqa: E402
+
 DEFAULT_BUDGET_TOKENS = 1500
 
 _CPP_EXTS: frozenset[str] = frozenset({".h", ".hpp", ".hh", ".hxx", ".c", ".cpp", ".cc", ".cxx"})
@@ -684,10 +692,35 @@ def rank_file_indices(
     return ranked
 
 
-def discover_repo_files(repo_root: Path) -> tuple[list[str], list[str]]:
+def discover_repo_files(
+    repo_root: Path,
+    scope: WorkspaceScope | None = None,
+) -> tuple[list[str], list[str]]:
     """Return deterministic sorted ``(all_files, cpp_files)`` relative to ``repo_root``."""
     all_files: list[str] = []
     cpp_files: list[str] = []
+    if scope is not None and scope.configured:
+        seen: set[str] = set()
+        for comp_dir in scope.target_dirs():
+            for path in sorted(comp_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(repo_root)
+                if any(part in _SKIP_DIRS for part in rel.parts):
+                    continue
+                rel_str = rel.as_posix()
+                if rel_str in seen:
+                    continue
+                if scope.is_excluded(rel_str) or not scope.is_in_active_components(rel_str):
+                    continue
+                seen.add(rel_str)
+                all_files.append(rel_str)
+                if path.suffix.lower() in _CPP_EXTS:
+                    cpp_files.append(rel_str)
+        all_files.sort()
+        cpp_files.sort()
+        return all_files, cpp_files
+
     for path in sorted(repo_root.rglob("*")):
         if not path.is_file():
             continue
@@ -739,10 +772,19 @@ def generate_repomap(
     budget: int = DEFAULT_BUDGET_TOKENS,
     include_title: bool = True,
     use_ctags: bool = False,
+    components: str | Sequence[str] | None = None,
+    all_components: bool = False,
+    project_config_path: Path | str | None = None,
 ) -> str:
     """Build a deterministic, ranked, token-budgeted Markdown code index for ``repo_root``."""
     root = Path(repo_root).resolve()
-    all_files, cpp_files = discover_repo_files(root)
+    scope = resolve_workspace_scope(
+        root,
+        project_config_path=project_config_path,
+        components=components,
+        all_components=all_components,
+    )
+    all_files, cpp_files = discover_repo_files(root, scope=scope)
 
     indices: list[FileIndex] = [extract_cpp_file_index(root / rel, rel) for rel in cpp_files]
     if use_ctags:
@@ -860,6 +902,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Optionally supplement stdlib regex parsing with ctags if installed.",
     )
+    parser.add_argument(
+        "--components",
+        default=None,
+        help="Comma-separated workspace component names to index (overrides [scan] defaults).",
+    )
+    parser.add_argument(
+        "--all-components",
+        action="store_true",
+        help="Index all configured/discovered workspace components.",
+    )
+    parser.add_argument(
+        "--project-config",
+        default="",
+        help="Optional path to project.toml (default: <repo>/.devpack/project.toml).",
+    )
     return parser
 
 
@@ -875,6 +932,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo_root = Path(args.repo)
     if not repo_root.is_dir():
         print(f"error: repository directory not found: {repo_root}", file=sys.stderr)
+        return 2
+    proj_cfg = Path(args.project_config) if args.project_config else None
+    if proj_cfg is not None and not proj_cfg.is_file():
+        print(f"error: project config not found: {proj_cfg}", file=sys.stderr)
         return 2
 
     task_text = ""
@@ -895,7 +956,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_text=task_text,
             budget=args.budget,
             use_ctags=bool(args.ctags),
+            components=args.components,
+            all_components=bool(args.all_components),
+            project_config_path=proj_cfg,
         )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except OSError as exc:
         print(f"error: failed to index repository '{repo_root}': {exc}", file=sys.stderr)
         return 1

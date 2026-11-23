@@ -28,6 +28,17 @@ All notable changes to ai-devpack are recorded here. Versioning follows
   `enforcement/gate/gate.example.toml`). Fails closed with exit `3` (`TOOL_MISSING`) when
   `cppcheck` is absent, supports `[cppcheck]` configuration in `eval/fixture/preflight.toml`
   and `.devpack/project.example.toml`, and supports portable JSON baselines (`--baseline`).
+- **Yocto workspace & component scope (`runner/workspace_scope.py`, `policy/workspace_scope.md`)**:
+  added `[workspace]`, `[[component]]`, and `[scan]` configuration in
+  `.devpack/project.example.toml` and `runner/agent_exec.py` (`load_project_config`),
+  automatic component discovery (`CMakeLists.txt`, `Makefile`, `meson.build`, `*.bb`,
+  `*.bbappend`), `--components` / `--all-components` and `DEVPACK_COMPONENTS` selection
+  across `enforcement/lint/preflight_lint.py`, `enforcement/static/cppcheck_check.py`
+  (using component `compile_commands` `--project=` or `include_dirs` plus
+  `--suppress=missingIncludeSystem`), `runner/repomap.py`, `runner/devpack_dispatch.py`,
+  `runner/devpack_run.py`, and `enforcement/gate/gate.py`, workspace-boundary enforcement
+  in `runner/brief_lint.py` and `enforcement/checks/scope_check.py`, and `components` /
+  `scan_mode` recording in `run.json`.
 
 ### Deprecated
 - `knowledge/skills/misra-cpp-2023/` and `knowledge/skills/doxygen-naming/` are marked

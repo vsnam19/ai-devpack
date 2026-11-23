@@ -35,6 +35,7 @@ if str(PACK_ROOT) not in sys.path:
     sys.path.insert(0, str(PACK_ROOT))
 
 from runner.agent_exec import _minimal_toml_loads  # noqa: E402
+from runner.workspace_scope import resolve_workspace_scope  # noqa: E402
 
 DEFAULT_CONTEXT_TOKENS: dict[str, int] = {
     "sonnet": 200000,
@@ -426,23 +427,26 @@ def _collect_repo_identifiers(repo_root: Path) -> set[str]:
     return idents
 
 
-def _extract_scope_entries(sections: Sequence[dict[str, Any]], lines: Sequence[str]) -> tuple[bool, int, list[str]]:
-    """Return ``(has_scope_section, line_no, entries)`` for allowed-files declarations."""
+def _extract_scope_entries_with_lines(
+    sections: Sequence[dict[str, Any]],
+    lines: Sequence[str],
+) -> tuple[bool, int, list[tuple[int, str]]]:
+    """Return ``(has_scope_section, line_no, [(entry_line, entry), ...])`` for allowed-files declarations."""
     for sec in sections:
         if sec["normalized"] in SCOPE_HEADING_ALIASES:
-            entries: list[str] = []
-            for _, bline in sec["body_lines"]:
+            entries: list[tuple[int, str]] = []
+            for lineno, bline in sec["body_lines"]:
                 stripped = bline.strip()
                 if not stripped or stripped.lower().startswith("out of scope"):
                     continue
                 if stripped.startswith(("-", "*")):
                     item = stripped.lstrip("-* ").strip().strip("`")
                     if item and not (item.startswith("{{") and item.endswith("}}")):
-                        entries.append(item)
+                        entries.append((lineno, item))
                 elif "`" in stripped:
                     for tok in _BACKTICK_RE.findall(stripped):
                         if tok.strip() and not tok.strip().startswith("{{"):
-                            entries.append(tok.strip())
+                            entries.append((lineno, tok.strip()))
             return True, int(sec["line"]), entries
 
     inline_re = re.compile(r"(?im)^\s*(?:files\s+allowed|allowed\s+files|allowed\s+globs)\s*:\s*(.+)$")
@@ -450,10 +454,16 @@ def _extract_scope_entries(sections: Sequence[dict[str, Any]], lines: Sequence[s
         m = inline_re.match(line)
         if m:
             raw_val = m.group(1).strip()
-            entries = [part.strip().strip("`") for part in raw_val.split(",") if part.strip()]
+            entries = [(idx, part.strip().strip("`")) for part in raw_val.split(",") if part.strip()]
             return True, idx, entries
 
     return False, 1, []
+
+
+def _extract_scope_entries(sections: Sequence[dict[str, Any]], lines: Sequence[str]) -> tuple[bool, int, list[str]]:
+    """Return ``(has_scope_section, line_no, entries)`` for allowed-files declarations."""
+    has_scope, scope_line, items = _extract_scope_entries_with_lines(sections, lines)
+    return has_scope, scope_line, [entry for _, entry in items]
 
 
 def _extract_contradiction_targets(text: str) -> set[str]:
@@ -479,6 +489,7 @@ def lint_brief_text(
     engine: str = "",
     engines_config: Path | str | None = None,
     author: str = "orchestrator",
+    project_config: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     """Lint ``brief_text`` against ``repo_root`` and return a list of finding dictionaries.
 
@@ -493,6 +504,11 @@ def lint_brief_text(
     repo = Path(repo_root).resolve()
     cfg_path = Path(engines_config).resolve() if engines_config else None
     err_sev = "warning" if author == "human" else "error"
+
+    try:
+        ws_scope = resolve_workspace_scope(repo, project_config_path=project_config)
+    except ValueError:
+        ws_scope = None
 
     lines = brief_text.splitlines()
     sections = _parse_sections(lines)
@@ -516,8 +532,9 @@ def lint_brief_text(
                 }
             )
 
-    # 2. BRIEF-NO-SCOPE
-    has_scope, scope_line, scope_entries = _extract_scope_entries(sections, lines)
+    # 2. BRIEF-NO-SCOPE & BRIEF-SCOPE-OUTSIDE-WORKSPACE
+    has_scope, scope_line, scope_items = _extract_scope_entries_with_lines(sections, lines)
+    scope_entries = [entry for _, entry in scope_items]
     if not has_scope or not scope_entries:
         findings.append(
             {
@@ -527,6 +544,20 @@ def lint_brief_text(
                 "message": "Brief is missing a non-empty allowed-files list (e.g. '## Files allowed').",
             }
         )
+    elif ws_scope is not None and ws_scope.configured:
+        for entry_line, entry in scope_items:
+            if ws_scope.glob_outside_workspace(entry):
+                findings.append(
+                    {
+                        "rule": "BRIEF-SCOPE-OUTSIDE-WORKSPACE",
+                        "severity": err_sev,
+                        "line": entry_line,
+                        "message": (
+                            f"Files-allowed glob '{entry}' lies outside workspace root "
+                            f"'{ws_scope.workspace_root_rel}'."
+                        ),
+                    }
+                )
 
     # 3. BRIEF-TOO-LONG
     est_tokens = estimate_tokens(brief_text)
@@ -545,11 +576,28 @@ def lint_brief_text(
             }
         )
 
-    # Pre-collect top-level repo directories and line counts lazily.
-    top_dirs = frozenset(
-        p.name for p in repo.iterdir() if p.is_dir() and p.name not in _SKIP_SCAN_DIRS
-    ) if repo.is_dir() else frozenset()
+    # Pre-collect top-level repo (and workspace root) directories and line counts lazily.
+    top_dirs_set: set[str] = set()
+    if repo.is_dir():
+        top_dirs_set.update(
+            p.name for p in repo.iterdir() if p.is_dir() and p.name not in _SKIP_SCAN_DIRS
+        )
+    if ws_scope is not None and ws_scope.configured and ws_scope.workspace_root.is_dir():
+        top_dirs_set.update(
+            p.name
+            for p in ws_scope.workspace_root.iterdir()
+            if p.is_dir() and p.name not in _SKIP_SCAN_DIRS
+        )
+    top_dirs = frozenset(top_dirs_set)
     line_count_cache: dict[Path, int] = {}
+
+    def _resolve_rel_path(rel_path: str) -> Path | None:
+        if ws_scope is not None:
+            resolved = ws_scope.resolve_path_in_workspace(rel_path)
+            if resolved is not None:
+                return resolved
+        cand = repo / rel_path
+        return cand if cand.exists() else None
 
     def _file_line_count(path: Path) -> int:
         if path not in line_count_cache:
@@ -579,8 +627,8 @@ def lint_brief_text(
             for m in _FILE_LINE_RE.finditer(line):
                 rel = m.group(1)
                 target_line = int(m.group(2))
-                candidate = repo / rel
-                if candidate.is_file():
+                candidate = _resolve_rel_path(rel)
+                if candidate is not None and candidate.is_file():
                     last_existing_file = candidate
                     total = _file_line_count(candidate)
                     if target_line < 1 or target_line > total:
@@ -604,8 +652,8 @@ def lint_brief_text(
                     continue
                 if Path(rel_path).name in _EXEMPT_OUTPUT_FILES or rel_path in _EXEMPT_OUTPUT_FILES:
                     continue
-                resolved = repo / rel_path
-                if resolved.exists():
+                resolved = _resolve_rel_path(rel_path)
+                if resolved is not None:
                     if resolved.is_file():
                         line_files.append(resolved)
                         last_existing_file = resolved
@@ -647,6 +695,11 @@ def lint_brief_text(
 
     # 6. BRIEF-SYMBOL-MISSING (warning only)
     repo_idents: set[str] | None = None
+    symbol_scan_root = (
+        ws_scope.workspace_root
+        if (ws_scope is not None and ws_scope.configured and ws_scope.workspace_root.is_dir())
+        else repo
+    )
     seen_missing_syms: set[tuple[int, str]] = set()
     for sec in sections:
         in_fence = False
@@ -671,7 +724,7 @@ def lint_brief_text(
                 if len(sym) < 3 or sym in _IGNORED_SYMBOLS:
                     continue
                 if repo_idents is None:
-                    repo_idents = _collect_repo_identifiers(repo)
+                    repo_idents = _collect_repo_identifiers(symbol_scan_root)
                 if sym not in repo_idents and (lineno, sym) not in seen_missing_syms:
                     seen_missing_syms.add((lineno, sym))
                     findings.append(

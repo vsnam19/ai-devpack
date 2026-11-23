@@ -1,0 +1,26 @@
+data_class = "internal"
+allow_unsandboxed_local = true
+
+[workspace]
+root = "meta-org/recipes-org/src"
+exclude = ["**/third_party/**", "**/generated/**"]
+
+[[component]]
+name = "ipc_bus"
+path = "middleware/ipc_bus"
+compile_commands = "build/ipc_bus/compile_commands.json"
+include_dirs = ["middleware/ipc_bus/include"]
+
+[[component]]
+name = "diag_svc"
+path = "services/diag_svc"
+include_dirs = ["services/diag_svc/include"]
+
+[[component]]
+name = "sensor_hub"
+path = "apps/sensor_hub"
+include_dirs = ["apps/sensor_hub/include"]
+
+[scan]
+default = "selected"
+selected = ["ipc_bus"]

@@ -63,6 +63,7 @@ from agent_exec import (  # noqa: E402
 from devpack_dispatch import run_cppcheck_on_changed, run_preflight_lint_on_changed  # noqa: E402
 from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 from memory import memory_root_for, process_memory_proposals  # noqa: E402
+from workspace_scope import resolve_workspace_scope  # noqa: E402
 
 ESCALATE_TO_HUMAN = "ESCALATE_TO_HUMAN"
 VERDICT_APPROVE = "APPROVE"
@@ -481,6 +482,8 @@ def run_task_workflow(
     memory_top_k: int | None = None,
     memory_budget_tokens: int | None = None,
     skills_enabled: bool = False,
+    components: str | Sequence[str] | None = None,
+    all_components: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -491,6 +494,13 @@ def run_task_workflow(
     agent is launched with ``--disable-slash-commands`` (default behaviour).
     Returns ``(exit_code, summary_dict)``.
     """
+    ws_scope = resolve_workspace_scope(
+        worktree,
+        components=components,
+        all_components=all_components,
+    )
+    active_component_names = [c.name for c in ws_scope.active_components]
+
     if isinstance(config, EnginesConfig):
         default_max_rounds = config.max_fix_rounds
         gate_cmd = list(config.gate_cmd)
@@ -526,6 +536,8 @@ def run_task_workflow(
             "worktree": str(worktree),
             "implement_template": impl_tpl_src,
             "max_fix_rounds": max_fix_rounds,
+            "components": active_component_names,
+            "scan_mode": ws_scope.scan_mode,
             "roles": {
                 "implementer": impl_engine.name,
                 "reviewer": rev_engine.name,
@@ -561,7 +573,15 @@ def run_task_workflow(
             kind="task",
             task=context["TASK_ID"],
             engines=role_engine_map,
+            components=active_component_names,
+            scan_mode=ws_scope.scan_mode,
             outcome="running",
+        )
+    else:
+        update_run_json(
+            active_run_dir,
+            components=active_component_names,
+            scan_mode=ws_scope.scan_mode,
         )
 
     iso_ok, iso_msg = check_local_isolation_allowed(
@@ -743,8 +763,21 @@ def run_task_workflow(
         static_ok = True
         if base_ref is not None:
             changed_files, _ = get_changed_files(worktree, base_ref)
+            if ws_scope.configured and changed_files:
+                outside_ws = [p for p in changed_files if ws_scope.outside_workspace(p)]
+                if outside_ws:
+                    gate_passed = False
+                    ws_msg = "\n".join(
+                        f"SCOPE_VIOLATION: {p} is outside workspace root ({ws_scope.workspace_root_rel})"
+                        for p in outside_ws
+                    )
+                    combined_gate_output = (
+                        (combined_gate_output + "\n\n" if combined_gate_output else "")
+                        + "[workspace_scope]\n"
+                        + ws_msg
+                    )
             lint_ok, lint_findings, lint_out = run_preflight_lint_on_changed(
-                worktree, changed_files or [], pack_root=lint_pack_root
+                worktree, changed_files or [], pack_root=lint_pack_root, scope=ws_scope
             )
             if lint_out:
                 combined_gate_output = (
@@ -756,7 +789,7 @@ def run_task_workflow(
                 gate_passed = False
 
             static_ok, static_findings, static_out = run_cppcheck_on_changed(
-                worktree, changed_files or [], pack_root=static_pack_root
+                worktree, changed_files or [], pack_root=static_pack_root, scope=ws_scope
             )
             if static_out:
                 combined_gate_output = (
@@ -998,6 +1031,8 @@ def run_task_workflow(
         task=context["TASK_ID"],
         engines=role_engine_map,
         outcome=final_status,
+        components=active_component_names,
+        scan_mode=ws_scope.scan_mode,
         lint_findings_first_attempt=lint_findings_first_attempt,
         lint_clean_final=bool(last_lint_clean),
         static_findings_first_attempt=static_findings_first_attempt,
@@ -1010,6 +1045,8 @@ def run_task_workflow(
         "task_title": context["TASK_TITLE"],
         "status": final_status,
         "verdict": final_verdict,
+        "components": active_component_names,
+        "scan_mode": ws_scope.scan_mode,
         "fix_rounds_used": fix_rounds_used,
         "max_fix_rounds": max_fix_rounds,
         "escalation_reason": escalation_reason,
@@ -1155,6 +1192,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the step plan and template resolution without running commands",
     )
+    parser.add_argument(
+        "--components",
+        default=None,
+        help="Comma-separated workspace component names to scope checks to",
+    )
+    parser.add_argument(
+        "--all-components",
+        action="store_true",
+        help="Run workspace-scoped checks across all configured/discovered components",
+    )
     return parser
 
 
@@ -1181,6 +1228,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             title=args.title,
             goal=args.goal,
             allowed_files=args.allowed_files,
+        )
+        resolve_workspace_scope(
+            worktree,
+            components=args.components,
+            all_components=bool(args.all_components),
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1224,6 +1276,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         credentials_path=credentials_path,
         agent_bin=args.agent_bin,
         skills_enabled=args.skills,
+        components=args.components,
+        all_components=bool(args.all_components),
     )
     return rc
 
