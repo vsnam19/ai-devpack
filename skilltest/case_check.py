@@ -113,6 +113,18 @@ def _check_review_taxonomy(
     return 1
 
 
+def _run_grader(cmd: list[str], grader_dir: Path, candidate: Path, root: Path) -> subprocess.CompletedProcess[str]:
+    """Run a draft grader command against one candidate directory."""
+    return subprocess.run(
+        [*cmd, str(candidate)],
+        cwd=grader_dir,
+        env={**os.environ, "DEVPACK_ROOT": str(root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def _check_skill_authoring(draft: Path, case: str, root: Path) -> int:
     """Validate skill-authoring frontmatter-draft and test-matrix candidate drafts."""
     if case == "frontmatter-draft":
@@ -136,21 +148,21 @@ def _check_skill_authoring(draft: Path, case: str, root: Path) -> int:
         cases = config.get("behaviour", [])
         if not cases:
             return 1
+        reference = root / "knowledge/skills/skill-authoring/tests/expected" / case / "signal-helper" / "tests" / "expected"
         for beh in cases:
             fixture_dir = draft / "tests" / beh["fixture"]
             grader_dir = draft / "tests" / beh["grader"]
             cmd = shlex.split(beh["check"])
             if not fixture_dir.is_dir() or not grader_dir.is_dir() or not cmd:
                 return 1
-            res = subprocess.run(
-                [*cmd, str(fixture_dir)],
-                cwd=grader_dir,
-                env={**os.environ, "DEVPACK_ROOT": str(root)},
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if res.returncode == 0:
+            valid_candidate = reference / beh["name"]
+            if not valid_candidate.is_dir():
+                print("no valid candidate to prove grader acceptance", file=sys.stderr)
+                return 1
+            # The grader must accept a known-valid candidate and reject the bad fixture.
+            if _run_grader(cmd, grader_dir, valid_candidate, root).returncode != 0:
+                return 1
+            if _run_grader(cmd, grader_dir, fixture_dir, root).returncode == 0:
                 return 1
         return 0
 

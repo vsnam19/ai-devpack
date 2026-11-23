@@ -288,6 +288,62 @@ class F5bGraderRegressionsTests(unittest.TestCase):
             res = _run_check(goal_dir / "check.sh", work, base_sha)
             self.assertNotEqual(0, res.returncode, res.stdout + res.stderr)
 
+    def test_skill_authoring_rejects_always_fail_grader(self) -> None:
+        """A test-matrix draft whose grader is `exit 1` is rejected, even though it fails the bad fixture."""
+        case_check = REPO_ROOT / "skilltest" / "case_check.py"
+        env = {**os.environ, "DEVPACK_ROOT": str(REPO_ROOT)}
+        with tempfile.TemporaryDirectory() as tmp:
+            draft_parent = Path(tmp) / "always_fail"
+            shutil.copytree(
+                REPO_ROOT / "knowledge/skills/skill-authoring/tests/expected/test-matrix",
+                draft_parent,
+            )
+            grader = draft_parent / "signal-helper/tests/graders/summary/check.sh"
+            grader.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+            res = subprocess.run(
+                ["python3", str(case_check), "skill-authoring", "test-matrix", str(draft_parent)],
+                env=env, capture_output=True, text=True, check=False, timeout=300,
+            )
+            self.assertNotEqual(0, res.returncode, res.stdout + res.stderr)
+
+    def test_task07_signed_mutants_split(self) -> None:
+        """Task 07 defines separate lower-only and upper-only signed boundary mutants, each changing one bound."""
+        import json
+        import re
+
+        text = (REPO_ROOT / "eval/tasks/07-small-feature-codec-raw-range/check.sh").read_text(encoding="utf-8")
+        match = re.search(r"<<'JSON'\n(.*?)\nJSON\n", text, re.DOTALL)
+        self.assertIsNotNone(match, "mutant JSON heredoc not found")
+        mutants = {m["name"]: m["body"] for m in json.loads(match.group(1))}
+        base_min = "const std::int64_t minSigned = -(1LL << (signal.bitLength - 1U));"
+        base_max = "const std::int64_t maxSigned = (1LL << (signal.bitLength - 1U)) - 1LL;"
+        self.assertNotIn("signed off-by-one on lower and upper boundaries", mutants)
+        lower = [b for n, b in mutants.items() if "signed lower boundary" in n]
+        upper = [b for n, b in mutants.items() if "signed upper boundary" in n]
+        self.assertEqual(1, len(lower))
+        self.assertEqual(1, len(upper))
+        # Lower mutant moves only minSigned (accepts -129); upper mutant moves only maxSigned (accepts 128).
+        self.assertIn("-(1LL << (signal.bitLength - 1U)) - 1LL;", lower[0])
+        self.assertIn(base_max, lower[0])
+        self.assertNotIn(base_min, lower[0])
+        self.assertIn(base_min, upper[0])
+        self.assertIn("const std::int64_t maxSigned = (1LL << (signal.bitLength - 1U));", upper[0])
+        self.assertNotIn(base_max, upper[0])
+
+    def test_goal01_monotonic_mutant_keeps_timestamp_update(self) -> None:
+        """Goal 01 non-monotonic mutant drops only the nowMs comparison and keeps m_lastTimestampMs = nowMs."""
+        import json
+        import re
+
+        text = (REPO_ROOT / "eval/orchestrator_goals/01-link-fault-recovery/check.sh").read_text(encoding="utf-8")
+        match = re.search(r"<<'JSON'\n(.*?)\nJSON\n", text, re.DOTALL)
+        self.assertIsNotNone(match, "mutant JSON heredoc not found")
+        mutants = [m for m in json.loads(match.group(1)) if "non-monotonic" in m["name"]]
+        self.assertEqual(1, len(mutants))
+        body = mutants[0]["body"]
+        self.assertIn("m_lastTimestampMs = nowMs;", body)
+        self.assertNotIn("nowMs < m_lastTimestampMs", body)
+
 
 if __name__ == "__main__":
     unittest.main()

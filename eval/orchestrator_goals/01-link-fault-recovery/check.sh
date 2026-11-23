@@ -176,7 +176,7 @@ python3 "$DEVPACK_ROOT/eval/lib/mutate_cpp.py" --workdir "$WORKDIR" --test-file 
     "file": "src/link_state_machine.cpp",
     "mode": "replace_body",
     "func_regex": "\\bLinkStateMachine\\s*::\\s*recoverFromFault\\s*\\([^)]*\\)",
-    "body": "{\n    (void)nowMs;\n    if (m_state != LinkState::Fault || !isConfigValid()) {\n        return false;\n    }\n    m_state = LinkState::Connecting;\n    m_retryCount = 0U;\n    return true;\n}"
+    "body": "{\n    if (m_state != LinkState::Fault || !isConfigValid()) {\n        return false;\n    }\n    m_state = LinkState::Connecting;\n    m_retryCount = 0U;\n    m_lastTimestampMs = nowMs;\n    return true;\n}"
   },
   {
     "name": "recoverFromFault leaves state in Fault",
