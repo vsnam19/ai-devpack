@@ -166,7 +166,7 @@ run_gcov_visible_tests "visible build_and_test" "$WORKDIR"
 run_gcov_hidden_tests "hidden_test" "$WORKDIR" "$HIDDEN_DIR"
 
 # 4. Task-specific checks
-python3 - "$WORKDIR" <<'PY'
+python3 - "$WORKDIR" "$SCRIPT_DIR/vocab.txt" <<'PY'
 import pathlib
 import re
 import sys
@@ -175,6 +175,9 @@ workdir = pathlib.Path(sys.argv[1])
 hdr = (workdir / "include/can_codec.hpp").read_text(encoding="utf-8")
 src = (workdir / "src/can_codec.cpp").read_text(encoding="utf-8")
 
+VOCAB = set(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").split())
+# Recognized unit/bit-position abbreviations are words in the fixture domain.
+UNIT_TOKENS = {"ms", "msb", "lsb"}
 DENYLIST = {"tmp", "temp", "val", "var", "foo", "bar", "baz", "obj", "dat", "buf", "ptr"}
 CAMEL_CASE_RE = re.compile(r"^[a-z][a-zA-Z0-9]*$")
 LOOP_INDICES = {"i", "j", "k"}
@@ -205,6 +208,16 @@ def validate_meaningful_name(ident: str, kind: str, filename: str, *, allow_loop
         sys.exit(1)
     if not CAMEL_CASE_RE.fullmatch(ident):
         print(f"FAIL: non-camelCase {kind} '{ident}' in {filename}", file=sys.stderr)
+        sys.exit(1)
+
+
+    tokens = [token.lower() for token in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[0-9]+", ident)]
+    if not any(token in VOCAB for token in tokens) or any(
+        token not in UNIT_TOKENS and (
+            not re.search(r"[aeiouy]", token) or re.fullmatch(r"([a-z])\1+", token)
+        ) for token in tokens if not token.isdigit()
+    ):
+        print(f"FAIL: non-meaningful {kind} '{ident}' (domain vocabulary/non-word token) in {filename}", file=sys.stderr)
         sys.exit(1)
 
 
