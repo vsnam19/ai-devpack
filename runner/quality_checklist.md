@@ -10,3 +10,4 @@
 - Use `{}` braces on every `if`/`else`/`for`/`while`/`do` body; include `default:` in every `switch`.
 - Mark single-arg constructors `explicit` and overridden virtuals `override`; avoid `goto`, `[=]`, `[&]`.
 - Initialize all variables; use fixed-width integers (`std::uint8_t`, etc.); no commented-out code.
+- Static analysis (`cppcheck`): no null-pointer dereferences, uninitialized variables, out-of-bounds accesses, or leaks.

@@ -547,6 +547,62 @@ class DevpackDispatchTests(unittest.TestCase):
             run_meta = json.loads((Path(dev_data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
             self.assertEqual("DEV-007", run_meta["deviation_id"])
 
+    def test_dispatch_cppcheck_blocking_finding_fails_gate_and_records_static_metrics(self) -> None:
+        """Verify blocking cppcheck finding fails dispatch gate and records static metrics in payload and run.json."""
+        import shutil
+
+        if shutil.which("cppcheck") is None:
+            self.skipTest("cppcheck is not installed on PATH")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_repo(wt)
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nUpdate oneValue().\n", encoding="utf-8")
+
+            bad_cpp = (
+                "/**\n * @file mod.cpp\n * @brief Sample module.\n */\n"
+                "/**\n * @brief Bad function.\n * @param[in] flag Input flag.\n * @return Value.\n */\n"
+                "int oneValue(int flag) {\n"
+                "    int *missingPtr = nullptr;\n"
+                "    if (flag > 0) {\n"
+                "        return *missingPtr;\n"
+                "    }\n"
+                "    return 0;\n"
+                "}\n"
+            )
+            fake_agent = _write_fake_agent(
+                base / "fake_claude.py",
+                f"pathlib.Path('src/mod.cpp').write_text({bad_cpp!r}, encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'is_error': False, 'total_cost_usd': 0.01, 'num_turns': 1, 'result': 'done'}))\n",
+            )
+            rc, stdout, _ = self._run_dispatch(
+                [
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(base / "runs"),
+                    "--agent-bin", str(fake_agent),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(1, rc)
+            data = json.loads(stdout.strip())
+            self.assertEqual("fail", data["gate"])
+            self.assertGreater(data["static_findings"], 0)
+            self.assertFalse(data["static_clean"])
+            rdir = Path(data["run_dir"])
+            gate_txt = (rdir / "steps" / "02-gate.txt").read_text(encoding="utf-8")
+            self.assertIn("[cppcheck]", gate_txt)
+            self.assertIn("nullPointer", gate_txt)
+            run_meta = json.loads((rdir / "run.json").read_text(encoding="utf-8"))
+            self.assertGreater(run_meta["static_findings_first_attempt"], 0)
+            self.assertFalse(run_meta["static_clean_final"])
+
 
 if __name__ == "__main__":
     unittest.main()

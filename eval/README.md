@@ -35,7 +35,7 @@ user plugins, MCP servers, or global instructions.
   deterministic graders (`check.sh` using `DEVPACK_ROOT`), writes per-trial run directories
   under `--runs-root`, and writes `results.json` and `summary.md` (including `## Failure causes`).
 - `eval/Dockerfile`: Container image definition (`devpack-eval:<version>`) with Node
-  LTS, pinned `@anthropic-ai/claude-code`, `g++`, `cmake`, `python3`, `git`, and
+  LTS, pinned `@anthropic-ai/claude-code`, `g++`, `cmake`, `cppcheck`, `python3`, `git`, and
   a non-root user (`1000:1000`).
 - `eval/tests/`: Unit test suite for `run_eval.py` and the broker using fake agents.
 
@@ -151,7 +151,8 @@ summarized per engine in `summary.md` under `## Failure causes`.
   `--allow-unsandboxed-local` (or `allow_unsandboxed_local = true` in `.devpack/project.toml`).
 - **`DEVPACK_ROOT`**: exported by `run_eval.py`, `verify_tasks.sh`, and
   `tests/verify_orchestrator_goals.py` when running `check.sh` graders so each grader
-  resolves `enforcement/lint/preflight_lint.py`, `enforcement/checks/scope_check.py`,
+  resolves `enforcement/lint/preflight_lint.py`, `enforcement/static/cppcheck_check.py`,
+  `enforcement/checks/scope_check.py`,
   `enforcement/checks/test_lock.py` (invoked with `--no-deviation` so agents under test
   cannot self-exempt), and `eval/fixture/preflight.toml`.
 
@@ -188,8 +189,9 @@ For each `(task, engine/pair)` over `k` valid runs (`c` passing):
   `tokens_in`, `tokens_out`, `duration_s`, `num_turns`.
 - **`tool_protocol_errors`**: count of assistant turns that printed a JSON tool call as
   plain text instead of emitting a `tool_use` block (must be `0` for qualification).
-- **Code-quality metrics** (`single` and `runner`): `lint_findings_first_attempt`,
-  `lint_clean_final`, and `rounds_to_clean`.
+- **Code-quality and static-analysis metrics** (`single` and `runner`):
+  `lint_findings_first_attempt`, `lint_clean_final`, `rounds_to_clean`,
+  `static_findings_first_attempt`, and `static_clean_final`.
 - **Runner / reviewer metrics** (`runner` mode): `escalate` rate, `reviewer_false_approve`
   (`VERDICT: APPROVE` on a failing change), and `reviewer_false_reject`
   (`VERDICT: REQUEST_CHANGES` on a passing change).

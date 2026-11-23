@@ -591,6 +591,119 @@ class DevpackRunUnitTests(unittest.TestCase):
             self.assertIn("[ERROR][NAMING-MEANINGFUL]", fix2_prompt)
             self.assertNotIn("Fix 1 done", fix2_prompt)
 
+    def test_cppcheck_failure_feeds_fix_prompt_verbatim_and_tracks_static_metrics(self) -> None:
+        """Verify blocking cppcheck findings fail the gate, enter the fix brief verbatim, and record static metrics."""
+        import shutil
+        import subprocess
+
+        if shutil.which("cppcheck") is None:
+            self.skipTest("cppcheck is not installed on PATH")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "worktree"
+            (wt / "src").mkdir(parents=True)
+            (wt / "preflight.toml").write_text(
+                '[general]\nstd = "c++17"\n\n'
+                '[cppcheck]\nfail_on = ["error", "warning"]\n',
+                encoding="utf-8",
+            )
+            (wt / "src" / "calc.cpp").write_text(
+                "/**\n * @file calc.cpp\n * @brief Calc.\n */\n"
+                "/**\n * @brief Add one.\n * @param[in] value Input.\n * @return Output.\n */\n"
+                "int addOne(int value) { return value + 1; }\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=wt, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=wt, check=True)
+
+            state_path = base / "static_state.json"
+            state_path.write_text(json.dumps({"step": 0}), encoding="utf-8")
+            bad_cpp = (
+                "/**\n * @file calc.cpp\n * @brief Calc.\n */\n"
+                "/**\n * @brief Add one.\n * @param[in] value Input.\n * @return Output.\n */\n"
+                "int addOne(int value) {\n"
+                "    int *nullPtr = nullptr;\n"
+                "    if (value > 0) {\n"
+                "        return *nullPtr;\n"
+                "    }\n"
+                "    return value + 1;\n"
+                "}\n"
+            )
+            clean_cpp = (
+                "/**\n * @file calc.cpp\n * @brief Calc.\n */\n"
+                "/**\n * @brief Add one.\n * @param[in] value Input.\n * @return Output.\n */\n"
+                "int addOne(int value) { return value + 1; }\n"
+            )
+            fake_claude = base / "fake_claude.py"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib\n"
+                f"sf = pathlib.Path({str(state_path)!r})\n"
+                "st = json.loads(sf.read_text(encoding='utf-8'))\n"
+                "st['step'] += 1\n"
+                "n = st['step']\n"
+                "sf.write_text(json.dumps(st), encoding='utf-8')\n"
+                "target = pathlib.Path('src/calc.cpp')\n"
+                "if n == 1:\n"
+                f"    target.write_text({bad_cpp!r}, encoding='utf-8')\n"
+                "    res = 'Implemented'\n"
+                "elif n == 2:\n"
+                f"    target.write_text({clean_cpp!r}, encoding='utf-8')\n"
+                "    res = 'Fixed static issue'\n"
+                "else:\n"
+                "    res = 'Clean\\nVERDICT: APPROVE'\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 1, 'result': res}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_claude, stat.S_IRWXU)
+
+            fake_gate = base / "fake_gate.py"
+            fake_gate.write_text("#!/usr/bin/env python3\nprint('BUILD_OK')\n", encoding="utf-8")
+            os.chmod(fake_gate, stat.S_IRWXU)
+
+            config_path = base / "engines.toml"
+            config_path.write_text(
+                "version = 2\n"
+                f'gate_cmd = ["python3", "{fake_gate}"]\n'
+                "[engines.haiku]\n"
+                'model = "haiku"\n'
+                'class = "cloud"\n'
+                "[roles]\n"
+                'implementer = "haiku"\n'
+                'reviewer = "haiku"\n'
+                'fixer = "haiku"\n',
+                encoding="utf-8",
+            )
+
+            runs_root = base / "runs"
+            rc = devpack_run.main(
+                [
+                    "--config", str(config_path),
+                    "--worktree", str(wt),
+                    "--runs-root", str(runs_root),
+                    "--agent-bin", str(fake_claude),
+                    "--task-id", "static-loop",
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(0, rc)
+            rdir = next(runs_root.iterdir())
+            summary = json.loads((rdir / "run_summary.json").read_text(encoding="utf-8"))
+            self.assertGreater(summary["static_findings_first_attempt"], 0)
+            self.assertTrue(summary["static_clean_final"])
+            run_json = json.loads((rdir / "run.json").read_text(encoding="utf-8"))
+            self.assertGreater(run_json["static_findings_first_attempt"], 0)
+            self.assertTrue(run_json["static_clean_final"])
+
+            fix_prompt = (rdir / "steps" / "03-fixer-haiku.prompt.md").read_text(encoding="utf-8")
+            self.assertIn("[cppcheck]", fix_prompt)
+            self.assertIn("nullPointer", fix_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

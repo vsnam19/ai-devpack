@@ -87,7 +87,7 @@ from runner.agent_exec import (  # noqa: E402
     save_qualification_data,
     update_run_json,
 )
-from runner.devpack_dispatch import run_preflight_lint_on_changed  # noqa: E402
+from runner.devpack_dispatch import run_cppcheck_on_changed, run_preflight_lint_on_changed  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
 from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 
@@ -187,6 +187,8 @@ class TrialResult:
     lint_findings_first_attempt: int | None = None
     lint_clean_final: bool | None = None
     rounds_to_clean: int | None = None
+    static_findings_first_attempt: int | None = None
+    static_clean_final: bool | None = None
     mode: str = "single"
     rounds_used: int | None = None
     escalated: bool = False
@@ -245,6 +247,8 @@ class TaskModelSummary:
     mean_lint_findings_first_attempt: float | None = None
     lint_clean_final_rate: float | None = None
     mean_rounds_to_clean: float | None = None
+    mean_static_findings_first_attempt: float | None = None
+    static_clean_final_rate: float | None = None
     mean_local_tokens: float | None = None
     mean_local_wall_s: float | None = None
     mean_rounds_used: float | None = None
@@ -1314,6 +1318,8 @@ def _run_trial_body(
     lint_findings_first: int | None = None
     lint_clean_final: bool | None = None
     rounds_to_clean: int | None = None
+    static_findings_first: int | None = None
+    static_clean_final: bool | None = None
     if not is_harness_err and not timed_out:
         base_ref = _resolve_baseline_ref(work_dir)
         changed_files, _ = get_changed_files(work_dir, base_ref)
@@ -1323,6 +1329,12 @@ def _run_trial_body(
         lint_findings_first = lint_count
         lint_clean_final = lint_ok
         rounds_to_clean = 0 if lint_ok else None
+
+        static_ok, static_count, _static_out = run_cppcheck_on_changed(
+            work_dir, changed_files or [], pack_root=REPO_ROOT
+        )
+        static_findings_first = static_count
+        static_clean_final = static_ok
 
     check_rc, check_out = _run_check_script(
         task.check_sh,
@@ -1353,6 +1365,10 @@ def _run_trial_body(
         trial_run_dir,
         outcome=outcome,
         timed_out=timed_out,
+        lint_findings_first_attempt=lint_findings_first,
+        lint_clean_final=lint_clean_final,
+        static_findings_first_attempt=static_findings_first,
+        static_clean_final=static_clean_final,
         context=context_mode,
         brief_variant=brief_variant,
         skills_enabled=skills_enabled,
@@ -1398,6 +1414,8 @@ def _run_trial_body(
         lint_findings_first_attempt=lint_findings_first,
         lint_clean_final=lint_clean_final,
         rounds_to_clean=rounds_to_clean,
+        static_findings_first_attempt=static_findings_first,
+        static_clean_final=static_clean_final,
         mode="single",
         init_model=agent_res.init_model,
         init_digest=agent_res.init_digest,
@@ -1700,6 +1718,8 @@ def run_runner_trial(
             lint_findings_first_attempt=summary.get("lint_findings_first_attempt"),
             lint_clean_final=summary.get("lint_clean_final"),
             rounds_to_clean=summary.get("rounds_to_clean"),
+            static_findings_first_attempt=summary.get("static_findings_first_attempt"),
+            static_clean_final=summary.get("static_clean_final"),
             local_tokens=int(summary.get("local_tokens", 0) or 0),
             local_wall_s=float(summary.get("local_wall_s", 0.0) or 0.0),
             mode="runner",
@@ -2525,6 +2545,12 @@ def aggregate_results(
             ]
             lint_clean = [r.lint_clean_final for r in valid if r.lint_clean_final is not None]
             lint_rounds = [r.rounds_to_clean for r in valid if r.rounds_to_clean is not None]
+            static_first = [
+                r.static_findings_first_attempt
+                for r in valid
+                if r.static_findings_first_attempt is not None
+            ]
+            static_clean = [r.static_clean_final for r in valid if r.static_clean_final is not None]
 
             rounds_used_list = [r.rounds_used for r in valid if r.rounds_used is not None]
             runner_runs = [r for r in valid if r.mode == "runner"]
@@ -2607,6 +2633,14 @@ def aggregate_results(
                     ),
                     mean_rounds_to_clean=(
                         round(sum(lint_rounds) / len(lint_rounds), 4) if lint_rounds else None
+                    ),
+                    mean_static_findings_first_attempt=(
+                        round(sum(static_first) / len(static_first), 4) if static_first else None
+                    ),
+                    static_clean_final_rate=(
+                        round(sum(1 for x in static_clean if x) / len(static_clean), 4)
+                        if static_clean
+                        else None
                     ),
                     mean_local_tokens=(sum(r.local_tokens for r in valid) / len(valid) if valid else None),
                     mean_local_wall_s=(sum(r.local_wall_s for r in valid) / len(valid) if valid else None),
@@ -2691,6 +2725,16 @@ def aggregate_results(
                 for s in matching
                 if s.mean_rounds_to_clean is not None
             ]
+            cat_static_first = [
+                s.mean_static_findings_first_attempt
+                for s in matching
+                if s.mean_static_findings_first_attempt is not None
+            ]
+            cat_static_clean = [
+                s.static_clean_final_rate
+                for s in matching
+                if s.static_clean_final_rate is not None
+            ]
             cat_rounds_used = [
                 s.mean_rounds_used for s in matching if s.mean_rounds_used is not None
             ]
@@ -2731,6 +2775,8 @@ def aggregate_results(
                     "mean_lint_findings_first_attempt": _mean(cat_lint_first),
                     "lint_clean_final_rate": _mean(cat_lint_clean),
                     "mean_rounds_to_clean": _mean(cat_rounds_clean),
+                    "mean_static_findings_first_attempt": _mean(cat_static_first),
+                    "static_clean_final_rate": _mean(cat_static_clean),
                     "mean_rounds_used": _mean(cat_rounds_used),
                     "escalate_rate": _mean(cat_escalate),
                     "false_approve_count": sum(s.false_approve_count for s in matching),
@@ -2828,8 +2874,8 @@ def render_summary_markdown(
         "",
         "Pass metrics include timeouts as not passed; harness errors are excluded.",
         "",
-        "| Category | Engine | Tasks | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | Lint 1st | Lint Clean |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Category | Engine | Tasks | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | Lint 1st | Lint Clean | Static 1st | Static Clean |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for cat in category_summaries:
         cost_str = (
@@ -2843,7 +2889,8 @@ def render_summary_markdown(
             f"{cat['harness_errors']} | {cat.get('timeouts', 0)} | {cat.get('tool_protocol_errors', 0)} | "
             f"{_fmt(cat['pass_at_1'])} | {_fmt(cat['pass_hat_k'])} | "
             f"{_fmt(cat['pass_pow_k'])} | {cost_str} | {tok_str} | {cat['mean_duration_s']:.2f} | "
-            f"{_fmt(cat.get('mean_lint_findings_first_attempt'))} | {_fmt(cat.get('lint_clean_final_rate'))} |"
+            f"{_fmt(cat.get('mean_lint_findings_first_attempt'))} | {_fmt(cat.get('lint_clean_final_rate'))} | "
+            f"{_fmt(cat.get('mean_static_findings_first_attempt'))} | {_fmt(cat.get('static_clean_final_rate'))} |"
         )
 
     lines.extend(
@@ -2851,8 +2898,8 @@ def render_summary_markdown(
             "",
             "## Per-Task Summary",
             "",
-            "| Task | Category | Engine | Passes (c/valid) | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | Lint 1st | Lint Clean | Rounds Clean |",
-            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Task | Category | Engine | Passes (c/valid) | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | Lint 1st | Lint Clean | Rounds Clean | Static 1st | Static Clean |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for ts in task_summaries:
@@ -2865,7 +2912,8 @@ def render_summary_markdown(
             f"{ts.passes}/{ts.valid_runs} | {ts.harness_errors} | {ts.timeouts} | {ts.tool_protocol_errors} | "
             f"{_fmt(ts.pass_at_1)} | {_fmt(ts.pass_hat_k)} | "
             f"{_fmt(ts.pass_pow_k)} | {cost_str} | {tok_str} | {ts.mean_duration_s:.2f} | "
-            f"{_fmt(ts.mean_lint_findings_first_attempt)} | {_fmt(ts.lint_clean_final_rate)} | {_fmt(ts.mean_rounds_to_clean)} |"
+            f"{_fmt(ts.mean_lint_findings_first_attempt)} | {_fmt(ts.lint_clean_final_rate)} | {_fmt(ts.mean_rounds_to_clean)} | "
+            f"{_fmt(ts.mean_static_findings_first_attempt)} | {_fmt(ts.static_clean_final_rate)} |"
         )
 
     if any(r.mode == "runner" for ts in task_summaries for r in ts.runs):

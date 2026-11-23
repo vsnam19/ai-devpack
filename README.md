@@ -17,7 +17,7 @@ internally.
 
 | Path | Content |
 |---|---|
-| `policy/` | operating model, ASIL boundaries (company policy, needs safety approval), sandbox, data governance, provenance, failure handling, `policy/failure_attribution.md`, tool confidence, deviations, `policy/logging.md`, `policy/local_models.md`, `policy/memory.md` |
+| `policy/` | operating model, ASIL boundaries (company policy, needs safety approval), sandbox, data governance, provenance, failure handling, `policy/failure_attribution.md`, `policy/static_analysis.md`, tool confidence, deviations, `policy/logging.md`, `policy/local_models.md`, `policy/memory.md` |
 | `knowledge/` | `lessons.md` (LSN-001..LSN-019), `context_template/AGENTS.md`, `skills/` (`automotive-cpp`, `review-taxonomy`, `skill-authoring`, `requirements-analysis`; deprecated: `misra-cpp-2023`, `doxygen-naming`), `engine_profiles/` |
 | `workflow/templates/` | brief (implement, fix, review), task plan and ADR templates |
 | `workflow/ci/` | `pipeline.md` and examples (`examples/gitlab-ci.yml`, `examples/Jenkinsfile`) |
@@ -27,6 +27,7 @@ internally.
 | `learning/` | `harvest.py`, `propose.py`, `validate.py` for mining run logs and validating bounded engine profiles |
 | `enforcement/gate/` | `gate.py` fail-closed gate and `gate.example.toml` (the pack's own offline gate config) |
 | `enforcement/lint/` | `preflight_lint.py` C/C++ preflight linter and its README |
+| `enforcement/static/` | `cppcheck_check.py` C/C++ static analysis (local stand-in for Coverity; `policy/static_analysis.md`) |
 | `enforcement/checks/` | secret/PII, scope, trace and test-lock checks |
 | `enforcement/hooks/` | `pre-commit` hook and `install.sh` |
 | `enforcement/evidence/` | `collect.py` evidence collector |

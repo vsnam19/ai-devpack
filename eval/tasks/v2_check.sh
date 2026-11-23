@@ -62,11 +62,12 @@ if [[ -z "${DEVPACK_ROOT:-}" ]]; then
 fi
 
 PREFLIGHT_LINT="$DEVPACK_ROOT/enforcement/lint/preflight_lint.py"
+CPPCHECK_CHECK="$DEVPACK_ROOT/enforcement/static/cppcheck_check.py"
 PREFLIGHT_CFG="$DEVPACK_ROOT/eval/fixture/preflight.toml"
 TEST_LOCK="$DEVPACK_ROOT/enforcement/checks/test_lock.py"
 SCOPE_CHECK="$DEVPACK_ROOT/enforcement/checks/scope_check.py"
 
-if [[ ! -f "$PREFLIGHT_LINT" || ! -f "$PREFLIGHT_CFG" || ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" ]]; then
+if [[ ! -f "$PREFLIGHT_LINT" || ! -f "$CPPCHECK_CHECK" || ! -f "$PREFLIGHT_CFG" || ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" ]]; then
     echo "GRADER_MISCONFIGURED: missing enforcement scripts or preflight.toml under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
     exit 2
 fi
@@ -272,7 +273,7 @@ else
     fi
 fi
 
-# 6. Run preflight lint on changed src/ and include/ files
+# 6. Run preflight lint and cppcheck static analysis on changed src/ and include/ files
 mapfile -t CHANGED_CPP_FILES < <(
     {
         git -C "$WORKDIR" diff --name-only "$BASE_REF" -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
@@ -288,6 +289,21 @@ if [[ "${#CHANGED_CPP_FILES[@]}" -gt 0 ]]; then
     done
     if [[ "${#lint_targets[@]}" -gt 0 ]]; then
         python3 "$PREFLIGHT_LINT" --no-cache --repo-root "$WORKDIR" --config "$PREFLIGHT_CFG" "${lint_targets[@]}" >/dev/null
+        set +e
+        cppcheck_out="$(python3 "$CPPCHECK_CHECK" --repo-root "$WORKDIR" --config "$PREFLIGHT_CFG" "${lint_targets[@]}" 2>&1)"
+        cppcheck_rc=$?
+        set -e
+        if [[ "$cppcheck_rc" -eq 3 ]]; then
+            echo "GRADER_MISCONFIGURED: cppcheck TOOL_MISSING: $cppcheck_out" >&2
+            exit 2
+        elif [[ "$cppcheck_rc" -eq 2 ]]; then
+            echo "GRADER_MISCONFIGURED: cppcheck_check execution error: $cppcheck_out" >&2
+            exit 2
+        elif [[ "$cppcheck_rc" -ne 0 ]]; then
+            echo "FAIL: cppcheck static analysis blocking findings:" >&2
+            echo "$cppcheck_out" >&2
+            exit 1
+        fi
     fi
 fi
 
