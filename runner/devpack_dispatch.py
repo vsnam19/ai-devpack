@@ -596,27 +596,40 @@ def _resolve_gate_command(
     run_dir: Path,
     pack_root: Path = PACK_ROOT,
     trusted_gate_toml: Path | None = None,
+    *,
+    all_components: bool = False,
+    components: Sequence[str] | None = None,
+    project_config_path: Path | None = None,
 ) -> tuple[list[str] | None, int]:
-    """Determine the deterministic gate command and timeout for ``workdir``."""
+    """Determine the deterministic gate command and timeout for ``workdir``.
+
+    Scope (``all_components`` / ``components``) and ``project_config_path`` are forwarded to
+    gate.py on both the trusted-config and the project-gate paths via the shared builder.
+    Raises ``ValueError`` when no gate can be resolved (for example, ``gate_config`` is unset).
+    """
     timeout_s = engines_cfg.gate_timeout_s if engines_cfg is not None else 300
     if explicit_gate_cmd.strip():
         return shlex.split(explicit_gate_cmd), timeout_s
 
     if trusted_gate_toml is not None and trusted_gate_toml.is_file():
-        return [
-            "python3",
-            str(pack_root / "enforcement" / "gate" / "gate.py"),
-            "--config",
-            str(trusted_gate_toml),
-            "--repo",
-            str(workdir),
-            "--receipt",
-            str(run_dir / "steps" / "02-gate-receipt.json"),
-        ], timeout_s
+        return agent_exec.build_gate_argv(
+            trusted_gate_toml,
+            workdir,
+            receipt=run_dir / "steps" / "02-gate-receipt.json",
+            all_components=all_components,
+            components=components,
+            project_config_path=project_config_path,
+            pack_root=pack_root,
+        ), timeout_s
 
     if engines_cfg is not None and list(engines_cfg.gate_cmd) != list(agent_exec.DEFAULT_GATE_CMD):
         return list(engines_cfg.gate_cmd), timeout_s
-    return agent_exec.resolve_project_gate_command(workdir), timeout_s
+    return agent_exec.resolve_project_gate_command(
+        workdir,
+        project_config_path=project_config_path,
+        all_components=all_components,
+        components=components,
+    ), timeout_s
 
 
 def _render_run_dir_quietly(
@@ -931,6 +944,7 @@ def dispatch_job(
             gate_cmd=gate_cmd,
             no_gate=no_gate,
             project_config_path=project_config_path,
+            all_components=all_components,
             isolation=isolation,
             allow_unsandboxed_local=allow_unsandboxed_local,
             credentials_path=credentials_path,
@@ -981,6 +995,7 @@ def _dispatch_job_with_trusted_cfg(
     gate_cmd: str,
     no_gate: bool,
     project_config_path: Path | None,
+    all_components: bool,
     isolation: str,
     allow_unsandboxed_local: bool,
     credentials_path: Path | None,
@@ -1159,6 +1174,52 @@ def _dispatch_job_with_trusted_cfg(
             qualification_warning=qual_reason,
             engine_config_hash=engine_cfg_hash,
         )
+
+    # Resolve and validate the gate before any agent starts: a missing gate configuration is a
+    # clean refusal here, not an exception raised after the agent has already run.
+    resolved_gate_cmd: list[str] | None = None
+    gate_timeout_s = 300
+    if not no_gate:
+        gate_scope_names = (
+            [c.name for c in ws_scope.active_components]
+            if ws_scope.configured and ws_scope.scan_mode == "selected"
+            else None
+        )
+        try:
+            resolved_gate_cmd, gate_timeout_s = _resolve_gate_command(
+                gate_cmd,
+                engines_cfg,
+                workdir,
+                run_dir,
+                pack_root=pack_root,
+                trusted_gate_toml=trusted_cfg.gate_toml_path,
+                all_components=all_components or ws_scope.scan_mode == "all",
+                components=gate_scope_names,
+                project_config_path=project_config_path,
+            )
+        except ValueError as exc:
+            refusal = f"Refused before agent launch: {exc}"
+            sys.stderr.write(refusal + "\n")
+            update_run_json(
+                run_dir,
+                outcome="refused",
+                gate="skipped",
+                refusal_reason=refusal,
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+            payload = {
+                "run_dir": str(run_dir),
+                "status": "refused",
+                "gate": "skipped",
+                "scope": "ok",
+                "changed_files": [],
+                "final_text_tail": "",
+                "cost_usd": None if engine.is_local else 0.0,
+                "error": refusal,
+            }
+            _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
+            _emit_json_line(payload)
+            return 1, payload
 
     req = AgentRequest(
         engine=engine,
@@ -1459,15 +1520,7 @@ def _dispatch_job_with_trusted_cfg(
             if not static_clean:
                 gate_ok = False
 
-            # 3. Configured gate command (if any)
-            resolved_gate_cmd, gate_timeout_s = _resolve_gate_command(
-                gate_cmd,
-                engines_cfg,
-                workdir,
-                run_dir,
-                pack_root=pack_root,
-                trusted_gate_toml=trusted_cfg.gate_toml_path,
-            )
+            # 3. Configured gate command (resolved and validated before the agent launched)
             if resolved_gate_cmd is not None:
                 g_rc, g_out, g_err = _run_subprocess(resolved_gate_cmd, workdir, timeout_s=gate_timeout_s)
                 g_combined = (g_out + "\n" + g_err).strip()

@@ -4483,7 +4483,11 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     if not files:
         if args.allow_empty:
-            print("SKIP: no C/C++ changes")
+            if args.json:
+                skip_payload = {"status": "skip", "reason": "no C/C++ changes", "files": 0, "findings": []}
+                print(json.dumps(skip_payload, separators=(",", ":")))
+            else:
+                print("SKIP: no C/C++ changes")
             return 0
         print("NO_FILES_CHECKED: no matching in-scope C/C++ files found", file=sys.stderr)
         return 1

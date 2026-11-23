@@ -1181,5 +1181,34 @@ class PluginAndAstScopeTests(unittest.TestCase):
             self.assertEqual(2, res_std.returncode)
 
 
+class EmptyScanOutputTests(unittest.TestCase):
+    """An intentionally empty scan (--allow-empty) reports its skip in the requested output format."""
+
+    def test_allow_empty_with_json_prints_machine_readable_skip(self) -> None:
+        """With --json an empty scan prints exactly the documented skip object and exits 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                rc = preflight_lint.main(["--json", "--allow-empty", "--repo-root", tmp])
+            self.assertEqual(0, rc)
+            self.assertEqual(
+                '{"status":"skip","reason":"no C/C++ changes","files":0,"findings":[]}',
+                out.getvalue().strip(),
+            )
+            self.assertEqual(
+                {"status": "skip", "reason": "no C/C++ changes", "files": 0, "findings": []},
+                json.loads(out.getvalue()),
+            )
+
+    def test_allow_empty_without_json_keeps_plain_skip_line(self) -> None:
+        """Without --json the empty scan keeps the plain SKIP line."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                rc = preflight_lint.main(["--allow-empty", "--repo-root", tmp])
+            self.assertEqual(0, rc)
+            self.assertEqual("SKIP: no C/C++ changes", out.getvalue().strip())
+
+
 if __name__ == "__main__":
     unittest.main()

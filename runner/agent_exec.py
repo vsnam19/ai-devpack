@@ -792,10 +792,46 @@ def load_project_config(
     return defaults
 
 
+def build_gate_argv(
+    gate_config: Path | str,
+    repo: Path | str,
+    *,
+    receipt: Path | str | None = None,
+    all_components: bool = True,
+    components: Sequence[str] | None = None,
+    project_config_path: Path | str | None = None,
+    pack_root: Path | str | None = None,
+) -> list[str]:
+    """Build the ``enforcement/gate/gate.py`` argv shared by dispatch and the project gate.
+
+    Scope precedence matches the lint and cppcheck invocations: ``all_components`` wins, otherwise
+    a non-empty ``components`` list is forwarded as one ``--components`` value. ``project_config_path``
+    is forwarded so gate.py resolves the same project settings as the caller.
+    """
+    root = Path(pack_root) if pack_root is not None else Path(__file__).resolve().parents[1]
+    argv = [
+        "python3", str(root / "enforcement" / "gate" / "gate.py"),
+        "--config", str(gate_config), "--repo", str(repo),
+    ]
+    if receipt is not None:
+        argv.extend(["--receipt", str(receipt)])
+    if all_components:
+        argv.append("--all-components")
+    elif components:
+        argv.extend(["--components", ",".join(components)])
+    if project_config_path is not None and str(project_config_path):
+        argv.extend(["--project-config", str(project_config_path)])
+    return argv
+
+
 def resolve_project_gate_command(
     workdir: Path,
     gate_config: Path | str | None = None,
     project_config_path: Path | str | None = None,
+    *,
+    receipt: Path | str | None = None,
+    all_components: bool = True,
+    components: Sequence[str] | None = None,
 ) -> list[str]:
     """Build a pack-absolute gate command from the project's explicit gate configuration."""
     project = load_project_config(workdir, project_config_path)
@@ -807,10 +843,14 @@ def resolve_project_gate_command(
         config = Path(raw)
     if not config.is_file():
         raise ValueError(f"Project gate_config not found: {config}")
-    return [
-        "python3", str(Path(__file__).resolve().parents[1] / "enforcement/gate/gate.py"),
-        "--config", str(config), "--repo", str(workdir.resolve()), "--all-components",
-    ]
+    return build_gate_argv(
+        config,
+        workdir.resolve(),
+        receipt=receipt,
+        all_components=all_components,
+        components=components,
+        project_config_path=project_config_path,
+    )
 
 
 def check_data_class_allowed(engine: EngineConfig, data_class: str) -> tuple[bool, str]:
