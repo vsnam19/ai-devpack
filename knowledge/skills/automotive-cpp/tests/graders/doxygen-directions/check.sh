@@ -36,10 +36,17 @@ grep -q '@return' "$CANDIDATE/frame_crc.hpp"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti \
+if ! g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti \
   -I"$CANDIDATE" \
   "$CANDIDATE/frame_crc.cpp" \
   "$GRADER_DIR/grader_test.cpp" \
-  -o "$tmpdir/test_frame_crc"
+  -o "$tmpdir/test_frame_crc"; then
+  echo "FAIL: candidate does not compile with the grader" >&2
+  exit 1
+fi
 
-"$tmpdir/test_frame_crc"
+# A failing grader assertion aborts the binary; report it as a candidate failure (exit 1).
+if ! "$tmpdir/test_frame_crc"; then
+  echo "FAIL: grader known-answer assertions failed" >&2
+  exit 1
+fi

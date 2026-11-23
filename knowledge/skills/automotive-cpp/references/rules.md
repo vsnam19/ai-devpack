@@ -116,10 +116,16 @@ void update(std::uint16_t& frame, std::uint16_t sample) noexcept;
 // Bad
 std::uint32_t factorial(std::uint32_t n) { return (n <= 1U) ? 1U : (n * factorial(n - 1U)); }
 // Good
-std::uint32_t factorial(const std::uint32_t limit) noexcept {
-    std::uint32_t result{1U};
+enum class FactorialStatus : std::uint8_t { kOk, kOutOfRange };
+
+// 12! = 479001600 fits in std::uint32_t; 13! overflows it.
+constexpr std::uint32_t kMaxFactorialLimit{12U};
+
+FactorialStatus factorial(const std::uint32_t limit, std::uint32_t& result) noexcept {
+    result = 1U;
+    if (limit > kMaxFactorialLimit) { return FactorialStatus::kOutOfRange; }
     for (std::uint32_t idx{2U}; idx <= limit; ++idx) { result *= idx; }
-    return result;
+    return FactorialStatus::kOk;
 }
 ```
 
