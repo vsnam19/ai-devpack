@@ -34,3 +34,14 @@ orchestrator = "sonnet"
 # documented deviation (policy/deviations.md) because local isolation exposes
 # the host filesystem and network to the agent's Bash tool.
 allow_unsandboxed_local = false
+
+# Default static analysis configuration for enforcement/static/cppcheck_check.py
+# (projects with a preflight.toml may place [cppcheck] there instead; see
+# policy/static_analysis.md). Coverity on company CI remains authoritative.
+[cppcheck]
+enable = ["warning", "style", "performance", "portability"]
+std = "c++17"
+include_dirs = ["include"]
+suppressions_file = ""
+extra_args = ["--inline-suppr"]
+fail_on = ["error", "warning"]

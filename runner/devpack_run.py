@@ -60,7 +60,7 @@ from agent_exec import (  # noqa: E402
     run_agent,
     update_run_json,
 )
-from devpack_dispatch import run_preflight_lint_on_changed  # noqa: E402
+from devpack_dispatch import run_cppcheck_on_changed, run_preflight_lint_on_changed  # noqa: E402
 from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 from memory import memory_root_for, process_memory_proposals  # noqa: E402
 
@@ -596,6 +596,7 @@ def run_task_workflow(
 
     base_ref = _resolve_git_base_ref(worktree)
     lint_pack_root = repo_root if (repo_root / "enforcement" / "lint" / "preflight_lint.py").is_file() else REPO_ROOT
+    static_pack_root = repo_root if (repo_root / "enforcement" / "static" / "cppcheck_check.py").is_file() else REPO_ROOT
 
     step_index = 0
     step_logs: list[str] = []
@@ -612,6 +613,8 @@ def run_task_workflow(
     lint_findings_first_attempt: int | None = None
     last_lint_clean = True
     rounds_to_clean: int | None = None
+    static_findings_first_attempt: int | None = None
+    last_static_clean = True
     effective_mem_root = memory_root if memory_root is not None else memory_root_for(worktree)
     mem_cfg = config.memory if isinstance(config, EnginesConfig) else None
     all_memory_ids: list[str] = []
@@ -736,6 +739,8 @@ def run_task_workflow(
 
         lint_findings = 0
         lint_ok = True
+        static_findings = 0
+        static_ok = True
         if base_ref is not None:
             changed_files, _ = get_changed_files(worktree, base_ref)
             lint_ok, lint_findings, lint_out = run_preflight_lint_on_changed(
@@ -750,11 +755,26 @@ def run_task_workflow(
             if not lint_ok:
                 gate_passed = False
 
+            static_ok, static_findings, static_out = run_cppcheck_on_changed(
+                worktree, changed_files or [], pack_root=static_pack_root
+            )
+            if static_out:
+                combined_gate_output = (
+                    (combined_gate_output + "\n\n" if combined_gate_output else "")
+                    + "[cppcheck]\n"
+                    + static_out
+                )
+            if not static_ok:
+                gate_passed = False
+
         if lint_findings_first_attempt is None:
             lint_findings_first_attempt = lint_findings
         last_lint_clean = lint_ok
         if rounds_to_clean is None and lint_ok:
             rounds_to_clean = fix_rounds_used
+        if static_findings_first_attempt is None:
+            static_findings_first_attempt = static_findings
+        last_static_clean = static_ok
 
         write_gate_step_file(
             active_run_dir,
@@ -774,6 +794,8 @@ def run_task_workflow(
                 "gate_passed": gate_passed,
                 "lint_findings": lint_findings,
                 "lint_clean": lint_ok,
+                "static_findings": static_findings,
+                "static_clean": static_ok,
                 "stdout": gate_out,
                 "stderr": gate_err,
                 "duration_s": gate_dur,
@@ -976,6 +998,10 @@ def run_task_workflow(
         task=context["TASK_ID"],
         engines=role_engine_map,
         outcome=final_status,
+        lint_findings_first_attempt=lint_findings_first_attempt,
+        lint_clean_final=bool(last_lint_clean),
+        static_findings_first_attempt=static_findings_first_attempt,
+        static_clean_final=bool(last_static_clean),
         finished=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -997,6 +1023,8 @@ def run_task_workflow(
         "lint_findings_first_attempt": lint_findings_first_attempt,
         "lint_clean_final": bool(last_lint_clean),
         "rounds_to_clean": rounds_to_clean,
+        "static_findings_first_attempt": static_findings_first_attempt,
+        "static_clean_final": bool(last_static_clean),
         "timed_out": any_timeout,
         "harness_error": any_harness_error,
         "harness_error_reason": first_harness_error,

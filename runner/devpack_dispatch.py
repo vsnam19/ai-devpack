@@ -88,6 +88,9 @@ from runner.memory import memory_root_for, process_memory_proposals  # noqa: E40
 
 CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
 _LINT_SUMMARY_RE = re.compile(r"Summary:\s+\d+\s+file\(s\)\s+checked,\s+(\d+)\s+finding\(s\)\.")
+_CPPCHECK_SUMMARY_RE = re.compile(
+    r"Summary:\s+\d+\s+file\(s\)\s+checked,\s+\d+\s+finding\(s\)\s+\((\d+)\s+blocking"
+)
 
 
 def _run_subprocess(cmd: Sequence[str], cwd: Path, timeout_s: int = 300) -> tuple[int, str, str]:
@@ -166,6 +169,52 @@ def run_preflight_lint_on_changed(
     combined = "\n".join(part for part in (out.strip(), err.strip()) if part).strip()
     findings = parse_lint_finding_count(combined, rc)
     return rc == 0, findings, combined
+
+
+def parse_cppcheck_blocking_count(cppcheck_output: str, returncode: int) -> int:
+    """Extract the blocking finding count from ``cppcheck_check.py`` output."""
+    match = _CPPCHECK_SUMMARY_RE.search(cppcheck_output)
+    if match:
+        return int(match.group(1))
+    return 0 if returncode == 0 else 1
+
+
+def run_cppcheck_on_changed(
+    workdir: Path,
+    changed_files: Sequence[str],
+    pack_root: Path = PACK_ROOT,
+) -> tuple[bool, int, str]:
+    """Run ``cppcheck_check.py`` on changed C/C++ files inside ``workdir``.
+
+    Returns ``(passed, blocking_finding_count, combined_output)``.
+    """
+    static_targets = [
+        str(workdir / rel)
+        for rel in changed_files
+        if rel.lower().endswith(CPP_SUFFIXES) and (workdir / rel).is_file()
+    ]
+    if not static_targets:
+        return True, 0, ""
+
+    cppcheck_script = pack_root / "enforcement" / "static" / "cppcheck_check.py"
+    if not cppcheck_script.is_file():
+        return False, 1, f"Missing cppcheck static analyzer: {cppcheck_script}"
+
+    cmd: list[str] = [
+        "python3",
+        str(cppcheck_script),
+        "--repo-root",
+        str(workdir),
+    ]
+    cfg_candidate = workdir / "preflight.toml"
+    if cfg_candidate.is_file():
+        cmd.extend(["--config", str(cfg_candidate)])
+    cmd.extend(static_targets)
+
+    rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
+    combined = "\n".join(part for part in (out.strip(), err.strip()) if part).strip()
+    blocking = parse_cppcheck_blocking_count(combined, rc)
+    return rc == 0, blocking, combined
 
 
 def _inject_quality_checklist(brief_text: str, pack_root: Path = PACK_ROOT) -> str:
@@ -691,9 +740,11 @@ def dispatch_job(
         scope_status = "violation"
         scope_out = "\n".join(f"SCOPE_VIOLATION: {name} is broker control data" for name in control_changes)
 
-    # Gate + test_lock + preflight_lint
+    # Gate + test_lock + preflight_lint + cppcheck
     gate_status = "skipped"
     lint_findings = 0
+    static_findings = 0
+    static_clean = True
     test_lock_status = "skipped"
     gate_logs: list[str] = []
 
@@ -735,6 +786,15 @@ def dispatch_job(
             if lint_out:
                 gate_logs.append(f"[preflight_lint]\n{lint_out}")
             if not lint_ok:
+                gate_ok = False
+
+            # 2b. Static analysis (cppcheck) on changed C/C++ files
+            static_clean, static_findings, static_out = run_cppcheck_on_changed(
+                workdir, changed_files, pack_root=pack_root
+            )
+            if static_out:
+                gate_logs.append(f"[cppcheck]\n{static_out}")
+            if not static_clean:
                 gate_ok = False
 
             # 3. Configured gate command (if any)
@@ -787,6 +847,9 @@ def dispatch_job(
         scope=scope_status,
         test_lock=test_lock_status,
         lint_findings=lint_findings,
+        static_findings=static_findings,
+        static_findings_first_attempt=static_findings,
+        static_clean_final=static_clean,
         brief_lint=effective_brief_lint,
         data_class=project_cfg["data_class"],
         memory_ids=list(agent_res.memory_ids),
@@ -812,6 +875,8 @@ def dispatch_job(
         "tool_protocol_errors": agent_res.tool_protocol_errors,
         "test_lock": test_lock_status,
         "lint_findings": lint_findings,
+        "static_findings": static_findings,
+        "static_clean": static_clean,
         "memory_ids": list(agent_res.memory_ids),
         "memory_hashes": dict(agent_res.memory_hashes),
         "memory_tokens": int(agent_res.memory_tokens),

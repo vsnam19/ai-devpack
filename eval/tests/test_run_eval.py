@@ -684,6 +684,7 @@ class HarnessErrorTests(unittest.TestCase):
                     rounds_used=1, escalated=False, reviewer_verdict="APPROVE",
                     reviewer_false_approve=True, reviewer_false_reject=False,
                     lint_findings_first_attempt=2, lint_clean_final=True, rounds_to_clean=1,
+                    static_findings_first_attempt=1, static_clean_final=True,
                 ),
                 run_eval.TrialResult(
                     task_id=task.task_id, category=task.category, model="haiku:sonnet",
@@ -692,6 +693,7 @@ class HarnessErrorTests(unittest.TestCase):
                     rounds_used=2, escalated=True, reviewer_verdict="REQUEST_CHANGES",
                     reviewer_false_approve=False, reviewer_false_reject=True,
                     lint_findings_first_attempt=0, lint_clean_final=True, rounds_to_clean=0,
+                    static_findings_first_attempt=0, static_clean_final=True,
                 ),
             ]
             task_sums, cat_sums = run_eval.aggregate_results([task], ["haiku:sonnet"], 2, trials)
@@ -705,6 +707,15 @@ class HarnessErrorTests(unittest.TestCase):
             self.assertAlmostEqual(1.0, ts.mean_lint_findings_first_attempt)
             self.assertAlmostEqual(1.0, ts.lint_clean_final_rate)
             self.assertAlmostEqual(0.5, ts.mean_rounds_to_clean)
+            self.assertAlmostEqual(0.5, ts.mean_static_findings_first_attempt)
+            self.assertAlmostEqual(1.0, ts.static_clean_final_rate)
+            self.assertAlmostEqual(0.5, cat_sums[0]["mean_static_findings_first_attempt"])
+            self.assertAlmostEqual(1.0, cat_sums[0]["static_clean_final_rate"])
+            md = run_eval.render_summary_markdown(
+                "r1", "2026-11-23", "local", 2, ["haiku:sonnet"], task_sums, cat_sums, mode="runner"
+            )
+            self.assertIn("Static 1st", md)
+            self.assertIn("Static Clean", md)
             self.assertEqual(1, cat_sums[0]["false_approve_count"])
             self.assertEqual(1, cat_sums[0]["false_reject_count"])
 
@@ -862,6 +873,89 @@ class HarnessErrorTests(unittest.TestCase):
                 self.assertEqual(1, rc_bad)
                 qdata2 = json.loads(qual_file.read_text(encoding="utf-8"))
                 self.assertEqual("unqualified", qdata2["engines"]["local"]["status"])
+
+    def test_v2_check_cppcheck_tool_missing_and_blocking_finding(self) -> None:
+        """v2_check.sh maps cppcheck TOOL_MISSING (exit 3) to GRADER_MISCONFIGURED (exit 2) and fails on blocking findings."""
+        import shutil
+
+        if shutil.which("cppcheck") is None:
+            self.skipTest("cppcheck is not installed on PATH")
+
+        fixture_dir = REPO_ROOT / "eval" / "fixture"
+        task_dir = REPO_ROOT / "eval" / "tasks" / "11-vague-link-recovery"
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            work = base / "work"
+            shutil.copytree(fixture_dir, work)
+            subprocess.run(["git", "init", "-q"], cwd=work, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=work, check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=work, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "chore: base fixture"], cwd=work, check=True)
+            subprocess.run(["git", "apply", str(task_dir / "setup.patch")], cwd=work, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "chore: apply setup.patch"], cwd=work, check=True)
+            subprocess.run(["git", "apply", str(task_dir / "solution.patch")], cwd=work, check=True)
+
+            # Inject a nullPointer dereference into a clean solution function
+            lsm_path = work / "src" / "link_state_machine.cpp"
+            lsm_text = lsm_path.read_text(encoding="utf-8")
+            marker = "void LinkStateMachine::reset() noexcept {"
+            self.assertIn(marker, lsm_text)
+            lsm_path.write_text(
+                lsm_text.replace(
+                    marker,
+                    marker + "\n    const int* badPtr = nullptr;\n    if (m_state == LinkState::Fault && m_retryCount == 255U && *badPtr == 1) {\n        m_state = LinkState::Idle;\n    }",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            env_with_cppcheck = {**os.environ, "DEVPACK_ROOT": str(REPO_ROOT)}
+            proc_fail = subprocess.run(
+                ["bash", str(task_dir / "check.sh"), "--workdir", str(work)],
+                env=env_with_cppcheck,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(1, proc_fail.returncode, proc_fail.stdout + proc_fail.stderr)
+            self.assertIn("nullPointer", proc_fail.stderr)
+
+            # Now simulate missing cppcheck while keeping compiler/clang/build tools available
+            bin_dir = base / "bin_no_cppcheck"
+            bin_dir.mkdir()
+            for entry in Path("/usr/bin").iterdir():
+                if entry.name == "cppcheck":
+                    continue
+                target = bin_dir / entry.name
+                if not target.exists():
+                    try:
+                        target.symlink_to(entry)
+                    except OSError:
+                        pass
+            env_no_cppcheck = {
+                "PATH": str(bin_dir),
+                "HOME": str(base / "home"),
+                "TMPDIR": str(base),
+                "DEVPACK_ROOT": str(REPO_ROOT),
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            }
+            (bin_dir.parent / "home").mkdir(exist_ok=True)
+            # Restore clean solution.patch so preflight_lint passes and step 6 reaches cppcheck_check
+            subprocess.run(["git", "checkout", "--", "."], cwd=work, check=True)
+            subprocess.run(["git", "clean", "-q", "-fd"], cwd=work, check=True)
+            subprocess.run(["git", "apply", str(task_dir / "solution.patch")], cwd=work, check=True)
+            proc_missing = subprocess.run(
+                ["bash", str(task_dir / "check.sh"), "--workdir", str(work)],
+                env=env_no_cppcheck,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(2, proc_missing.returncode, proc_missing.stdout + proc_missing.stderr)
+            self.assertIn("GRADER_MISCONFIGURED", proc_missing.stderr)
+            self.assertIn("TOOL_MISSING", proc_missing.stderr)
 
 
 if __name__ == "__main__":

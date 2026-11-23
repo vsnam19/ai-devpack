@@ -3,6 +3,18 @@
 All notable changes to ai-devpack are recorded here. Versioning follows
 [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH, see `VERSION`.
 
+## [Unreleased]
+
+### Added
+- **Local static analysis with `cppcheck` (`enforcement/static/cppcheck_check.py`, `policy/static_analysis.md`)**:
+  added `cppcheck` as the local early-warning stand-in for Coverity everywhere preflight
+  lint runs — worker dispatch (`runner/devpack_dispatch.py`), runner gate and fix loop
+  (`runner/devpack_run.py`), v2 eval grading (`eval/tasks/v2_check.sh`, `eval/Dockerfile`),
+  eval metrics/summaries (`eval/run_eval.py`), and the pack gate (`cppcheck-fixture` in
+  `enforcement/gate/gate.example.toml`). Fails closed with exit `3` (`TOOL_MISSING`) when
+  `cppcheck` is absent, supports `[cppcheck]` configuration in `eval/fixture/preflight.toml`
+  and `.devpack/project.example.toml`, and supports portable JSON baselines (`--baseline`).
+
 ## [0.2.0] - 2026-11-23
 
 ### Added

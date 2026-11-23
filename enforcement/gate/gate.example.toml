@@ -161,3 +161,14 @@ cmd = [
 ]
 timeout_s = 600
 required = true
+
+[[check]]
+name = "cppcheck-fixture"
+cmd = [
+  "python3", "-B", "enforcement/static/cppcheck_check.py",
+  "--config", "eval/fixture/preflight.toml",
+  "--repo-root", "eval/fixture",
+  "eval/fixture/src",
+]
+timeout_s = 300
+required = true

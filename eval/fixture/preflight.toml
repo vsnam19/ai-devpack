@@ -2,3 +2,10 @@
 
 [general]
 std = "c++17"
+
+[cppcheck]
+enable = ["warning", "style", "performance", "portability"]
+std = "c++17"
+include_dirs = ["include"]
+extra_args = ["--inline-suppr"]
+fail_on = ["error", "warning"]
