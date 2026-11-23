@@ -692,15 +692,34 @@ def _resolve_within_repo(raw_path: str, repo_root: Path) -> Path:
     return candidate
 
 
-def _resolve_suppressions_file(raw_path: str, config_dir: Path, repo_root: Path) -> Path:
+def _resolve_suppressions_file(
+    raw_path: str,
+    config_dir: Path,
+    repo_root: Path,
+    trusted_dir: Path | None = None,
+) -> Path:
     """Resolve ``suppressions_file``: repo root first, then the config directory (pack-provided lists).
 
     Absolute paths must lie inside ``repo_root``; relative paths must not escape ``repo_root``
     or ``config_dir``. A missing file is returned as the repo-root candidate so the caller
     reports it.
+
+    When ``trusted_dir`` is given (a trusted snapshot prepared by the dispatcher), the path
+    must be relative and is resolved ONLY inside that directory; the working tree is never
+    consulted. A missing file is returned as the trusted-dir candidate so the caller reports it.
     """
     p = Path(raw_path)
     repo_res = repo_root.resolve()
+    if trusted_dir is not None:
+        if p.is_absolute():
+            raise ValueError(f"suppressions_file '{raw_path}' must be relative to the trusted snapshot")
+        trusted_res = trusted_dir.resolve()
+        trusted_candidate = (trusted_res / p).resolve()
+        if not trusted_candidate.is_relative_to(trusted_res):
+            raise ValueError(
+                f"suppressions_file '{raw_path}' resolves outside the trusted snapshot {trusted_res}"
+            )
+        return trusted_candidate
     cfg_res = config_dir.resolve()
     if p.is_absolute():
         return _resolve_within_repo(raw_path, repo_res)
@@ -1022,8 +1041,13 @@ def run_cppcheck_check(
     components: str | Sequence[str] | None = None,
     all_components: bool = False,
     project_config_path: Path | None = None,
+    trusted_suppressions_dir: Path | None = None,
 ) -> CppcheckRunResult:
-    """Run cppcheck on ``targets`` or git-changed files since ``base_ref``."""
+    """Run cppcheck on ``targets`` or git-changed files since ``base_ref``.
+
+    ``trusted_suppressions_dir`` pins relative ``suppressions_file`` resolution to a trusted
+    snapshot directory (see ``_resolve_suppressions_file``).
+    """
     effective_root = (repo_root or Path.cwd()).resolve()
     config, resolved_cfg_path = load_cppcheck_config(config_path, effective_root)
     ws_scope = resolve_workspace_scope(
@@ -1114,7 +1138,10 @@ def run_cppcheck_check(
         cmd.extend(["--xml", "--xml-version=2"])
         if config.suppressions_file:
             suppr_path = _resolve_suppressions_file(
-                config.suppressions_file, cfg_base_dir, effective_root
+                config.suppressions_file,
+                cfg_base_dir,
+                effective_root,
+                trusted_dir=trusted_suppressions_dir,
             )
             if not suppr_path.is_file():
                 raise ValueError(
@@ -1410,6 +1437,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional cppcheck suppressions file",
     )
     parser.add_argument(
+        "--trusted-suppressions-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Trusted snapshot directory: relative suppressions_file is resolved only inside it "
+            "(never from the working tree)"
+        ),
+    )
+    parser.add_argument(
         "--extra-arg",
         action="append",
         dest="extra_args",
@@ -1486,6 +1522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             components=args.components,
             all_components=bool(args.all_components),
             project_config_path=args.project_config,
+            trusted_suppressions_dir=args.trusted_suppressions_dir,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

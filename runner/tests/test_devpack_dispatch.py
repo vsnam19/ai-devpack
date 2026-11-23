@@ -60,6 +60,25 @@ def _write_fake_agent(path: Path, script_body: str) -> Path:
     return path
 
 
+def _write_fake_cppcheck(path: Path) -> Path:
+    """Write a fake cppcheck that logs its suppression list contents and reports no findings."""
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, sys\n"
+        "entry = {'argv': sys.argv[1:], 'suppressions_text': None}\n"
+        "for arg in sys.argv[1:]:\n"
+        "    if arg.startswith('--suppressions-list='):\n"
+        "        entry['suppressions_text'] = pathlib.Path(arg.split('=', 1)[1]).read_text(encoding='utf-8')\n"
+        "with open(os.environ['FAKE_CPPCHECK_LOG'], 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps(entry) + '\\n')\n"
+        "sys.stderr.write('<?xml version=\"1.0\"?>\\n<results version=\"2\">\\n"
+        "<cppcheck version=\"2.0\"/>\\n<errors>\\n</errors>\\n</results>\\n')\n",
+        encoding="utf-8",
+    )
+    os.chmod(path, stat.S_IRWXU)
+    return path
+
+
 class DevpackDispatchTests(unittest.TestCase):
     """Test suite for dispatch ok/fail/scope/data-class/sandbox/JSON line and orchestrator configs."""
 
@@ -741,6 +760,172 @@ class DevpackDispatchTests(unittest.TestCase):
             run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
             self.assertEqual("project_config", run_meta["gate_config_source"])
             self.assertEqual(64, len(run_meta["gate_config_sha256"]))
+
+
+    def test_dot_prefixed_protected_paths_are_not_mangled_by_normalisation(self) -> None:
+        """Only a literal leading './' is removed, so '.cppcheck-suppressions' stays protected by its real name."""
+        from enforcement.checks.scope_check import is_gate_protected_path, normalize_rel_posix_path
+
+        self.assertEqual(".cppcheck-suppressions", normalize_rel_posix_path("./.cppcheck-suppressions"))
+        self.assertEqual(".clang-tidy", normalize_rel_posix_path("././.clang-tidy"))
+        self.assertEqual("a/b", normalize_rel_posix_path(".//a/./b"))
+        self.assertEqual("", normalize_rel_posix_path("./"))
+        refs = devpack_dispatch._extract_referenced_config_paths(
+            b'[cppcheck]\nsuppressions_file = "./.cppcheck-suppressions"\n'
+        )
+        self.assertEqual((".cppcheck-suppressions",), refs)
+        self.assertTrue(is_gate_protected_path(".cppcheck-suppressions", refs))
+
+    def test_worker_edits_to_dot_named_gate_files_are_gate_touched(self) -> None:
+        """With allow '**', a worker editing .cppcheck-suppressions or .clang-tidy is flagged gate-touched."""
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_repo(wt)
+            base_toml = '[cppcheck]\nsuppressions_file = "./.cppcheck-suppressions"\n'
+            (wt / "preflight.toml").write_text(base_toml, encoding="utf-8")
+            (wt / ".cppcheck-suppressions").write_text("# trusted list\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "trusted suppressions"], cwd=wt, check=True)
+            expected_sha = hashlib.sha256(b"# trusted list\n").hexdigest()
+
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nHide a defect by editing suppressions.\n", encoding="utf-8")
+            fake_agent = _write_fake_agent(
+                base / "fake_claude.py",
+                "pathlib.Path('.cppcheck-suppressions').write_text('*:src/mod.cpp\\n', encoding='utf-8')\n"
+                "pathlib.Path('.clang-tidy').write_text('Checks: \"*\"\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'is_error': False, 'result': 'done'}))\n",
+            )
+            rc, stdout, _ = self._run_dispatch(
+                [
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(base / "runs"),
+                    "--agent-bin", str(fake_agent),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(1, rc)
+            data = json.loads(stdout.strip())
+            self.assertEqual("violation", data["scope"])
+            self.assertIn(".cppcheck-suppressions", data["gate_touched"])
+            self.assertIn(".clang-tidy", data["gate_touched"])
+            run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(".cppcheck-suppressions", run_meta["gate_suppressions_path"])
+            self.assertEqual(expected_sha, run_meta["gate_suppressions_sha256"])
+
+    def test_trusted_config_snapshots_sibling_suppressions_from_base_commit(self) -> None:
+        """The suppression file named by the trusted config is copied beside the snapshot from the base commit."""
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_repo(wt)
+            (wt / "cfg").mkdir()
+            (wt / "preflight.toml").write_text('[cppcheck]\nsuppressions_file = "cfg/suppr.txt"\n', encoding="utf-8")
+            (wt / "cfg" / "suppr.txt").write_text("unusedFunction:src/legacy.cpp\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "suppressions"], cwd=wt, check=True)
+            (wt / "cfg" / "suppr.txt").write_text("nullPointer:src/mod.cpp\n", encoding="utf-8")
+
+            with tempfile.TemporaryDirectory() as snap:
+                trusted = devpack_dispatch.resolve_trusted_gate_config(wt, Path(snap), base_ref="HEAD")
+                snapshot_copy = Path(snap) / "cfg" / "suppr.txt"
+                self.assertEqual(b"unusedFunction:src/legacy.cpp\n", snapshot_copy.read_bytes())
+                self.assertEqual("cfg/suppr.txt", trusted.suppressions_rel_path)
+                self.assertEqual(
+                    hashlib.sha256(b"unusedFunction:src/legacy.cpp\n").hexdigest(),
+                    trusted.suppressions_sha256,
+                )
+                self.assertIn("cfg/suppr.txt", trusted.protected_rel_paths)
+
+    def _run_trusted_suppressions_job(self, base: Path, *, tamper: bool) -> tuple[dict, list[dict], str]:
+        """Dispatch a job whose trusted config names sibling suppressions.txt; return (payload, cppcheck calls, trusted text)."""
+        wt = base / "wt"
+        _init_git_repo(wt)
+        trusted_list = "unusedFunction:src/legacy.cpp\n"
+        (wt / "preflight.toml").write_text('[cppcheck]\nsuppressions_file = "suppressions.txt"\n', encoding="utf-8")
+        (wt / "suppressions.txt").write_text(trusted_list, encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "trusted suppressions"], cwd=wt, check=True)
+
+        fake_bin = base / "fakebin"
+        fake_bin.mkdir()
+        cpp_log = base / "cppcheck_calls.jsonl"
+        _write_fake_cppcheck(fake_bin / "cppcheck")
+        brief = base / "brief.md"
+        brief.write_text("# Brief\nTouch the module.\n", encoding="utf-8")
+        good_cpp = (
+            "/**\n * @file mod.cpp\n * @brief Sample module.\n */\n"
+            "/**\n * @brief Return one.\n * @return Constant 1.\n */\n"
+            "int oneValue() { return 2 - 1; }\n"
+        )
+        tamper_line = (
+            "pathlib.Path('suppressions.txt').write_text('nullPointer:src/mod.cpp\\n', encoding='utf-8')\n"
+            if tamper
+            else ""
+        )
+        fake_agent = _write_fake_agent(
+            base / "fake_claude.py",
+            f"pathlib.Path('src/mod.cpp').write_text({good_cpp!r}, encoding='utf-8')\n"
+            + tamper_line
+            + "print(json.dumps({'type': 'result', 'is_error': False, 'result': 'done'}))\n",
+        )
+        env = {
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "FAKE_CPPCHECK_LOG": str(cpp_log),
+        }
+        rc, stdout, _ = self._run_dispatch(
+            [
+                "--engine", "haiku",
+                "--brief", str(brief),
+                "--workdir", str(wt),
+                "--allow", "**",
+                "--gate-cmd", "true",
+                "--runs-root", str(base / "runs"),
+                "--agent-bin", str(fake_agent),
+                "--isolation", "local",
+                "--allow-unsandboxed-local",
+            ],
+            env_extra=env,
+        )
+        data = json.loads(stdout.strip())
+        calls = [json.loads(line) for line in cpp_log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(calls, "fake cppcheck was not invoked")
+        data["_rc"] = rc
+        return data, calls, trusted_list
+
+    def test_trusted_sibling_suppressions_pass_when_worker_leaves_them_alone(self) -> None:
+        """A trusted config with sibling suppressions.txt lets a clean job pass; cppcheck gets the base-commit list."""
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data, calls, trusted_list = self._run_trusted_suppressions_job(Path(tmp), tamper=False)
+            self.assertEqual(0, data["_rc"])
+            self.assertEqual("ok", data["scope"])
+            self.assertEqual("ok", data["gate"])
+            self.assertEqual(trusted_list, calls[-1]["suppressions_text"])
+            run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(hashlib.sha256(trusted_list.encode("utf-8")).hexdigest(), run_meta["gate_suppressions_sha256"])
+
+    def test_worker_modified_working_tree_suppressions_are_ignored(self) -> None:
+        """Worker-modified suppression file is ignored: cppcheck receives the base-commit copy and the edit is gate-touched."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data, calls, trusted_list = self._run_trusted_suppressions_job(Path(tmp), tamper=True)
+            self.assertEqual(1, data["_rc"])
+            self.assertEqual("violation", data["scope"])
+            self.assertIn("suppressions.txt", data["gate_touched"])
+            self.assertEqual(trusted_list, calls[-1]["suppressions_text"])
+            run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("suppressions.txt", run_meta["gate_suppressions_path"])
 
 
 if __name__ == "__main__":

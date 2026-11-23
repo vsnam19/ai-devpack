@@ -25,12 +25,27 @@ from runner.workspace_scope import resolve_workspace_scope  # noqa: E402
 GATE_PROTECTED_FILENAMES: frozenset[str] = frozenset({"preflight.toml", ".clang-tidy", "gate.toml"})
 
 
-def _normalize_rel_path(rel_posix_path: str) -> str:
-    """Normalize a repository-relative POSIX path for matching."""
-    norm = rel_posix_path.strip().replace("\\", "/")
-    if norm.startswith("./"):
+def normalize_rel_posix_path(raw_path: str) -> str:
+    """Normalize a repository-relative path for protected/allowed comparisons.
+
+    Backslashes become slashes, surrounding whitespace and leading slashes are removed, and
+    a leading ``./`` prefix is removed repeatedly. Only that literal prefix is stripped, so
+    dot-prefixed names such as ``.clang-tidy`` or ``.cppcheck-suppressions`` are preserved.
+    Returns ``""`` for empty input or the current directory.
+    """
+    norm = raw_path.strip().replace("\\", "/")
+    while norm.startswith("./"):
         norm = norm[2:]
-    return norm.lstrip("/")
+    norm = norm.lstrip("/")
+    if not norm:
+        return ""
+    text = pathlib.PurePosixPath(norm).as_posix()
+    return "" if text == "." else text
+
+
+def _normalize_rel_path(rel_posix_path: str) -> str:
+    """Normalize a repository-relative POSIX path for matching (see ``normalize_rel_posix_path``)."""
+    return normalize_rel_posix_path(rel_posix_path)
 
 
 def is_gate_protected_path(
@@ -52,7 +67,7 @@ def is_gate_protected_path(
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Compile a POSIX path glob pattern (supporting ``*``, ``?``, and ``**``) to a regex."""
     norm = pattern.strip().replace("\\", "/")
-    if norm.startswith("./"):
+    while norm.startswith("./"):
         norm = norm[2:]
     norm = norm.lstrip("/")
 
@@ -84,10 +99,7 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 def matches_any_glob(rel_posix_path: str, compiled_globs: list[re.Pattern[str]]) -> bool:
     """Return True if ``rel_posix_path`` matches at least one compiled glob pattern."""
-    norm = rel_posix_path.strip().replace("\\", "/")
-    if norm.startswith("./"):
-        norm = norm[2:]
-    norm = norm.lstrip("/")
+    norm = normalize_rel_posix_path(rel_posix_path)
     return any(rx.match(norm) is not None for rx in compiled_globs)
 
 
@@ -193,9 +205,10 @@ def main(argv: list[str] | None = None) -> int:
     effective_patterns = list(allow_patterns)
     if ws_scope.configured and ws_scope.workspace_root_rel != ".":
         for pat in allow_patterns:
-            norm_pat = pat.strip().replace("\\", "/").lstrip("/")
-            if norm_pat.startswith("./"):
+            norm_pat = pat.strip().replace("\\", "/")
+            while norm_pat.startswith("./"):
                 norm_pat = norm_pat[2:]
+            norm_pat = norm_pat.lstrip("/")
             if (
                 not ws_scope.glob_outside_workspace(norm_pat)
                 and norm_pat != ws_scope.workspace_root_rel

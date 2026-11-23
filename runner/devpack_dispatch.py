@@ -35,7 +35,8 @@ import hashlib
 from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shlex
 import subprocess
@@ -63,7 +64,11 @@ for _p in (str(PACK_ROOT), str(RUNNER_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from enforcement.checks.scope_check import get_changed_files, is_gate_protected_path  # noqa: E402
+from enforcement.checks.scope_check import (  # noqa: E402
+    get_changed_files,
+    is_gate_protected_path,
+    normalize_rel_posix_path,
+)
 from runner import agent_exec  # noqa: E402
 from runner.agent_exec import (  # noqa: E402
     AgentRequest,
@@ -112,6 +117,8 @@ class TrustedGateConfig:
     sha256: str
     protected_rel_paths: tuple[str, ...] = ()
     gate_toml_path: Path | None = None
+    suppressions_rel_path: str | None = None
+    suppressions_sha256: str | None = None
 
 
 def _git_show_regular_blob(workdir: Path, ref: str, rel_path: str) -> bytes | None:
@@ -144,24 +151,71 @@ def _git_show_regular_blob(workdir: Path, ref: str, rel_path: str) -> bytes | No
     return show_proc.stdout
 
 
-def _extract_referenced_config_paths(cfg_bytes: bytes) -> tuple[str, ...]:
-    """Extract repo-relative suppressions/plugin paths from TOML bytes for gate-touched protection."""
+def _cppcheck_suppressions_ref(cfg_bytes: bytes) -> str | None:
+    """Return the normalised relative ``[cppcheck].suppressions_file`` from TOML bytes, or None.
+
+    Absolute paths and paths that escape the config directory are rejected (None).
+    """
     try:
         parsed = parse_toml_with_arrays(cfg_bytes.decode("utf-8", errors="replace"))
     except Exception:
-        return ()
-    refs: list[str] = []
+        return None
     cpp_tbl = parsed.get("cppcheck")
-    if isinstance(cpp_tbl, dict):
-        suppr = cpp_tbl.get("suppressions_file")
-        if isinstance(suppr, str) and suppr.strip() and not Path(suppr.strip()).is_absolute():
-            refs.append(suppr.strip().replace("\\", "/").lstrip("./"))
+    if not isinstance(cpp_tbl, dict):
+        return None
+    raw = cpp_tbl.get("suppressions_file")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    raw = raw.strip()
+    if raw.startswith(("/", "\\")) or Path(raw).is_absolute():
+        return None
+    norm = normalize_rel_posix_path(raw)
+    if not norm or ".." in PurePosixPath(norm).parts:
+        return None
+    return norm
+
+
+def _extract_referenced_config_paths(cfg_bytes: bytes) -> tuple[str, ...]:
+    """Extract repo-relative suppressions/plugin paths from TOML bytes for gate-touched protection."""
+    refs: list[str] = []
+    suppr = _cppcheck_suppressions_ref(cfg_bytes)
+    if suppr is not None:
+        refs.append(suppr)
+    try:
+        parsed = parse_toml_with_arrays(cfg_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        return tuple(refs)
     plugins_tbl = parsed.get("plugins")
     if isinstance(plugins_tbl, dict) and isinstance(plugins_tbl.get("paths"), list):
         for item in plugins_tbl["paths"]:
             if isinstance(item, str) and item.strip() and not Path(item.strip()).is_absolute():
-                refs.append(item.strip().replace("\\", "/").lstrip("./"))
+                norm = normalize_rel_posix_path(item)
+                if norm:
+                    refs.append(norm)
     return tuple(dict.fromkeys(refs))
+
+
+def _read_trusted_sibling(
+    workdir: Path,
+    base_ref: str,
+    source: str,
+    source_fs_dir: Path | None,
+    rel_ref: str,
+) -> bytes | None:
+    """Read ``rel_ref`` relative to the trusted config's own directory, never from the working tree.
+
+    ``base:<path>`` sources read the git blob beside the config in ``base_ref``; external
+    project configs and pack configs read beside the file in their trusted directory.
+    Returns None when no trusted copy exists (including pre-run snapshots, which hold no copy).
+    """
+    if source.startswith("base:") and base_ref:
+        cfg_dir = posixpath.dirname(source[len("base:"):])
+        return _git_show_regular_blob(workdir, base_ref, posixpath.normpath(posixpath.join(cfg_dir, rel_ref)))
+    if source_fs_dir is not None:
+        candidate = source_fs_dir / rel_ref
+        if candidate.is_file() and not candidate.is_symlink():
+            return candidate.read_bytes()
+    return None
 
 
 def resolve_trusted_gate_config(
@@ -179,6 +233,7 @@ def resolve_trusted_gate_config(
 
     cfg_bytes: bytes | None = None
     source = ""
+    source_fs_dir: Path | None = None
     out_name = "preflight.toml"
 
     if eff_base:
@@ -196,6 +251,7 @@ def resolve_trusted_gate_config(
         if not p_res.is_relative_to(wd_res):
             cfg_bytes = p_res.read_bytes()
             source = "project_config"
+            source_fs_dir = p_res.parent
             out_name = "project.toml"
         else:
             rel_proj = p_res.relative_to(wd_res).as_posix()
@@ -227,6 +283,7 @@ def resolve_trusted_gate_config(
         if pack_example.is_file():
             cfg_bytes = pack_example.read_bytes()
             source = "pack:.devpack/project.example.toml"
+            source_fs_dir = pack_example.parent
             out_name = "project.example.toml"
         else:
             cfg_bytes = DEFAULT_TRUSTED_GATE_TOML.encode("utf-8")
@@ -237,6 +294,16 @@ def resolve_trusted_gate_config(
     out_path.write_bytes(cfg_bytes)
     sha256 = hashlib.sha256(cfg_bytes).hexdigest()
     protected = _extract_referenced_config_paths(cfg_bytes)
+
+    suppr_rel = _cppcheck_suppressions_ref(cfg_bytes)
+    suppr_sha: str | None = None
+    if suppr_rel is not None:
+        suppr_bytes = _read_trusted_sibling(wd_res, eff_base, source, source_fs_dir, suppr_rel)
+        if suppr_bytes is not None:
+            suppr_dest = temp_dir / suppr_rel
+            suppr_dest.parent.mkdir(parents=True, exist_ok=True)
+            suppr_dest.write_bytes(suppr_bytes)
+            suppr_sha = hashlib.sha256(suppr_bytes).hexdigest()
 
     gate_toml_path: Path | None = None
     if eff_base:
@@ -251,6 +318,8 @@ def resolve_trusted_gate_config(
         sha256=sha256,
         protected_rel_paths=protected,
         gate_toml_path=gate_toml_path,
+        suppressions_rel_path=suppr_rel,
+        suppressions_sha256=suppr_sha,
     )
 
 
@@ -404,8 +473,13 @@ def run_cppcheck_on_changed(
     scope: WorkspaceScope | None = None,
     config_path: Path | None = None,
     base_ref: str = "",
+    trusted_snapshot_dir: Path | None = None,
 ) -> tuple[bool, int, str]:
     """Run ``cppcheck_check.py`` on changed C/C++ files inside ``workdir``.
+
+    ``trusted_snapshot_dir`` is the directory holding the trusted config snapshot; relative
+    ``suppressions_file`` entries are resolved only there. When ``config_path`` is None the
+    temporary snapshot directory is used.
 
     Returns ``(passed, blocking_finding_count, combined_output)``.
     """
@@ -445,6 +519,7 @@ def run_cppcheck_on_changed(
 
     with contextlib.ExitStack() as stack:
         effective_cfg = config_path
+        snapshot_dir = trusted_snapshot_dir
         if effective_cfg is None:
             tmp_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="devpack-cppcheck-cfg-")))
             effective_cfg = resolve_trusted_gate_config(
@@ -454,6 +529,7 @@ def run_cppcheck_on_changed(
                 project_config_path=project_config_path,
                 pack_root=pack_root,
             ).config_path
+            snapshot_dir = tmp_dir
 
         cmd: list[str] = [
             "python3",
@@ -463,6 +539,8 @@ def run_cppcheck_on_changed(
             "--config",
             str(effective_cfg),
         ]
+        if snapshot_dir is not None:
+            cmd.extend(["--trusted-suppressions-dir", str(snapshot_dir)])
         if project_config_path is not None:
             cmd.extend(["--project-config", str(project_config_path)])
         if active_scope.configured:
@@ -1275,6 +1353,7 @@ def _dispatch_job_with_trusted_cfg(
                 scope=ws_scope,
                 config_path=trusted_cfg.config_path,
                 base_ref=effective_base,
+                trusted_snapshot_dir=trusted_cfg.config_path.parent,
             )
             if static_out:
                 gate_logs.append(f"[cppcheck]\n{static_out}")
@@ -1328,6 +1407,10 @@ def _dispatch_job_with_trusted_cfg(
         mem_proposal_summary = prop_res.to_dict()
 
     outcome = "pass" if passed else ("timeout" if agent_res.status == "timeout" else "fail")
+    suppressions_meta: dict[str, Any] = {}
+    if trusted_cfg.suppressions_rel_path is not None:
+        suppressions_meta["gate_suppressions_path"] = trusted_cfg.suppressions_rel_path
+        suppressions_meta["gate_suppressions_sha256"] = trusted_cfg.suppressions_sha256
     run_extra: dict[str, Any] = {}
     if ws_scope.configured or out_of_scope_changes:
         run_extra["out_of_scope_changes"] = out_of_scope_changes
@@ -1354,6 +1437,7 @@ def _dispatch_job_with_trusted_cfg(
         scan_mode=ws_scope.scan_mode,
         gate_config_source=trusted_cfg.source,
         gate_config_sha256=trusted_cfg.sha256,
+        **suppressions_meta,
         finished=datetime.now(timezone.utc).isoformat(),
         **run_extra,
     )
@@ -1383,6 +1467,7 @@ def _dispatch_job_with_trusted_cfg(
         "scan_mode": ws_scope.scan_mode,
         "gate_config_source": trusted_cfg.source,
         "gate_config_sha256": trusted_cfg.sha256,
+        **suppressions_meta,
     }
     if ws_scope.configured or out_of_scope_changes:
         payload["out_of_scope_changes"] = out_of_scope_changes

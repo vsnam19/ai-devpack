@@ -366,6 +366,62 @@ class CppcheckPathResolutionTests(unittest.TestCase):
                 )
                 self.assertIn(f"--suppressions-list={(repo / 'suppr.txt').resolve()}", calls[1])
 
+    def test_trusted_suppressions_dir_never_reads_working_tree_copy(self) -> None:
+        """With a trusted snapshot dir, relative suppressions_file resolves only inside that snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            snap = base / "snapshot"
+            repo = base / "repo"
+            snap.mkdir()
+            (repo / "src").mkdir(parents=True)
+            (repo / "src" / "ok.cpp").write_text("int ok() { return 1; }\n", encoding="utf-8")
+            (repo / "suppr.txt").write_text("# worker-edited working-tree copy\n", encoding="utf-8")
+            cfg = snap / "preflight.toml"
+            cfg.write_text('[cppcheck]\nsuppressions_file = "suppr.txt"\n', encoding="utf-8")
+
+            calls: list[list[str]] = []
+            cwds: list[str] = []
+            with mock.patch.object(
+                cppcheck_check.subprocess,
+                "run",
+                side_effect=_recording_subprocess_run(calls, cwds),
+            ):
+                with self.assertRaisesRegex(ValueError, "suppressions file does not exist"):
+                    cppcheck_check.run_cppcheck_check(
+                        targets=["src/ok.cpp"],
+                        repo_root=repo,
+                        config_path=cfg,
+                        cppcheck_bin=sys.executable,
+                        trusted_suppressions_dir=snap,
+                    )
+                self.assertEqual([], calls)
+
+                (snap / "suppr.txt").write_text("# trusted snapshot\n", encoding="utf-8")
+                cppcheck_check.run_cppcheck_check(
+                    targets=["src/ok.cpp"],
+                    repo_root=repo,
+                    config_path=cfg,
+                    cppcheck_bin=sys.executable,
+                    trusted_suppressions_dir=snap,
+                )
+                self.assertIn(f"--suppressions-list={(snap / 'suppr.txt').resolve()}", calls[0])
+                self.assertFalse(any(str(repo) in arg and "--suppressions-list=" in arg for arg in calls[0]))
+
+    def test_trusted_suppressions_dir_rejects_absolute_and_escaping_paths(self) -> None:
+        """Trusted-mode resolution refuses absolute paths and paths that escape the snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            snap = base / "snapshot"
+            snap.mkdir()
+            repo = base / "repo"
+            repo.mkdir()
+            with self.assertRaisesRegex(ValueError, "must be relative"):
+                cppcheck_check._resolve_suppressions_file(
+                    str(base / "x.txt"), snap, repo, trusted_dir=snap
+                )
+            with self.assertRaisesRegex(ValueError, "outside the trusted snapshot"):
+                cppcheck_check._resolve_suppressions_file("../x.txt", snap, repo, trusted_dir=snap)
+
     def test_real_cppcheck_reads_repo_header_not_config_dir_header(self) -> None:
         """Real cppcheck reports a defect visible only through the analysed repo's header, not the pack copy."""
         if shutil.which("cppcheck") is None:
