@@ -24,6 +24,8 @@ from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 from enforcement.checks.symbol_check import (  # noqa: E402
     check_worker_objects,
     compile_source_to_object,
+    compile_symbol_allowlist,
+    load_symbol_allowlist_file,
 )
 from enforcement.checks.test_proof import clear_gcda_files, verify_gcov_proof  # noqa: E402
 from runner.safe_git import GitSecurityError, run_git  # noqa: E402
@@ -37,6 +39,7 @@ from runner.workspace_scope import (  # noqa: E402
 )
 
 CPP_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"})
+_HEADER_SUFFIXES = frozenset({".h", ".hh", ".hpp", ".hxx"})
 _TEST_SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx"})
 _PACK_FRAMEWORK_RE = re.compile(r'#\s*include\s*"test_framework\.hpp"|\bcan_fixture_test::')
 _XML_MTIME_SLACK_S = 0.05
@@ -243,6 +246,65 @@ def _resolve_component_build_and_xml(
     return build_dirs, xml_paths
 
 
+def _resolve_component_symbol_allowlists(
+    repo: Path,
+    scope: WorkspaceScope,
+    project_config_path: str | None,
+) -> dict[str, tuple[tuple[str, ...], Path | None]]:
+    """Resolve optional production undefined-symbol allowlists from project TOML."""
+    cfg_path = _select_project_config_file(repo, project_config_path)
+    parsed: dict[str, object] = {}
+    raw_entries: dict[str, dict[str, object]] = {}
+    if cfg_path is not None and cfg_path.is_file():
+        parsed = parse_toml_with_arrays(cfg_path.read_text(encoding="utf-8"))
+        for entry in parsed.get("component") or ():
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                raw_entries[entry["name"].strip()] = entry
+
+    def _extract_allowlist(table: dict[str, object], label_prefix: str) -> tuple[tuple[str, ...], Path | None]:
+        raw_list = table.get("symbol_allowlist")
+        if raw_list is None:
+            raw_list = table.get("allowlist")
+        patterns: tuple[str, ...] = ()
+        if raw_list is not None:
+            if not isinstance(raw_list, list) or any(not isinstance(item, str) for item in raw_list):
+                raise ValueError(f"{label_prefix}.symbol_allowlist must be a list of regex strings")
+            patterns = tuple(item.strip() for item in raw_list if item.strip())
+            compile_symbol_allowlist(patterns)
+
+        raw_file = table.get("symbol_allowlist_file")
+        if raw_file is None:
+            raw_file = table.get("allowlist_file")
+        allow_file: Path | None = None
+        if raw_file is not None:
+            if not isinstance(raw_file, str):
+                raise ValueError(f"{label_prefix}.symbol_allowlist_file must be a relative path string")
+            if raw_file.strip():
+                norm_file = _normalize_relative_subpath(
+                    raw_file, field_name=f"{label_prefix}.symbol_allowlist_file"
+                )
+                allow_file = validate_path_contained(
+                    repo / norm_file, repo, label=f"{label_prefix}.symbol_allowlist_file"
+                )
+                load_symbol_allowlist_file(allow_file)
+        return patterns, allow_file
+
+    ws_table = parsed.get("workspace") if isinstance(parsed.get("workspace"), dict) else {}
+    sym_table = parsed.get("symbols") if isinstance(parsed.get("symbols"), dict) else {}
+    default_patterns, default_file = _extract_allowlist(
+        {**ws_table, **sym_table}, "[symbols]" if sym_table else "[workspace]"
+    )
+
+    result: dict[str, tuple[tuple[str, ...], Path | None]] = {}
+    for comp in scope.all_components:
+        entry = raw_entries.get(comp.name, {})
+        comp_patterns, comp_file = _extract_allowlist(entry, f"[[component]] '{comp.name}'")
+        merged_patterns = comp_patterns if comp_patterns else default_patterns
+        chosen_file = comp_file if comp_file is not None else default_file
+        result[comp.name] = (merged_patterns, chosen_file)
+    return result
+
+
 def _find_gcov_obj_dir(
     component: ComponentSpec,
     build_dir: Path,
@@ -286,46 +348,10 @@ def _run_component_symbol_check(
     *,
     base_ref: str,
     uses_pack_fw: bool,
+    import_allowlist: Sequence[str] = (),
+    import_allowlist_file: Path | None = None,
 ) -> tuple[int, str]:
     """Compile worker-changed/component C/C++ sources and run ``symbol_check.py`` before tests."""
-    changed_sources: list[Path] = []
-    if base_ref:
-        try:
-            changed, _err = get_changed_files(repo, base_ref)
-        except GitSecurityError:
-            changed = None
-        if changed:
-            for rel in changed:
-                cand = (repo / rel).resolve()
-                if (
-                    cand.is_file()
-                    and cand.suffix.lower() in _TEST_SOURCE_SUFFIXES
-                    and cand.is_relative_to(component.abs_path.resolve())
-                    and not scope.is_excluded(cand)
-                ):
-                    changed_sources.append(cand)
-
-    if not changed_sources and component.abs_path.is_dir():
-        for fp in sorted(component.abs_path.rglob("*")):
-            if not fp.is_file() or fp.suffix.lower() not in _TEST_SOURCE_SUFFIXES:
-                continue
-            if scope.is_excluded(fp):
-                continue
-            if any(part == ".git" or part.startswith("build") for part in fp.parts):
-                continue
-            if not _is_component_test_path(fp, repo, component):
-                changed_sources.append(fp)
-
-    worker_srcs = [fp for fp in changed_sources if not _is_component_test_path(fp, repo, component)]
-    worker_test_srcs = [
-        fp
-        for fp in changed_sources
-        if _is_component_test_path(fp, repo, component)
-        and fp.name not in ("test_main.cpp", "test_can_codec.cpp", "test_ring_buffer.cpp", "test_link_state_machine.cpp", "test_dtc_debouncer.cpp")
-    ]
-    if not worker_srcs and not worker_test_srcs:
-        return 0, ""
-
     inc_dirs: list[Path] = []
     for raw_inc in component.include_dirs:
         p = Path(raw_inc)
@@ -335,6 +361,58 @@ def _run_component_symbol_check(
     for fallback_inc in (component.abs_path / "include", repo / "include", component.abs_path / "tests", repo / "tests"):
         if fallback_inc.is_dir() and fallback_inc not in inc_dirs:
             inc_dirs.append(fallback_inc)
+
+    changed_sources: list[Path] = []
+    header_changed = False
+    comp_resolved = component.abs_path.resolve()
+    resolved_inc_dirs = tuple(d.resolve() for d in inc_dirs)
+    if base_ref:
+        try:
+            changed, _err = get_changed_files(repo, base_ref)
+        except GitSecurityError:
+            changed = None
+        if changed:
+            for rel in changed:
+                cand = (repo / rel).resolve()
+                if scope.is_excluded(cand):
+                    continue
+                in_comp = cand.is_relative_to(comp_resolved) or any(
+                    cand.is_relative_to(inc_d) for inc_d in resolved_inc_dirs
+                )
+                if cand.suffix.lower() in _HEADER_SUFFIXES and in_comp:
+                    header_changed = True
+                    continue
+                if (
+                    cand.is_file()
+                    and cand.suffix.lower() in _TEST_SOURCE_SUFFIXES
+                    and cand.is_relative_to(comp_resolved)
+                ):
+                    changed_sources.append(cand)
+
+    worker_test_srcs = [
+        fp
+        for fp in changed_sources
+        if _is_component_test_path(fp, repo, component)
+        and fp.name not in ("test_main.cpp", "test_can_codec.cpp", "test_ring_buffer.cpp", "test_link_state_machine.cpp", "test_dtc_debouncer.cpp")
+    ]
+
+    if header_changed or (not changed_sources and component.abs_path.is_dir()):
+        worker_srcs: list[Path] = []
+        if component.abs_path.is_dir():
+            for fp in sorted(component.abs_path.rglob("*")):
+                if not fp.is_file() or fp.suffix.lower() not in _TEST_SOURCE_SUFFIXES:
+                    continue
+                if scope.is_excluded(fp):
+                    continue
+                if any(part == ".git" or part.startswith("build") for part in fp.parts):
+                    continue
+                if not _is_component_test_path(fp, repo, component):
+                    worker_srcs.append(fp)
+    else:
+        worker_srcs = [fp for fp in changed_sources if not _is_component_test_path(fp, repo, component)]
+
+    if not worker_srcs and not worker_test_srcs:
+        return 0, ""
 
     cc_path = (repo / component.compile_commands) if component.compile_commands else None
     fw_hdr = None
@@ -402,6 +480,9 @@ def _run_component_symbol_check(
             worker_objs,
             worker_test_objs=worker_test_objs,
             framework_objs=framework_objs,
+            import_profile="production",
+            import_allowlist=import_allowlist,
+            import_allowlist_file=import_allowlist_file,
         )
         if res.exit_code == 3:
             return 3, "; ".join(res.errors)
@@ -550,6 +631,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             build_dirs, xml_paths = _resolve_component_build_and_xml(
                 repo, scope, args.project_config
             )
+            symbol_allowlists = (
+                _resolve_component_symbol_allowlists(repo, scope, args.project_config)
+                if args.check == "tests"
+                else {}
+            )
             commands = []
             for component in scope.active_components:
                 command = component.build_cmd if args.check == "build" else component.test_cmd
@@ -569,6 +655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         comp_xml = xml_paths.get(component.name)
                         uses_fw = _uses_pack_test_framework(repo, component)
 
+                        comp_allow_pats, comp_allow_file = symbol_allowlists.get(component.name, ((), None))
                         sym_rc, sym_msg = _run_component_symbol_check(
                             repo,
                             component,
@@ -576,6 +663,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             scope,
                             base_ref=raw_base_opt,
                             uses_pack_fw=uses_fw,
+                            import_allowlist=comp_allow_pats,
+                            import_allowlist_file=comp_allow_file,
                         )
                         if sym_rc != 0:
                             print(sym_msg, file=sys.stderr)

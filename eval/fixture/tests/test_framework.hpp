@@ -22,6 +22,8 @@ namespace can_fixture_test {
 struct TestCounters {
     /** @brief Total number of assertions evaluated. */
     std::size_t totalChecks;
+    /** @brief Number of assertions that passed. */
+    std::size_t passedChecks;
     /** @brief Number of assertions that failed. */
     std::size_t failedChecks;
 };
@@ -33,7 +35,7 @@ struct TestCounters {
  */
 template <int Tag = 0>
 inline TestCounters& counters() noexcept {
-    static TestCounters instance{0U, 0U};
+    static TestCounters instance{0U, 0U, 0U};
     return instance;
 }
 
@@ -72,9 +74,11 @@ inline void recordCheck(
     const char* fileName,
     int lineNumber) {
     TestCounters& state = counters<Tag>();
-    ++state.totalChecks;
+    ++state.totalChecks;  // DEVPACK_CHECK_TOTAL
     if (!condition) {
         recordCheckFailure<Tag>("CHECK", expressionText, fileName, lineNumber);  // DEVPACK_FAILURE_PATH
+    } else {
+        ++state.passedChecks;  // DEVPACK_SUCCESS_PATH
     }
 }
 
@@ -96,9 +100,11 @@ inline void recordCheckEq(
     const char* fileName,
     int lineNumber) {
     TestCounters& state = counters<0>();
-    ++state.totalChecks;
+    ++state.totalChecks;  // DEVPACK_CHECK_TOTAL
     if (!(actualValue == expectedValue)) {
         recordCheckFailure<0>("CHECK_EQ", expressionText, fileName, lineNumber);  // DEVPACK_FAILURE_PATH
+    } else {
+        ++state.passedChecks;  // DEVPACK_SUCCESS_PATH
     }
 }
 
@@ -110,13 +116,12 @@ inline void recordCheckEq(
 template <int Tag = 0>
 inline int printSummaryAndExitCode() {
     const TestCounters& state = counters<Tag>();
-    const std::size_t passedChecks = state.totalChecks - state.failedChecks;
-    std::cout << "TEST SUMMARY: " << passedChecks << "/" << state.totalChecks
+    std::cout << "TEST SUMMARY: " << state.passedChecks << "/" << state.totalChecks
               << " checks passed (" << state.failedChecks << " failed)\n"
               << "DEVPACK_TESTS_COMPLETED checks=" << state.totalChecks
               << " failed=" << state.failedChecks << "\n"
               << std::flush;
-    if (state.totalChecks == 0U || state.failedChecks > 0U) {
+    if (state.totalChecks == 0U || state.failedChecks > 0U || state.passedChecks != state.totalChecks) {
         return 1;  // DEVPACK_FAILURE_PATH
     }
     return 0;

@@ -229,7 +229,7 @@ run_worker_symbol_check() {
         while IFS= read -r rel_f; do
             [[ -z "$rel_f" ]] && continue
             case "$rel_f" in
-                include/*.h|include/*.hh|include/*.hpp|include/*.hxx)
+                include/*.h|include/*.hh|include/*.hpp|include/*.hxx|src/*.h|src/*.hh|src/*.hpp|src/*.hxx)
                     check_all_src=1
                     ;;
                 src/*.c|src/*.cc|src/*.cpp|src/*.cxx)
@@ -269,7 +269,7 @@ run_worker_symbol_check() {
         return 0
     fi
 
-    local sym_args=(--label "worker_symbol_check")
+    local sym_args=(--label "worker_symbol_check" --import-profile eval)
     if [[ -d "$workdir/include" ]]; then
         sym_args+=(-I "$workdir/include")
     fi
@@ -377,7 +377,7 @@ run_gcov_hidden_tests() {
     fi
 
     if [[ "${#src_objs[@]}" -gt 0 ]]; then
-        local sym_args=(--label "$label")
+        local sym_args=(--label "$label" --import-profile eval)
         local fw_o
         for fw_o in "${test_objs[@]}"; do
             sym_args+=(--framework-obj "$fw_o")

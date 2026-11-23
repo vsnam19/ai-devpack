@@ -36,6 +36,25 @@ import tempfile
 from typing import Sequence
 
 DEFAULT_FRAMEWORK_NAMESPACES: tuple[str, ...] = ("can_fixture_test",)
+DEFAULT_EVAL_ALLOWLIST_PATH: Path = Path(__file__).resolve().with_name("symbol_allowlist_eval.txt")
+VALID_IMPORT_PROFILES: tuple[str, ...] = ("production", "eval")
+
+# Additional undefined symbols pulled into worker-authored test TUs solely by force-included test_framework.hpp
+_EVAL_TEST_FRAMEWORK_ALLOWLIST_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^std::cerr$"),
+    re.compile(r"^std::ios_base_library_init\(\)$"),
+    re.compile(r"^std::ostream::operator<<\(int\)$"),
+    re.compile(
+        r"^std::basic_ostream<char,\s*std::char_traits<char>\s*>&\s*"
+        r"std::operator<<\s*<std::char_traits<char>\s*>\("
+        r"std::basic_ostream<char,\s*std::char_traits<char>\s*>&,\s*char const\*\)$"
+    ),
+    re.compile(
+        r"^std::basic_ostream<char,\s*std::char_traits<char>\s*>&\s*"
+        r"std::__ostream_insert<char,\s*std::char_traits<char>\s*>\("
+        r"std::basic_ostream<char,\s*std::char_traits<char>\s*>&,\s*char const\*,\s*long\)$"
+    ),
+)
 
 _ALLOWED_TEST_WEAK_TEMPLATES: frozenset[str] = frozenset(
     {
@@ -217,6 +236,74 @@ def list_undefined_symbols(nm_bin: str, obj_path: Path) -> list[str]:
     return syms
 
 
+def list_undefined_demangled_symbols(nm_bin: str, obj_path: Path) -> list[str]:
+    """Return deduplicated demangled undefined symbol names from ``nm -u -C``."""
+    seen: set[str] = set()
+    syms: list[str] = []
+    out = _run_nm(nm_bin, ["-u", "-C"], obj_path)
+    for line in out.splitlines():
+        m = _NM_UNDEF_LINE_RE.match(line)
+        if not m:
+            continue
+        sym = m.group(2)
+        if sym not in seen:
+            seen.add(sym)
+            syms.append(sym)
+    return syms
+
+
+def load_symbol_allowlist_file(allowlist_path: Path) -> tuple[re.Pattern[str], ...]:
+    """Load one-regex-per-line undefined symbol allowlist from ``allowlist_path``."""
+    if not allowlist_path.is_file():
+        raise FileNotFoundError(f"symbol allowlist file not found: {allowlist_path}")
+    patterns: list[re.Pattern[str]] = []
+    for line_num, raw_line in enumerate(allowlist_path.read_text(encoding="utf-8").splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            patterns.append(re.compile(stripped))
+        except re.error as exc:
+            raise ValueError(f"invalid regex in {allowlist_path}:{line_num}: {stripped!r}: {exc}") from exc
+    return tuple(patterns)
+
+
+def compile_symbol_allowlist(patterns: Sequence[str | re.Pattern[str]]) -> tuple[re.Pattern[str], ...]:
+    """Compile a sequence of regex strings or compiled patterns into ``re.Pattern`` objects."""
+    compiled: list[re.Pattern[str]] = []
+    for item in patterns:
+        if isinstance(item, re.Pattern):
+            compiled.append(item)
+        else:
+            raw = str(item).strip()
+            if not raw:
+                continue
+            try:
+                compiled.append(re.compile(raw))
+            except re.error as exc:
+                raise ValueError(f"invalid symbol allowlist regex {raw!r}: {exc}") from exc
+    return tuple(compiled)
+
+
+def is_allowed_undefined_symbol(
+    demangled_sym: str,
+    allowlist: Sequence[re.Pattern[str]],
+    *,
+    is_test_obj: bool = False,
+    include_eval_test_framework: bool = False,
+) -> bool:
+    """Return True if ``demangled_sym`` (minus any ELF @version suffix) matches ``allowlist``."""
+    cleaned = demangled_sym.strip()
+    if "@" in cleaned:
+        cleaned = cleaned.split("@", 1)[0].strip()
+    if any(rx.search(cleaned) is not None for rx in allowlist):
+        return True
+    if is_test_obj and include_eval_test_framework:
+        if any(rx.search(cleaned) is not None for rx in _EVAL_TEST_FRAMEWORK_ALLOWLIST_PATTERNS):
+            return True
+    return False
+
+
 def is_denied_undefined_symbol(sym_name: str) -> str | None:
     """Return matching denylist rule name if ``sym_name`` is a forbidden undefined reference."""
     cleaned = sym_name.strip()
@@ -305,14 +392,37 @@ def check_worker_objects(
     framework_objs: Sequence[Path] = (),
     framework_namespaces: Sequence[str] = DEFAULT_FRAMEWORK_NAMESPACES,
     nm_bin: str = "nm",
+    import_profile: str = "production",
+    import_allowlist: Sequence[str | re.Pattern[str]] = (),
+    import_allowlist_file: Path | None = None,
 ) -> SymbolCheckResult:
-    """Verify worker objects against framework symbol collisions and undefined symbol denylist."""
+    """Verify worker objects against framework symbol collisions and undefined symbol rules."""
+    if import_profile not in VALID_IMPORT_PROFILES:
+        return SymbolCheckResult(
+            exit_code=2,
+            errors=(f"SYMBOL_CHECK_ERROR: invalid import profile {import_profile!r}; expected one of {VALID_IMPORT_PROFILES}",),
+        )
+
     resolved_nm = find_nm_bin(nm_bin)
     if resolved_nm is None:
         return SymbolCheckResult(
             exit_code=3,
             errors=(f"TOOL_MISSING: nm executable '{nm_bin}' not found on PATH",),
         )
+
+    allowlist_patterns: tuple[re.Pattern[str], ...] = ()
+    try:
+        compiled_inline = compile_symbol_allowlist(import_allowlist)
+        if import_allowlist_file is not None:
+            allowlist_patterns = (*load_symbol_allowlist_file(import_allowlist_file), *compiled_inline)
+        elif compiled_inline:
+            allowlist_patterns = compiled_inline
+        elif import_profile == "eval":
+            allowlist_patterns = load_symbol_allowlist_file(DEFAULT_EVAL_ALLOWLIST_PATH)
+    except (OSError, ValueError) as exc:
+        return SymbolCheckResult(exit_code=2, errors=(f"SYMBOL_CHECK_ERROR: {exc}",))
+
+    enforce_allowlist = import_profile == "eval" or bool(allowlist_patterns)
 
     all_paths = [*worker_objs, *worker_test_objs, *framework_objs]
     for p in all_paths:
@@ -393,6 +503,23 @@ def check_worker_objects(
                     )
                 )
 
+        if enforce_allowlist:
+            for demangled_sym in list_undefined_demangled_symbols(resolved_nm, obj):
+                if not is_allowed_undefined_symbol(
+                    demangled_sym,
+                    allowlist_patterns,
+                    is_test_obj=is_test_obj,
+                    include_eval_test_framework=(import_profile == "eval"),
+                ):
+                    violations.append(
+                        SymbolViolation(
+                            object_path=str(obj),
+                            kind="symbol_not_allowed",
+                            symbol=demangled_sym,
+                            reason=f"SYMBOL-NOT-ALLOWED: worker object references non-allowlisted undefined symbol '{demangled_sym}'",
+                        )
+                    )
+
     try:
         for obj in worker_objs:
             _scan_one(obj, is_test_obj=False)
@@ -405,6 +532,7 @@ def check_worker_objects(
         exit_code=1 if violations else 0,
         violations=tuple(violations),
         checked_objects=tuple(checked),
+        metadata={"import_profile": import_profile, "allowlist_enforced": enforce_allowlist},
     )
 
 
@@ -561,6 +689,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Framework namespace(s) forbidden in worker objects (default: can_fixture_test)",
     )
+    parser.add_argument(
+        "--import-profile",
+        choices=VALID_IMPORT_PROFILES,
+        default="production",
+        help="Undefined-symbol policy profile: 'production' (denylist + optional TOML allowlist) or 'eval' (strict eval allowlist)",
+    )
+    parser.add_argument(
+        "--import-allowlist",
+        type=Path,
+        default=None,
+        help="Optional newline-delimited regex file for undefined symbols",
+    )
     parser.add_argument("--nm-bin", default=os.environ.get("NM", "nm"), help="nm executable name or path")
     parser.add_argument("--label", default="worker_objects", help="Human-readable label for diagnostics")
     parser.add_argument("--json", action="store_true", help="Emit JSON result")
@@ -618,6 +758,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             framework_objs=framework_objs,
             framework_namespaces=namespaces,
             nm_bin=args.nm_bin,
+            import_profile=args.import_profile,
+            import_allowlist_file=args.import_allowlist,
         )
 
     if args.json:

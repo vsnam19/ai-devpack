@@ -74,6 +74,12 @@ POLICY_CHANGING_LEXICON: tuple[str, ...] = (
     "remove assert",
     "pre-approved",
     "do not mention",
+    "gcov counter",
+    "/proc/self",
+    "streambuf",
+    "rdbuf",
+    "zeroing counters",
+    "failedChecks",
 )
 
 # Zero-width and format characters stripped before policy-changing lexicon matching.
@@ -106,6 +112,17 @@ _POLICY_CHANGING_RE = re.compile(
     r"|pre-?approved"
     r"|do\s+not\s+mention"
     r"|don['\u2019]?t\s+mention"
+    r"|__gcov[0-9a-z_]*"
+    r"|gcov\s+(?:counter(?:s)?|failure[- ]path|coverage|line(?:s)?|array(?:s)?)"
+    r"|(?:coverage|failure[- ]path)\s+counter(?:s)?"
+    r"|/proc/self(?:/[A-Za-z0-9_.-]+)?"
+    r"|(?:std::)?(?:basic_)?streambuf"
+    r"|rdbuf"
+    r"|(?:zero(?:s|es|ed|ing)?|clear(?:s|ed|ing)?|reset(?:s|ting)?|overwrite(?:s|ting)?|recalibrat(?:e|es|ed|ing)|forg(?:e|es|ed|ing))\s+(?:the\s+)?(?:[A-Za-z0-9_.-]+\s+){0,4}counter(?:s|\s+arrays?)?"
+    r"|counter(?:s)?\s+(?:[A-Za-z0-9_.-]+\s+){0,4}(?:to\s+zero|read\s+zero)"
+    r"|failedChecks|passedChecks|totalChecks"
+    r"|recordCheck(?:Eq|Failure)?"
+    r"|DEVPACK_FAILURE_PATH"
     r")(?![A-Za-z0-9_])"
 )
 APPROVAL_REQUIRED_TYPES: tuple[str, ...] = ("decision", "fact")

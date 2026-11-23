@@ -959,6 +959,74 @@ def infer_repo_include_flags(target: pathlib.Path) -> list[str]:
     return flags
 
 
+def _resolve_effective_compiler_flags(
+    path: pathlib.Path,
+    cfg: LintConfig,
+    compile_commands: pathlib.Path | None,
+    *,
+    tool_env: RuntimeToolEnv | None = None,
+    include_warning_flags: bool = True,
+    gcc_dir: str | None = None,
+    for_header: bool = False,
+) -> list[str]:
+    """Resolve effective compiler flags shared by preprocessing, syntax, and AST checks."""
+    is_c = path.suffix in C_EXTS
+    if tool_env is not None and compile_commands is not None and tool_env.compile_commands_entries:
+        cc_flags = (
+            _extract_flags_from_entries(tool_env.compile_commands_entries, compile_commands.parent, path)
+            or infer_repo_include_flags(path)
+        )
+    else:
+        cc_flags = extract_compile_flags(compile_commands, path) or infer_repo_include_flags(path)
+
+    if is_c:
+        warn_flags = (
+            [
+                "-Wall",
+                "-Wextra",
+                "-Wpedantic",
+                "-Werror",
+                "-Wswitch-enum",
+                "-Wvla",
+                "-Wunreachable-code",
+            ]
+            if include_warning_flags
+            else []
+        )
+        return [f"-std={cfg.c_std}", *warn_flags, *cc_flags]
+
+    exc_flags = ["-fno-exceptions"] if cfg.no_exceptions else []
+    rtti_flags = ["-fno-rtti"] if cfg.no_rtti else []
+    warn_flags = (
+        [
+            "-Wall",
+            "-Wextra",
+            "-Wpedantic",
+            "-Werror",
+            "-Wswitch-enum",
+            "-Woverloaded-virtual",
+            "-Wnon-virtual-dtor",
+            "-Wsuggest-override",
+            "-Wno-error=suggest-override",
+            "-Wunreachable-code",
+        ]
+        if include_warning_flags
+        else []
+    )
+    base_flags = [
+        f"-std={cfg.std}",
+        *exc_flags,
+        *rtti_flags,
+        *warn_flags,
+        *cc_flags,
+    ]
+    if gcc_dir is not None:
+        base_flags.append(f"--gcc-install-dir={gcc_dir}")
+    if for_header and include_warning_flags:
+        base_flags = ["-x", "c++-header", *base_flags]
+    return base_flags
+
+
 def is_heap_allowed_for_path(
     path: pathlib.Path,
     repository_root: pathlib.Path | None,
@@ -2996,6 +3064,24 @@ def _find_absolute_includes(path: pathlib.Path, raw_text: str) -> list[tuple[int
     return hits
 
 
+def _collect_include_dirs_from_flags(flags: Sequence[str]) -> set[str]:
+    """Return resolved/normalized include directory strings present in compiler ``flags``."""
+    dirs: set[str] = set()
+    idx = 0
+    while idx < len(flags):
+        tok = flags[idx]
+        if tok in ("-I", "-isystem", "-iquote") and idx + 1 < len(flags):
+            dirs.add(flags[idx + 1])
+            idx += 2
+            continue
+        if tok.startswith("-I") and len(tok) > 2:
+            dirs.add(tok[2:])
+        elif tok.startswith("-isystem") and len(tok) > 8:
+            dirs.add(tok[8:])
+        idx += 1
+    return dirs
+
+
 def _preprocess_repo_lines(
     path: pathlib.Path,
     raw_text: str,
@@ -3008,21 +3094,35 @@ def _preprocess_repo_lines(
     max_as_bytes: int = DEFAULT_MAX_AS_BYTES,
     strip_framework_include: bool = False,
     allow_missing_tools: bool = False,
+    effective_flags: Sequence[str] | None = None,
+    compile_commands: pathlib.Path | None = None,
+    tool_env: RuntimeToolEnv | None = None,
 ) -> list[tuple[int, str]]:
     """Run ``g++ -E`` with resource limits (no silent fallback) and return repo-local lines."""
     compiler_bin = shutil.which("g++" if not is_c else "gcc") or shutil.which(
         "clang++" if not is_c else "clang"
     )
-    inc_flags = infer_repo_include_flags(path)
-    if str(path.parent) not in [f[2:] for f in inc_flags if f.startswith("-I")]:
-        inc_flags.append(f"-I{path.parent}")
+    if effective_flags is not None:
+        preproc_flags = list(effective_flags)
+    else:
+        preproc_flags = _resolve_effective_compiler_flags(
+            path,
+            LintConfig(std=std, c_std=c_std),
+            compile_commands,
+            tool_env=tool_env,
+            include_warning_flags=False,
+        )
+
+    existing_inc_dirs = _collect_include_dirs_from_flags(preproc_flags)
+    if str(path.parent) not in existing_inc_dirs:
+        preproc_flags.extend(["-I", str(path.parent)])
+        existing_inc_dirs.add(str(path.parent))
     if repository_root is not None:
         for sub in ("include", "src", "tests"):
             cand = repository_root / sub
-            if cand.is_dir():
-                flag = f"-I{cand}"
-                if flag not in inc_flags:
-                    inc_flags.append(flag)
+            if cand.is_dir() and str(cand) not in existing_inc_dirs:
+                preproc_flags.extend(["-I", str(cand)])
+                existing_inc_dirs.add(str(cand))
 
     resolved_target = path.resolve()
     resolved_root = repository_root.resolve() if repository_root is not None else None
@@ -3060,13 +3160,12 @@ def _preprocess_repo_lines(
         )
 
     lang = "c" if is_c else "c++"
-    std_flag = f"-std={c_std if is_c else std}"
     if strip_framework_include:
         filtered_src = "\n".join(
             "" if _FRAMEWORK_HEADER_INCLUDE_RE.match(ln) else ln
             for ln in raw_text.splitlines()
         )
-        cmd = [compiler_bin, "-E", "-x", lang, std_flag, *inc_flags, "-"]
+        cmd = [compiler_bin, "-E", "-x", lang, *preproc_flags, "-"]
         try:
             proc = _run_limited_subprocess(
                 cmd,
@@ -3077,7 +3176,7 @@ def _preprocess_repo_lines(
         except OSError as exc:
             raise PreprocessFailedError(f"preprocessor launch failed: {exc}") from exc
     else:
-        cmd = [compiler_bin, "-E", "-x", lang, std_flag, *inc_flags, str(path)]
+        cmd = [compiler_bin, "-E", "-x", lang, *preproc_flags, str(path)]
         try:
             proc = _run_limited_subprocess(
                 cmd,
@@ -3487,6 +3586,13 @@ def check_c_or_cpp_file(
     resource_limit_hit = False
     preprocess_failed = False
     preproc_lines: list[tuple[int, str]] | None = None
+    preproc_flags = _resolve_effective_compiler_flags(
+        path,
+        cfg,
+        compile_commands,
+        tool_env=tool_env,
+        include_warning_flags=False,
+    )
     if not has_abs_include and (
         "INLINE-ASM" not in disabled
         or (enforce_proc_term and "PROCESS-TERMINATION" not in disabled)
@@ -3504,6 +3610,9 @@ def check_c_or_cpp_file(
                 max_as_bytes=cfg.max_as_bytes,
                 strip_framework_include=False,
                 allow_missing_tools=cfg.allow_missing_tools,
+                effective_flags=preproc_flags,
+                compile_commands=compile_commands,
+                tool_env=tool_env,
             )
         except LintResourceLimitError as exc:
             resource_limit_hit = True
@@ -3560,6 +3669,9 @@ def check_c_or_cpp_file(
                     max_as_bytes=cfg.max_as_bytes,
                     strip_framework_include=is_test_dir,
                     allow_missing_tools=cfg.allow_missing_tools,
+                    effective_flags=preproc_flags,
+                    compile_commands=compile_commands,
+                    tool_env=tool_env,
                 )
             except LintResourceLimitError as exc:
                 resource_limit_hit = True
@@ -3666,49 +3778,15 @@ def check_c_or_cpp_file(
             f"Required compiler/AST tool '{'clang' if is_c else 'clang++'}' is not installed or not on PATH"
         )
     if compiler_bin:
-        if tool_env is not None and compile_commands is not None and tool_env.compile_commands_entries:
-            cc_flags = (
-                _extract_flags_from_entries(tool_env.compile_commands_entries, compile_commands.parent, path)
-                or infer_repo_include_flags(path)
-            )
-        else:
-            cc_flags = extract_compile_flags(compile_commands, path) or infer_repo_include_flags(path)
-
-        if is_c:
-            base_flags = [
-                f"-std={cfg.c_std}",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Werror",
-                "-Wswitch-enum",
-                "-Wvla",
-                "-Wunreachable-code",
-                *cc_flags,
-            ]
-        else:
-            exc_flags = ["-fno-exceptions"] if cfg.no_exceptions else []
-            rtti_flags = ["-fno-rtti"] if cfg.no_rtti else []
-            base_flags = [
-                f"-std={cfg.std}",
-                *exc_flags,
-                *rtti_flags,
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Werror",
-                "-Wswitch-enum",
-                "-Woverloaded-virtual",
-                "-Wnon-virtual-dtor",
-                "-Wsuggest-override",
-                "-Wno-error=suggest-override",
-                "-Wunreachable-code",
-                *cc_flags,
-            ]
-            if gcc_dir is not None:
-                base_flags.append(f"--gcc-install-dir={gcc_dir}")
-            if is_header:
-                base_flags = ["-x", "c++-header", *base_flags]
+        base_flags = _resolve_effective_compiler_flags(
+            path,
+            cfg,
+            compile_commands,
+            tool_env=tool_env,
+            include_warning_flags=True,
+            gcc_dir=None if is_c else gcc_dir,
+            for_header=is_header,
+        )
 
         syntax_cmd = [compiler_bin, "-fsyntax-only", *base_flags, str(path)]
         try:
@@ -4575,49 +4653,15 @@ def _compute_file_cache_key(
     compiler_bin = tool_env.clang_bin if is_c else tool_env.clangxx_bin
     compiler_version = tool_env.clang_version if is_c else tool_env.clangxx_version
 
-    if compile_commands is not None and tool_env.compile_commands_entries:
-        cc_flags = (
-            _extract_flags_from_entries(tool_env.compile_commands_entries, compile_commands.parent, target_path)
-            or infer_repo_include_flags(target_path)
-        )
-    else:
-        cc_flags = extract_compile_flags(compile_commands, target_path) or infer_repo_include_flags(target_path)
-
-    if is_c:
-        base_flags = [
-            f"-std={config.c_std}",
-            "-Wall",
-            "-Wextra",
-            "-Wpedantic",
-            "-Werror",
-            "-Wswitch-enum",
-            "-Wvla",
-            "-Wunreachable-code",
-            *cc_flags,
-        ]
-    else:
-        exc_flags = ["-fno-exceptions"] if config.no_exceptions else []
-        rtti_flags = ["-fno-rtti"] if config.no_rtti else []
-        base_flags = [
-            f"-std={config.std}",
-            *exc_flags,
-            *rtti_flags,
-            "-Wall",
-            "-Wextra",
-            "-Wpedantic",
-            "-Werror",
-            "-Wswitch-enum",
-            "-Woverloaded-virtual",
-            "-Wnon-virtual-dtor",
-            "-Wsuggest-override",
-            "-Wno-error=suggest-override",
-            "-Wunreachable-code",
-            *cc_flags,
-        ]
-        if tool_env.gcc_dir:
-            base_flags.append(f"--gcc-install-dir={tool_env.gcc_dir}")
-        if is_header:
-            base_flags = ["-x", "c++-header", *base_flags]
+    base_flags = _resolve_effective_compiler_flags(
+        target_path,
+        config,
+        compile_commands,
+        tool_env=tool_env,
+        include_warning_flags=True,
+        gcc_dir=None if is_c else (tool_env.gcc_dir or None),
+        for_header=is_header,
+    )
 
     deps: list[tuple[str, str]] = []
     if compiler_bin:

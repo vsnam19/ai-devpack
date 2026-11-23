@@ -93,7 +93,9 @@ GUARD_MACRO="DEVPACK_TF_GUARD_$(date +%s)_$$"
 mapfile -t SRC_FILES < <(find "$FIXTURE_ROOT/src" -maxdepth 1 -type f -name '*.cpp' | sort)
 mapfile -t TEST_FILES < <(find "$FIXTURE_ROOT/tests" -maxdepth 1 -type f -name '*.cpp' | sort)
 
+USED_CMAKE=0
 if [[ "$USE_CMAKE" -eq 1 ]] && command -v cmake >/dev/null 2>&1; then
+    USED_CMAKE=1
     find "$BUILD_DIR" -name '*.gcda' -delete
     cmake -S "$FIXTURE_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null
     cmake --build "$BUILD_DIR" --parallel 2 >/dev/null
@@ -145,3 +147,33 @@ python3 "$PROOF_PY" verify \
     --returncode "$test_rc" \
     --start-time "$TEST_START_TIME" \
     --label "fixture_tests"
+
+SYM_PY="$PACK_ROOT/enforcement/checks/symbol_check.py"
+if [[ -f "$SYM_PY" && "${#SRC_FILES[@]}" -gt 0 ]]; then
+    sym_args=(--import-profile eval --label "fixture_symbol_check")
+    if [[ -d "$FIXTURE_ROOT/include" ]]; then
+        sym_args+=(-I "$FIXTURE_ROOT/include")
+    fi
+    if [[ "$USED_CMAKE" -eq 0 ]]; then
+        for obj_f in "${SRC_OBJS[@]}"; do
+            sym_args+=(--worker-obj "$obj_f")
+        done
+    else
+        for src_f in "${SRC_FILES[@]}"; do
+            sym_args+=(--worker-src "$src_f")
+        done
+    fi
+    if [[ -f "$FIXTURE_ROOT/tests/test_main.cpp" ]]; then
+        sym_args+=(--framework-src "$FIXTURE_ROOT/tests/test_main.cpp" -I "$FIXTURE_ROOT/tests" --force-include-framework "$PACK_FRAMEWORK_HDR")
+    fi
+    for tst_f in "${TEST_FILES[@]}"; do
+        case "$(basename "$tst_f")" in
+            test_main.cpp|test_can_codec.cpp|test_ring_buffer.cpp|test_link_state_machine.cpp|test_dtc_debouncer.cpp)
+                ;;
+            *)
+                sym_args+=(--worker-test-src "$tst_f")
+                ;;
+        esac
+    done
+    python3 "$SYM_PY" "${sym_args[@]}" >/dev/null
+fi

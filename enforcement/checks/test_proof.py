@@ -36,11 +36,16 @@ from typing import Sequence
 
 DEFAULT_ASSERT_REGEX = r"(?<![A-Za-z0-9_])CHECK(?:_EQ|_TRUE|_FALSE|_NEAR)?\s*\("
 FAILURE_PATH_MARKER = "DEVPACK_FAILURE_PATH"
+SUCCESS_PATH_MARKER = "DEVPACK_SUCCESS_PATH"
+CHECK_TOTAL_MARKER = "DEVPACK_CHECK_TOTAL"
 _FAILURE_PATH_RE = re.compile(rf"//[^\n]*\b{FAILURE_PATH_MARKER}\b")
+_SUCCESS_PATH_RE = re.compile(rf"//[^\n]*\b{SUCCESS_PATH_MARKER}\b")
+_CHECK_TOTAL_RE = re.compile(rf"(?://[^\n]*\b{CHECK_TOTAL_MARKER}\b|\+\+\s*state\.totalChecks\b)")
 _FAILURE_LINE_RE = re.compile(
     r"(?m)^(?:\s*FAIL:|.*:\s*CHECK(?:_EQ|_TRUE|_FALSE|_NEAR)?\([^)]*\)\s+failed|.*GRADER_CHECK\s+failed)"
 )
 _COMPLETION_LINE_RE = re.compile(r"\bprintSummaryAndExitCode\s*(?:<[^>]*>)?\s*\(|DEVPACK_TESTS_COMPLETED")
+_COMPLETED_TALLY_RE = re.compile(r"DEVPACK_TESTS_COMPLETED\s+checks=(\d+)\s+failed=(\d+)")
 _FRAMEWORK_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"[^"]*test_framework\.hpp"', re.MULTILINE)
 _MTIME_JIFFY_SLACK_S = 0.05
 
@@ -164,6 +169,26 @@ def extract_failure_path_lines(source_path: Path) -> list[int]:
     return lines
 
 
+def extract_success_path_lines(source_path: Path) -> list[int]:
+    """Return 1-based line numbers annotated with ``DEVPACK_SUCCESS_PATH`` in ``source_path``."""
+    raw_text = source_path.read_text(encoding="utf-8", errors="replace")
+    lines: list[int] = []
+    for idx, line in enumerate(raw_text.splitlines(), start=1):
+        if _SUCCESS_PATH_RE.search(line):
+            lines.append(idx)
+    return lines
+
+
+def extract_check_total_lines(source_path: Path) -> list[int]:
+    """Return 1-based line numbers tracking total executed checks in ``source_path``."""
+    raw_text = source_path.read_text(encoding="utf-8", errors="replace")
+    lines: list[int] = []
+    for idx, line in enumerate(raw_text.splitlines(), start=1):
+        if _CHECK_TOTAL_RE.search(line):
+            lines.append(idx)
+    return lines
+
+
 def _find_gcda_and_gcno_for_source(obj_dir: Path, src_path: Path) -> tuple[Path | None, Path | None]:
     """Locate ``.gcno`` and ``.gcda`` files in ``obj_dir`` corresponding to ``src_path``."""
     stem = src_path.stem
@@ -209,7 +234,8 @@ def _parse_gcov_json_payload(payload_text: str) -> dict[str, dict[int, int]]:
                 ln = line_rec.get("line_number")
                 cnt = line_rec.get("count")
                 if isinstance(ln, int) and isinstance(cnt, int):
-                    line_map[ln] = max(line_map.get(ln, 0), cnt)
+                    # Sum across template instantiations/functions sharing a line in one .gcno
+                    line_map[ln] = line_map.get(ln, 0) + cnt
     return counts_by_file
 
 
@@ -251,7 +277,7 @@ def _run_gcov_json(gcov_bin: str, gcno_path: Path, obj_dir: Path) -> dict[str, d
         for fkey, lmap in _parse_gcov_json_payload(text).items():
             dest = merged.setdefault(fkey, {})
             for ln, cnt in lmap.items():
-                dest[ln] = max(dest.get(ln, 0), cnt)
+                dest[ln] = dest.get(ln, 0) + cnt
     return merged
 
 
@@ -335,6 +361,7 @@ def verify_gcov_proof(
         )
 
     all_counts: dict[str, dict[int, int]] = {}
+    seen_gcnos: set[Path] = set()
     for src in test_sources:
         if not src.is_file():
             return ProofResult(
@@ -370,6 +397,10 @@ def verify_gcov_proof(
                     reason=f"FAIL: {label} stale gcov .gcda data for {src.name} (written before test run started)",
                     output=output_text,
                 )
+        resolved_gcno = gcno.resolve()
+        if resolved_gcno in seen_gcnos:
+            continue
+        seen_gcnos.add(resolved_gcno)
         try:
             parsed = _run_gcov_json(resolved_gcov, gcno, obj_dir)
         except (OSError, RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
@@ -381,7 +412,7 @@ def verify_gcov_proof(
         for fkey, lmap in parsed.items():
             dest = all_counts.setdefault(fkey, {})
             for ln, cnt in lmap.items():
-                dest[ln] = max(dest.get(ln, 0), cnt)
+                dest[ln] = dest.get(ln, 0) + cnt
 
     total_verified = 0
     uses_pack_fw = False
@@ -469,6 +500,48 @@ def verify_gcov_proof(
                     reason=f"FAIL: {label} test_framework.hpp recorded 0 executed assertions in gcov",
                     output=output_text,
                 )
+            fw_success_lines = extract_success_path_lines(fw_path)
+            if fw_success_lines:
+                fw_success_count = sum(fw_counts.get(ln, 0) for ln in fw_success_lines)
+                fw_total_lines = extract_check_total_lines(fw_path)
+                fw_total_count = sum(fw_counts.get(ln, 0) for ln in fw_total_lines)
+                if fw_success_count == 0:
+                    return ProofResult(
+                        exit_code=1,
+                        reason=f"FAIL: {label} {fw_path.name} DEVPACK_SUCCESS_PATH recorded 0 passed checks in gcov",
+                        output=output_text,
+                    )
+                if fw_total_lines and fw_success_count != fw_total_count:
+                    return ProofResult(
+                        exit_code=1,
+                        reason=(
+                            f"FAIL: {label} {fw_path.name} success-path count ({fw_success_count}) "
+                            f"!= CHECK execution count ({fw_total_count}) in gcov"
+                        ),
+                        output=output_text,
+                    )
+                if fw_success_count < total_verified:
+                    return ProofResult(
+                        exit_code=1,
+                        reason=(
+                            f"FAIL: {label} {fw_path.name} success-path count ({fw_success_count}) "
+                            f"< executed CHECK lines ({total_verified})"
+                        ),
+                        output=output_text,
+                    )
+                tally_match = _COMPLETED_TALLY_RE.search(output_text)
+                if tally_match:
+                    reported_checks = int(tally_match.group(1))
+                    reported_failed = int(tally_match.group(2))
+                    if reported_failed != 0 or fw_success_count != reported_checks:
+                        return ProofResult(
+                            exit_code=1,
+                            reason=(
+                                f"FAIL: {label} {fw_path.name} success-path gcov count ({fw_success_count}) "
+                                f"!= DEVPACK_TESTS_COMPLETED checks={reported_checks} failed={reported_failed}"
+                            ),
+                            output=output_text,
+                        )
 
     if require_nonempty_checks and total_verified == 0:
         return ProofResult(

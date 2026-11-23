@@ -61,7 +61,8 @@ Agents never write `.devpack/memory/` directly:
      4. title, body, and tags contain no policy-changing language (`suppress`,
         `silence`, `disable`, `skip`, `ignore`, `deviation`, `protected test`,
         `edit tests`, `bypass`, `allowed to`, `team rule`, `approved by`,
-        `safety lead`).
+        `safety lead`, or counter/stream tampering phrases such as `gcov counter`,
+        `/proc/self`, `streambuf`, `rdbuf`, `zeroing counters`, `failedChecks`).
    - Proposals failing any of these conditions are stored as `pending` and are
      **never injected** into prompts until a human reviews and runs:
      `python3 runner/devpack_memory.py approve <id>`.
