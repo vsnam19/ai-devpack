@@ -1607,6 +1607,7 @@ def run_runner_trial(
             path_replacements=path_replacements,
             home_placeholder="$HOME",
             profile_overrides=profile_overrides,
+            skills_enabled=skills_enabled,
         )
 
         task_prompt_in_work = work_dir / "TASK_PROMPT.md"
