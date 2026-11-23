@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import tempfile
 import subprocess
 import sys
 
@@ -32,13 +34,8 @@ REVIEW_DEFECT_TERMS: dict[str, tuple[str, ...]] = {
         "unchecked",
     ),
     "gate-review": (
-        "gate",
-        "receipt",
-        "check",
-        "verify",
-        "deterministic",
-        "evidence",
-        "skipped",
+        "no gate receipt", "missing gate receipt", "gate receipt is missing",
+        "gate receipt was not provided", "without a gate receipt",
     ),
 }
 
@@ -160,10 +157,16 @@ def _check_skill_authoring(draft: Path, case: str, root: Path) -> int:
                 print("no valid candidate to prove grader acceptance", file=sys.stderr)
                 return 1
             # The grader must accept a known-valid candidate and reject the bad fixture.
-            if _run_grader(cmd, grader_dir, valid_candidate, root).returncode != 0:
-                return 1
-            if _run_grader(cmd, grader_dir, fixture_dir, root).returncode == 0:
-                return 1
+            # Reuse the same neutral path for both trials: paths disclose no label.
+            with tempfile.TemporaryDirectory(prefix="draft-trial-") as trial:
+                candidate = Path(trial) / "candidate"
+                shutil.copytree(valid_candidate, candidate)
+                if _run_grader(cmd, grader_dir, candidate, root).returncode != 0:
+                    return 1
+                shutil.rmtree(candidate)
+                shutil.copytree(fixture_dir, candidate)
+                if _run_grader(cmd, grader_dir, candidate, root).returncode == 0:
+                    return 1
         return 0
 
     return 2

@@ -238,11 +238,12 @@ def _parse_spec_sections(spec_text: str) -> tuple[str, dict[str, str], list[str]
                 current_ids = found_ids
                 in_unnumbered = False
                 for req_id in found_ids:
-                    sections.setdefault(req_id, []).append(stripped)
+                    sections.setdefault(req_id, [])
             else:
                 current_ids = []
                 in_unnumbered = True
-                unnumbered.append(stripped)
+            continue
+        if stripped.startswith("#") or "shall" not in stripped.lower():
             continue
         if current_ids:
             for req_id in current_ids:
@@ -253,7 +254,7 @@ def _parse_spec_sections(spec_text: str) -> tuple[str, dict[str, str], list[str]
     normalized_sections = {
         req_id: _normalize_ws(" ".join(parts)) for req_id, parts in sections.items()
     }
-    return _normalize_ws(spec_text), normalized_sections, [
+    return _normalize_ws(" ".join(normalized_sections.values()) + " " + " ".join(unnumbered)), normalized_sections, [
         _normalize_ws(part) for part in unnumbered if part.strip()
     ]
 
@@ -461,6 +462,46 @@ def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
                 failures.append(
                     f"Row {row_index} ({row['id']}) quote does not appear verbatim in source specification"
                 )
+
+        # Match source concepts, allowing the domain synonyms used in the references.
+        stopwords = {"the", "shall", "when", "while", "then", "into", "after", "before", "within",
+                     "with", "from", "that", "this", "and", "true", "false", "linkmanager",
+                     "can", "cancodec", "dtcdebouncer", "received", "called", "system"}
+        terms = {word.lower() for word in re.findall(r"[A-Za-z]+|\d+", clean_quote)
+                 if len(word) > 2 or word.isdigit()} - stopwords
+        aliases = {
+            "quickly": {"handshake", "response", "latency", "deadline"},
+            "corrupted": {"corruption", "corrupted", "crc", "dlc"},
+            "samples": {"sample", "samples", "counter", "step", "clamping"},
+            "counter": {"threshold", "confirmation", "confirmed", "req-dtc-012"},
+            "default": {"default", "defaults", "per-signal"},
+        }
+        for word in tuple(terms):
+            terms.update(aliases.get(word, ()))
+        for field in ("why", "question"):
+            if not any(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", row[field], re.I)
+                       for term in terms):
+                failures.append(f"Row {row_index} ({row['id']}) {field} must reference a specific quoted term/value")
+
+        rewrite = row["rewrite"]
+        # A typed unresolved quantity needs a unit; open questions must also have
+        # matching BLOCKED entries below, even if another criterion is present.
+        criterion = re.search(
+            r"(?:\b\d+(?:\.\d+)?|<TBD: [a-z]+(?:_[a-z0-9]+)*>)`?\s*"
+            r"(?:ms|s|us|bytes?|bits?|cycles?|samples?|degC|%)(?![A-Za-z])"
+            r"|\b[A-Za-z_]\w*::[A-Za-z_]\w*", rewrite
+        )
+        # Non-numeric rules may also remain typed and unresolved (for example
+        # state_rule); they must describe the SHALL action, not just its guard.
+        action = re.split(r"\bSHALL\b", rewrite, maxsplit=1, flags=re.I)[-1]
+        unresolved_rule = re.search(
+            r"<TBD: [a-z]+(?:_[a-z0-9]+)*_(?:rule|state|flag|mode|class|values)>", action
+        )
+        if not (criterion or unresolved_rule) or re.search(r"\bSHALL\s+(?:work|function|operate)\b", rewrite, re.I):
+            failures.append(f"Row {row_index} ({row['id']}) rewrite lacks a measurable criterion")
+        subjects = re.findall(r"`(LinkManager|CanCodec|DtcDebouncer)`", clean_quote)
+        if subjects and not all(subject in rewrite for subject in subjects):
+            failures.append(f"Row {row_index} ({row['id']}) rewrite must retain the requirement subject")
 
         invented = sorted(extract_numbers(row["rewrite"]) - source_numbers)
         if invented:
