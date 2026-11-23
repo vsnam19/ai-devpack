@@ -215,15 +215,72 @@ for member in ("m_config", "m_state", "m_lastTimestampMs", "m_retryCount"):
         print(f"FAIL: expected private member '{member}' in include/link_state_machine.hpp", file=sys.stderr)
         sys.exit(1)
 
-for fn_name in ("startConnect", "onHandshakeAck", "onHeartbeat", "onTick"):
-    pattern = rf"/\*\*([\s\S]*?)\*/\s*(?:bool|LinkState)\s+{fn_name}\s*\("
-    m = re.search(pattern, hdr)
-    if not m:
+def strip_comments_keep_len(text: str) -> str:
+    return re.sub(
+        r"//[^\n]*|/\*[\s\S]*?\*/",
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)),
+        text,
+    )
+
+def extract_param_names(param_str: str) -> list[str]:
+    stripped = param_str.strip()
+    if not stripped or stripped == "void":
+        return []
+    parts = [p.strip() for p in stripped.split(",")]
+    names = []
+    for p in parts:
+        p_no_default = p.split("=", 1)[0].strip()
+        tokens = re.findall(r"[A-Za-z_]\w*", p_no_default)
+        if not tokens:
+            return []
+        names.append(tokens[-1])
+    return names
+
+hdr_code = strip_comments_keep_len(hdr)
+doc_blocks = list(re.finditer(r"/\*\*([\s\S]*?)\*/", hdr))
+
+targets = [
+    ("LinkStateMachine", True, r"(?:explicit\s+)?LinkStateMachine"),
+    ("isConfigValid", False, r"bool\s+isConfigValid"),
+    ("startConnect", False, r"bool\s+startConnect"),
+    ("onHandshakeAck", False, r"bool\s+onHandshakeAck"),
+    ("onHeartbeat", False, r"bool\s+onHeartbeat"),
+    ("onTick", False, r"LinkState\s+onTick"),
+    ("reset", True, r"void\s+reset"),
+    ("state", False, r"LinkState\s+state"),
+    ("retryCount", False, r"std::uint8_t\s+retryCount"),
+    ("lastTimestampMs", False, r"std::uint64_t\s+lastTimestampMs"),
+]
+
+for fn_name, is_void, sig_prefix in targets:
+    decl_re = re.compile(rf"(?:^|\n)[ \t]*{sig_prefix}\s*\(([\s\S]*?)\)\s*(?:const\s+)?noexcept\s*;")
+    dm = decl_re.search(hdr_code)
+    if not dm:
+        print(f"FAIL: missing declaration for {fn_name} in include/link_state_machine.hpp", file=sys.stderr)
+        sys.exit(1)
+    decl_start = dm.start()
+    if hdr_code[decl_start:decl_start + 1] == "\n":
+        decl_start += 1
+    preceding = [b for b in doc_blocks if b.end() <= decl_start]
+    if not preceding:
         print(f"FAIL: missing Doxygen block before {fn_name} in include/link_state_machine.hpp", file=sys.stderr)
         sys.exit(1)
-    doc_block = m.group(1)
-    if "@brief" not in doc_block or "@return" not in doc_block or "@param[in]" not in doc_block:
-        print(f"FAIL: incomplete Doxygen (@brief/@param[in]/@return) on {fn_name}", file=sys.stderr)
+    nearest = preceding[-1]
+    gap = hdr_code[nearest.end():decl_start]
+    if gap.strip():
+        print(f"FAIL: non-whitespace code between nearest Doxygen block and {fn_name}", file=sys.stderr)
+        sys.exit(1)
+    doc_block = nearest.group(1)
+    if not re.search(r"@brief\s+\S+", doc_block):
+        print(f"FAIL: missing @brief on {fn_name}", file=sys.stderr)
+        sys.exit(1)
+    if not is_void and not re.search(r"@return\s+\S+", doc_block):
+        print(f"FAIL: missing @return on non-void {fn_name}", file=sys.stderr)
+        sys.exit(1)
+    decl_params = extract_param_names(dm.group(1))
+    doc_params = re.findall(r"@param\s*\[(?:in|out|in,out)\]\s+([A-Za-z_]\w*)", doc_block)
+    if doc_params != decl_params:
+        print(f"FAIL: @param names {doc_params} do not match declared parameters {decl_params} on {fn_name}", file=sys.stderr)
         sys.exit(1)
 PY
 

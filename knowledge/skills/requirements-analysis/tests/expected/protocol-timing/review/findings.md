@@ -1,7 +1,7 @@
 # Requirements Findings: Link Handshake Timing Specification
 
 Document: `spec.md`
-Requirements inventoried: `REQ-COM-001`, `REQ-COM-002`, `REQ-COM-003`, `REQ-COM-004` (no temporary IDs needed).
+Requirements inventoried: `REQ-COM-001`, `REQ-COM-002`, `REQ-COM-003`, `REQ-COM-004`, `REQ-COM-005` (no temporary IDs needed).
 
 ## Findings table
 
@@ -27,6 +27,8 @@ Requirements inventoried: `REQ-COM-001`, `REQ-COM-002`, `REQ-COM-003`, `REQ-COM-
 - `REQ-COM-001` (ready):
   - Equivalence/transition: call `startConnect(nowMs)` in `LinkState::Idle` with `isConfigValid() == true`; verify `state() == LinkState::Connecting`, `retryCount() == 0`, `lastTimestampMs() == nowMs`, and completion within `1` cycle (`<= 10` ms).
   - Boundary/invalid: call `startConnect(nowMs)` with `isConfigValid() == false` or from non-`Idle` states (flag expected rejection behaviour with stakeholder if unspecified).
+- `REQ-COM-005` (ready):
+  - State transition: call `reset()` from `Connecting`, `Active`, `Degraded`, and `Fault`; verify `state() == LinkState::Idle`, `retryCount() == 0`, and `lastTimestampMs() == 0` ms within `1` cycle (`<= 10` ms).
 - REQ-COM-002: BLOCKED (open question) — see findings row REQ-COM-002
 - REQ-COM-003: BLOCKED (open question) — see findings row REQ-COM-003
 - REQ-COM-004: BLOCKED (open question) — see findings row REQ-COM-004

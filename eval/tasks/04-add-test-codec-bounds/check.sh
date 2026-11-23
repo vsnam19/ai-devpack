@@ -187,19 +187,23 @@ expected_hidden="$(count_expected_checks "$HIDDEN_DIR/hidden_test.cpp")"
 run_verified_test_binary "hidden_test" "$expected_hidden" "$TMP_GRADE_DIR/hidden_test"
 
 # 4. Task-specific checks
-python3 - "$WORKDIR" <<'PY'
+python3 - "$WORKDIR" "$FIXTURE_TESTS_DIR/test_can_codec.cpp" <<'PY'
 import pathlib
 import re
 import sys
 
 workdir = pathlib.Path(sys.argv[1])
+baseline_path = pathlib.Path(sys.argv[2])
 test_text = (workdir / "tests/test_can_codec.cpp").read_text(encoding="utf-8")
 if not re.search(r"@req\s+REQ-CODEC-006\b", test_text):
     print("FAIL: missing @req REQ-CODEC-006 tag in tests/test_can_codec.cpp", file=sys.stderr)
     sys.exit(1)
-check_count = len(re.findall(r"\bCHECK(?:_EQ|_NEAR)?\s*\(", test_text))
-if check_count < 32:
-    print(f"FAIL: insufficient assertions in tests/test_can_codec.cpp ({check_count} < 32)", file=sys.stderr)
+check_rx = re.compile(r"\bCHECK(?:_EQ|_NEAR)?\s*\(")
+baseline_count = len(check_rx.findall(baseline_path.read_text(encoding="utf-8"))) if baseline_path.is_file() else 36
+min_required = baseline_count + 3
+check_count = len(check_rx.findall(test_text))
+if check_count < min_required:
+    print(f"FAIL: insufficient assertions in tests/test_can_codec.cpp ({check_count} < {min_required}, baseline={baseline_count})", file=sys.stderr)
     sys.exit(1)
 PY
 
@@ -232,6 +236,57 @@ p.write_text(mutated, encoding="utf-8")
 PY
 if bash "$TMP_GRADE_DIR/mutant2/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
     echo "FAIL: tests did not catch mutant 2 (frame shorter than 8 bytes)" >&2
+    exit 1
+fi
+
+# Mutation 3: bypass frameBytes == nullptr guard in packRaw
+cp -r "$WORKDIR/." "$TMP_GRADE_DIR/mutant3"
+python3 - "$TMP_GRADE_DIR/mutant3/src/can_codec.cpp" <<'PY'
+import pathlib
+import sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text(encoding="utf-8")
+old = "    if (!isValidSignal(signal) || frameBytes == nullptr || frameLength < kMaxFrameBytes) {"
+new = "    if (frameBytes == nullptr) { return true; }\n    if (!isValidSignal(signal) || frameLength < kMaxFrameBytes) {"
+assert old in text, "mutant3 target missing"
+p.write_text(text.replace(old, new, 1), encoding="utf-8")
+PY
+if bash "$TMP_GRADE_DIR/mutant3/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
+    echo "FAIL: tests did not catch mutant 3 (packRaw frameBytes == nullptr)" >&2
+    exit 1
+fi
+
+# Mutation 4: bypass frameBytes == nullptr guard in unpackRaw
+cp -r "$WORKDIR/." "$TMP_GRADE_DIR/mutant4"
+python3 - "$TMP_GRADE_DIR/mutant4/src/can_codec.cpp" <<'PY'
+import pathlib
+import sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text(encoding="utf-8")
+old = "    if (!isValidSignal(signal) || frameBytes == nullptr || rawOut == nullptr ||\n        frameLength < kMaxFrameBytes) {"
+new = "    if (frameBytes == nullptr) { return true; }\n    if (!isValidSignal(signal) || rawOut == nullptr || frameLength < kMaxFrameBytes) {"
+assert old in text, "mutant4 target missing"
+p.write_text(text.replace(old, new, 1), encoding="utf-8")
+PY
+if bash "$TMP_GRADE_DIR/mutant4/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
+    echo "FAIL: tests did not catch mutant 4 (unpackRaw frameBytes == nullptr)" >&2
+    exit 1
+fi
+
+# Mutation 5: bypass rawOut == nullptr guard in unpackRaw
+cp -r "$WORKDIR/." "$TMP_GRADE_DIR/mutant5"
+python3 - "$TMP_GRADE_DIR/mutant5/src/can_codec.cpp" <<'PY'
+import pathlib
+import sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text(encoding="utf-8")
+old = "    if (!isValidSignal(signal) || frameBytes == nullptr || rawOut == nullptr ||\n        frameLength < kMaxFrameBytes) {"
+new = "    if (rawOut == nullptr) { return true; }\n    if (!isValidSignal(signal) || frameBytes == nullptr || frameLength < kMaxFrameBytes) {"
+assert old in text, "mutant5 target missing"
+p.write_text(text.replace(old, new, 1), encoding="utf-8")
+PY
+if bash "$TMP_GRADE_DIR/mutant5/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
+    echo "FAIL: tests did not catch mutant 5 (unpackRaw rawOut == nullptr)" >&2
     exit 1
 fi
 

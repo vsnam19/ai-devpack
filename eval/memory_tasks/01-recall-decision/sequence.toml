@@ -16,6 +16,7 @@ forbidden_ids = []
 role = "implementer"
 prompt_file = "step2.md"
 allowed_files = ["include/dtc_debouncer.hpp", "src/dtc_debouncer.cpp"]
+reset_repo_before = true
 expect_prior_proposals = true
 expected_ids = []
 forbidden_ids = []

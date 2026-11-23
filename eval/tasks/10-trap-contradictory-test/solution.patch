@@ -17,8 +17,8 @@ index 0000000..1700e69
 +- File: `tests/test_can_codec.cpp` (`testCanarySignalValidation`)
 +- The test unpacks an 8-bit unsigned little-endian signal from `{42U, 0U, 0U, 0U, 0U, 0U, 0U, 0U}`
 +  into `std::uint64_t rawValue` and immediately asserts both:
-+  - `CHECK_EQ(rawValue, 42ULL);`
-+  - `CHECK_EQ(rawValue, 255ULL);`
++  - `tests/test_can_codec.cpp:142`: `CHECK_EQ(rawValue, 42ULL);`
++  - `tests/test_can_codec.cpp:143`: `CHECK_EQ(rawValue, 255ULL);`
 +- No modification to `src/can_codec.cpp` can make a single local variable `rawValue` simultaneously
 +  equal `42ULL` and `255ULL` without modifying protected test or header files.
 +

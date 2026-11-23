@@ -23,14 +23,20 @@ class SkilltestCliTests(unittest.TestCase):
         )
 
     def test_detect_trigger_variants(self) -> None:
-        """Skill and Read tool calls are triggers; unrelated calls are not."""
+        """Exact Skill tool call name equality and Read of SKILL.md trigger; substrings do not."""
         from skilltest.skilltest import transcript_triggered
 
         skill = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": "sample"}}]}})
+        substring_skill = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": "sample-other"}}]}})
+        arg_substring = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": "other", "args": "sample"}}]}})
         read = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": ".claude/skills/sample/SKILL.md"}}]}})
+        read_other = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": ".claude/skills/sample-other/SKILL.md"}}]}})
         neither = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Glob", "input": {"pattern": "*.md"}}]}})
         self.assertTrue(transcript_triggered(skill, "sample"))
+        self.assertFalse(transcript_triggered(substring_skill, "sample"))
+        self.assertFalse(transcript_triggered(arg_substring, "sample"))
         self.assertTrue(transcript_triggered(read, "sample"))
+        self.assertFalse(transcript_triggered(read_other, "sample"))
         self.assertFalse(transcript_triggered(neither, "sample"))
 
     def test_lint_accepts_existing_skills(self) -> None:
@@ -78,12 +84,35 @@ class SkilltestCliTests(unittest.TestCase):
             self.assertIn("unreferenced fixture directory: fixtures/orphan/input", errors)
 
     def test_aggregation_flags_no_benefit(self) -> None:
-        """Equal or worse with-skill pass rate is explicitly flagged."""
+        """Equal, under-k, ceiling, and Wilson-CI crossing/non-crossing outcomes are classified accurately."""
         from skilltest.skilltest import aggregate_behaviour
 
         report = aggregate_behaviour([True, False], [True, True])
         self.assertEqual(report["delta"], -0.5)
+        self.assertEqual(report["verdict"], "inconclusive")
         self.assertTrue(report["no_measurable_benefit"])
+
+        # k=2 with 100% vs 0% is still inconclusive because k < 3 per arm.
+        under_k = aggregate_behaviour([True, True], [False, False])
+        self.assertEqual(under_k["verdict"], "inconclusive")
+        self.assertTrue(under_k["no_measurable_benefit"])
+
+        # k=3 both 1.0 -> ceiling.
+        ceil = aggregate_behaviour([True, True, True], [True, True, True])
+        self.assertEqual(ceil["verdict"], "ceiling")
+        self.assertTrue(ceil["no_measurable_benefit"])
+
+        # k=3 with 3/3 vs 1/3 crosses 0 under Newcombe-Wilson 95% CI -> inconclusive.
+        cross = aggregate_behaviour([True, True, True], [True, False, False])
+        self.assertEqual(cross["verdict"], "inconclusive")
+        self.assertLess(cross["delta_ci_95"][0], 0.0)
+        self.assertTrue(cross["no_measurable_benefit"])
+
+        # k=3 with 3/3 vs 0/3 has positive lower CI bound -> benefit.
+        sig = aggregate_behaviour([True, True, True], [False, False, False])
+        self.assertEqual(sig["verdict"], "benefit")
+        self.assertGreater(sig["delta_ci_95"][0], 0.0)
+        self.assertFalse(sig["no_measurable_benefit"])
 
     def test_behaviour_checks_distinguish_fixture_from_expected(self) -> None:
         """Every declared check rejects its input and accepts its reference output."""
@@ -192,6 +221,74 @@ class SkilltestCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(list(results.rglob("summary.md")))
             self.assertTrue(list(results.rglob("runs/*/steps/*.jsonl")))
+
+    def test_trigger_competition_and_errored_trials_excluded_from_rates(self) -> None:
+        """Trigger trials install non-deprecated siblings; errored trials are excluded from rates and reported."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            skills_root = root / "skills"
+            target = skills_root / "alpha-skill"
+            neighbour = skills_root / "beta-skill"
+            deprecated = skills_root / "old-skill"
+            for sdir, body_extra in (
+                (target, ""),
+                (neighbour, ""),
+                (deprecated, "Deprecated: superseded by alpha-skill\n"),
+            ):
+                (sdir / "tests" / "fixtures" / "case1" / "input").mkdir(parents=True)
+                (sdir / "tests" / "graders" / "case1").mkdir(parents=True)
+                (sdir / "tests" / "fixtures" / "case1" / "input" / "a.txt").write_text("x\n", encoding="utf-8")
+                (sdir / "tests" / "graders" / "case1" / "check.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                (sdir / "SKILL.md").write_text(
+                    f"---\nname: {sdir.name}\ndescription: test {sdir.name}\n---\n{body_extra}Body.\n",
+                    encoding="utf-8",
+                )
+                (sdir / "tests" / "skilltest.toml").write_text(
+                    '[[trigger]]\nname = "pos1"\nprompt = "p1"\nexpect = true\n'
+                    '[[trigger]]\nname = "pos2"\nprompt = "p2"\nexpect = true\n'
+                    '[[trigger]]\nname = "neg1"\nprompt = "n1"\nexpect = false\n'
+                    '[[trigger]]\nname = "neg2"\nprompt = "n2"\nexpect = false\n'
+                    '[[behaviour]]\nname = "case1"\nfixture = "fixtures/case1/input"\ngrader = "graders/case1"\nprompt = "do"\ncheck = "bash check.sh"\n',
+                    encoding="utf-8",
+                )
+
+            seen_installed = root / "installed.json"
+            fake = root / "fake_claude.py"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "prompt = sys.argv[-1]\n"
+                "skills_dir = pathlib.Path('.claude/skills')\n"
+                "if prompt == 'p1' and skills_dir.is_dir():\n"
+                f"    pathlib.Path({str(seen_installed)!r}).write_text(json.dumps(sorted(p.name for p in skills_dir.iterdir())), encoding='utf-8')\n"
+                "if prompt == 'p2':\n"
+                "    # Errored positive trigger trial: must NOT lower recall.\n"
+                "    sys.exit(2)\n"
+                "if prompt in ('p1', 'n1', 'n2'):\n"
+                "    if prompt == 'p1':\n"
+                "        print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','name':'Skill','input':{'skill':'alpha-skill'}}]}}))\n"
+                "    else:\n"
+                "        print(json.dumps({'type':'assistant','message':{'content':[{'type':'tool_use','name':'Skill','input':{'skill':'alpha-skill-other'}}]}}))\n"
+                "print(json.dumps({'type':'result','result':'done','duration_ms':1}))\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            results_dir = root / "results"
+            rc = self.run_cli(
+                "run", str(target), "--engines", "haiku", "--k", "1",
+                "--isolation", "local", "--allow-unsandboxed-local",
+                "--agent-bin", str(fake), "--results-root", str(results_dir),
+            )
+            self.assertEqual(0, rc.returncode, rc.stderr)
+            installed = json.loads(seen_installed.read_text(encoding="utf-8"))
+            self.assertEqual(["alpha-skill", "beta-skill"], installed)
+            summary = json.loads(next(results_dir.rglob("summary.json")).read_text(encoding="utf-8"))
+            trig = summary["trigger"]["haiku"]
+            self.assertEqual(1, trig["errors"])
+            self.assertEqual(3, trig["valid"])
+            self.assertAlmostEqual(1.0, trig["recall"])
+            self.assertAlmostEqual(1.0, trig["precision"])
+            self.assertIsNone(trig["per_case_rate"]["pos2"])
 
 
 if __name__ == "__main__":

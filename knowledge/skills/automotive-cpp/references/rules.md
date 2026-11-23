@@ -36,7 +36,7 @@ if (len == 0U) { return DecodeStatus::InvalidLength; }
 // Bad
 std::int32_t avg = (std::int32_t)(sum / count);
 // Good
-std::int32_t avg = static_cast<std::int32_t>(sum / count);
+const auto avg = static_cast<std::int32_t>(sum / count);
 ```
 
 ### Lambda captures

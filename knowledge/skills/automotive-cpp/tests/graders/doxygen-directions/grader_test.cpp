@@ -11,12 +11,30 @@
 #include "frame_crc.hpp"
 
 #include <array>
-#include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
+#ifdef GRADER_CHECK
+#error "Candidate header must not define GRADER_CHECK"
+#endif
+
 namespace {
+
+inline void graderFail(const char* expr, const char* file, int line) noexcept
+{
+    std::fprintf(stderr, "GRADER_CHECK failed at %s:%d: %s\n", file, line, expr);
+    std::exit(1);
+}
+
+#define GRADER_CHECK(cond)                                    \
+    do {                                                      \
+        if (!(cond)) {                                        \
+            graderFail(#cond, __FILE__, __LINE__);            \
+        }                                                     \
+    } while (false)
 
 /**
  * @brief Compute the CRC of a NUL-free ASCII string starting from 0xFFFF.
@@ -29,8 +47,8 @@ std::uint16_t crcOfText(const char* text) noexcept
     bool valid = false;
     const bool updated = updateFrameCrc(crc, reinterpret_cast<const std::uint8_t*>(text),
                                         std::strlen(text), valid);
-    assert(updated);
-    assert(valid);
+    GRADER_CHECK(updated);
+    GRADER_CHECK(valid);
     return crc;
 }
 
@@ -41,43 +59,43 @@ int main()
     std::uint16_t crc = 0xFFFFU;
     bool valid = true;
 
-    assert(!updateFrameCrc(crc, nullptr, 4U, valid));
-    assert(!valid);
-    assert(crc == 0xFFFFU);
+    GRADER_CHECK(!updateFrameCrc(crc, nullptr, 4U, valid));
+    GRADER_CHECK(!valid);
+    GRADER_CHECK(crc == 0xFFFFU);
 
     const std::array<std::uint8_t, 4U> payload{0x01U, 0x02U, 0x03U, 0x04U};
-    assert(!updateFrameCrc(crc, payload.data(), 0U, valid));
-    assert(!valid);
+    GRADER_CHECK(!updateFrameCrc(crc, payload.data(), 0U, valid));
+    GRADER_CHECK(!valid);
 
-    assert(!updateFrameCrc(crc, payload.data(), 65U, valid));
-    assert(!valid);
+    GRADER_CHECK(!updateFrameCrc(crc, payload.data(), 65U, valid));
+    GRADER_CHECK(!valid);
 
-    assert(updateFrameCrc(crc, payload.data(), payload.size(), valid));
-    assert(valid);
-    assert(crc == 0x89C3U);
+    GRADER_CHECK(updateFrameCrc(crc, payload.data(), payload.size(), valid));
+    GRADER_CHECK(valid);
+    GRADER_CHECK(crc == 0x89C3U);
 
     const std::uint16_t firstCrc = crc;
     std::uint16_t repeatCrc = 0xFFFFU;
-    assert(updateFrameCrc(repeatCrc, payload.data(), payload.size(), valid));
-    assert(valid);
-    assert(repeatCrc == firstCrc);
+    GRADER_CHECK(updateFrameCrc(repeatCrc, payload.data(), payload.size(), valid));
+    GRADER_CHECK(valid);
+    GRADER_CHECK(repeatCrc == firstCrc);
 
     // Known-answer vectors from the original fixture algorithm.
-    assert(crcOfText("123456789") == 0x29B1U);
-    assert(crcOfText("CAN") == 0x1F96U);
+    GRADER_CHECK(crcOfText("123456789") == 0x29B1U);
+    GRADER_CHECK(crcOfText("CAN") == 0x1F96U);
 
     const std::vector<std::uint8_t> maxFrame(64U, 0xA5U);
     std::uint16_t maxCrc = 0xFFFFU;
-    assert(updateFrameCrc(maxCrc, maxFrame.data(), maxFrame.size(), valid));
-    assert(valid);
-    assert(maxCrc == 0x0E6EU);
+    GRADER_CHECK(updateFrameCrc(maxCrc, maxFrame.data(), maxFrame.size(), valid));
+    GRADER_CHECK(valid);
+    GRADER_CHECK(maxCrc == 0x0E6EU);
 
     // Successive update: CRC of "1234" then "56789" through the accumulator equals CRC of "123456789".
     std::uint16_t chainedCrc = 0xFFFFU;
-    assert(updateFrameCrc(chainedCrc, reinterpret_cast<const std::uint8_t*>("1234"), 4U, valid));
-    assert(valid);
-    assert(updateFrameCrc(chainedCrc, reinterpret_cast<const std::uint8_t*>("56789"), 5U, valid));
-    assert(valid);
-    assert(chainedCrc == crcOfText("123456789"));
+    GRADER_CHECK(updateFrameCrc(chainedCrc, reinterpret_cast<const std::uint8_t*>("1234"), 4U, valid));
+    GRADER_CHECK(valid);
+    GRADER_CHECK(updateFrameCrc(chainedCrc, reinterpret_cast<const std::uint8_t*>("56789"), 5U, valid));
+    GRADER_CHECK(valid);
+    GRADER_CHECK(chainedCrc == crcOfText("123456789"));
     return 0;
 }

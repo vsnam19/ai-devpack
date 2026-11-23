@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import functools
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -104,6 +105,7 @@ from enforcement.checks.scope_check import get_changed_files  # noqa: E402
 EXCERPT_MAX_CHARS = 4000
 STDERR_TAIL_MAX_CHARS = 2000
 ORCHESTRATOR_PACK_PATH = Path(".devpack/pack")
+CPP_EXTENSIONS = frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp"})
 
 REQUIRED_TASK_FILES = ("task.md", "check.sh", "setup.patch", "solution.patch")
 
@@ -163,6 +165,7 @@ class MemoryStepSpec:
     forbidden_ids: tuple[str, ...] = ()
     expect_proposals: bool = False
     expect_prior_proposals: bool = False
+    reset_repo_before: bool = False
 
 
 @dataclass(frozen=True)
@@ -210,8 +213,11 @@ class TrialResult:
     local_tokens: int = 0
     local_wall_s: float = 0.0
     lint_findings_first_attempt: int | None = None
+    lint_findings_final: int | None = None
+    lint_findings_per_gate: list[dict[str, Any]] = field(default_factory=list)
     lint_clean_final: bool | None = None
     rounds_to_clean: int | None = None
+    no_cpp_change: bool = False
     static_findings_first_attempt: int | None = None
     static_clean_final: bool | None = None
     mode: str = "single"
@@ -256,7 +262,8 @@ class TaskModelSummary:
     passes: int
     pass_at_1: float | None
     pass_hat_k: float | None
-    pass_pow_k: float | None
+    pass_hat_k_unbiased: float | None
+    pass_at_k_unbiased: float | None
     mean_cost_usd: float | None
     mean_turns: float | None
     mean_duration_s: float
@@ -270,8 +277,11 @@ class TaskModelSummary:
     mean_tokens_in: float | None = None
     mean_tokens_out: float | None = None
     mean_lint_findings_first_attempt: float | None = None
+    mean_lint_findings_final: float | None = None
     lint_clean_final_rate: float | None = None
     mean_rounds_to_clean: float | None = None
+    rounds_to_clean_fail_share: float | None = None
+    no_cpp_change_runs: int = 0
     mean_static_findings_first_attempt: float | None = None
     static_clean_final_rate: float | None = None
     mean_local_tokens: float | None = None
@@ -498,6 +508,7 @@ def load_and_validate_memory_sequences(
                     forbidden_ids=tuple(str(x) for x in sdata.get("forbidden_ids", [])),
                     expect_proposals=bool(sdata.get("expect_proposals", False)),
                     expect_prior_proposals=bool(sdata.get("expect_prior_proposals", False)),
+                    reset_repo_before=bool(sdata.get("reset_repo_before", False)),
                 )
             )
 
@@ -1066,25 +1077,40 @@ def compute_pass_at_1(passes: int, total: int) -> float:
     return passes / total
 
 
-def compute_pass_hat_k(passes: int, total: int) -> float:
-    """Compute strict pass^k indicator (1.0 iff all k runs passed, else 0.0)."""
+def compute_pass_hat_k(passes: int, total: int, k: int | None = None) -> float | None:
+    """Compute strict pass^k indicator (1.0 iff all k runs passed, else 0.0; None when total != k)."""
     if total < 1:
         raise ValueError("total must be >= 1")
     if passes < 0 or passes > total:
         raise ValueError("passes must be between 0 and total")
+    target_k = total if k is None else k
+    if target_k < 1:
+        raise ValueError("k must be >= 1")
+    if total != target_k:
+        return None
     return 1.0 if passes == total else 0.0
 
 
-def compute_pass_pow_k(passes: int, total: int, k: int | None = None) -> float:
-    """Compute Bernoulli pass^k estimate ((c / n) ** k)."""
-    if total < 1:
-        raise ValueError("total must be >= 1")
+def compute_pass_hat_k_unbiased(passes: int, total: int, k: int) -> float | None:
+    """Compute unbiased pass^k estimator C(c, k) / C(n, k) when n >= k, else None."""
+    if total < 1 or k < 1:
+        raise ValueError("total and k must be >= 1")
     if passes < 0 or passes > total:
         raise ValueError("passes must be between 0 and total")
-    exponent = total if k is None else k
-    if exponent < 1:
-        raise ValueError("k must be >= 1")
-    return (passes / total) ** exponent
+    if total < k:
+        return None
+    return math.comb(passes, k) / math.comb(total, k)
+
+
+def compute_pass_at_k_unbiased(passes: int, total: int, k: int) -> float | None:
+    """Compute unbiased pass@k estimator 1 - C(n - c, k) / C(n, k) when n >= k, else None."""
+    if total < 1 or k < 1:
+        raise ValueError("total and k must be >= 1")
+    if passes < 0 or passes > total:
+        raise ValueError("passes must be between 0 and total")
+    if total < k:
+        return None
+    return 1.0 - (math.comb(total - passes, k) / math.comb(total, k))
 
 
 def _resolve_baseline_ref(
@@ -1429,29 +1455,44 @@ def _run_trial_body(
         )
 
     lint_findings_first: int | None = None
+    lint_findings_final: int | None = None
     lint_clean_final: bool | None = None
     rounds_to_clean: int | None = None
+    no_cpp_change = False
     static_findings_first: int | None = None
     static_clean_final: bool | None = None
-    if not is_harness_err and not timed_out:
-        base_ref = _resolve_baseline_ref(
-            work_dir,
-            trial_dir=paths["trial_root"],
-            baseline_sha=str(paths.get("baseline_sha", "")),
-        )
-        changed_files, _ = get_changed_files(work_dir, base_ref)
-        lint_ok, lint_count, _lint_out = run_preflight_lint_on_changed(
-            work_dir, changed_files or [], pack_root=REPO_ROOT
-        )
-        lint_findings_first = lint_count
-        lint_clean_final = lint_ok
-        rounds_to_clean = 0 if lint_ok else None
+    if not is_harness_err:
+        if timed_out:
+            lint_clean_final = False
+            rounds_to_clean = 1
+            static_clean_final = False
+        else:
+            base_ref = _resolve_baseline_ref(
+                work_dir,
+                trial_dir=paths["trial_root"],
+                baseline_sha=str(paths.get("baseline_sha", "")),
+            )
+            changed_files, _ = get_changed_files(work_dir, base_ref)
+            has_cpp_change = any(
+                Path(p).suffix.lower() in CPP_EXTENSIONS for p in (changed_files or [])
+            )
+            if not has_cpp_change:
+                no_cpp_change = True
+            else:
+                lint_ok, lint_count, _lint_out = run_preflight_lint_on_changed(
+                    work_dir, changed_files or [], pack_root=REPO_ROOT
+                )
+                lint_findings_final = lint_count
+                # Retained on Python TrialResult for learning/validate.py; omitted in single-mode JSON/summary.
+                lint_findings_first = lint_count
+                lint_clean_final = lint_ok
+                rounds_to_clean = 0 if lint_ok else 1
 
-        static_ok, static_count, _static_out = run_cppcheck_on_changed(
-            work_dir, changed_files or [], pack_root=REPO_ROOT
-        )
-        static_findings_first = static_count
-        static_clean_final = static_ok
+                static_ok, static_count, _static_out = run_cppcheck_on_changed(
+                    work_dir, changed_files or [], pack_root=REPO_ROOT
+                )
+                static_findings_first = static_count
+                static_clean_final = static_ok
 
     check_rc, check_out = _run_check_script(
         task.check_sh,
@@ -1484,8 +1525,9 @@ def _run_trial_body(
         trial_run_dir,
         outcome=outcome,
         timed_out=timed_out,
-        lint_findings_first_attempt=lint_findings_first,
+        lint_findings_final=lint_findings_final,
         lint_clean_final=lint_clean_final,
+        no_cpp_change=no_cpp_change,
         static_findings_first_attempt=static_findings_first,
         static_clean_final=static_clean_final,
         context=context_mode,
@@ -1531,8 +1573,10 @@ def _run_trial_body(
         tokens_in=int(agent_res.tokens_in) if not is_harness_err else 0,
         tokens_out=int(agent_res.tokens_out) if not is_harness_err else 0,
         lint_findings_first_attempt=lint_findings_first,
+        lint_findings_final=lint_findings_final,
         lint_clean_final=lint_clean_final,
         rounds_to_clean=rounds_to_clean,
+        no_cpp_change=no_cpp_change,
         static_findings_first_attempt=static_findings_first,
         static_clean_final=static_clean_final,
         mode="single",
@@ -1831,6 +1875,66 @@ def run_runner_trial(
         runner_init_model, runner_init_digest = _implementer_init_info(
             trial_run_dir, summary.get("step_logs", []) or []
         )
+        gate_lint_records: list[dict[str, Any]] = []
+        for log_name in summary.get("step_logs", []) or []:
+            log_path = trial_run_dir / log_name
+            if not log_path.is_file():
+                continue
+            try:
+                log_obj = json.loads(log_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(log_obj, dict) and log_obj.get("step") == "gate":
+                gate_lint_records.append(
+                    {
+                        "step_index": log_obj.get("step_index"),
+                        "round": log_obj.get("round"),
+                        "lint_findings": log_obj.get("lint_findings"),
+                        "lint_clean": log_obj.get("lint_clean"),
+                    }
+                )
+
+        runner_no_cpp = False
+        runner_lint_first: int | None = None
+        runner_lint_final: int | None = None
+        runner_lint_clean: bool | None = None
+        runner_rounds_clean: int | None = None
+        runner_static_first: int | None = summary.get("static_findings_first_attempt")
+        runner_static_clean: bool | None = summary.get("static_clean_final")
+        if not is_harness_err:
+            if timed_out:
+                runner_lint_clean = False
+                runner_rounds_clean = max_fix_rounds + 1
+                runner_static_clean = False
+                if gate_lint_records and gate_lint_records[0].get("lint_findings") is not None:
+                    runner_lint_first = int(gate_lint_records[0]["lint_findings"])
+            else:
+                base_ref_runner = _resolve_baseline_ref(
+                    work_dir,
+                    trial_dir=paths["trial_root"],
+                    baseline_sha=str(paths.get("baseline_sha", "")),
+                )
+                runner_changed, _ = get_changed_files(work_dir, base_ref_runner)
+                runner_has_cpp = any(
+                    Path(p).suffix.lower() in CPP_EXTENSIONS for p in (runner_changed or [])
+                )
+                if not runner_has_cpp:
+                    runner_no_cpp = True
+                    runner_static_first = None
+                    runner_static_clean = None
+                else:
+                    if gate_lint_records and gate_lint_records[0].get("lint_findings") is not None:
+                        runner_lint_first = int(gate_lint_records[0]["lint_findings"])
+                    else:
+                        runner_lint_first = summary.get("lint_findings_first_attempt")
+                    if gate_lint_records and gate_lint_records[-1].get("lint_findings") is not None:
+                        runner_lint_final = int(gate_lint_records[-1]["lint_findings"])
+                    runner_lint_clean = bool(summary.get("lint_clean_final", False))
+                    if runner_lint_clean:
+                        raw_rounds = summary.get("rounds_to_clean")
+                        runner_rounds_clean = int(raw_rounds) if raw_rounds is not None else 0
+                    else:
+                        runner_rounds_clean = max_fix_rounds + 1
 
         return TrialResult(
             task_id=task.task_id,
@@ -1853,11 +1957,14 @@ def run_runner_trial(
             engine_class="local" if all_local else "cloud",
             tokens_in=int(summary.get("tokens_in", 0) or 0),
             tokens_out=int(summary.get("tokens_out", 0) or 0),
-            lint_findings_first_attempt=summary.get("lint_findings_first_attempt"),
-            lint_clean_final=summary.get("lint_clean_final"),
-            rounds_to_clean=summary.get("rounds_to_clean"),
-            static_findings_first_attempt=summary.get("static_findings_first_attempt"),
-            static_clean_final=summary.get("static_clean_final"),
+            lint_findings_first_attempt=runner_lint_first,
+            lint_findings_final=runner_lint_final,
+            lint_findings_per_gate=gate_lint_records,
+            lint_clean_final=runner_lint_clean,
+            rounds_to_clean=runner_rounds_clean,
+            no_cpp_change=runner_no_cpp,
+            static_findings_first_attempt=runner_static_first,
+            static_clean_final=runner_static_clean,
             local_tokens=int(summary.get("local_tokens", 0) or 0),
             local_wall_s=float(summary.get("local_wall_s", 0.0) or 0.0),
             mode="runner",
@@ -2419,6 +2526,21 @@ def run_memory_trial(
         violation_detail = ""
 
         for step_idx, step in enumerate(seq.steps, start=1):
+            if step.reset_repo_before:
+                run_git(
+                    ["reset", "-q", "--hard", mem_base_sha],
+                    repo_root=work_dir,
+                    cwd=work_dir,
+                    env=git_env,
+                    check=True,
+                )
+                run_git(
+                    ["clean", "-q", "-fd"],
+                    repo_root=work_dir,
+                    cwd=work_dir,
+                    env=git_env,
+                    check=True,
+                )
             step_prompt = step.prompt_file.read_text(encoding="utf-8")
             req = AgentRequest(
                 engine=engine,
@@ -2721,19 +2843,30 @@ def aggregate_results(
             tokens_in_list = [r.tokens_in for r in valid]
             tokens_out_list = [r.tokens_out for r in valid]
 
+            no_cpp_change_runs = sum(1 for r in valid if r.no_cpp_change)
+            lint_eligible = [r for r in valid if not r.no_cpp_change]
             lint_first = [
                 r.lint_findings_first_attempt
-                for r in valid
-                if r.lint_findings_first_attempt is not None
+                for r in lint_eligible
+                if r.mode != "single" and r.lint_findings_first_attempt is not None
             ]
-            lint_clean = [r.lint_clean_final for r in valid if r.lint_clean_final is not None]
-            lint_rounds = [r.rounds_to_clean for r in valid if r.rounds_to_clean is not None]
+            lint_final = [
+                r.lint_findings_final
+                for r in lint_eligible
+                if r.lint_findings_final is not None
+            ]
+            lint_clean = [r.lint_clean_final for r in lint_eligible if r.lint_clean_final is not None]
+            lint_rounds = [r.rounds_to_clean for r in lint_eligible if r.rounds_to_clean is not None]
+            lint_fail_count = sum(1 for x in lint_clean if not x)
+            rounds_fail_share = (
+                round(lint_fail_count / len(lint_clean), 4) if lint_clean else None
+            )
             static_first = [
                 r.static_findings_first_attempt
-                for r in valid
+                for r in lint_eligible
                 if r.static_findings_first_attempt is not None
             ]
-            static_clean = [r.static_clean_final for r in valid if r.static_clean_final is not None]
+            static_clean = [r.static_clean_final for r in lint_eligible if r.static_clean_final is not None]
 
             rounds_used_list = [r.rounds_used for r in valid if r.rounds_used is not None]
             runner_runs = [r for r in valid if r.mode == "runner"]
@@ -2760,23 +2893,28 @@ def aggregate_results(
                 else None
             )
 
+            strict_hat_k = compute_pass_hat_k(passes, total, k=k) if has_valid else None
+            unbiased_hat_k = compute_pass_hat_k_unbiased(passes, total, k=k) if has_valid else None
+            unbiased_at_k = compute_pass_at_k_unbiased(passes, total, k=k) if has_valid else None
+
             task_summaries.append(
                 TaskModelSummary(
                     task_id=tid,
                     category=task.category,
                     model=model,
-                    k=len(runs) if runs else k,
+                    k=k,
                     passes=passes,
                     pass_at_1=(
                         round(compute_pass_at_1(passes, total), 4) if has_valid else None
                     ),
                     pass_hat_k=(
-                        round(compute_pass_hat_k(passes, total), 4) if has_valid else None
+                        round(strict_hat_k, 4) if strict_hat_k is not None else None
                     ),
-                    pass_pow_k=(
-                        round(compute_pass_pow_k(passes, total, total), 4)
-                        if has_valid
-                        else None
+                    pass_hat_k_unbiased=(
+                        round(unbiased_hat_k, 4) if unbiased_hat_k is not None else None
+                    ),
+                    pass_at_k_unbiased=(
+                        round(unbiased_at_k, 4) if unbiased_at_k is not None else None
                     ),
                     mean_cost_usd=(
                         round(sum(costs) / len(costs), 6) if costs else None
@@ -2809,6 +2947,9 @@ def aggregate_results(
                     mean_lint_findings_first_attempt=(
                         round(sum(lint_first) / len(lint_first), 4) if lint_first else None
                     ),
+                    mean_lint_findings_final=(
+                        round(sum(lint_final) / len(lint_final), 4) if lint_final else None
+                    ),
                     lint_clean_final_rate=(
                         round(sum(1 for x in lint_clean if x) / len(lint_clean), 4)
                         if lint_clean
@@ -2817,6 +2958,8 @@ def aggregate_results(
                     mean_rounds_to_clean=(
                         round(sum(lint_rounds) / len(lint_rounds), 4) if lint_rounds else None
                     ),
+                    rounds_to_clean_fail_share=rounds_fail_share,
+                    no_cpp_change_runs=no_cpp_change_runs,
                     mean_static_findings_first_attempt=(
                         round(sum(static_first) / len(static_first), 4) if static_first else None
                     ),
@@ -2883,7 +3026,8 @@ def aggregate_results(
 
             mean_pass_at_1 = _mean([s.pass_at_1 for s in scored if s.pass_at_1 is not None])
             mean_pass_hat_k = _mean([s.pass_hat_k for s in scored if s.pass_hat_k is not None])
-            mean_pass_pow_k = _mean([s.pass_pow_k for s in scored if s.pass_pow_k is not None])
+            mean_pass_hat_k_unbiased = _mean([s.pass_hat_k_unbiased for s in scored if s.pass_hat_k_unbiased is not None])
+            mean_pass_at_k_unbiased = _mean([s.pass_at_k_unbiased for s in scored if s.pass_at_k_unbiased is not None])
             cat_is_local = all(s.engine_class == "local" for s in matching)
             cat_costs = (
                 []
@@ -2898,6 +3042,11 @@ def aggregate_results(
                 for s in matching
                 if s.mean_lint_findings_first_attempt is not None
             ]
+            cat_lint_final = [
+                s.mean_lint_findings_final
+                for s in matching
+                if s.mean_lint_findings_final is not None
+            ]
             cat_lint_clean = [
                 s.lint_clean_final_rate
                 for s in matching
@@ -2908,6 +3057,12 @@ def aggregate_results(
                 for s in matching
                 if s.mean_rounds_to_clean is not None
             ]
+            cat_rounds_fail_share = [
+                s.rounds_to_clean_fail_share
+                for s in matching
+                if s.rounds_to_clean_fail_share is not None
+            ]
+            cat_no_cpp_runs = sum(s.no_cpp_change_runs for s in matching)
             cat_static_first = [
                 s.mean_static_findings_first_attempt
                 for s in matching
@@ -2936,7 +3091,10 @@ def aggregate_results(
                     "k": k,
                     "pass_at_1": mean_pass_at_1,
                     "pass_hat_k": mean_pass_hat_k,
-                    "pass_pow_k": mean_pass_pow_k,
+                    "pass_hat_k_unbiased": mean_pass_hat_k_unbiased,
+                    "pass_at_k_unbiased": mean_pass_at_k_unbiased,
+                    "valid_runs": sum(s.valid_runs for s in matching),
+                    "any_under_k": any(s.valid_runs < s.k for s in matching),
                     "harness_errors": sum(s.harness_errors for s in matching),
                     "timeouts": sum(s.timeouts for s in matching),
                     "tool_protocol_errors": sum(s.tool_protocol_errors for s in matching),
@@ -2956,8 +3114,11 @@ def aggregate_results(
                         else 0.0
                     ),
                     "mean_lint_findings_first_attempt": _mean(cat_lint_first),
+                    "mean_lint_findings_final": _mean(cat_lint_final),
                     "lint_clean_final_rate": _mean(cat_lint_clean),
                     "mean_rounds_to_clean": _mean(cat_rounds_clean),
+                    "rounds_to_clean_fail_share": _mean(cat_rounds_fail_share),
+                    "no_cpp_change_runs": cat_no_cpp_runs,
                     "mean_static_findings_first_attempt": _mean(cat_static_first),
                     "static_clean_final_rate": _mean(cat_static_clean),
                     "mean_rounds_used": _mean(cat_rounds_used),
@@ -2981,6 +3142,13 @@ def aggregate_results(
 def _fmt(value: float | None) -> str:
     """Format a metric with two decimals, or ``n/a`` when there are no valid runs."""
     return "n/a" if value is None else f"{value:.2f}"
+
+
+def _fmt_k_metric(value: float | None, under_k: bool) -> str:
+    """Format a k-dependent metric, labelling insufficient valid runs as ``n/a (n<k)``."""
+    if value is not None:
+        return f"{value:.2f}"
+    return "n/a (n<k)" if under_k else "n/a"
 
 
 def _fmt_tokens(tok_in: float | int | None, tok_out: float | int | None) -> str:
@@ -3044,6 +3212,7 @@ def render_summary_markdown(
     ablation_records: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """Format evaluation results into a human-readable Markdown report."""
+    lint_col_label = "Lint Final" if mode == "single" else "Lint 1st"
     lines = [
         f"# Evaluation Summary ({run_id})",
         "",
@@ -3055,10 +3224,10 @@ def render_summary_markdown(
         "",
         "## Per-Category Summary",
         "",
-        "Pass metrics include timeouts as not passed; harness errors are excluded.",
+        "Pass metrics include timeouts as not passed; harness errors are excluded. Lint rates exclude no-C/C++-change trials (counted in No-C++) and count timeouts as not clean.",
         "",
-        "| Category | Engine | Tasks | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | Lint 1st | Lint Clean | Static 1st | Static Clean |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| Category | Engine | Tasks | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k_unbiased | pass@k_unbiased | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | {lint_col_label} | Lint Clean | Lint Fail Share | No-C++ | Static 1st | Static Clean |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for cat in category_summaries:
         cost_str = (
@@ -3067,12 +3236,20 @@ def render_summary_markdown(
             else "n/a"
         )
         tok_str = _fmt_tokens(cat.get("mean_tokens_in"), cat.get("mean_tokens_out"))
+        under_k = bool(cat.get("any_under_k", False))
+        lint_val = (
+            cat.get("mean_lint_findings_final")
+            if mode == "single"
+            else cat.get("mean_lint_findings_first_attempt")
+        )
         lines.append(
             f"| {cat['category']} | {cat['model']} | {cat['tasks_count']} | "
             f"{cat['harness_errors']} | {cat.get('timeouts', 0)} | {cat.get('tool_protocol_errors', 0)} | "
-            f"{_fmt(cat['pass_at_1'])} | {_fmt(cat['pass_hat_k'])} | "
-            f"{_fmt(cat['pass_pow_k'])} | {cost_str} | {tok_str} | {cat['mean_duration_s']:.2f} | "
-            f"{_fmt(cat.get('mean_lint_findings_first_attempt'))} | {_fmt(cat.get('lint_clean_final_rate'))} | "
+            f"{_fmt(cat['pass_at_1'])} | {_fmt_k_metric(cat['pass_hat_k'], under_k)} | "
+            f"{_fmt_k_metric(cat.get('pass_hat_k_unbiased'), under_k)} | {_fmt_k_metric(cat.get('pass_at_k_unbiased'), under_k)} | "
+            f"{cost_str} | {tok_str} | {cat['mean_duration_s']:.2f} | "
+            f"{_fmt(lint_val)} | {_fmt(cat.get('lint_clean_final_rate'))} | "
+            f"{_fmt(cat.get('rounds_to_clean_fail_share'))} | {cat.get('no_cpp_change_runs', 0)} | "
             f"{_fmt(cat.get('mean_static_findings_first_attempt'))} | {_fmt(cat.get('static_clean_final_rate'))} |"
         )
 
@@ -3081,8 +3258,8 @@ def render_summary_markdown(
             "",
             "## Per-Task Summary",
             "",
-            "| Task | Category | Engine | Passes (c/valid) | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k (p^k) | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | Lint 1st | Lint Clean | Rounds Clean | Static 1st | Static Clean |",
-            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            f"| Task | Category | Engine | Passes (c/valid) | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k_unbiased | pass@k_unbiased | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | {lint_col_label} | Lint Clean | Rounds Clean | Lint Fail Share | No-C++ | Static 1st | Static Clean |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for ts in task_summaries:
@@ -3090,12 +3267,20 @@ def render_summary_markdown(
             f"{ts.mean_cost_usd:.4f}" if ts.mean_cost_usd is not None else "n/a"
         )
         tok_str = _fmt_tokens(ts.mean_tokens_in, ts.mean_tokens_out)
+        under_k = ts.valid_runs < ts.k
+        lint_val = (
+            ts.mean_lint_findings_final
+            if mode == "single"
+            else ts.mean_lint_findings_first_attempt
+        )
         lines.append(
             f"| {ts.task_id} | {ts.category} | {ts.model} | "
             f"{ts.passes}/{ts.valid_runs} | {ts.harness_errors} | {ts.timeouts} | {ts.tool_protocol_errors} | "
-            f"{_fmt(ts.pass_at_1)} | {_fmt(ts.pass_hat_k)} | "
-            f"{_fmt(ts.pass_pow_k)} | {cost_str} | {tok_str} | {ts.mean_duration_s:.2f} | "
-            f"{_fmt(ts.mean_lint_findings_first_attempt)} | {_fmt(ts.lint_clean_final_rate)} | {_fmt(ts.mean_rounds_to_clean)} | "
+            f"{_fmt(ts.pass_at_1)} | {_fmt_k_metric(ts.pass_hat_k, under_k)} | "
+            f"{_fmt_k_metric(ts.pass_hat_k_unbiased, under_k)} | {_fmt_k_metric(ts.pass_at_k_unbiased, under_k)} | "
+            f"{cost_str} | {tok_str} | {ts.mean_duration_s:.2f} | "
+            f"{_fmt(lint_val)} | {_fmt(ts.lint_clean_final_rate)} | {_fmt(ts.mean_rounds_to_clean)} | "
+            f"{_fmt(ts.rounds_to_clean_fail_share)} | {ts.no_cpp_change_runs} | "
             f"{_fmt(ts.mean_static_findings_first_attempt)} | {_fmt(ts.static_clean_final_rate)} |"
         )
 
@@ -3496,11 +3681,14 @@ def evaluate_and_record_qualification(
             messages.append(f"{eng_name}: no smoke-tier tasks evaluated")
             continue
 
-        pow3_values = [
-            compute_pass_pow_k(ts.passes, ts.valid_runs, k=3) if ts.valid_runs > 0 else 0.0
+        hat3_values = [
+            compute_pass_hat_k_unbiased(ts.passes, ts.valid_runs, k=3)
             for ts in smoke_sums
         ]
-        mean_pass_pow_3 = sum(pow3_values) / len(pow3_values)
+        if any(v is None for v in hat3_values):
+            mean_pass_hat_3: float | None = None
+        else:
+            mean_pass_hat_3 = sum(v for v in hat3_values if v is not None) / len(hat3_values)
         total_proto_errors = sum(ts.tool_protocol_errors for ts in smoke_sums)
         passing_trials = [
             r for ts in smoke_sums for r in ts.runs if not r.harness_error and r.passed
@@ -3512,8 +3700,10 @@ def evaluate_and_record_qualification(
         )
 
         failures: list[str] = []
-        if mean_pass_pow_3 < 0.8:
-            failures.append(f"smoke pass^3={mean_pass_pow_3:.4f} < 0.8")
+        if mean_pass_hat_3 is None:
+            failures.append("smoke pass^3_unbiased=n/a (n<3)")
+        elif mean_pass_hat_3 < 0.8:
+            failures.append(f"smoke pass^3_unbiased={mean_pass_hat_3:.4f} < 0.8")
         if total_proto_errors != 0:
             failures.append(f"tool_protocol_errors={total_proto_errors} != 0")
         if not passing_trials:
@@ -3532,6 +3722,7 @@ def evaluate_and_record_qualification(
                 changed_existing = True
             continue
 
+        assert mean_pass_hat_3 is not None
         all_trials = [r for ts in smoke_sums for r in ts.runs]
         init_model = next((r.init_model for r in all_trials if r.init_model), "") or engine_cfg.model
         init_digest = next((r.init_digest for r in all_trials if r.init_digest), "")
@@ -3544,14 +3735,14 @@ def evaluate_and_record_qualification(
             "date": now_iso,
             "eval_summary_path": summary_rel,
             "metrics": {
-                "pass_pow_3": round(mean_pass_pow_3, 4),
+                "pass_hat_3_unbiased": round(mean_pass_hat_3, 4),
                 "tool_protocol_errors": total_proto_errors,
                 "lint_clean_final_rate": round(lint_clean_rate, 4),
             },
         }
         changed_existing = True
         messages.append(
-            f"{eng_name}: qualified (model_id={init_model}, pass^3={mean_pass_pow_3:.4f}, "
+            f"{eng_name}: qualified (model_id={init_model}, pass^3_unbiased={mean_pass_hat_3:.4f}, "
             f"lint_clean={lint_clean_rate:.4f})"
         )
 
@@ -4214,6 +4405,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     failure_causes = _compute_failure_cause_rows(unit_labels, task_summaries)
 
+    serialized_tasks: list[dict[str, Any]] = []
+    for ts in task_summaries:
+        ts_dict = asdict(ts)
+        for run_item in ts_dict.get("runs", []):
+            if run_item.get("mode") == "single":
+                run_item.pop("lint_findings_first_attempt", None)
+        serialized_tasks.append(ts_dict)
+
     raw_payload: dict[str, Any] = {
         "run_id": run_id,
         "date": date_str,
@@ -4228,7 +4427,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "engines": unit_labels,
         "k": args.k,
         "runs_root": str(runs_root),
-        "tasks": [asdict(ts) for ts in task_summaries],
+        "tasks": serialized_tasks,
         "categories": category_summaries,
         "failure_causes": failure_causes,
         "ablation": ablation_records,

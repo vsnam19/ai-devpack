@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check doxygen-directions candidate: preflight lint, required Doxygen tags, compile, and hidden tests.
+# Check doxygen-directions candidate: preflight lint, forbidden macro/pragma scan, required Doxygen tags, compile, and hidden tests.
 # Exit codes: 0 pass, 1 candidate failure, 2 invalid arguments or environment.
 set -euo pipefail
 
@@ -19,6 +19,21 @@ if [[ ! -f "$CANDIDATE/frame_crc.hpp" || ! -f "$CANDIDATE/frame_crc.cpp" ]]; the
   echo "FAIL: missing frame_crc.hpp or frame_crc.cpp" >&2
   exit 1
 fi
+
+python3 - "$CANDIDATE/frame_crc.hpp" "$CANDIDATE/frame_crc.cpp" <<'PY'
+import pathlib, re, sys
+patterns = [
+    (r"\bNDEBUG\b", "forbidden NDEBUG reference"),
+    (r"#\s*pragma\s+(?:GCC|clang)\s+diagnostic\b", "forbidden compiler diagnostic pragma"),
+    (r"#\s*(?:undef|define)\s+GRADER_[A-Za-z0-9_]*\b", "forbidden grader macro manipulation"),
+]
+for raw in sys.argv[1:]:
+    text = pathlib.Path(raw).read_text(encoding="utf-8")
+    for rx, msg in patterns:
+        if re.search(rx, text):
+            print(f"FAIL: {msg} in {pathlib.Path(raw).name}", file=sys.stderr)
+            sys.exit(1)
+PY
 
 python3 "$DEVPACK_ROOT/enforcement/lint/preflight_lint.py" \
   --config "$DEVPACK_ROOT/eval/fixture/preflight.toml" \
@@ -45,7 +60,6 @@ if ! g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti \
   exit 1
 fi
 
-# A failing grader assertion aborts the binary; report it as a candidate failure (exit 1).
 if ! "$tmpdir/test_frame_crc"; then
   echo "FAIL: grader known-answer assertions failed" >&2
   exit 1

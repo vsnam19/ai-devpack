@@ -226,6 +226,126 @@ class RequirementsAnalysisSkillTests(unittest.TestCase):
             failures = grade_findings.grade_candidate("dtc-debouncer", candidate)
             self.assertTrue(any("Recall too low" in item for item in failures), failures)
 
+    def test_cases_have_at_least_two_clean_ids_and_overflagging_fails(self) -> None:
+        """Every case defines >= 2 clean IDs and flagging any clean ID fails grading."""
+        for case_name, spec in grade_findings.CASES.items():
+            self.assertGreaterEqual(len(spec.clean_ids), 2, case_name)
+            self.assertGreaterEqual(spec.min_recall, len(spec.seeded_patterns) - 1, case_name)
+            for clean_id in spec.clean_ids:
+                with tempfile.TemporaryDirectory() as temp:
+                    candidate = self._copy_expected(temp, case_name)
+                    findings = candidate / "review" / "findings.md"
+                    original = findings.read_text(encoding="utf-8")
+                    # Insert a finding row for clean_id right before ## Set-level gaps and conflicts.
+                    spec_text = (candidate / "spec.md").read_text(encoding="utf-8")
+                    quote_line = ""
+                    capture = False
+                    for ln in spec_text.splitlines():
+                        if ln.startswith(f"## {clean_id}:"):
+                            capture = True
+                            continue
+                        if capture and ln.strip():
+                            quote_line = ln.strip()
+                            break
+                    flagged = original.replace(
+                        "\n\n## Set-level gaps and conflicts",
+                        f'\n| {clean_id} | Ambiguous wording [low, candidate] | "{quote_line}" | Fake finding. | None? | '
+                        f"WHEN triggered, the module SHALL respond. |\n\n## Set-level gaps and conflicts",
+                    )
+                    findings.write_text(flagged, encoding="utf-8")
+                    failures = grade_findings.grade_candidate(case_name, candidate)
+                    self.assertTrue(any(clean_id in item for item in failures), (case_name, clean_id, failures))
+
+    def test_mutants_for_verbatim_quote_defect_type_number_words_and_unlinked_ideas(self) -> None:
+        """Mutants covering every reviewer bypass fail the grader."""
+        with tempfile.TemporaryDirectory() as temp:
+            # 1. Reviewer bypass style: defect_type='x', quote='x', number words, unlinked ideas.
+            cand1 = Path(temp) / "rev_bypass"
+            shutil.copytree(TESTS_DIR / "fixtures" / "dtc-debouncer" / "input", cand1)
+            (cand1 / "review").mkdir()
+            (cand1 / "review" / "findings.md").write_text(
+                "| ID | defect type | quote | why it matters | question to stakeholder | proposed rewrite |\n"
+                "|---|---|---|---|---|---|\n"
+                "| REQ-DTC-011 | x | x | x | x | The debouncer SHALL confirm after ten samples. |\n"
+                "| REQ-DTC-012 | x | x | x | x | The debouncer SHALL confirm after fifty samples. |\n"
+                "| REQ-DTC-013 | x | x | x | x | The debouncer SHALL do things. |\n\n"
+                "## Open questions\nconflict\n\n"
+                "## Derived test ideas\n"
+                "- Check that the hundredth sample confirms the fault for threshold A.\n"
+                "- Check that the fiftieth sample confirms the fault for threshold B.\n",
+                encoding="utf-8",
+            )
+            f1 = grade_findings.grade_candidate("dtc-debouncer", cand1)
+            self.assertTrue(any("checklist vocabulary" in item for item in f1), f1)
+            self.assertTrue(any("quote is too short" in item for item in f1), f1)
+            self.assertTrue(any("invented numeric value" in item and "10" in item for item in f1), f1)
+            self.assertTrue(any("BLOCKED (open question)" in item for item in f1), f1)
+            self.assertTrue(any("must reference a clean requirement ID" in item for item in f1), f1)
+
+            # 2. Non-verbatim quote fails.
+            cand2 = Path(temp) / "non_verbatim"
+            shutil.copytree(TESTS_DIR / "expected" / "protocol-timing", cand2)
+            f2_path = cand2 / "review" / "findings.md"
+            f2_text = f2_path.read_text(encoding="utf-8")
+            f2_path.write_text(
+                f2_text.replace(
+                    '"The `LinkManager` shall respond quickly after receiving a handshake request."',
+                    '"The LinkManager responds fast to a handshake."',
+                ),
+                encoding="utf-8",
+            )
+            f2 = grade_findings.grade_candidate("protocol-timing", cand2)
+            self.assertTrue(any("verbatim" in item for item in f2), f2)
+
+            # 3. Non-vocabulary defect type fails.
+            cand3 = Path(temp) / "bad_defect_type"
+            shutil.copytree(TESTS_DIR / "expected" / "can-watchdog", cand3)
+            f3_path = cand3 / "review" / "findings.md"
+            f3_path.write_text(
+                f3_path.read_text(encoding="utf-8").replace(
+                    "Incomplete specification + missing error behaviour [high, candidate]",
+                    "Bad quality issue [high, candidate]",
+                ),
+                encoding="utf-8",
+            )
+            f3 = grade_findings.grade_candidate("can-watchdog", cand3)
+            self.assertTrue(any("checklist vocabulary" in item for item in f3), f3)
+
+            # 4. Number words (zero..twenty, hundred, thousand, dozen, half) fail when not in source.
+            for word, expected_num in (("ten", "10"), ("twenty", "20"), ("hundred", "100"), ("thousand", "1000"), ("dozen", "12"), ("half", "0.5")):
+                cand4 = Path(temp) / f"nw_{word}"
+                case_use = "can-watchdog" if word == "ten" else "protocol-timing"
+                shutil.copytree(TESTS_DIR / "expected" / case_use, cand4)
+                f4_path = cand4 / "review" / "findings.md"
+                txt4 = f4_path.read_text(encoding="utf-8")
+                if case_use == "can-watchdog":
+                    txt4 = txt4.replace(
+                        "`<TBD: notify_deadline_ms>` ms.",
+                        f"{word} ms.",
+                    )
+                else:
+                    txt4 = txt4.replace(
+                        "`<TBD: response_deadline_ms>` ms.",
+                        f"{word} ms.",
+                    )
+                f4_path.write_text(txt4, encoding="utf-8")
+                f4 = grade_findings.grade_candidate(case_use, cand4)
+                self.assertTrue(
+                    any("invented numeric value" in item and expected_num in item for item in f4),
+                    (word, expected_num, f4),
+                )
+
+            # 5. Unlinked test idea (omitting ID) fails even without invented numbers.
+            cand5 = Path(temp) / "unlinked_idea"
+            shutil.copytree(TESTS_DIR / "expected" / "protocol-timing", cand5)
+            f5_path = cand5 / "review" / "findings.md"
+            f5_path.write_text(
+                f5_path.read_text(encoding="utf-8") + "- Verify handshake timeout triggers Fault.\n",
+                encoding="utf-8",
+            )
+            f5 = grade_findings.grade_candidate("protocol-timing", cand5)
+            self.assertTrue(any("must reference a clean requirement ID" in item for item in f5), f5)
+
 
 if __name__ == "__main__":
     unittest.main()
