@@ -26,6 +26,11 @@ import re
 import sys
 from typing import Any, Sequence
 
+try:
+    import tomllib  # type: ignore[attr-defined]
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    tomllib = None  # type: ignore[assignment]
+
 RUNNER_DIR = pathlib.Path(__file__).resolve().parent
 REPO_ROOT = RUNNER_DIR.parent
 if str(REPO_ROOT) not in sys.path:

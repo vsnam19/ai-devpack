@@ -160,9 +160,7 @@ run_verified_test_binary() {
     local tmp_out
     tmp_out="$(mktemp "${TMPDIR:-/tmp}/devpack-test-proof.XXXXXX")"
     local rc=0
-    if ! "$@" >"$tmp_out" 2>&1; then
-        rc=$?
-    fi
+    "$@" >"$tmp_out" 2>&1 || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         cat "$tmp_out" >&2 || true
         rm -f "$tmp_out"

@@ -355,6 +355,10 @@ class MemoryStoreAndRetrievalTests(unittest.TestCase):
             self.assertTrue(all(e.status == "active" for e in res.accepted))
             self.assertEqual(2, len(res.pending))
             self.assertTrue(all(e.status == "pending" for e in res.pending))
+            decision_entries = [e for e in res.pending if e.entry_type == "decision"]
+            self.assertEqual(1, len(decision_entries))
+            self.assertEqual("decision", decision_entries[0].entry_type)
+            self.assertEqual("pending", decision_entries[0].status)
 
             # Empty/None proposal section yields 0 proposals
             self.assertEqual([], memory.parse_memory_proposals("## Memory proposals\nNone.\n"))

@@ -45,12 +45,19 @@ def _is_within(child: pathlib.Path, parent: pathlib.Path) -> bool:
 
 
 def _parse_minimal_toml_or_json(raw_text: str, path: pathlib.Path) -> Any:
-    """Parse JSON or TOML registry content using stdlib parsers."""
+    """Parse registry content, choosing the format by file extension.
+
+    ``.json`` is parsed with ``json`` and ``.toml`` with ``tomllib`` (or the
+    runner's minimal TOML reader on Python 3.10). Any other extension is refused.
+    """
     stripped = raw_text.strip()
     if not stripped:
         raise ValueError(f"deviation registry is empty: {path}")
-    if path.suffix.lower() == ".json" or stripped.startswith(("{", "[")):
+    suffix = path.suffix.lower()
+    if suffix == ".json":
         return json.loads(stripped)
+    if suffix != ".toml":
+        raise ValueError(f"unsupported deviation registry extension '{suffix}' (use .toml or .json)")
     if tomllib is not None:
         return tomllib.loads(raw_text)
     try:
