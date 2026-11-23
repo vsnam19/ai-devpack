@@ -27,6 +27,15 @@ deviation (`deviations.md`), never a default (LSN-014).
    `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`), `--no-ext-diff`/`--no-textconv`,
    a `.git/config` denylist check, and pre/post-agent snapshots of `.git/config` and hooks
    (`git_metadata_tampered` scope violation on any change).
+   The snapshot is the full-content SHA-256 of every metadata file that can affect host git
+   (`config`, `config.worktree`, `info/attributes`, `info/exclude`, `commondir`, `gitdir`, and
+   every entry under `hooks/`, for both the git dir and the common dir) plus the output of
+   `git config --list --show-origin -z --no-includes`. The denylist is applied to keys as git
+   itself normalises them (so `[filter "a]"]` cannot hide a key). Filters are kept from running
+   on the host by two rules: repository config may not define `filter.*` (denylisted, and any
+   change to config files is tampering), and host git runs with `core.attributesFile=/dev/null`
+   and `GIT_ATTR_NOSYSTEM=1`, so attribute files (`.gitattributes`, `info/attributes`) only select
+   driver names that have no definition. Their contents are therefore not hashed.
 5. **No repo-controlled sandbox opt-out.** Unsandboxed `--isolation local` requires an
    explicit CLI/API flag (`--allow-unsandboxed-local`), host broker flag, or operator-owned
    `DEVPACK_OPERATOR_CONFIG` outside the workdir. Any `allow_unsandboxed_local` setting in
