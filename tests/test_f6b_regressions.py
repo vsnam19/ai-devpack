@@ -362,6 +362,19 @@ class SecretScanSplitTests(unittest.TestCase):
             self.assertTrue(findings, f"expected a finding for {rule}")
             self.assertIn(rule, " ".join(findings))
 
+    def test_quoted_json_and_single_quoted_credential_keys_are_blocked(self) -> None:
+        """Quoted keys with a high-entropy literal value fail; identifiers and numbers still pass."""
+        value = "Xk92LmQ7vT4pRz8sNb3W"
+        for text in (
+            '{\n  "client_secret": "' + value + '"\n}\n',
+            "{'api_key': '" + value + "'}\n",
+        ):
+            findings = self._findings(text, rel="conf/creds.json")
+            self.assertTrue(findings, text)
+            self.assertIn("high-entropy-assignment", " ".join(findings))
+        self.assertEqual([], self._findings('{"secret": computeSeed(level)}\n', rel="conf/app.json"))
+        self.assertEqual([], self._findings('{"token_count": 3}\n', rel="conf/app.json"))
+
     def test_config_style_credential_line_is_blocked(self) -> None:
         """A whole-line name=value credential in a config file is a finding; C++ expressions are not."""
         findings = self._findings("password=" + "MyHiddenPass123\n", rel="conf/leak.conf")

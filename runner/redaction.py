@@ -88,9 +88,10 @@ _CREDENTIAL_NAMES = (
     r"|secret[_-]?key|private[_-]?key|bearer[_-]?token|secret|token|passw(?:or)?d)"
 )
 _HIGH_ENTROPY_ASSIGN_RE = re.compile(
-    # Quoted literal in source or config: name = "value" (>= 20 characters).
+    # Quoted literal in source or config: name = "value" or "name": "value" (>= 20 characters).
     rf"\b(?:[a-z0-9]+[_-])*{_CREDENTIAL_NAMES}"
-    r"\s*[:=]\s*(?P<q>['\"])(?=[^'\"]*[A-Za-z])(?=[^'\"]*[0-9])[A-Za-z0-9._~+/=-]{20,}(?P=q)"
+    # The name may be quoted (JSON/YAML keys: "client_secret": "value").
+    r"['\"]?\s*[:=]\s*(?P<q>['\"])(?=[^'\"]*[A-Za-z])(?=[^'\"]*[0-9])[A-Za-z0-9._~+/=-]{20,}(?P=q)"
     r"|"
     # Whole-line config assignment: name=value or name: value with no operators or ';'.
     # Excludes source expressions such as ``token = secretIndex + 1U;``.

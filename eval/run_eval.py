@@ -3887,11 +3887,17 @@ def evaluate_and_record_qualification(
     qualification_file: Path,
     eval_summary_path: Path,
     repo_root: Path,
+    run_invalid: bool = False,
 ) -> tuple[bool, list[str]]:
     """Check SPEC 5.3 qualification criteria and write ``qualification.json`` when met.
 
+    An INVALID_RUN (harness errors above the cap) is never qualified, regardless of
+    ``--allow-harness-errors``; nothing is written in that case.
+
     Returns ``(all_qualified, messages)``.
     """
+    if run_invalid:
+        return False, ["INVALID_RUN: qualification not recorded"]
     if tier not in ("smoke", "all"):
         return False, [f"Qualification requires --tier smoke or --tier all (got '{tier}')."]
     if mode not in ("single", "runner"):
@@ -4759,6 +4765,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             qualification_file=qual_path,
             eval_summary_path=dated_dir / "summary.md",
             repo_root=repo_root,
+            run_invalid=run_invalid,
         )
         for msg in qual_messages:
             stream = sys.stdout if qual_ok else sys.stderr
