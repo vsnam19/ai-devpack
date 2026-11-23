@@ -275,6 +275,32 @@ class BriefLintTests(unittest.TestCase):
             self.assertEqual("error", missing[0]["severity"])
             self.assertTrue(brief_lint.has_errors(findings))
 
+    def test_rule_brief_path_missing_inherits_enclosing_h2_for_subsections(self) -> None:
+        """Subsections (### and deeper) under ## Input or ## Expected output inherit enclosing ## section."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _create_sample_repo(repo)
+            text = _valid_brief_text().replace(
+                "## Input\n- `include/widget.hpp` (around line 5)\n- `src/widget.cpp:7`\n",
+                "## Input\n### Source files\n- `include/widget.hpp` (around line 5)\n"
+                "#### Extra paths\n- `src/missing_sub.cpp`\n- `src/widget.cpp:7`\n",
+            ).replace(
+                "## Expected output\n- Modify `src/widget.cpp` so `computeValue()` returns 2.\n",
+                "## Expected output\n### New deliverables\n- Create `src/planned_new.cpp`.\n"
+                "- Modify `src/widget.cpp` so `computeValue()` returns 2.\n",
+            )
+            findings = brief_lint.lint_brief_text(text, repo_root=repo)
+            missing = [f for f in findings if f["rule"] == "BRIEF-PATH-MISSING"]
+            by_msg = {f["message"]: f for f in missing}
+            err_items = [f for f in missing if "src/missing_sub.cpp" in f["message"]]
+            warn_items = [f for f in missing if "src/planned_new.cpp" in f["message"]]
+            self.assertEqual(1, len(err_items), findings)
+            self.assertEqual("error", err_items[0]["severity"])
+            self.assertEqual(1, len(warn_items), findings)
+            self.assertEqual("warning", warn_items[0]["severity"])
+            self.assertTrue(brief_lint.has_errors(findings))
+            self.assertEqual(2, len(by_msg), findings)
+
     def test_rule_line_out_of_range_positive_and_negative(self) -> None:
         """file:line and 'around line N' beyond EOF trigger BRIEF-LINE-OUT-OF-RANGE."""
         with tempfile.TemporaryDirectory() as tmp:

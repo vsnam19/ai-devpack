@@ -993,6 +993,7 @@ class AgentRequest:
     memory_budget_tokens: int | None = None
     memory_config: MemoryConfig | None = None
     memory_task_text: str | None = None
+    code_map: str = ""
 
     def __init__(
         self,
@@ -1028,6 +1029,7 @@ class AgentRequest:
         memory_budget_tokens: int | None = None,
         memory_config: MemoryConfig | None = None,
         memory_task_text: str | None = None,
+        code_map: str = "",
         **kwargs: Any,
     ) -> None:
         """Initialize AgentRequest with support for SPEC parameter aliases (timeout, engine_config, prompt_text)."""
@@ -1091,6 +1093,7 @@ class AgentRequest:
         )
         self.memory_config = memory_config
         self.memory_task_text = memory_task_text
+        self.code_map = str(code_map or "")
 
     @property
     def timeout(self) -> int:
@@ -2493,6 +2496,13 @@ def run_agent(request: AgentRequest) -> AgentResult:
         request.profile_path
     )
     effective_prompt = request.prompt
+    if request.code_map and "## Code map" not in effective_prompt:
+        effective_prompt = (
+            effective_prompt.rstrip()
+            + "\n\n## Code map\n\n"
+            + request.code_map.strip()
+            + "\n"
+        )
     if profile_body and "## Known mistakes for this engine" not in effective_prompt:
         effective_prompt = (
             effective_prompt.rstrip()

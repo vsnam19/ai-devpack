@@ -48,7 +48,9 @@ for _p in (str(REPO_ROOT), str(REPO_ROOT / "runner")):
         sys.path.insert(0, _p)
 
 from runner import agent_exec  # noqa: E402
+from runner import devpack_logs  # noqa: E402
 from runner import devpack_run  # noqa: E402
+from runner import repomap  # noqa: E402
 from runner.agent_exec import (  # noqa: E402
     ALLOWED_TOOLS,
     DEFAULT_CLAUDE_VERSION,
@@ -204,6 +206,16 @@ class TrialResult:
     memory_injected_tokens: int | None = None
     memory_injected_ids: list[str] = field(default_factory=list)
     violation_reason: str = ""
+    brief_variant: str = "standard"
+    context_mode: str = "none"
+    skills_enabled: bool = False
+    skipped: bool = False
+    skip_reason: str = ""
+    suspected_cause: str | None = None
+    attribution_secondary: str | None = None
+    ablation_cause: str | None = None
+    ablation_arms: dict[str, Any] = field(default_factory=dict)
+    arm: str = "base"
 
 
 @dataclass
@@ -247,6 +259,9 @@ class TaskModelSummary:
     pass_with_memory: float | None = None
     pass_without_memory: float | None = None
     memory_ab_delta: float | None = None
+    skipped_runs: int = 0
+    ablation_cause: str | None = None
+    ablation_arms: dict[str, Any] = field(default_factory=dict)
 
 
 def parse_category(task_md_text: str) -> str:
@@ -643,12 +658,220 @@ def docker_image_tag(claude_version: str) -> str:
     return f"devpack-eval:{claude_version}"
 
 
+def extract_minimal_brief(task_md_text: str) -> str:
+    """Return only the task heading and first goal paragraph from a task Markdown string."""
+    lines = task_md_text.splitlines()
+    title = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            title = stripped
+            break
+
+    goal_lines: list[str] = []
+    in_goal = False
+    found_goal_heading = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == "## goal":
+            found_goal_heading = True
+            in_goal = True
+            continue
+        if in_goal:
+            if stripped.startswith("## "):
+                break
+            if not stripped:
+                if goal_lines:
+                    break
+                continue
+            goal_lines.append(stripped)
+
+    if not found_goal_heading:
+        for line in lines:
+            stripped = line.strip()
+            if (
+                not stripped
+                or stripped.startswith("#")
+                or stripped.startswith(("Category:", "Tier:", "Status:"))
+            ):
+                if goal_lines and not stripped:
+                    break
+                continue
+            goal_lines.append(stripped)
+
+    parts: list[str] = []
+    if title:
+        parts.append(title)
+    if goal_lines:
+        if found_goal_heading:
+            parts.append("## Goal\n" + "\n".join(goal_lines))
+        else:
+            parts.append("\n".join(goal_lines))
+    return ("\n\n".join(parts).strip() + "\n") if parts else task_md_text
+
+
+def build_task_prompt_text(
+    task: TaskSpec,
+    *,
+    brief_variant: str = "standard",
+    context_mode: str = "none",
+    work_dir: Path | None = None,
+    repomap_budget: int = 1500,
+) -> tuple[str, str | None]:
+    """Assemble the worker prompt for ``task`` under the requested brief and context arms.
+
+    When ``brief_variant == 'standard'`` and ``context_mode == 'none'``, returns the exact
+    contents of ``task.task_md`` unchanged. Returns ``('', 'no_oracle')`` if
+    ``brief_variant == 'oracle'`` and ``oracle.md`` is missing in ``task.task_dir``.
+    """
+    if brief_variant not in ("standard", "minimal", "oracle"):
+        raise ValueError(f"Unsupported brief_variant: {brief_variant}")
+    if context_mode not in ("none", "repomap"):
+        raise ValueError(f"Unsupported context_mode: {context_mode}")
+
+    raw_task = task.task_md.read_text(encoding="utf-8")
+    if brief_variant == "standard":
+        prompt_text = raw_task
+    elif brief_variant == "minimal":
+        prompt_text = extract_minimal_brief(raw_task)
+    else:
+        oracle_path = task.task_dir / "oracle.md"
+        if not oracle_path.is_file():
+            return "", "no_oracle"
+        oracle_text = oracle_path.read_text(encoding="utf-8").strip()
+        prompt_text = raw_task.rstrip() + "\n\n" + oracle_text + "\n"
+
+    if context_mode == "repomap":
+        target_repo = work_dir if work_dir is not None else task.task_dir
+        map_md = repomap.generate_repomap(
+            target_repo,
+            task_text=prompt_text,
+            budget=repomap_budget,
+            include_title=False,
+        )
+        prompt_text = prompt_text.rstrip() + "\n\n## Code map\n\n" + map_md.strip() + "\n"
+
+    return prompt_text, None
+
+
+def _install_pack_skills(work_dir: Path, pack_root: Path = REPO_ROOT) -> list[str]:
+    """Copy pack skills into ``<work_dir>/.claude/skills/`` for skill-on trials."""
+    skills_src = pack_root / "knowledge" / "skills"
+    installed: list[str] = []
+    if not skills_src.is_dir():
+        return installed
+    for sdir in sorted(skills_src.iterdir()):
+        if not sdir.is_dir() or not (sdir / "SKILL.md").is_file():
+            continue
+        dest = work_dir / ".claude" / "skills" / sdir.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            sdir,
+            dest,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("tests", "__pycache__"),
+        )
+        installed.append(sdir.name)
+    return installed
+
+
+def compute_ablation_cause(
+    base_passed: bool,
+    *,
+    oracle_passed: bool | None,
+    repomap_passed: bool | None,
+    skill_passed: bool | None,
+    analyze_cause: str | None = None,
+    analyze_signals: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Attribute failure cause from ablation arm outcomes and ``devpack_logs analyze`` signals.
+
+    Rules (SPEC 5.6):
+    - Base passed -> ``None``
+    - Passes only with oracle brief -> ``BRIEF``
+    - Passes only with repomap context -> ``CONTEXT``
+    - Passes only with toggled skill -> ``SKILL``
+    - Multi-arm passes -> minimal sufficient intervention (``CONTEXT``, then ``SKILL``, then ``BRIEF``)
+    - None pass -> ``MODEL_OR_TOOL``, split via ``analyze`` signals into ``TOOL``, ``ENV``, or ``MODEL``
+      when a deterministic signal is present (otherwise ``MODEL_OR_TOOL``).
+    """
+    if base_passed:
+        return None
+    o = oracle_passed is True
+    r = repomap_passed is True
+    s = skill_passed is True
+
+    if o and not r and not s:
+        return "BRIEF"
+    if r and not o and not s:
+        return "CONTEXT"
+    if s and not o and not r:
+        return "SKILL"
+    if r:
+        return "CONTEXT"
+    if s:
+        return "SKILL"
+    if o:
+        return "BRIEF"
+
+    sigs = analyze_signals or {}
+    if (
+        analyze_cause == "TOOL"
+        or bool(sigs.get("denied_calls"))
+        or bool(sigs.get("prompt_over_context"))
+        or int(sigs.get("tool_protocol_errors") or 0) > 0
+    ):
+        return "TOOL"
+    if (
+        analyze_cause == "ENV"
+        or bool(sigs.get("timeout"))
+        or bool(sigs.get("quota_or_network_error"))
+    ):
+        return "ENV"
+    if analyze_cause == "MODEL":
+        return "MODEL"
+    return "MODEL_OR_TOOL"
+
+
+def _analyze_failed_run_dir(
+    trial_run_dir: Path,
+    fixture_dir: Path,
+    engines_config_path: Path | None = None,
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    """Run ``devpack_logs.analyze_run_dir`` on a failed trial and return ``(cause, secondary, signals)``."""
+    if not (trial_run_dir / "run.json").is_file():
+        return None, None, {}
+    try:
+        attr = devpack_logs.analyze_run_dir(
+            trial_run_dir,
+            repo_root=fixture_dir,
+            engines_config=engines_config_path,
+            write=True,
+        )
+    except Exception:
+        return None, None, {}
+    cause = attr.get("suspected_cause")
+    sec = attr.get("secondary")
+    sigs = attr.get("signals")
+    return (
+        str(cause) if cause else None,
+        str(sec) if sec else None,
+        dict(sigs) if isinstance(sigs, Mapping) else {},
+    )
+
+
 def prepare_isolated_trial_dir(
     trial_root: Path,
     fixture_dir: Path,
     task: TaskSpec,
     credentials_path: Path | None,
     agent_cwd: str | None = None,
+    *,
+    brief_variant: str = "standard",
+    context_mode: str = "none",
+    repomap_budget: int = 1500,
+    skills_enabled: bool = False,
+    pack_root: Path = REPO_ROOT,
 ) -> dict[str, Path]:
     """Create an isolated trial directory with home, cfg, and git-initialized task workdir.
 
@@ -714,7 +937,15 @@ def prepare_isolated_trial_dir(
     _run_git(["add", "-A"])
     _run_git(["commit", "-q", "-m", "chore: apply setup.patch"])
 
-    prompt_text = task.task_md.read_text(encoding="utf-8")
+    prompt_text, skip_reason = build_task_prompt_text(
+        task,
+        brief_variant=brief_variant,
+        context_mode=context_mode,
+        work_dir=work_dir,
+        repomap_budget=repomap_budget,
+    )
+    if skip_reason is not None:
+        raise RuntimeError(f"Task '{task.task_id}' skipped: {skip_reason}")
     prompt_file = trial_root / "prompt.md"
     prompt_file.write_text(prompt_text, encoding="utf-8")
 
@@ -723,6 +954,8 @@ def prepare_isolated_trial_dir(
 
     claude_dir = work_dir / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
+    if skills_enabled:
+        _install_pack_skills(work_dir, pack_root)
     settings_path = claude_dir / "settings.json"
     settings_path.write_text(
         json.dumps(build_project_settings(), indent=2) + "\n",
@@ -901,12 +1134,40 @@ def run_single_trial(
     engine_config: EngineConfig | None = None,
     allow_unsandboxed_local: bool = False,
     profile_overrides: Mapping[str, Path | None] | None = None,
+    brief_variant: str = "standard",
+    context_mode: str = "none",
+    repomap_budget: int = 1500,
+    skills_enabled: bool = False,
+    engines_config_path: Path | None = None,
+    arm: str = "base",
 ) -> TrialResult:
     """Execute one (task, model, run_index) trial in an isolated workspace.
 
     Credentials and the config directory contents are always deleted afterwards,
     whether the trial succeeds, fails, times out, or raises.
     """
+    if brief_variant == "oracle" and not (task.task_dir / "oracle.md").is_file():
+        engine = engine_config or resolve_engine(model)
+        return TrialResult(
+            task_id=task.task_id,
+            category=task.category,
+            model=model,
+            run_index=run_index,
+            passed=False,
+            agent_returncode=0,
+            check_returncode=0,
+            cost_usd=None,
+            turns=None,
+            duration_s=0.0,
+            engine_class=engine.engine_class,
+            mode="single",
+            brief_variant=brief_variant,
+            context_mode=context_mode,
+            skills_enabled=skills_enabled,
+            skipped=True,
+            skip_reason="no_oracle",
+            arm=arm,
+        )
     trial_name = f"{task.task_id}__{model}__run{run_index}"
     trial_root = run_root / trial_name
     try:
@@ -928,6 +1189,12 @@ def run_single_trial(
             engine_config=engine_config,
             allow_unsandboxed_local=allow_unsandboxed_local,
             profile_overrides=profile_overrides,
+            brief_variant=brief_variant,
+            context_mode=context_mode,
+            repomap_budget=repomap_budget,
+            skills_enabled=skills_enabled,
+            engines_config_path=engines_config_path,
+            arm=arm,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")
@@ -951,6 +1218,12 @@ def _run_trial_body(
     engine_config: EngineConfig | None = None,
     allow_unsandboxed_local: bool = False,
     profile_overrides: Mapping[str, Path | None] | None = None,
+    brief_variant: str = "standard",
+    context_mode: str = "none",
+    repomap_budget: int = 1500,
+    skills_enabled: bool = False,
+    engines_config_path: Path | None = None,
+    arm: str = "base",
 ) -> TrialResult:
     """Run the agent via agent_exec and execute check.sh for one single-mode trial."""
     if isolation not in ("local", "docker"):
@@ -965,6 +1238,10 @@ def _run_trial_body(
         task=task,
         credentials_path=credentials_path if engine.is_cloud else None,
         agent_cwd=DOCKER_TASK_DIR if isolation == "docker" else None,
+        brief_variant=brief_variant,
+        context_mode=context_mode,
+        repomap_budget=repomap_budget,
+        skills_enabled=skills_enabled,
     )
     prompt_text = paths["prompt_file"].read_text(encoding="utf-8")
     work_dir = paths["work_dir"]
@@ -991,7 +1268,7 @@ def _run_trial_body(
         isolation=isolation,
         allow_unsandboxed_local=allow_unsandboxed_local,
         timeout_s=timeout_s,
-        skills_enabled=False,
+        skills_enabled=skills_enabled,
         credentials_path=credentials_path if engine.is_cloud else None,
         agent_bin=agent_bin,
         docker_bin=docker_bin or "docker",
@@ -1076,8 +1353,19 @@ def _run_trial_body(
         trial_run_dir,
         outcome=outcome,
         timed_out=timed_out,
+        context=context_mode,
+        brief_variant=brief_variant,
+        skills_enabled=skills_enabled,
+        arm=arm,
         finished=datetime.now(timezone.utc).isoformat(),
     )
+
+    suspected_cause: str | None = None
+    attr_secondary: str | None = None
+    if not passed:
+        suspected_cause, attr_secondary, _ = _analyze_failed_run_dir(
+            trial_run_dir, fixture_dir, engines_config_path
+        )
 
     trial_cost: float | None = None
     if not is_harness_err and not engine.is_local:
@@ -1113,6 +1401,12 @@ def _run_trial_body(
         mode="single",
         init_model=agent_res.init_model,
         init_digest=agent_res.init_digest,
+        brief_variant=brief_variant,
+        context_mode=context_mode,
+        skills_enabled=skills_enabled,
+        suspected_cause=suspected_cause,
+        attribution_secondary=attr_secondary,
+        arm=arm,
     )
 
 
@@ -1163,8 +1457,36 @@ def run_runner_trial(
     runs_root: Path | None = None,
     allow_unsandboxed_local: bool = False,
     profile_overrides: Mapping[str, Path | None] | None = None,
+    brief_variant: str = "standard",
+    context_mode: str = "none",
+    repomap_budget: int = 1500,
+    skills_enabled: bool = False,
+    engines_config_path: Path | None = None,
+    arm: str = "base",
 ) -> TrialResult:
     """Execute one runner-mode trial (implement -> gate -> review -> fix) and grade it."""
+    if brief_variant == "oracle" and not (task.task_dir / "oracle.md").is_file():
+        all_local = impl_engine.is_local and rev_engine.is_local and fixer_engine.is_local
+        return TrialResult(
+            task_id=task.task_id,
+            category=task.category,
+            model=pair_label,
+            run_index=run_index,
+            passed=False,
+            agent_returncode=0,
+            check_returncode=0,
+            cost_usd=None,
+            turns=None,
+            duration_s=0.0,
+            engine_class="local" if all_local else "cloud",
+            mode="runner",
+            brief_variant=brief_variant,
+            context_mode=context_mode,
+            skills_enabled=skills_enabled,
+            skipped=True,
+            skip_reason="no_oracle",
+            arm=arm,
+        )
     safe_pair = pair_label.replace(":", "-")
     trial_name = f"{task.task_id}__{safe_pair}__run{run_index}"
     trial_root = run_root / trial_name
@@ -1182,6 +1504,10 @@ def run_runner_trial(
             task=task,
             credentials_path=credentials_path if any_cloud else None,
             agent_cwd=DOCKER_TASK_DIR if isolation == "docker" else None,
+            brief_variant=brief_variant,
+            context_mode=context_mode,
+            repomap_budget=repomap_budget,
+            skills_enabled=skills_enabled,
         )
         work_dir = paths["work_dir"]
         effective_runs_root = runs_root if runs_root is not None else (trial_root / "runs")
@@ -1249,13 +1575,14 @@ def run_runner_trial(
                 "fixer": fix_cfg,
             },
         )
-        task_text = task.task_md.read_text(encoding="utf-8")
-        allowed_str = _parse_task_allowed_files(task_text)
+        task_raw_text = task.task_md.read_text(encoding="utf-8")
+        task_prompt_text = paths["prompt_file"].read_text(encoding="utf-8")
+        allowed_str = _parse_task_allowed_files(task_raw_text)
         context = devpack_run.load_task_data(
             task_file=paths["prompt_file"],
             task_id=task.task_id,
             title=task.task_id,
-            goal=task_text,
+            goal=task_prompt_text,
             allowed_files=allowed_str,
         )
         _rc, summary = devpack_run.run_task_workflow(
@@ -1327,8 +1654,19 @@ def run_runner_trial(
             trial_run_dir,
             outcome=outcome,
             timed_out=timed_out,
+            context=context_mode,
+            brief_variant=brief_variant,
+            skills_enabled=skills_enabled,
+            arm=arm,
             finished=datetime.now(timezone.utc).isoformat(),
         )
+
+        suspected_cause: str | None = None
+        attr_secondary: str | None = None
+        if not passed:
+            suspected_cause, attr_secondary, _ = _analyze_failed_run_dir(
+                trial_run_dir, fixture_dir, engines_config_path
+            )
 
         trial_cost: float | None = None
         if not is_harness_err and not all_local:
@@ -1371,6 +1709,12 @@ def run_runner_trial(
             reviewer_false_reject=false_reject,
             init_model=runner_init_model,
             init_digest=runner_init_digest,
+            brief_variant=brief_variant,
+            context_mode=context_mode,
+            skills_enabled=skills_enabled,
+            suspected_cause=suspected_cause,
+            attribution_secondary=attr_secondary,
+            arm=arm,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")
@@ -1604,8 +1948,18 @@ def run_orchestrator_trial(
             outcome=outcome,
             timed_out=timed_out,
             orchestrator_analysis=analysis,
+            context="none",
+            brief_variant="standard",
+            skills_enabled=False,
             finished=datetime.now(timezone.utc).isoformat(),
         )
+
+        suspected_cause: str | None = None
+        attr_secondary: str | None = None
+        if not passed:
+            suspected_cause, attr_secondary, _ = _analyze_failed_run_dir(
+                trial_run_dir, fixture_dir, engines_config
+            )
 
         trial_cost: float | None = None
         if not is_harness_err and not orch_engine.is_local:
@@ -1640,6 +1994,8 @@ def run_orchestrator_trial(
             orchestrator_compliant=bool(analysis["compliant"]),
             disallowed_bash_commands=analysis["disallowed_bash_commands"],
             denied_tool_calls=analysis["denied_tool_calls"],
+            suspected_cause=suspected_cause,
+            attribution_secondary=attr_secondary,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")
@@ -2057,8 +2413,18 @@ def run_memory_trial(
             memory_recall_rate=recall_rate,
             memory_over_recall_rate=over_recall_rate,
             memory_injected_tokens=total_injected_tokens,
+            context="none",
+            brief_variant="standard",
+            skills_enabled=False,
             finished=datetime.now(timezone.utc).isoformat(),
         )
+
+        suspected_cause: str | None = None
+        attr_secondary: str | None = None
+        if not passed:
+            suspected_cause, attr_secondary, _ = _analyze_failed_run_dir(
+                trial_run_dir, fixture_dir, None
+            )
 
         return TrialResult(
             task_id=seq.seq_id,
@@ -2092,6 +2458,8 @@ def run_memory_trial(
             memory_injected_tokens=total_injected_tokens,
             memory_injected_ids=all_injected_ids,
             violation_reason=violation_reason,
+            suspected_cause=suspected_cause,
+            attribution_secondary=attr_secondary,
         )
     finally:
         cleanup_cfg_dir(trial_root / "cfg")
@@ -2125,9 +2493,10 @@ def aggregate_results(
                 key=lambda r: r.run_index,
             )
             harness_errors = sum(1 for r in runs if r.harness_error)
+            skipped_runs = sum(1 for r in runs if r.skipped)
             timeouts = sum(1 for r in runs if r.timed_out and not r.harness_error)
             protocol_errors = sum(int(r.tool_protocol_errors) for r in runs)
-            valid = [r for r in runs if not r.harness_error]
+            valid = [r for r in runs if not r.harness_error and not r.skipped]
             memory_runs = [r for r in valid if r.mode == "memory"]
             with_mem_runs = [r for r in memory_runs if r.memory_arm == "with_memory"]
             without_mem_runs = [r for r in memory_runs if r.memory_arm == "without_memory"]
@@ -2270,6 +2639,9 @@ def aggregate_results(
                     pass_with_memory=pass_with_mem,
                     pass_without_memory=pass_without_mem,
                     memory_ab_delta=mem_ab_delta,
+                    skipped_runs=skipped_runs,
+                    ablation_cause=next((r.ablation_cause for r in runs if r.ablation_cause), None),
+                    ablation_arms=next((dict(r.ablation_arms) for r in runs if r.ablation_arms), {}),
                 )
             )
 
@@ -2388,6 +2760,48 @@ def _fmt_tokens(tok_in: float | int | None, tok_out: float | int | None) -> str:
     return f"{int(round(tok_in or 0))}/{int(round(tok_out or 0))}"
 
 
+def _compute_failure_cause_rows(
+    models: Sequence[str],
+    task_summaries: Sequence[TaskModelSummary],
+) -> list[dict[str, Any]]:
+    """Aggregate per-engine failure counts, shares, and example tasks for summary reporting."""
+    rows: list[dict[str, Any]] = []
+    for eng in models:
+        failed_runs = [
+            r
+            for ts in task_summaries
+            if ts.model == eng
+            for r in ts.runs
+            if not r.passed and not r.skipped
+        ]
+        total_fail = len(failed_runs)
+        if total_fail == 0:
+            continue
+        counts: dict[str, int] = {}
+        examples: dict[str, str] = {}
+        for r in failed_runs:
+            cause = (
+                r.ablation_cause
+                or r.suspected_cause
+                or ("ENV" if r.timed_out else ("TOOL" if r.harness_error else "MODEL"))
+            )
+            counts[cause] = counts.get(cause, 0) + 1
+            if cause not in examples or r.task_id < examples[cause]:
+                examples[cause] = r.task_id
+        for cause, cnt in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            share = round((cnt / total_fail) * 100.0, 1)
+            rows.append(
+                {
+                    "engine": eng,
+                    "cause": cause,
+                    "count": cnt,
+                    "share_pct": share,
+                    "example_task": examples[cause],
+                }
+            )
+    return rows
+
+
 def render_summary_markdown(
     run_id: str,
     date_str: str,
@@ -2397,6 +2811,7 @@ def render_summary_markdown(
     task_summaries: Sequence[TaskModelSummary],
     category_summaries: Sequence[dict[str, Any]],
     mode: str = "single",
+    ablation_records: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """Format evaluation results into a human-readable Markdown report."""
     lines = [
@@ -2487,22 +2902,69 @@ def render_summary_markdown(
                 f"{_fmt(ts.memory_recall_rate)} | {_fmt(ts.memory_over_recall_rate)} | {_fmt(ts.mean_injected_tokens)} |"
             )
 
+    cause_rows = _compute_failure_cause_rows(models, task_summaries)
+    lines.extend(["", "## Failure causes", ""])
+    if cause_rows:
+        lines.extend(
+            [
+                "| Engine | Cause | Count | Share | Example task |",
+                "|---|---|---:|---:|---|",
+            ]
+        )
+        for row in cause_rows:
+            lines.append(
+                f"| {row['engine']} | {row['cause']} | {row['count']} | "
+                f"{row['share_pct']:.1f}% | {row['example_task']} |"
+            )
+    else:
+        lines.append("_No failures recorded._")
+
+    if ablation_records:
+        lines.extend(
+            [
+                "",
+                "## Ablation Arms",
+                "",
+                "| Task | Engine | Base | Oracle Brief | Repomap | Skill Toggle | Ablation Cause |",
+                "|---|---|---|---|---|---|---|",
+            ]
+        )
+        for rec in ablation_records:
+            arms_map = rec.get("arms", {}) if isinstance(rec, Mapping) else {}
+            def _arm_cell(arm_dict: Any) -> str:
+                if not isinstance(arm_dict, Mapping):
+                    return "n/a"
+                if arm_dict.get("skipped"):
+                    return f"skipped ({arm_dict.get('skip_reason', 'skipped')})"
+                return "pass" if arm_dict.get("passed") else "fail"
+            skill_cell = _arm_cell(arms_map.get("skill-on") or arms_map.get("skill-off"))
+            lines.append(
+                f"| {rec.get('task_id', '')} | {rec.get('model', '')} | fail | "
+                f"{_arm_cell(arms_map.get('oracle-brief'))} | "
+                f"{_arm_cell(arms_map.get('repomap'))} | "
+                f"{skill_cell} | {rec.get('ablation_cause') or 'n/a'} |"
+            )
+
     lines.extend(
         [
             "",
             "## Per-Trial Runs",
             "",
-            "| Task | Engine | Run | Passed | Timed Out | Cost (USD) | Tokens (in/out) | Duration (s) | Tool Protocol Errors | Run Dir |",
-            "|---|---|---:|---|---|---:|---:|---:|---:|---|",
+            "| Task | Engine | Run | Passed | Timed Out | Cause | Cost (USD) | Tokens (in/out) | Duration (s) | Tool Protocol Errors | Run Dir |",
+            "|---|---|---:|---|---|---|---|---:|---:|---:|---|",
         ]
     )
     for ts in task_summaries:
         for run in ts.runs:
             run_cost = f"{run.cost_usd:.4f}" if run.cost_usd is not None else "n/a"
             tok_str = _fmt_tokens(run.tokens_in, run.tokens_out)
+            pass_str = f"skipped ({run.skip_reason})" if run.skipped else ("yes" if run.passed else "no")
+            cause_str = (
+                run.ablation_cause or run.suspected_cause or "-"
+            ) if not run.passed and not run.skipped else "-"
             lines.append(
                 f"| {run.task_id} | {run.model} | {run.run_index} | "
-                f"{'yes' if run.passed else 'no'} | {'yes' if run.timed_out else 'no'} | {run_cost} | "
+                f"{pass_str} | {'yes' if run.timed_out else 'no'} | {cause_str} | {run_cost} | "
                 f"{tok_str} | {run.duration_s:.2f} | {run.tool_protocol_errors} | `{run.run_dir}` |"
             )
 
@@ -2709,6 +3171,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="ENGINE=PATH",
         help="Override engine profile path for an engine during evaluation (repeatable)",
     )
+    parser.add_argument(
+        "--context",
+        choices=("none", "repomap"),
+        default="none",
+        help="Code context injection mode: none or repomap (default: none)",
+    )
+    parser.add_argument(
+        "--brief-variant",
+        choices=("standard", "minimal", "oracle"),
+        default="standard",
+        help="Task brief variant: standard, minimal, or oracle (default: standard)",
+    )
+    parser.add_argument(
+        "--repomap-budget",
+        type=int,
+        default=1500,
+        help="Estimated token budget for --context repomap (default: 1500)",
+    )
+    parser.add_argument(
+        "--skills",
+        action="store_true",
+        help="Install pack skills into isolated workspaces and enable skills in agent invocations",
+    )
+    parser.add_argument(
+        "--ablate",
+        action="store_true",
+        help="Rerun failing base-arm tasks across oracle-brief, repomap, and toggled-skill arms",
+    )
     return parser
 
 
@@ -2852,6 +3342,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_parallel < 1:
         print("error: --max-parallel must be >= 1", file=sys.stderr)
         return 2
+    if args.repomap_budget < 1:
+        print("error: --repomap-budget must be >= 1", file=sys.stderr)
+        return 2
 
     fixture_dir = Path(args.fixture_dir).resolve()
     tasks_dir = Path(args.tasks_dir).resolve()
@@ -2983,17 +3476,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             for run_idx in range(1, args.k + 1)
         ]
         kind_label = "pair" if mode == "runner" else "engine"
+        skill_arm_name = "skill-off" if args.skills else "skill-on"
+        ablation_arms_list = ("oracle-brief", "repomap", skill_arm_name)
         print(f"DRY-RUN {mode} plan ({len(plan_items)} total trials):")
         print(f"  mode: {mode}")
         print(f"  isolation: {args.isolation}")
         print(f"  tier: {args.tier}")
         print(f"  {kind_label}s: {', '.join(unit_labels)}")
+        print(f"  brief_variant: {args.brief_variant}")
+        print(f"  context: {args.context}")
+        print(f"  skills: {'on' if args.skills else 'off'}")
+        if args.ablate:
+            print(f"  ablate: enabled (arms on failure: {', '.join(ablation_arms_list)})")
         print(f"  k: {args.k}")
         print(f"  tasks ({len(eval_units)}): {', '.join(t.task_id for t in eval_units)}")  # type: ignore[union-attr]
         for idx, (task, lbl, run_idx) in enumerate(plan_items, start=1):
+            oracle_tag = "yes" if (task.task_dir / "oracle.md").is_file() else "no"
+            extra_ablate = (
+                f" ablation_arms=[{', '.join(ablation_arms_list)}] oracle={oracle_tag}"
+                if args.ablate
+                else ""
+            )
             print(
                 f"  [{idx:03d}/{len(plan_items):03d}] "
-                f"task={task.task_id} category={task.category} {kind_label}={lbl} run={run_idx}/{args.k}"
+                f"task={task.task_id} category={task.category} {kind_label}={lbl} "
+                f"brief={args.brief_variant} context={args.context} run={run_idx}/{args.k}"
+                f"{extra_ablate}"
             )
         return 0
 
@@ -3223,6 +3731,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             runs_root=runs_root,
                             allow_unsandboxed_local=args.allow_unsandboxed_local,
                             profile_overrides=profile_overrides,
+                            brief_variant=args.brief_variant,
+                            context_mode=args.context,
+                            repomap_budget=args.repomap_budget,
+                            skills_enabled=args.skills,
+                            engines_config_path=engines_config_path,
                         )
                     )
             else:
@@ -3250,6 +3763,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             runs_root,
                             args.allow_unsandboxed_local,
                             profile_overrides,
+                            args.brief_variant,
+                            args.context,
+                            args.repomap_budget,
+                            args.skills,
+                            engines_config_path,
                         )
                         for t, lbl, imp_e, rev_e, fix_e, run_idx in runner_jobs
                     ]
@@ -3283,6 +3801,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             engine_config=engine_map[model],
                             allow_unsandboxed_local=args.allow_unsandboxed_local,
                             profile_overrides=profile_overrides,
+                            brief_variant=args.brief_variant,
+                            context_mode=args.context,
+                            repomap_budget=args.repomap_budget,
+                            skills_enabled=args.skills,
+                            engines_config_path=engines_config_path,
                         )
                     )
             else:
@@ -3307,6 +3830,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             engine_map[model],
                             args.allow_unsandboxed_local,
                             profile_overrides,
+                            args.brief_variant,
+                            args.context,
+                            args.repomap_budget,
+                            args.skills,
+                            engines_config_path,
                         )
                         for task, model, run_idx in plan_items
                     ]
@@ -3316,12 +3844,143 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    ablation_records: list[dict[str, Any]] = []
+    if args.ablate and mode in ("single", "runner"):
+        pair_map = (
+            {f"{imp}:{rev}": (engine_map[imp], engine_map[rev], engine_map[fix]) for imp, rev, fix in parse_runner_pairs(args.pairs)}
+            if mode == "runner"
+            else {}
+        )
+        skill_arm_name = "skill-off" if args.skills else "skill-on"
+        arm_specs = (
+            ("oracle-brief", "oracle", args.context, args.skills),
+            ("repomap", args.brief_variant, "repomap", args.skills),
+            (skill_arm_name, args.brief_variant, args.context, not args.skills),
+        )
+        for task in eval_units:  # type: ignore[assignment]
+            for label in unit_labels:
+                base_group = [
+                    t for t in trials if t.task_id == task.task_id and t.model == label  # type: ignore[union-attr]
+                ]
+                failing_base = [
+                    t for t in base_group if not t.passed and not t.harness_error and not t.skipped
+                ]
+                if not failing_base:
+                    continue
+                rep_trial = failing_base[0]
+                analyze_signals: dict[str, Any] = {}
+                if rep_trial.run_dir:
+                    attr_file = runs_root / Path(rep_trial.run_dir).name / "attribution.json"
+                    if attr_file.is_file():
+                        try:
+                            attr_obj = json.loads(attr_file.read_text(encoding="utf-8"))
+                            if isinstance(attr_obj, dict) and isinstance(attr_obj.get("signals"), dict):
+                                analyze_signals = attr_obj["signals"]
+                        except (OSError, json.JSONDecodeError):
+                            pass
+
+                arm_results: dict[str, TrialResult] = {}
+                for arm_name, a_brief, a_ctx, a_skill in arm_specs:
+                    arm_run_root = run_root / "ablation" / arm_name
+                    if mode == "runner":
+                        imp_e, rev_e, fix_e = pair_map[label]
+                        arm_res = run_runner_trial(
+                            task=task,  # type: ignore[arg-type]
+                            pair_label=label,
+                            impl_engine=imp_e,
+                            rev_engine=rev_e,
+                            fixer_engine=fix_e,
+                            run_index=1,
+                            run_root=arm_run_root,
+                            fixture_dir=fixture_dir,
+                            credentials_path=credentials_path,
+                            isolation=args.isolation,
+                            agent_bin=args.agent_bin,
+                            timeout_s=args.timeout_s,
+                            max_fix_rounds=args.max_fix_rounds,
+                            docker_bin=docker_bin,
+                            extra_secrets=extra_secrets,
+                            path_replacements=path_replacements,
+                            image_tag=image_tag,
+                            runs_root=runs_root,
+                            allow_unsandboxed_local=args.allow_unsandboxed_local,
+                            profile_overrides=profile_overrides,
+                            brief_variant=a_brief,
+                            context_mode=a_ctx,
+                            repomap_budget=args.repomap_budget,
+                            skills_enabled=a_skill,
+                            engines_config_path=engines_config_path,
+                            arm=arm_name,
+                        )
+                    else:
+                        arm_res = run_single_trial(
+                            task=task,  # type: ignore[arg-type]
+                            model=label,
+                            run_index=1,
+                            run_root=arm_run_root,
+                            fixture_dir=fixture_dir,
+                            credentials_path=credentials_path,
+                            isolation=args.isolation,
+                            agent_bin=args.agent_bin,
+                            timeout_s=args.timeout_s,
+                            docker_bin=docker_bin,
+                            extra_secrets=extra_secrets,
+                            path_replacements=path_replacements,
+                            image_tag=image_tag,
+                            runs_root=runs_root,
+                            engine_config=engine_map[label],
+                            allow_unsandboxed_local=args.allow_unsandboxed_local,
+                            profile_overrides=profile_overrides,
+                            brief_variant=a_brief,
+                            context_mode=a_ctx,
+                            repomap_budget=args.repomap_budget,
+                            skills_enabled=a_skill,
+                            engines_config_path=engines_config_path,
+                            arm=arm_name,
+                        )
+                    arm_results[arm_name] = arm_res
+
+                oracle_res = arm_results["oracle-brief"]
+                repomap_res = arm_results["repomap"]
+                skill_res = arm_results[skill_arm_name]
+                ab_cause = compute_ablation_cause(
+                    False,
+                    oracle_passed=(None if (oracle_res.skipped or oracle_res.harness_error) else oracle_res.passed),
+                    repomap_passed=(None if (repomap_res.skipped or repomap_res.harness_error) else repomap_res.passed),
+                    skill_passed=(None if (skill_res.skipped or skill_res.harness_error) else skill_res.passed),
+                    analyze_cause=rep_trial.suspected_cause,
+                    analyze_signals=analyze_signals,
+                )
+                arm_summary = {
+                    a_name: {
+                        "passed": r.passed,
+                        "skipped": r.skipped,
+                        "skip_reason": r.skip_reason,
+                        "harness_error": r.harness_error,
+                        "run_dir": r.run_dir,
+                    }
+                    for a_name, r in arm_results.items()
+                }
+                for ft in failing_base:
+                    ft.ablation_cause = ab_cause
+                    ft.ablation_arms = arm_summary
+                ablation_records.append(
+                    {
+                        "task_id": task.task_id,  # type: ignore[union-attr]
+                        "model": label,
+                        "suspected_cause": rep_trial.suspected_cause,
+                        "ablation_cause": ab_cause,
+                        "arms": arm_summary,
+                    }
+                )
+
     task_summaries, category_summaries = aggregate_results(
         tasks=eval_units,
         models=unit_labels,
         k=args.k,
         trials=trials,
     )
+    failure_causes = _compute_failure_cause_rows(unit_labels, task_summaries)
 
     raw_payload: dict[str, Any] = {
         "run_id": run_id,
@@ -3329,12 +3988,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "mode": mode,
         "tier": args.tier,
         "isolation": args.isolation,
+        "brief_variant": args.brief_variant,
+        "context": args.context,
+        "skills": bool(args.skills),
+        "ablate": bool(args.ablate),
         "models": unit_labels,
         "engines": unit_labels,
         "k": args.k,
         "runs_root": str(runs_root),
         "tasks": [asdict(ts) for ts in task_summaries],
         "categories": category_summaries,
+        "failure_causes": failure_causes,
+        "ablation": ablation_records,
     }
     redacted_payload = redact_structure(
         raw_payload,
@@ -3352,6 +4017,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         task_summaries=task_summaries,
         category_summaries=category_summaries,
         mode=mode,
+        ablation_records=ablation_records,
     )
     redacted_markdown = redact_sensitive_text(
         raw_markdown,

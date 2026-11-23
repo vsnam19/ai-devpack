@@ -30,9 +30,10 @@ user plugins, MCP servers, or global instructions.
   `02-superseded-decision`, `03-distractors-overrecall`, `04-stale-vs-code`,
   `05-scope-isolation`) for `--mode memory`.
 - `eval/run_eval.py`: Runs `single`, `runner`, `orchestrator`, or `memory` modes in
-  isolation, invokes deterministic graders (`check.sh` using `DEVPACK_ROOT`), writes
-  per-trial run directories under `--runs-root`, and writes `results.json` and
-  `summary.md`.
+  isolation, supports ablation arms (`--context none|repomap`, `--brief-variant standard|minimal|oracle`,
+  `--skills`, `--ablate`), runs `runner/devpack_logs.py` analysis on failed trials, invokes
+  deterministic graders (`check.sh` using `DEVPACK_ROOT`), writes per-trial run directories
+  under `--runs-root`, and writes `results.json` and `summary.md` (including `## Failure causes`).
 - `eval/Dockerfile`: Container image definition (`devpack-eval:<version>`) with Node
   LTS, pinned `@anthropic-ai/claude-code`, `g++`, `cmake`, `python3`, `git`, and
   a non-root user (`1000:1000`).
@@ -106,6 +107,41 @@ Runs multi-step sequences under `eval/memory_tasks/` in A/B arms (`with_memory` 
 `without_memory`; pass `--no-memory-ab` to run `with_memory` only), starting a fresh
 agent session per step and enforcing `scope_check.py` + `test_lock.py --no-deviation`
 before accepting `handoff`/`known-gap` proposals.
+
+### 6. Ablation Arms and Failure Attribution (`--ablate`)
+
+To attribute why a task failed (`BRIEF` vs `CONTEXT` vs `SKILL` vs `MODEL` / `TOOL`, per
+`policy/failure_attribution.md`), `eval/run_eval.py` supports controlled arm flags:
+
+- `--context none|repomap`: `repomap` runs `runner/repomap.py` on the task workspace
+  (budgeted via `--repomap-budget`, default `1500` tokens) and appends the ranked C/C++
+  file tree + public symbols + Doxygen `@brief` index under `## Code map`.
+- `--brief-variant standard|minimal|oracle`: `standard` sends `task.md` unchanged;
+  `minimal` sends only the task title and first goal paragraph; `oracle` appends
+  `oracle.md` from the task directory when present (skipping trials with `no_oracle`
+  when absent).
+- `--skills`: installs `knowledge/skills/` into `.claude/skills/` and enables skill invocation.
+- `--ablate`: runs the base arm first, runs `runner/devpack_logs.py` (`analyze`) on every
+  failed trial, and reruns each failing `(task, engine)` across `oracle-brief`, `repomap`,
+  and `skill-on` (or `skill-off` if `--skills` was set in the base arm):
+
+```bash
+python3 eval/run_eval.py \
+  --mode single --tier v2 \
+  --engines haiku,local --k 1 --ablate \
+  --isolation docker \
+  --credentials "$DEVPACK_CLAUDE_CREDENTIALS"
+```
+
+Attribution rules: passes only with `oracle-brief` -> `BRIEF`; passes only with `repomap`
+-> `CONTEXT`; passes only with skill toggle -> `SKILL`; fails under all arms -> `MODEL_OR_TOOL`
+(split into `TOOL`, `ENV`, or `MODEL` using `devpack_logs analyze` signals). Results are
+summarized per engine in `summary.md` under `## Failure causes`.
+
+> **Cost note:** `--ablate` multiplies trials for every failing `(task, engine)` pair by up
+> to `4x` (`1` base trial + `3` ablation arms: `oracle-brief`, `repomap`, `skill-on`/`skill-off`).
+> Validate the plan offline with `--dry-run --ablate` and prefer `--k 1` or filtered
+> `--tasks` when running ablation sweeps against paid cloud engines.
 
 ## Isolation and `DEVPACK_ROOT`
 
