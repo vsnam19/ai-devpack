@@ -98,6 +98,8 @@ for seq_dir in "$MEM_TASKS_ROOT"/*/; do
 
     # 2. Seed memory or process reference Step 1 proposals
     mem_dir="$work_dir/.devpack/memory"
+    # The verifier owns the seed memory, which is outside the worker's file scope.
+    printf '\n.devpack/\n' >> "$work_dir/.git/info/exclude"
     mkdir -p "$mem_dir"
     if [[ -d "$seq_dir/seed_memory" ]]; then
         cp -r "$seq_dir/seed_memory/." "$mem_dir/"

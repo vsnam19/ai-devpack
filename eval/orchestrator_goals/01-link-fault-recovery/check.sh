@@ -3,8 +3,9 @@
 #
 # Usage: bash check.sh [--help] [--workdir DIR]
 #
-# Verifies file scope, test lock, new REQ-LINK-006 unit tests, visible fixture
-# tests, hidden REQ-LINK-006 behavior tests, and preflight lint.
+# Verifies file scope, test lock, preflight lint, and cppcheck BEFORE running
+# worker code, then runs visible fixture tests and hidden REQ-LINK-006 tests
+# with out-of-process gcov coverage proof.
 #
 # Exit codes:
 #   0 - All grading checks passed
@@ -13,7 +14,7 @@
 set -euo pipefail
 
 usage() {
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 WORKDIR=""
@@ -45,17 +46,24 @@ done
 
 if [[ -z "${DEVPACK_ROOT:-}" ]]; then
     echo "GRADER_MISCONFIGURED: DEVPACK_ROOT is unset" >&2
+    if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
+        printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
+    fi
     exit 2
 fi
 
 PREFLIGHT_LINT="$DEVPACK_ROOT/enforcement/lint/preflight_lint.py"
+CPPCHECK_CHECK="$DEVPACK_ROOT/enforcement/static/cppcheck_check.py"
 PREFLIGHT_CFG="$DEVPACK_ROOT/eval/fixture/preflight.toml"
 TEST_LOCK="$DEVPACK_ROOT/enforcement/checks/test_lock.py"
 SCOPE_CHECK="$DEVPACK_ROOT/enforcement/checks/scope_check.py"
 SAFE_GIT_SH="$DEVPACK_ROOT/eval/lib/safe_git.sh"
 
-if [[ ! -f "$PREFLIGHT_LINT" || ! -f "$PREFLIGHT_CFG" || ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" || ! -f "$SAFE_GIT_SH" ]]; then
+if [[ ! -f "$PREFLIGHT_LINT" || ! -f "$CPPCHECK_CHECK" || ! -f "$PREFLIGHT_CFG" || ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" || ! -f "$SAFE_GIT_SH" ]]; then
     echo "GRADER_MISCONFIGURED: missing enforcement scripts, preflight.toml, or safe_git.sh under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
+    if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
+        printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
+    fi
     exit 2
 fi
 
@@ -65,8 +73,7 @@ source "$SAFE_GIT_SH"
 GOAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HIDDEN_SRC="$GOAL_DIR/hidden/test_req_link_006.cpp"
 if [[ ! -f "$HIDDEN_SRC" ]]; then
-    echo "GRADER_MISCONFIGURED: missing hidden test $HIDDEN_SRC" >&2
-    exit 2
+    grader_misconfigured "missing hidden test $HIDDEN_SRC"
 fi
 
 if [[ -z "$WORKDIR" ]]; then
@@ -90,7 +97,7 @@ fi
 ALLOWED_FILES=(
     "include/link_state_machine.hpp"
     "src/link_state_machine.cpp"
-    "tests/test_link_state_machine.cpp"
+    "tests/test_link_fault_recovery.cpp"
     "briefs/**"
     "runs/**"
     ".claude/**"
@@ -99,57 +106,49 @@ ALLOWED_FILES=(
 python3 "$SCOPE_CHECK" --repo "$WORKDIR" --base "$BASE_REF" --allow "${ALLOWED_FILES[@]}" >/dev/null
 python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' --no-deviation >/dev/null
 
-
-
-# Verify unit tests for REQ-LINK-006 were added to tests/test_link_state_machine.cpp
-if ! grep -q 'recoverFromFault' "$WORKDIR/tests/test_link_state_machine.cpp" ||
-   ! grep -q 'faultCount' "$WORKDIR/tests/test_link_state_machine.cpp"; then
-    echo "FAIL: tests/test_link_state_machine.cpp must add tests for recoverFromFault and faultCount" >&2
+# Verify unit tests for REQ-LINK-006 were added to the new test file
+NEW_TEST_FILE="$WORKDIR/tests/test_link_fault_recovery.cpp"
+if [[ ! -f "$NEW_TEST_FILE" ]] ||
+   ! grep -q 'recoverFromFault' "$NEW_TEST_FILE" ||
+   ! grep -q 'faultCount' "$NEW_TEST_FILE"; then
+    echo "FAIL: tests/test_link_fault_recovery.cpp must add tests for recoverFromFault and faultCount" >&2
     exit 1
 fi
 
-# Visible fixture build + tests
-expected_visible="$(count_expected_checks "$DEVPACK_ROOT/eval/fixture/tests"/*.cpp)"
-run_verified_test_binary "visible build_and_test" "$expected_visible" \
-    bash "$WORKDIR/build_and_test.sh" --no-cmake
-
-# Hidden REQ-LINK-006 test compilation + run
-TMP_GRADE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/devpack-grade-goal01.XXXXXX")"
-# shellcheck disable=SC2317,SC2329
-cleanup() {
-    rm -rf "$TMP_GRADE_DIR"
-}
-trap cleanup EXIT
-
-mapfile -t fixture_srcs < <(find "$WORKDIR/src" -maxdepth 1 -type f -name '*.cpp' | sort)
-CXX_BIN="${CXX:-g++}"
-CXXFLAGS=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachable-code -fno-exceptions -fno-rtti)
-"$CXX_BIN" "${CXXFLAGS[@]}" \
-    -I"$WORKDIR/include" \
-    "${fixture_srcs[@]}" \
-    "$HIDDEN_SRC" \
-    -o "$TMP_GRADE_DIR/hidden_test"
-expected_hidden="$(grep -chE '^[[:space:]]*checkCond[[:space:]]*\(' "$HIDDEN_SRC" 2>/dev/null || true)"
-run_verified_test_binary "hidden_test (REQ-LINK-006)" "$expected_hidden" "$TMP_GRADE_DIR/hidden_test"
-
-# Preflight lint on changed C/C++ files
-mapfile -t CHANGED_CPP_FILES < <(
-    {
-        safe_git -C "$WORKDIR" diff --name-only "$BASE_REF" -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
-        safe_git -C "$WORKDIR" ls-files --others --exclude-standard -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
-    } | sort -u
-)
-if [[ "${#CHANGED_CPP_FILES[@]}" -gt 0 ]]; then
-    lint_targets=()
-    for rel_f in "${CHANGED_CPP_FILES[@]}"; do
-        if [[ -f "$WORKDIR/$rel_f" ]]; then
-            lint_targets+=("$WORKDIR/$rel_f")
-        fi
-    done
-    if [[ "${#lint_targets[@]}" -gt 0 ]]; then
-        python3 "$PREFLIGHT_LINT" --no-cache --repo-root "$WORKDIR" --config "$PREFLIGHT_CFG" "${lint_targets[@]}" >/dev/null
+# Preflight lint and cppcheck BEFORE compiling/executing any worker code
+mapfile -t CHANGED_ALL < <(list_changed_files "$WORKDIR" "$BASE_REF")
+lint_targets=()
+for rel_f in "${CHANGED_ALL[@]}"; do
+    case "$rel_f" in
+        *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx)
+            if [[ -f "$WORKDIR/$rel_f" ]]; then
+                lint_targets+=("$WORKDIR/$rel_f")
+            fi
+            ;;
+    esac
+done
+if [[ "${#lint_targets[@]}" -gt 0 ]]; then
+    python3 "$PREFLIGHT_LINT" --no-cache --repo-root "$WORKDIR" --config "$PREFLIGHT_CFG" --base "$BASE_REF" "${lint_targets[@]}" >/dev/null
+    set +e
+    cppcheck_out="$(python3 "$CPPCHECK_CHECK" --repo-root "$WORKDIR" --config "$PREFLIGHT_CFG" "${lint_targets[@]}" 2>&1)"
+    cppcheck_rc=$?
+    set -e
+    if [[ "$cppcheck_rc" -eq 3 ]]; then
+        grader_misconfigured "cppcheck TOOL_MISSING: $cppcheck_out"
+    elif [[ "$cppcheck_rc" -eq 2 ]]; then
+        grader_misconfigured "cppcheck_check execution error: $cppcheck_out"
+    elif [[ "$cppcheck_rc" -ne 0 ]]; then
+        echo "FAIL: cppcheck static analysis blocking findings:" >&2
+        echo "$cppcheck_out" >&2
+        exit 1
     fi
 fi
+
+# Visible fixture build + tests with gcov out-of-process proof
+run_gcov_visible_tests "visible build_and_test" "$WORKDIR" "$NEW_TEST_FILE"
+
+# Hidden REQ-LINK-006 test compilation + run with gcov out-of-process proof
+run_gcov_hidden_tests "hidden_test (REQ-LINK-006)" "$WORKDIR" "$GOAL_DIR/hidden" '\bcheckCond\s*\('
 
 echo "PASS: 01-link-fault-recovery"
 exit 0

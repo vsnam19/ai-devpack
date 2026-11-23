@@ -87,18 +87,20 @@ class EvalBuildTimeoutTests(unittest.TestCase):
 
             cred = base / "creds.json"
             cred.write_text('{"accessToken":"fake-eval-tok"}', encoding="utf-8")
-            real_run = subprocess.run
+            real_check = run_eval._run_check_script
 
-            def _run_with_build_timeout(cmd: object, *args: object, **kwargs: object) -> object:
-                """Raise TimeoutExpired when invoking build_and_test.sh; pass through everything else."""
-                if isinstance(cmd, list) and any(str(part).endswith("build_and_test.sh") for part in cmd):
-                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=float(kwargs.get("timeout") or 0))
-                return real_run(cmd, *args, **kwargs)
+            def _run_with_build_timeout(check: Path, *args: object, **kwargs: object) -> object:
+                """Simulate a timeout of the isolated memory build grader."""
+                if check.name == "check_memory_step.sh":
+                    self.assertEqual(kwargs["isolation"], "local")
+                    self.assertTrue(kwargs["allow_unsandboxed_local"])
+                    return 124, "check.sh timed out", False
+                return real_check(check, *args, **kwargs)
 
             with (
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
-                mock.patch("subprocess.run", side_effect=_run_with_build_timeout),
+                mock.patch.object(run_eval, "_run_check_script", side_effect=_run_with_build_timeout),
             ):
                 rc = run_eval.main(
                     [

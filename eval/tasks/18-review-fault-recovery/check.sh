@@ -53,6 +53,9 @@ done
 
 if [[ -z "${DEVPACK_ROOT:-}" ]]; then
     echo "GRADER_MISCONFIGURED: DEVPACK_ROOT is unset" >&2
+    if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
+        printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
+    fi
     exit 2
 fi
 
@@ -61,6 +64,9 @@ SCOPE_CHECK="$DEVPACK_ROOT/enforcement/checks/scope_check.py"
 SAFE_GIT_SH="$DEVPACK_ROOT/eval/lib/safe_git.sh"
 if [[ ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" || ! -f "$SAFE_GIT_SH" ]]; then
     echo "GRADER_MISCONFIGURED: missing enforcement scripts or safe_git.sh under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
+    if [[ -n "${DEVPACK_HARNESS_NONCE:-}" && -n "${DEVPACK_HARNESS_NONCE_FILE:-}" ]]; then
+        printf '%s\n' "$DEVPACK_HARNESS_NONCE" > "$DEVPACK_HARNESS_NONCE_FILE" 2>/dev/null || true
+    fi
     exit 2
 fi
 
@@ -70,8 +76,7 @@ source "$SAFE_GIT_SH"
 TASK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REVIEW_PATCH="$TASK_DIR/review.patch"
 if [[ ! -f "$REVIEW_PATCH" ]]; then
-    echo "GRADER_MISCONFIGURED: missing $REVIEW_PATCH" >&2
-    exit 2
+    grader_misconfigured "missing $REVIEW_PATCH"
 fi
 
 if [[ -z "$WORKDIR" ]]; then
@@ -115,9 +120,7 @@ if ! safe_git -C "$TMP_PATCH_DIR/work" apply "$REVIEW_PATCH"; then
     echo "FAIL: review.patch failed to apply to fixture" >&2
     exit 1
 fi
-expected_visible="$(count_expected_checks "$DEVPACK_ROOT/eval/fixture/tests"/*.cpp)"
-if ! run_verified_test_binary "review.patch build_and_test" "$expected_visible" \
-    bash "$TMP_PATCH_DIR/work/build_and_test.sh" --no-cmake; then
+if ! run_gcov_visible_tests "review.patch build_and_test" "$TMP_PATCH_DIR/work"; then
     echo "FAIL: review.patch failed to compile and pass fixture build" >&2
     exit 1
 fi

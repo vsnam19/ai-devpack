@@ -11,14 +11,27 @@ index 60aeb94..ed31f39 100644
          m_isLatched = false;
          m_healingCounter = 0U;
          m_counter = 0;
-diff --git a/tests/test_dtc_debouncer.cpp b/tests/test_dtc_debouncer.cpp
-index 517f3f8..1b17673 100644
---- a/tests/test_dtc_debouncer.cpp
-+++ b/tests/test_dtc_debouncer.cpp
-@@ -141,6 +141,26 @@ void testResetAndUnconfirmedPassRecovery() {
-     CHECK(!debouncer.isConfirmed());
- }
- 
+diff --git a/tests/test_vague_dtc_healing.cpp b/tests/test_vague_dtc_healing.cpp
+new file mode 100644
+index 0000000..c5d9181
+--- /dev/null
++++ b/tests/test_vague_dtc_healing.cpp
+@@ -0,0 +1,40 @@
++/**
++ * @file test_vague_dtc_healing.cpp
++ * @brief Unit tests for REQ-DTC-003 single-cycle aging clear behavior.
++ */
++
++#include "dtc_debouncer.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::DtcConfig;
++using can_fixture::DtcDebouncer;
++using can_fixture::DtcState;
 +
 +/**
 + * @brief Verify single-cycle aging clears immediately at agingThreshold == 1.
@@ -39,14 +52,8 @@ index 517f3f8..1b17673 100644
 +    CHECK_EQ(debouncer.counter(), static_cast<std::int16_t>(0));
 +}
 +
- }  // namespace
- 
- void runDtcDebouncerTests() {
-@@ -148,6 +168,7 @@ void runDtcDebouncerTests() {
-     testPendingAndConfirmDebounceThresholds();
-     testOperationCycleAgingAndHealing();
-     testResetAndUnconfirmedPassRecovery();
-+    testSingleCycleAgingBoundary();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testSingleCycleAgingBoundary);
++
++}  // namespace can_fixture_test

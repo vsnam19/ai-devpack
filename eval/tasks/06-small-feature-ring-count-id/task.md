@@ -16,13 +16,13 @@ Specifically:
    ```
    with complete Doxygen documentation (`@brief`, `@param[in] canId`, `@return`).
 2. In `src/ring_buffer.cpp`, implement `FrameRingBuffer::countByCanId(std::uint32_t canId) const noexcept` to iterate across the `m_count` active slots starting from `m_tail` (wrapping modulo `m_capacity`) and return how many buffered frames have `frame.canId == canId`.
-3. In `test_ring_buffer.cpp` (in `tests/`), add a unit test tagged `@req REQ-RING-004` and call it from `runRingBufferTests()`.
+3. In a new test file tests/test_ring_count_id.cpp (do not modify existing protected tests/test_*.cpp files), add unit tests tagged `@req REQ-RING-004` and register the test function via `REGISTER_TEST_SUITE(...)` from `test_framework.hpp`.
 
 ## Files allowed
 
 - `include/ring_buffer.hpp`
 - `src/ring_buffer.cpp`
-- `test_ring_buffer.cpp` (in `tests/`)
+- tests/test_ring_count_id.cpp
 
 ## Commands to run
 
@@ -30,7 +30,7 @@ Specifically:
 
 ## STOP rule
 
-- Only edit `include/ring_buffer.hpp`, `src/ring_buffer.cpp`, and `test_ring_buffer.cpp` (in `tests/`).
+- Only edit `include/ring_buffer.hpp` and `src/ring_buffer.cpp`, and create tests/test_ring_count_id.cpp. Do not modify existing tests/test_*.cpp.
 - Follow all Doxygen (`@param[in]`) and naming rules (no non-meaningful names such as `tmp`, `val`, `buf`).
 - Never delete or weaken existing tests or assertions.
 - Maximum 2 fix attempts per distinct error; if still failing, stop and report the exact failure.

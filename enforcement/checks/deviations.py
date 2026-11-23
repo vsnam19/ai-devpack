@@ -197,6 +197,9 @@ def load_deviations_registry(
         except ValueError as exc:
             return None, f"deviation '{dev_id}' invalid field: {exc}"
 
+        if not rules:
+            return None, f"deviation '{dev_id}' missing non-empty rules"
+
         approved_by = str(raw.get("approved_by") or "").strip()
         if not approved_by:
             return None, f"deviation '{dev_id}' missing non-empty approved_by"
@@ -255,7 +258,7 @@ def verify_deviation(
     if is_expired(entry.expires, now=now):
         return None, f"deviation '{clean_id}' expired on {entry.expires}"
 
-    if rule and entry.rules and "*" not in entry.rules and rule not in entry.rules:
+    if rule and (not entry.rules or ("*" not in entry.rules and rule not in entry.rules)):
         return None, f"deviation '{clean_id}' does not cover rule '{rule}'"
 
     if files:

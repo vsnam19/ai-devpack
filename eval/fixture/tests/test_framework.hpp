@@ -4,7 +4,11 @@
  */
 
 #ifndef CAN_FIXTURE_TEST_FRAMEWORK_HPP
-#define CAN_FIXTURE_TEST_FRAMEWORK_HPP
+#ifdef DEVPACK_FRAMEWORK_GUARD
+#define CAN_FIXTURE_TEST_FRAMEWORK_HPP DEVPACK_FRAMEWORK_GUARD
+#else
+#define CAN_FIXTURE_TEST_FRAMEWORK_HPP 1
+#endif
 
 #include <cmath>
 #include <cstddef>
@@ -122,7 +126,63 @@ void runLinkStateMachineTests();
  */
 void runDtcDebouncerTests();
 
+/**
+ * @brief Intrusive linked-list node for self-registering test suites in separate files.
+ */
+struct TestSuiteNode {
+    /** @brief Test suite entry function pointer. */
+    void (*run)();
+    /** @brief Next registered node in the intrusive list. */
+    TestSuiteNode* next;
+};
+
+/**
+ * @brief Return the head pointer reference for self-registered test suites.
+ * @tparam Tag Dummy template parameter to keep function header-only under lint rules.
+ * @return Reference to head pointer of registered test suites.
+ */
+template <int Tag = 0>
+inline TestSuiteNode*& registeredSuiteHead() noexcept {
+    static TestSuiteNode* head = nullptr;
+    return head;
+}
+
+/**
+ * @brief Execute all self-registered test suites in registration order.
+ * @tparam Tag Dummy template parameter to keep function header-only under lint rules.
+ */
+template <int Tag = 0>
+inline void runRegisteredTestSuites() {
+    for (const TestSuiteNode* node = registeredSuiteHead<Tag>(); node != nullptr; node = node->next) {
+        if (node->run != nullptr) {
+            node->run();
+        }
+    }
+}
+
+/**
+ * @brief Static registrar adding a test suite function to the global intrusive list.
+ * @tparam Tag Dummy template parameter to keep definition header-only under lint rules.
+ */
+template <int Tag = 0>
+struct AutoTestSuiteRegistrar {
+    /**
+     * @brief Register @p suiteFn on static initialization.
+     * @param[in] suiteFn Test suite function to invoke from test_main.
+     */
+    explicit AutoTestSuiteRegistrar(void (*suiteFn)()) noexcept : node{suiteFn, nullptr} {
+        node.next = registeredSuiteHead<Tag>();
+        registeredSuiteHead<Tag>() = &node;
+    }
+
+    /** @brief Embedded intrusive node for this suite. */
+    TestSuiteNode node;
+};
+
 }  // namespace can_fixture_test
+
+#define REGISTER_TEST_SUITE(fn) \
+    static ::can_fixture_test::AutoTestSuiteRegistrar<0> kSuiteReg##fn(&(fn))
 
 #define CHECK(expr) \
     ::can_fixture_test::recordCheck<0>(static_cast<bool>(expr), #expr, __FILE__, __LINE__)

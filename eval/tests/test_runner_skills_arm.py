@@ -41,7 +41,7 @@ class RunnerTrialSkillsArmTests(unittest.TestCase):
         run_root = base / "runs_root"
         with mock.patch.object(
             devpack_run, "run_task_workflow", side_effect=_workflow_stub
-        ) as workflow, mock.patch.object(run_eval, "_run_check_script", return_value=(0, "")):
+        ) as workflow, mock.patch.object(run_eval, "_run_check_script", return_value=(0, "", False)):
             run_eval.run_runner_trial(
                 task=task,
                 pair_label="haiku:haiku",

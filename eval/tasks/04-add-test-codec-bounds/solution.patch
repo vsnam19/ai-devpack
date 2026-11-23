@@ -1,11 +1,27 @@
-diff --git a/tests/test_can_codec.cpp b/tests/test_can_codec.cpp
-index bc4e33c..ba8c098 100644
---- a/tests/test_can_codec.cpp
-+++ b/tests/test_can_codec.cpp
-@@ -130,6 +130,35 @@ void testPhysicalScalingAndClamping() {
-     CHECK_NEAR(decodedTemp, -40.0, 1e-6);
- }
- 
+diff --git a/tests/test_codec_bounds.cpp b/tests/test_codec_bounds.cpp
+new file mode 100644
+index 0000000..c5d9181
+--- /dev/null
++++ b/tests/test_codec_bounds.cpp
+@@ -0,0 +1,52 @@
++/**
++ * @file test_codec_bounds.cpp
++ * @brief Unit tests for CAN codec null-pointer, short-frame, and 64-bit boundary checks.
++ */
++
++#include <array>
++
++#include "can_codec.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::Endianness;
++using can_fixture::kMaxFrameBytes;
++using can_fixture::SignalDef;
++
 +/**
 + * @brief Verify packRaw and unpackRaw reject null pointers, short frames, and out-of-bounds signals.
 + * @req REQ-CODEC-006
@@ -35,14 +51,8 @@ index bc4e33c..ba8c098 100644
 +    CHECK(!can_fixture::unpackRaw(validBoundary, frameBytes.data(), 0U, &rawValue));
 +}
 +
- }  // namespace
- 
- void runCanCodecTests() {
-@@ -138,6 +167,7 @@ void runCanCodecTests() {
-     testBigEndianPackUnpack();
-     testSignedSignalEncodeDecode();
-     testPhysicalScalingAndClamping();
-+    testCodecBoundsAndNullChecks();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testCodecBoundsAndNullChecks);
++
++}  // namespace can_fixture_test

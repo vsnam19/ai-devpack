@@ -157,3 +157,5 @@ Lesson attribution, including the base pack and v0.2 build rework evidence
 | `LSN-023` | `TOOL` | `MODEL` | Test lock checks preprocessing directives and compiler-preprocessed assertion counts |
 | `LSN-024` | `TOOL` | `MODEL` | Agent-authored exemptions, baselines, and memory proposals are untrusted |
 | `LSN-025` | `TOOL` | - | One shared redactor protects every persisted and rendered log surface |
+| `LSN-026` | `TOOL` | `MODEL` | Worker-controlled stdout is forgeable; verify test execution outside the process |
+| `LSN-027` | `TOOL` | `MODEL` | Ignore files and static-analysis suppressions are trusted gate inputs |

@@ -98,14 +98,28 @@ index 000ff0f..2b251d7 100644
 +}
 +
  }  // namespace can_fixture
-diff --git a/tests/test_link_state_machine.cpp b/tests/test_link_state_machine.cpp
-index 199f640..a4b5f6b 100644
---- a/tests/test_link_state_machine.cpp
-+++ b/tests/test_link_state_machine.cpp
-@@ -112,6 +112,27 @@ void testResetFromAnyState() {
-     CHECK_EQ(machine.state(), LinkState::Connecting);
- }
- 
+diff --git a/tests/test_link_fault_recovery.cpp b/tests/test_link_fault_recovery.cpp
+new file mode 100644
+index 0000000..c5d9181
+--- /dev/null
++++ b/tests/test_link_fault_recovery.cpp
+@@ -0,0 +1,42 @@
++/**
++ * @file test_link_fault_recovery.cpp
++ * @brief Unit tests for REQ-LINK-006 faultCount and recoverFromFault.
++ */
++
++#include "link_state_machine.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::LinkConfig;
++using can_fixture::LinkState;
++using can_fixture::LinkStateMachine;
++
 +/**
 + * @brief Verify faultCount tracking, recoverFromFault guards, and reset clearing.
 + * @req REQ-LINK-006
@@ -127,14 +141,8 @@ index 199f640..a4b5f6b 100644
 +    CHECK_EQ(machine.faultCount(), static_cast<std::uint32_t>(0U));
 +}
 +
- }  // namespace
- 
- void runLinkStateMachineTests() {
-@@ -119,6 +140,7 @@ void runLinkStateMachineTests() {
-     testHandshakeRetryAndFault();
-     testHeartbeatSupervisionAndDegradedEscalation();
-     testResetFromAnyState();
-+    testFaultCountAndRecovery();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testFaultCountAndRecovery);
++
++}  // namespace can_fixture_test

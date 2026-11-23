@@ -11,14 +11,27 @@ index 6480c63..000ff0f 100644
          nowMs < m_lastTimestampMs) {
          return false;
      }
-diff --git a/tests/test_link_state_machine.cpp b/tests/test_link_state_machine.cpp
-index 199f640..9da711a 100644
---- a/tests/test_link_state_machine.cpp
-+++ b/tests/test_link_state_machine.cpp
-@@ -112,6 +112,24 @@ void testResetFromAnyState() {
-     CHECK_EQ(machine.state(), LinkState::Connecting);
- }
- 
+diff --git a/tests/test_vague_link_recovery.cpp b/tests/test_vague_link_recovery.cpp
+new file mode 100644
+index 0000000..c5d9181
+--- /dev/null
++++ b/tests/test_vague_link_recovery.cpp
+@@ -0,0 +1,38 @@
++/**
++ * @file test_vague_link_recovery.cpp
++ * @brief Unit tests for REQ-LINK-005 link fault heartbeat guards.
++ */
++
++#include "link_state_machine.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::LinkConfig;
++using can_fixture::LinkState;
++using can_fixture::LinkStateMachine;
 +
 +/**
 + * @brief Verify onHeartbeat is rejected in Idle, Connecting, Fault, and stale timestamps.
@@ -37,14 +50,8 @@ index 199f640..9da711a 100644
 +    CHECK_EQ(machine.state(), LinkState::Fault);
 +}
 +
- }  // namespace
- 
- void runLinkStateMachineTests() {
-@@ -119,6 +137,7 @@ void runLinkStateMachineTests() {
-     testHandshakeRetryAndFault();
-     testHeartbeatSupervisionAndDegradedEscalation();
-     testResetFromAnyState();
-+    testHeartbeatStateGuards();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testHeartbeatStateGuards);
++
++}  // namespace can_fixture_test

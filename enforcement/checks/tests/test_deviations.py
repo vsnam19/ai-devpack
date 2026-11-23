@@ -64,7 +64,7 @@ class DeviationRegistryFormatTests(unittest.TestCase):
     def test_json_registry_with_top_level_list_parses(self) -> None:
         """A .json registry whose content starts with '[' is parsed as JSON."""
         content = (
-            '[{"id": "DEV-900", "files": ["tests/test_a.py"], '
+            '[{"id": "DEV-900", "files": ["tests/test_a.py"], "rules": ["test_lock"], '
             '"approved_by": "lead", "expires": "2027-01-01"}]'
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,7 +80,7 @@ class DeviationRegistryFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             reg = Path(tmp) / "registry.toml"
             reg.write_text(
-                '[[deviations]]\nid = "DEV-002"\nfiles = ["a.py"]\n'
+                '[[deviations]]\nid = "DEV-002"\nfiles = ["a.py"]\nrules = ["test_lock"]\n'
                 'approved_by = "lead"\nexpires = "2027-01-01"\n',
                 encoding="utf-8",
             )
@@ -88,6 +88,21 @@ class DeviationRegistryFormatTests(unittest.TestCase):
         self.assertIsNone(err)
         assert entries is not None
         self.assertIn("DEV-002", entries)
+
+    def test_ruleless_entry_is_rejected(self) -> None:
+        """Registry entries omitting the required rules field are rejected."""
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = Path(tmp) / "deviations.json"
+            reg.write_text(
+                '{"deviations":[{"id":"DEV-NORULE","files":["src/a.cpp"],'
+                '"approved_by":"lead","expires":"2099-12-31"}]}',
+                encoding="utf-8",
+            )
+            entries, err = deviations.load_deviations_registry(reg)
+        self.assertIsNone(entries)
+        self.assertIsNotNone(err)
+        assert err is not None
+        self.assertIn("rules", err)
 
     def test_unsupported_extension_is_refused(self) -> None:
         """A registry with an extension other than .toml or .json is refused with a clear error."""

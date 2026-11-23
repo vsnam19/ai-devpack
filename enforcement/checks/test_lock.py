@@ -141,9 +141,10 @@ def code_lines(text: str) -> list[str]:
 
 
 def preserves_lines(base: str, current: str) -> bool:
-    """Check that existing code lines remain in order, allowing insertions anywhere."""
-    remaining = iter(code_lines(current))
-    return all(any(candidate == line for candidate in remaining) for line in code_lines(base))
+    """Check that protected test file is byte-identical except trailing whitespace on lines."""
+    base_lines = [line.rstrip() for line in base.splitlines()]
+    current_lines = [line.rstrip() for line in current.splitlines()]
+    return base_lines == current_lines
 
 
 def count_assertions(text: str, assert_rx: re.Pattern[str]) -> int:
@@ -361,9 +362,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"TEST_LOCK_VIOLATION: preprocessor directives modified in {rel_path}"
             )
             file_violated = True
-        if not preserves_lines(base_content, current_content):
+        if not preserves_lines(base_raw, current_raw):
             violations.append(
-                f"TEST_LOCK_VIOLATION: existing non-comment test lines modified or deleted in {rel_path}"
+                f"TEST_LOCK_VIOLATION: protected test file modified (must be byte-identical except trailing whitespace) in {rel_path}"
             )
             file_violated = True
         base_count = count_assertions(base_content, assert_rx)

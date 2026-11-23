@@ -25,16 +25,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import functools
+import hmac
 import json
 import math
 import os
 from pathlib import Path
+import secrets
+import shlex
 import shutil
 import signal
 import time
 import stat
 import subprocess
 import sys
+import tempfile
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
@@ -1138,6 +1142,68 @@ def _resolve_baseline_ref(
     return sha
 
 
+def build_docker_grader_invocation(
+    check_sh: Path,
+    work_dir: Path,
+    home_dir: Path,
+    tmp_dir: Path,
+    baseline_sha: str,
+    *,
+    docker_bin: str = "docker",
+    image_tag: str = DOCKER_IMAGE_TAG,
+) -> list[str]:
+    """Build an isolated ``docker run --network=none`` command for a grader script (no credentials)."""
+    resolved_work = work_dir.resolve()
+    resolved_pack = REPO_ROOT.resolve()
+    resolved_check = check_sh.resolve()
+    resolved_home = home_dir.resolve()
+    resolved_tmp = tmp_dir.resolve()
+
+    mounts = [
+        "-v", f"{resolved_work}:{DOCKER_TASK_DIR}:rw",
+        "-v", f"{resolved_pack}:/workspace/pack:ro",
+        "-v", f"{resolved_home}:/workspace/home:rw",
+        "-v", f"{resolved_tmp}:/workspace/tmp:rw",
+    ]
+    try:
+        rel_check = resolved_check.relative_to(resolved_pack)
+        container_check = f"/workspace/pack/{rel_check.as_posix()}"
+    except ValueError:
+        mounts.extend(["-v", f"{resolved_check.parent}:/workspace/grader:ro"])
+        container_check = f"/workspace/grader/{resolved_check.name}"
+
+    return [
+        docker_bin,
+        "run",
+        "--rm",
+        "--network=none",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        "--workdir",
+        DOCKER_TASK_DIR,
+        *mounts,
+        "-e",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "-e",
+        "HOME=/workspace/home",
+        "-e",
+        "TMPDIR=/workspace/tmp",
+        "-e",
+        "DEVPACK_ROOT=/workspace/pack",
+        "-e",
+        f"DEVPACK_BASELINE_SHA={baseline_sha}",
+        "-e",
+        "LANG=C.UTF-8",
+        "-e",
+        "LC_ALL=C.UTF-8",
+        image_tag,
+        "bash",
+        container_check,
+        "--workdir",
+        DOCKER_TASK_DIR,
+    ]
+
+
 def _run_check_script(
     check_sh: Path,
     work_dir: Path,
@@ -1147,8 +1213,19 @@ def _run_check_script(
     *,
     trial_dir: Path | None = None,
     baseline_sha: str = "",
-) -> tuple[int, str]:
-    """Execute ``check_sh --workdir <work_dir>`` with ``DEVPACK_ROOT`` and ``DEVPACK_BASELINE_SHA`` set."""
+    isolation: str = "docker",
+    allow_unsandboxed_local: bool = False,
+    docker_bin: str | None = None,
+    image_tag: str = DOCKER_IMAGE_TAG,
+) -> tuple[int, str, bool]:
+    """Execute ``check_sh --workdir <work_dir>`` under isolation and confirm exit-2 errors via wrapper nonce."""
+    if isolation not in ("local", "docker"):
+        raise ValueError(f"Unsupported grader isolation mode: {isolation}")
+    if isolation == "local" and not allow_unsandboxed_local:
+        raise ValueError(
+            "Local grader execution (--isolation local) requires --allow-unsandboxed-local."
+        )
+
     resolved_sha = (baseline_sha or "").strip()
     if not resolved_sha and trial_dir is not None:
         bfile = trial_dir / "baseline.sha"
@@ -1157,31 +1234,82 @@ def _run_check_script(
     if not resolved_sha:
         resolved_sha = os.environ.get("DEVPACK_BASELINE_SHA", "").strip()
     if not resolved_sha:
-        return 2, "GRADER_MISCONFIGURED: missing external DEVPACK_BASELINE_SHA / baseline.sha"
-    check_env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(home_dir),
-        "TMPDIR": str(tmp_dir),
-        "DEVPACK_ROOT": str(REPO_ROOT),
-        "DEVPACK_BASELINE_SHA": resolved_sha,
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-    }
-    if trial_dir is not None:
-        check_env["TRIAL_DIR"] = str(trial_dir)
-    try:
-        check_proc = subprocess.run(
-            ["bash", str(check_sh), "--workdir", str(work_dir)],
-            cwd=str(work_dir),
-            env=check_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
+        return 2, "GRADER_MISCONFIGURED: missing external DEVPACK_BASELINE_SHA / baseline.sha", True
+
+    if isolation == "docker":
+        resolved_docker = docker_bin or shutil.which("docker")
+        if not resolved_docker:
+            return 2, "GRADER_MISCONFIGURED: docker binary unavailable for grader isolation", True
+        grader_cmd = build_docker_grader_invocation(
+            check_sh,
+            work_dir,
+            home_dir,
+            tmp_dir,
+            resolved_sha,
+            docker_bin=resolved_docker,
+            image_tag=image_tag,
         )
-        return check_proc.returncode, (check_proc.stdout + "\n" + check_proc.stderr).strip()
-    except subprocess.TimeoutExpired:
-        return 124, f"check.sh timed out after {timeout_s}s"
+        wrapper_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home_dir),
+            "TMPDIR": str(tmp_dir),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+        }
+    else:
+        grader_cmd = ["bash", str(check_sh), "--workdir", str(work_dir)]
+        wrapper_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home_dir),
+            "TMPDIR": str(tmp_dir),
+            "DEVPACK_ROOT": str(REPO_ROOT),
+            "DEVPACK_BASELINE_SHA": resolved_sha,
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+        }
+        if trial_dir is not None:
+            wrapper_env["TRIAL_DIR"] = str(trial_dir)
+
+    grader_out_dir = Path(tempfile.mkdtemp(prefix="devpack-grader-out-"))
+    nonce = secrets.token_hex(16)
+    nonce_file = grader_out_dir / "harness_nonce"
+    wrapper_sh = grader_out_dir / "run_grader.sh"
+    try:
+        cmd_str = " ".join(shlex.quote(arg) for arg in grader_cmd)
+        wrapper_sh.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -u\n"
+            "rc=0\n"
+            f"env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE {cmd_str} || rc=$?\n"
+            "if [[ \"$rc\" -eq 2 ]]; then\n"
+            f"    printf '%s\\n' {shlex.quote(nonce)} > {shlex.quote(str(nonce_file))}\n"
+            "fi\n"
+            "exit \"$rc\"\n",
+            encoding="utf-8",
+        )
+        os.chmod(wrapper_sh, stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            check_proc = subprocess.run(
+                ["bash", str(wrapper_sh)],
+                cwd=str(work_dir),
+                env=wrapper_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+            raw_nonce = nonce_file.read_text(encoding="utf-8").strip() if nonce_file.is_file() else ""
+            confirmed_harness = (
+                check_proc.returncode == 2
+                and bool(raw_nonce)
+                and hmac.compare_digest(raw_nonce, nonce)
+            )
+            combined_out = (check_proc.stdout + "\n" + check_proc.stderr).strip()
+            return check_proc.returncode, combined_out, confirmed_harness
+        except subprocess.TimeoutExpired:
+            return 124, f"check.sh timed out after {timeout_s}s", False
+    finally:
+        shutil.rmtree(grader_out_dir, ignore_errors=True)
 
 
 def _parse_task_allowed_files(task_md_text: str) -> str:
@@ -1484,7 +1612,10 @@ def _run_trial_body(
                 no_cpp_change = True
             else:
                 lint_ok, lint_count, _lint_out = run_preflight_lint_on_changed(
-                    work_dir, changed_files or [], pack_root=REPO_ROOT
+                    work_dir,
+                    changed_files or [],
+                    pack_root=REPO_ROOT,
+                    base_ref=str(paths.get("baseline_sha", "")),
                 )
                 lint_findings_final = lint_count
                 # Retained on Python TrialResult for learning/validate.py; omitted in single-mode JSON/summary.
@@ -1498,7 +1629,7 @@ def _run_trial_body(
                 static_findings_first = static_count
                 static_clean_final = static_ok
 
-    check_rc, check_out = _run_check_script(
+    check_rc, check_out, confirmed_harness_err = _run_check_script(
         task.check_sh,
         work_dir,
         paths["home_dir"],
@@ -1506,8 +1637,12 @@ def _run_trial_body(
         timeout_s,
         trial_dir=paths["trial_root"],
         baseline_sha=str(paths.get("baseline_sha", "")),
+        isolation=isolation,
+        allow_unsandboxed_local=allow_unsandboxed_local,
+        docker_bin=docker_bin,
+        image_tag=image_tag,
     )
-    if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
+    if confirmed_harness_err:
         is_harness_err = True
         if not harness_reason:
             harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
@@ -1538,6 +1673,8 @@ def _run_trial_body(
         brief_variant=brief_variant,
         skills_enabled=skills_enabled,
         arm=arm,
+        grader_isolation=isolation,
+        grader_unsandboxed_opt_in=(isolation == "local" and allow_unsandboxed_local),
         finished=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -1823,7 +1960,7 @@ def run_runner_trial(
                 git_metadata_tampered=True,
             )
         else:
-            check_rc, check_out = _run_check_script(
+            check_rc, check_out, confirmed_harness_err = _run_check_script(
                 task.check_sh,
                 work_dir,
                 paths["home_dir"],
@@ -1831,8 +1968,12 @@ def run_runner_trial(
                 timeout_s,
                 trial_dir=paths["trial_root"],
                 baseline_sha=str(paths.get("baseline_sha", "")),
+                isolation=isolation,
+                allow_unsandboxed_local=allow_unsandboxed_local,
+                docker_bin=docker_bin,
+                image_tag=image_tag,
             )
-            if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
+            if confirmed_harness_err:
                 is_harness_err = True
                 if not harness_reason:
                     harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
@@ -1863,6 +2004,8 @@ def run_runner_trial(
             brief_variant=brief_variant,
             skills_enabled=skills_enabled,
             arm=arm,
+            grader_isolation=isolation,
+            grader_unsandboxed_opt_in=(isolation == "local" and allow_unsandboxed_local),
             finished=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -2202,7 +2345,7 @@ def run_orchestrator_trial(
             grading_work = trial_root / "grading-work"
             shutil.copytree(work_dir, grading_work, symlinks=True,
                             ignore=shutil.ignore_patterns(".devpack"))
-            check_rc, check_out = _run_check_script(
+            check_rc, check_out, confirmed_harness_err = _run_check_script(
                 goal.check_sh,
                 grading_work,
                 home_dir,
@@ -2210,8 +2353,12 @@ def run_orchestrator_trial(
                 timeout_s,
                 trial_dir=trial_root,
                 baseline_sha=orch_base_sha,
+                isolation=isolation,
+                allow_unsandboxed_local=allow_unsandboxed_local,
+                docker_bin=docker_bin,
+                image_tag=image_tag,
             )
-            if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
+            if confirmed_harness_err:
                 is_harness_err = True
                 if not harness_reason:
                     harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
@@ -2241,6 +2388,8 @@ def run_orchestrator_trial(
             context="none",
             brief_variant="standard",
             skills_enabled=False,
+            grader_isolation=isolation,
+            grader_unsandboxed_opt_in=(isolation == "local" and allow_unsandboxed_local),
             finished=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -2660,23 +2809,26 @@ def run_memory_trial(
 
             # Auto-accept deterministic handoff/known-gap proposals after step build gate passes
             if mem_enabled and agent_res.status == "ok":
-                try:
-                    build_proc = subprocess.run(
-                        ["bash", str(work_dir / "build_and_test.sh"), "--no-cmake"],
-                        cwd=str(work_dir),
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout_s,
-                        check=False,
-                    )
-                except subprocess.TimeoutExpired:
+                build_rc, build_out, build_harness_error = _run_check_script(
+                    REPO_ROOT / "eval/lib/check_memory_step.sh",
+                    work_dir, home_dir, tmp_dir, timeout_s,
+                    trial_dir=trial_root,
+                    baseline_sha=step_base_ref,
+                    isolation=isolation,
+                    allow_unsandboxed_local=allow_unsandboxed_local,
+                    docker_bin=docker_bin,
+                    image_tag=image_tag,
+                )
+                if build_rc == 124 or build_harness_error:
                     any_harness_err = True
                     if not harness_reason:
                         harness_reason = _redact(
-                            f"step {step_idx}: build_timeout: build_and_test.sh timed out after {timeout_s}s"
+                            f"step {step_idx}: "
+                            + (f"build_timeout: build_and_test.sh timed out after {timeout_s}s"
+                               if build_rc == 124 else f"build grader error: {build_out}")
                         )
                     break
-                if build_proc.returncode == 0:
+                if build_rc == 0:
                     prop_res = process_memory_proposals(
                         mem_root,
                         agent_res.final_text,
@@ -2693,7 +2845,7 @@ def run_memory_trial(
             check_rc = 1
             check_out = f"SCOPE_VIOLATION: {violation_detail}"
         else:
-            check_rc, check_out = _run_check_script(
+            check_rc, check_out, confirmed_harness_err = _run_check_script(
                 seq.check_sh,
                 work_dir,
                 home_dir,
@@ -2701,8 +2853,12 @@ def run_memory_trial(
                 timeout_s,
                 trial_dir=trial_root,
                 baseline_sha=mem_base_sha,
+                isolation=isolation,
+                allow_unsandboxed_local=allow_unsandboxed_local,
+                docker_bin=docker_bin,
+                image_tag=image_tag,
             )
-            if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
+            if confirmed_harness_err:
                 any_harness_err = True
                 if not harness_reason:
                     harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
@@ -2747,6 +2903,8 @@ def run_memory_trial(
             memory_injected_tokens=total_injected_tokens,
             context="none",
             brief_variant="standard",
+            grader_isolation=isolation,
+            grader_unsandboxed_opt_in=(isolation == "local" and allow_unsandboxed_local),
             skills_enabled=False,
             finished=datetime.now(timezone.utc).isoformat(),
         )

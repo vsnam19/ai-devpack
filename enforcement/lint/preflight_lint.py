@@ -40,6 +40,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import difflib
 import fnmatch
 import hashlib
 import importlib.util
@@ -258,6 +259,8 @@ class LintConfig:
     naming: NamingConfig = field(default_factory=NamingConfig)
     plugin_paths: tuple[str, ...] = ()
     deviation_id: str = ""
+    base_ref: str = ""
+    changed_paths: set[str] | None = None
 
 
 @dataclass
@@ -2566,10 +2569,217 @@ _PROCESS_TERMINATION_IDENT_RE = re.compile(
 )
 _ATTR_CTOR_DTOR_RE = re.compile(r"__attribute__\s*\(\s*\(\s*(?:constructor|destructor)\b")
 _LOCAL_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"')
+_SYS_INCLUDE_CSIGNAL_RE = re.compile(r"^\s*#\s*include\s*[<\"](?:csignal|signal\.h)[>\"]")
+_LINEMARKER_RE = re.compile(r'^#\s+(\d+)\s+"([^"]*)"')
+
+_PROC_TERM_EXACT_IDENTS: frozenset[str] = frozenset(
+    {
+        "exit",
+        "_exit",
+        "_Exit",
+        "quick_exit",
+        "abort",
+        "terminate",
+        "syscall",
+        "pthread_exit",
+        "kill",
+        "raise",
+        "sigaction",
+        "dlsym",
+        "dlopen",
+        "system",
+        "popen",
+        "fork",
+        "vfork",
+        "posix_spawn",
+        "posix_spawnp",
+        "fexecve",
+        "__builtin_trap",
+        "__builtin_unreachable",
+        "setjmp",
+        "longjmp",
+        "atexit",
+        "at_quick_exit",
+        "_Pragma",
+    }
+)
+_FORBIDDEN_TEST_LITERALS: tuple[str, ...] = (
+    "DEVPACK_TESTS_COMPLETED",
+    "GRADER_MISCONFIGURED",
+)
+
+_FRAMEWORK_TAMPER_MACRO_RE = re.compile(
+    r"^\s*#\s*(?:define|undef)\s+"
+    r"(CAN_FIXTURE_TEST_FRAMEWORK_HPP|DEVPACK_FRAMEWORK_GUARD|CHECK|CHECK_EQ|CHECK_NEAR|REGISTER_TEST_SUITE)\b"
+)
+_FRAMEWORK_TAMPER_SYMBOLS_RE = re.compile(
+    r"(?:\bstruct\s+TestCounters\b"
+    r"|\bstruct\s+TestSuiteNode\b|\bstruct\s+AutoTestSuiteRegistrar\b"
+    r"|\b(?:recordCheck|recordCheckEq|counters|printSummaryAndExitCode"
+    r"|registeredSuiteHead|runRegisteredTestSuites)\b)"
+)
+_FRAMEWORK_NAMESPACE_RE = re.compile(r"\bnamespace\s+can_fixture_test\b")
+_FRAMEWORK_REGISTRY_FN_RE = re.compile(
+    r"\b(?:runCanCodecTests|runRingBufferTests|runLinkStateMachineTests|runDtcDebouncerTests)\b"
+)
+
+_SUPPRESSION_LINE_RE = re.compile(
+    r"(?:cppcheck-suppress\b|\bNOLINT(?:NEXTLINE|BEGIN|END)?\b"
+    r"|#\s*pragma\s+(?:GCC|clang)\s+diagnostic\b"
+    r"|\b_Pragma\s*\([^)]*diagnostic)"
+)
+_DEVIATION_INLINE_RE = re.compile(r"\bDeviation:\s*(DEV-[A-Za-z0-9_.-]+)")
+
+_TOKENIZE_PREPROC_RE = re.compile(
+    r'R"(?P<delim>[^ ()\\\t\r\n]{0,16})\(.*?\)(?P=delim)"'
+    r'|"(?:\\.|[^"\\])*"'
+    r"|'(?:\\.|[^'\\])*'"
+    r"|::|##|->|\[\[|\]\]"
+    r"|[A-Za-z_][A-Za-z0-9_]*"
+    r"|[(){}\[\];,=<>!&|+\-*/%^~?:.#]"
+)
+
+
+def _strip_comments_preserve_strings_and_lines(text: str) -> str:
+    """Remove C/C++ comments while preserving string literals and line numbers."""
+    rx = re.compile(
+        r'R"(?P<delim>[^ ()\\\t\r\n]{0,16})\(.*?\)(?P=delim)"'
+        r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+        r"|//(?:\\\n|[^\n])*|/\*.*?(?:\*/|\Z)",
+        re.DOTALL,
+    )
+
+    def _repl(match: re.Match[str]) -> str:
+        tok = match.group()
+        if tok.startswith(("//", "/*")):
+            return " " + "\n" * tok.count("\n")
+        return tok
+
+    return rx.sub(_repl, text)
+
+
+def _decode_c_string_literal(raw_tok: str) -> str:
+    """Best-effort decode of a C/C++ quoted string literal token."""
+    if raw_tok.startswith('R"') and "(" in raw_tok and raw_tok.endswith('"'):
+        open_idx = raw_tok.find("(")
+        close_idx = raw_tok.rfind(")")
+        if 0 <= open_idx < close_idx:
+            return raw_tok[open_idx + 1 : close_idx]
+    if len(raw_tok) >= 2 and raw_tok[0] == '"' and raw_tok[-1] == '"':
+        inner = raw_tok[1:-1]
+        return (
+            inner.replace('\\"', '"')
+            .replace("\\\\", "\\")
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+        )
+    return raw_tok
+
+
+def _repo_rel_posix(path: pathlib.Path, repository_root: pathlib.Path | None) -> str:
+    """Return POSIX path of ``path`` relative to ``repository_root`` when possible."""
+    if repository_root is not None:
+        try:
+            return path.resolve().relative_to(repository_root.resolve()).as_posix()
+        except ValueError:
+            pass
+    return path.as_posix().replace("\\", "/")
+
+
+def _git_path_from_repo_root(
+    rel: str,
+    repository_root: pathlib.Path,
+) -> str:
+    """Prefix ``rel`` with ``git rev-parse --show-prefix`` when ``repository_root`` is a subdirectory."""
+    prefix_proc = run_git(
+        ["rev-parse", "--show-prefix"],
+        repo_root=repository_root,
+        check=False,
+    )
+    if prefix_proc.returncode == 0:
+        prefix = prefix_proc.stdout.strip().replace("\\", "/")
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        if prefix:
+            return f"{prefix}{rel.lstrip('/')}"
+    return rel
+
+
+def _is_worker_changed_file(
+    path: pathlib.Path,
+    repository_root: pathlib.Path | None,
+    config: LintConfig,
+) -> bool:
+    """Return True if ``path`` is worker-changed (or not an unmodified pristine pack/test file)."""
+    rel = _repo_rel_posix(path, repository_root)
+    if config.changed_paths is not None:
+        return rel in config.changed_paths
+    if repository_root is None:
+        return True
+    try:
+        inside = run_git(
+            ["rev-parse", "--is-inside-work-tree"],
+            repo_root=repository_root,
+            check=False,
+        )
+    except GitSecurityError:
+        return True
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return True
+
+    ref = config.base_ref or "HEAD"
+    git_rel = _git_path_from_repo_root(rel, repository_root)
+    show_proc = run_git(["show", f"{ref}:{git_rel}"], repo_root=repository_root, check=False)
+    if show_proc.returncode != 0:
+        # New/untracked file relative to ref
+        return True
+    try:
+        current = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    return current != show_proc.stdout
+
+
+def _get_worker_added_line_numbers(
+    path: pathlib.Path,
+    raw_text: str,
+    repository_root: pathlib.Path | None,
+    config: LintConfig,
+) -> set[int]:
+    """Return 1-based line numbers added or modified by the worker in ``raw_text``."""
+    lines = raw_text.splitlines()
+    all_lines = set(range(1, len(lines) + 1))
+    rel = _repo_rel_posix(path, repository_root)
+    if repository_root is None:
+        return all_lines
+    try:
+        inside = run_git(
+            ["rev-parse", "--is-inside-work-tree"],
+            repo_root=repository_root,
+            check=False,
+        )
+    except GitSecurityError:
+        return all_lines
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return all_lines
+
+    ref = config.base_ref or "HEAD"
+    git_rel = _git_path_from_repo_root(rel, repository_root)
+    show_proc = run_git(["show", f"{ref}:{git_rel}"], repo_root=repository_root, check=False)
+    if show_proc.returncode != 0:
+        return all_lines
+
+    base_lines = show_proc.stdout.splitlines()
+    matcher = difflib.SequenceMatcher(None, base_lines, lines, autojunk=False)
+    added: set[int] = set()
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("insert", "replace"):
+            added.update(range(j1 + 1, j2 + 1))
+    return added
 
 
 def _is_test_code_path(path: pathlib.Path, repository_root: pathlib.Path | None) -> bool:
-    """Return True when ``path`` sits in a unit/hidden test directory rather than worker code."""
+    """Return True when ``path`` sits in a unit/hidden test directory."""
     try:
         rel = path.resolve().relative_to(repository_root.resolve()) if repository_root else path
         parts = rel.parts[:-1]
@@ -2578,13 +2788,25 @@ def _is_test_code_path(path: pathlib.Path, repository_root: pathlib.Path | None)
     return any(p in ("tests", "test", "hidden", "hidden_tests") for p in parts)
 
 
-def _line_has_process_termination(line_text: str) -> bool:
-    """Return True if a comment/string-stripped line invokes process-termination/exec/ctor primitives."""
-    return bool(
-        _PROCESS_TERMINATION_CALL_RE.search(line_text)
-        or _PROCESS_TERMINATION_IDENT_RE.search(line_text)
-        or _ATTR_CTOR_DTOR_RE.search(line_text)
+def _has_rule_deviation(
+    path: pathlib.Path,
+    repository_root: pathlib.Path | None,
+    deviation_id: str,
+    rule: str,
+) -> bool:
+    """Return True only if ``deviation_id`` validates in DEVPACK_DEVIATIONS for this file and rule."""
+    clean_id = (deviation_id or "").strip()
+    if not clean_id:
+        return False
+    rel_file = _repo_rel_posix(path, repository_root) if repository_root else path.name
+    roots = (repository_root,) if repository_root is not None else ()
+    entry, _reason = verify_deviation(
+        clean_id,
+        files=(rel_file,),
+        rule=rule,
+        worktree_roots=roots,
     )
+    return entry is not None
 
 
 def _has_process_termination_deviation(
@@ -2592,24 +2814,222 @@ def _has_process_termination_deviation(
     repository_root: pathlib.Path | None,
     deviation_id: str,
 ) -> bool:
-    """Return True only if ``deviation_id`` validates in DEVPACK_DEVIATIONS for this file."""
-    clean_id = (deviation_id or "").strip()
-    if not clean_id:
-        return False
-    rel_file = str(path.name)
-    if repository_root is not None:
-        try:
-            rel_file = path.resolve().relative_to(repository_root.resolve()).as_posix()
-        except ValueError:
-            rel_file = path.as_posix()
-    roots = (repository_root,) if repository_root is not None else ()
-    entry, _reason = verify_deviation(
-        clean_id,
-        files=(rel_file,),
-        rule="PROCESS-TERMINATION",
-        worktree_roots=roots,
+    """Return True only if ``deviation_id`` validates in DEVPACK_DEVIATIONS for PROCESS-TERMINATION."""
+    return _has_rule_deviation(path, repository_root, deviation_id, "PROCESS-TERMINATION")
+
+
+def _preprocess_repo_lines(
+    path: pathlib.Path,
+    raw_text: str,
+    *,
+    is_c: bool,
+    std: str,
+    c_std: str,
+    repository_root: pathlib.Path | None,
+) -> list[tuple[int, str]]:
+    """Run ``g++ -E`` (or fallback) and return ``[(source_line_num, text)]`` for repo-local code."""
+    compiler_bin = shutil.which("g++" if not is_c else "gcc") or shutil.which(
+        "clang++" if not is_c else "clang"
     )
-    return entry is not None
+    inc_flags = infer_repo_include_flags(path)
+    if repository_root is not None:
+        for sub in ("include", "src", "tests"):
+            cand = repository_root / sub
+            if cand.is_dir():
+                flag = f"-I{cand}"
+                if flag not in inc_flags:
+                    inc_flags.append(flag)
+
+    resolved_target = path.resolve()
+    resolved_root = repository_root.resolve() if repository_root is not None else None
+
+    def _is_repo_local_file(fname: str) -> bool:
+        if not fname or fname.startswith("<"):
+            return fname == "<stdin>"
+        fp = pathlib.Path(fname)
+        try:
+            res = fp.resolve()
+        except OSError:
+            return False
+        if res == resolved_target:
+            return True
+        if res.name == "test_framework.hpp" and res.parent.name == "tests":
+            return False
+        if resolved_root is not None:
+            try:
+                res.relative_to(resolved_root)
+                return True
+            except ValueError:
+                return False
+        return res.parent == resolved_target.parent
+
+    if compiler_bin is not None:
+        lang = "c" if is_c else "c++"
+        std_flag = f"-std={c_std if is_c else std}"
+        # Pass 1: full -E with linemarkers, filtering out system headers by file marker
+        cmd = [compiler_bin, "-E", "-x", lang, std_flag, *inc_flags, str(path)]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is not None and proc.returncode == 0 and proc.stdout:
+            collected: list[tuple[int, str]] = []
+            cur_file = str(resolved_target)
+            cur_line = 1
+            keep = True
+            for line in proc.stdout.splitlines():
+                lm = _LINEMARKER_RE.match(line)
+                if lm:
+                    cur_line = int(lm.group(1))
+                    cur_file = lm.group(2)
+                    keep = _is_repo_local_file(cur_file)
+                    continue
+                if keep and line.strip():
+                    report_ln = cur_line if pathlib.Path(cur_file).resolve() == resolved_target else 1
+                    collected.append((report_ln, line))
+                cur_line += 1
+            return collected
+
+        # Pass 2: strip `#include <...>` system headers and `#include "test_framework.hpp"` so local macros expand
+        no_sys = "\n".join(
+            ""
+            if re.match(r'^\s*#\s*include\s*(?:<[^>]+>|"test_framework\.hpp")', ln)
+            else ln
+            for ln in raw_text.splitlines()
+        )
+        cmd_p = [compiler_bin, "-E", "-P", "-x", lang, std_flag, *inc_flags, "-"]
+        try:
+            proc_p = subprocess.run(
+                cmd_p,
+                input=no_sys,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc_p = None
+        if proc_p is not None and proc_p.returncode == 0 and proc_p.stdout.strip():
+            return [(1, ln) for ln in proc_p.stdout.splitlines() if ln.strip()]
+
+    # Fallback: comment-stripped source preserving string literals and exact line numbers
+    stripped_keep_strings = _strip_comments_preserve_strings_and_lines(raw_text)
+    return [
+        (idx, ln)
+        for idx, ln in enumerate(stripped_keep_strings.splitlines(), start=1)
+        if ln.strip()
+    ]
+
+
+def _scan_process_termination_tokens(
+    preprocessed_lines: Sequence[tuple[int, str]],
+    raw_text: str,
+) -> list[tuple[int, str]]:
+    """Return ``[(line_num, reason)]`` for forbidden termination/exec/literal tokens."""
+    hits: list[tuple[int, str]] = []
+    seen_lines: set[tuple[int, str]] = set()
+    has_csignal = any(_SYS_INCLUDE_CSIGNAL_RE.match(ln) for ln in raw_text.splitlines())
+
+    def _record(ln: int, reason: str) -> None:
+        key = (ln, reason)
+        if key not in seen_lines:
+            seen_lines.add(key)
+            hits.append(key)
+
+    # Check raw comment-stripped text for forbidden literals and _Pragma (consumed during -E)
+    raw_no_comments = _strip_comments_preserve_strings_and_lines(raw_text)
+    for idx, line_txt in enumerate(raw_no_comments.splitlines(), start=1):
+        for lit in _FORBIDDEN_TEST_LITERALS:
+            if lit in line_txt:
+                _record(idx, f"Forbidden test-proof literal '{lit}'")
+        if re.search(r"\b_Pragma\b", strip_comments_and_strings(line_txt)):
+            _record(idx, "Forbidden primitive '_Pragma'")
+
+    # Tokenize preprocessed stream across lines so multiline calls / attributes / adjacent strings match
+    tokens: list[tuple[int, str, str]] = []  # (line_num, kind, value)
+    for ln, line_txt in preprocessed_lines:
+        for m in _TOKENIZE_PREPROC_RE.finditer(line_txt):
+            tok = m.group(0)
+            if tok.startswith(('"', 'R"')):
+                tokens.append((ln, "str", _decode_c_string_literal(tok)))
+            elif tok.startswith("'"):
+                tokens.append((ln, "char", tok))
+            elif tok[0].isalpha() or tok[0] == "_":
+                tokens.append((ln, "id", tok))
+            else:
+                tokens.append((ln, "op", tok))
+
+    # Merge adjacent string literals and scan them for forbidden literals
+    merged_strings: list[tuple[int, str]] = []
+    i = 0
+    while i < len(tokens):
+        ln, kind, val = tokens[i]
+        if kind == "str":
+            buf = [val]
+            j = i + 1
+            while j < len(tokens) and tokens[j][1] == "str":
+                buf.append(tokens[j][2])
+                j += 1
+            combined = "".join(buf)
+            merged_strings.append((ln, combined))
+            for lit in _FORBIDDEN_TEST_LITERALS:
+                if lit in combined:
+                    _record(ln, f"Forbidden test-proof literal '{lit}'")
+            i = j
+        else:
+            i += 1
+
+    # Scan identifier and punctuator token stream
+    n = len(tokens)
+    for idx, (ln, kind, val) in enumerate(tokens):
+        if kind != "id":
+            continue
+        if val in _PROC_TERM_EXACT_IDENTS or val.startswith("exec"):
+            _record(ln, f"Forbidden primitive '{val}'")
+            continue
+        if val == "signal":
+            prev_val = tokens[idx - 1][2] if idx > 0 else ""
+            prev2_val = tokens[idx - 2][2] if idx > 1 else ""
+            next_val = tokens[idx + 1][2] if idx + 1 < n else ""
+            is_member_access = next_val in (".", "->")
+            is_qualified = prev_val == "::"
+            is_call = next_val == "(" or (prev_val == "(" and next_val == ")" and idx + 2 < n and tokens[idx + 2][2] == "(")
+            is_assigned_or_ret = (not is_member_access) and (
+                prev_val in ("=", "return") or (prev_val == "&" and prev2_val == "=")
+            )
+            if has_csignal or is_qualified or is_call or is_assigned_or_ret:
+                _record(ln, "Forbidden signal handler primitive 'signal'")
+            continue
+        if val == "__attribute__":
+            # Look ahead up to 12 tokens for (( ... constructor/destructor ... ))
+            window = [t[2] for t in tokens[idx + 1 : min(n, idx + 13)]]
+            if len(window) >= 4 and window[0] == "(" and window[1] == "(":
+                if "constructor" in window or "destructor" in window:
+                    _record(ln, "Forbidden __attribute__((constructor/destructor))")
+            continue
+        if val in ("constructor", "destructor") and idx >= 3:
+            if tokens[idx - 1][2] == "::" and tokens[idx - 2][2] == "gnu":
+                _record(ln, f"Forbidden [[gnu::{val}]] attribute")
+
+    return hits
+
+
+def _line_has_process_termination(line_text: str) -> bool:
+    """Return True if a single comment/string-stripped line invokes process-termination primitives."""
+    hits = _scan_process_termination_tokens([(1, line_text)], line_text)
+    return bool(hits)
 
 
 def check_c_or_cpp_file(
@@ -2735,7 +3155,10 @@ def check_c_or_cpp_file(
         ):
             rule = "MISRA-C-21.4" if is_c else "MISRA-21.10.2"
             _add_lexical_finding(idx, rule, "error", "<setjmp.h> / setjmp / longjmp forbidden")
-        if re.search(r"(?<![.\w>:])\b(abort|exit|_Exit|quick_exit|system)\s*\(", line_text):
+        if re.search(
+            r"(?:(?<![.\w>:])|\bstd\s*::\s*|(?<!\w)::\s*)(abort|exit|_Exit|quick_exit|system)\s*\(",
+            line_text,
+        ):
             rule = "MISRA-C-21.8" if is_c else "MISRA-18.5.2"
             _add_lexical_finding(
                 idx,
@@ -2743,21 +3166,6 @@ def check_c_or_cpp_file(
                 "error",
                 "Process-terminating / shell functions (abort/exit/system) forbidden",
             )
-        if not _is_test_code_path(path, repository_root) and _line_has_process_termination(line_text):
-            if not _has_process_termination_deviation(path, repository_root, cfg.deviation_id):
-                finding = Finding(
-                    str(path),
-                    idx,
-                    "PROCESS-TERMINATION",
-                    "error",
-                    "Process-terminating, exec/spawn, or constructor/destructor attribute forbidden in worker code",
-                )
-                report.findings.append(finding)
-                if contexts is not None:
-                    contexts[id(finding)] = FingerprintContext(
-                        tokens=_extract_statement_tokens(raw_text, idx),
-                        extra_roots=extra_roots,
-                    )
         if re.search(r"(?<![.\w>:])\b(strcpy|strcat|sprintf|vsprintf|gets)\s*\(", line_text):
             rule = "MISRA-C-21.17" if is_c else "MISRA-STR-BOUND"
             _add_lexical_finding(
@@ -2772,14 +3180,102 @@ def check_c_or_cpp_file(
         ):
             _add_lexical_finding(idx, "MISRA-C-20.4", "error", "Macro shall not redefine a C/C++ keyword")
 
+    # 2b. Preprocessed token-stream PROCESS-TERMINATION, TEST-FRAMEWORK-TAMPER, and SUPPRESSION-WITHOUT-DEVIATION
+    is_test_dir = _is_test_code_path(path, repository_root)
+    pack_fixture_tests = pathlib.Path(_REPO_ROOT_STR) / "eval" / "fixture" / "tests"
+    is_pack_owned_framework = path.name in ("test_framework.hpp", "test_main.cpp") and (
+        path.resolve() == (pack_fixture_tests / path.name).resolve()
+        or (
+            (pack_fixture_tests / path.name).is_file()
+            and raw_text == (pack_fixture_tests / path.name).read_text(encoding="utf-8", errors="replace")
+        )
+    )
+    worker_changed = False if is_pack_owned_framework else _is_worker_changed_file(path, repository_root, cfg)
+    enforce_proc_term = (not is_test_dir) or worker_changed
+    if enforce_proc_term and "PROCESS-TERMINATION" not in disabled:
+        if not _has_process_termination_deviation(path, repository_root, cfg.deviation_id):
+            preproc_lines = _preprocess_repo_lines(
+                path,
+                raw_text,
+                is_c=is_c,
+                std=cfg.std,
+                c_std=cfg.c_std,
+                repository_root=repository_root,
+            )
+            for hit_ln, hit_reason in _scan_process_termination_tokens(preproc_lines, raw_text):
+                finding = Finding(
+                    str(path),
+                    hit_ln,
+                    "PROCESS-TERMINATION",
+                    "error",
+                    f"{hit_reason}; process-terminating, exec/spawn, constructor/destructor, or proof-literal forbidden",
+                )
+                report.findings.append(finding)
+                if contexts is not None:
+                    contexts[id(finding)] = FingerprintContext(
+                        tokens=_extract_statement_tokens(raw_text, hit_ln),
+                        extra_roots=extra_roots,
+                    )
+
+    # TEST-FRAMEWORK-TAMPER: worker headers/code/tests defining framework guard or framework symbols
+    is_pristine_framework_file = is_pack_owned_framework or (
+        (not worker_changed)
+        and path.name
+        in (
+            "test_framework.hpp",
+            "test_main.cpp",
+            "test_can_codec.cpp",
+            "test_ring_buffer.cpp",
+            "test_link_state_machine.cpp",
+            "test_dtc_debouncer.cpp",
+        )
+    )
+    if not is_pristine_framework_file and "TEST-FRAMEWORK-TAMPER" not in disabled:
+        for idx, raw_ln in enumerate(_strip_comments_preserve_strings_and_lines(raw_text).splitlines(), start=1):
+            tamper_hit = bool(_FRAMEWORK_TAMPER_MACRO_RE.search(raw_ln) or _FRAMEWORK_TAMPER_SYMBOLS_RE.search(raw_ln))
+            if not tamper_hit and (is_header or not is_test_dir):
+                tamper_hit = bool(_FRAMEWORK_REGISTRY_FN_RE.search(raw_ln) or _FRAMEWORK_NAMESPACE_RE.search(raw_ln))
+            if tamper_hit:
+                _add_lexical_finding(
+                    idx,
+                    "TEST-FRAMEWORK-TAMPER",
+                    "error",
+                    "Defining or redefining test framework guard, macros, or framework symbols is forbidden",
+                )
+
+    # SUPPRESSION-WITHOUT-DEVIATION: inline suppressions added by the worker require verified Deviation: DEV-<n>
+    if "SUPPRESSION-WITHOUT-DEVIATION" not in disabled:
+        added_lines = _get_worker_added_line_numbers(path, raw_text, repository_root, cfg)
+        raw_lines = raw_text.splitlines()
+        for idx in sorted(added_lines):
+            if idx < 1 or idx > len(raw_lines):
+                continue
+            raw_ln = raw_lines[idx - 1]
+            if not _SUPPRESSION_LINE_RE.search(raw_ln):
+                continue
+            dev_match = _DEVIATION_INLINE_RE.search(raw_ln)
+            dev_ok = bool(
+                dev_match
+                and _has_rule_deviation(
+                    path, repository_root, dev_match.group(1), "SUPPRESSION-WITHOUT-DEVIATION"
+                )
+            )
+            if not dev_ok:
+                _add_lexical_finding(
+                    idx,
+                    "SUPPRESSION-WITHOUT-DEVIATION",
+                    "error",
+                    "Inline suppression requires 'Deviation: DEV-<n>' on the same line matching DEVPACK_DEVIATIONS",
+                )
+
     # Scan non-standard locally #included fragments (e.g. .inc/.inl) within repo for PROCESS-TERMINATION
-    if not _is_test_code_path(path, repository_root):
+    if enforce_proc_term and "PROCESS-TERMINATION" not in disabled:
         for idx, raw_line in enumerate(raw_text.splitlines(), start=1):
             inc_match = _LOCAL_INCLUDE_RE.match(raw_line)
             if not inc_match:
                 continue
             inc_rel = inc_match.group(1)
-            for base_dir in (path.parent, *( [repository_root / "src", repository_root / "include"] if repository_root else [] )):
+            for base_dir in (path.parent, *([repository_root / "src", repository_root / "include"] if repository_root else [])):
                 cand = (base_dir / inc_rel).resolve()
                 if cand.is_file() and cand.suffix not in (C_EXTS | CPP_EXTS):
                     if repository_root is not None:
@@ -2787,20 +3283,26 @@ def check_c_or_cpp_file(
                             cand.relative_to(repository_root.resolve())
                         except ValueError:
                             continue
-                    inc_stripped = strip_comments_and_strings(cand.read_text(encoding="utf-8", errors="replace"))
-                    for inc_ln, inc_text in enumerate(inc_stripped.splitlines(), start=1):
-                        if _line_has_process_termination(inc_text) and not _has_process_termination_deviation(
-                            cand, repository_root, cfg.deviation_id
-                        ):
-                            finding = Finding(
-                                str(cand),
-                                inc_ln,
-                                "PROCESS-TERMINATION",
-                                "error",
-                                f"Process-terminating or constructor/destructor attribute forbidden in included fragment (from {path.name}:{idx})",
-                            )
-                            report.findings.append(finding)
-                            break
+                    cand_raw = cand.read_text(encoding="utf-8", errors="replace")
+                    cand_lines = [
+                        (ln_i, ln_t)
+                        for ln_i, ln_t in enumerate(_strip_comments_preserve_strings_and_lines(cand_raw).splitlines(), start=1)
+                        if ln_t.strip()
+                    ]
+                    frag_hits = _scan_process_termination_tokens(cand_lines, cand_raw)
+                    if frag_hits and not _has_process_termination_deviation(
+                        cand, repository_root, cfg.deviation_id
+                    ):
+                        inc_ln, frag_reason = frag_hits[0]
+                        finding = Finding(
+                            str(cand),
+                            inc_ln,
+                            "PROCESS-TERMINATION",
+                            "error",
+                            f"{frag_reason} in included fragment (from {path.name}:{idx})",
+                        )
+                        report.findings.append(finding)
+                        break
                     break
 
     # 3. Compiler syntax & warning check + 4. Clang AST JSON check
@@ -3992,7 +4494,14 @@ def _run_file_checks_with_context(
     @return Tuple of (FileReport, local_contexts).
     """
     cache_key: str | None = None
-    if not no_cache and cache_dir is not None and not plugins:
+    if (
+        not no_cache
+        and cache_dir is not None
+        and not plugins
+        and not config.base_ref
+        and config.changed_paths is None
+        and not config.deviation_id
+    ):
         cache_key = _compute_file_cache_key(
             path,
             config,
@@ -4253,6 +4762,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Human deviation ID verified against DEVPACK_DEVIATIONS (e.g. for PROCESS-TERMINATION)",
     )
+    parser.add_argument(
+        "--base",
+        default="",
+        help="Base git ref for detecting worker-added suppressions and changed test files",
+    )
     return parser
 
 
@@ -4316,6 +4830,7 @@ def _resolve_config_from_args(
             setattr(config.naming, naming_attr, val)
     config.naming.validate()
     config.deviation_id = str(getattr(args, "deviation", "") or "").strip()
+    config.base_ref = str(getattr(args, "base", "") or "").strip()
     return config
 
 
@@ -4452,6 +4967,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     try:
         config = _resolve_config_from_args(args, repository_root)
+        config.changed_paths = changed_paths
         plugins = load_plugins(
             config.plugin_paths,
             args.config.resolve().parent if args.config is not None else repository_root,

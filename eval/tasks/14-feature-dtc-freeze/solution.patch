@@ -81,14 +81,28 @@ index ed31f39..fbd665a 100644
 +}
 +
  }  // namespace can_fixture
-diff --git a/tests/test_dtc_debouncer.cpp b/tests/test_dtc_debouncer.cpp
-index 517f3f8..21a9c5f 100644
---- a/tests/test_dtc_debouncer.cpp
-+++ b/tests/test_dtc_debouncer.cpp
-@@ -141,6 +141,28 @@ void testResetAndUnconfirmedPassRecovery() {
-     CHECK(!debouncer.isConfirmed());
- }
- 
+diff --git a/tests/test_dtc_freeze.cpp b/tests/test_dtc_freeze.cpp
+new file mode 100644
+index 0000000..c5d9181
+--- /dev/null
++++ b/tests/test_dtc_freeze.cpp
+@@ -0,0 +1,43 @@
++/**
++ * @file test_dtc_freeze.cpp
++ * @brief Unit tests for REQ-DTC-005 monitor freeze control.
++ */
++
++#include "dtc_debouncer.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::DtcConfig;
++using can_fixture::DtcDebouncer;
++using can_fixture::DtcState;
++
 +/**
 + * @brief Verify monitor freeze suspends samples and aging until unfrozen or reset.
 + * @req REQ-DTC-005
@@ -111,14 +125,8 @@ index 517f3f8..21a9c5f 100644
 +    CHECK_EQ(debouncer.state(), DtcState::Inactive);
 +}
 +
- }  // namespace
- 
- void runDtcDebouncerTests() {
-@@ -148,6 +170,7 @@ void runDtcDebouncerTests() {
-     testPendingAndConfirmDebounceThresholds();
-     testOperationCycleAgingAndHealing();
-     testResetAndUnconfirmedPassRecovery();
-+    testMonitorFreezeControl();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testMonitorFreezeControl);
++
++}  // namespace can_fixture_test

@@ -59,14 +59,30 @@ index c96dd47..2af389f 100644
 +}
 +
  }  // namespace can_fixture
-diff --git a/tests/test_can_codec.cpp b/tests/test_can_codec.cpp
-index bc4e33c..f68c088 100644
---- a/tests/test_can_codec.cpp
-+++ b/tests/test_can_codec.cpp
-@@ -130,6 +130,23 @@ void testPhysicalScalingAndClamping() {
-     CHECK_NEAR(decodedTemp, -40.0, 1e-6);
- }
- 
+diff --git a/tests/test_mux_decode.cpp b/tests/test_mux_decode.cpp
+new file mode 100644
+index 0000000..c5d9181
+--- /dev/null
++++ b/tests/test_mux_decode.cpp
+@@ -0,0 +1,40 @@
++/**
++ * @file test_mux_decode.cpp
++ * @brief Unit tests for REQ-CODEC-008 multiplexed physical signal decoding.
++ */
++
++#include <array>
++
++#include "can_codec.hpp"
++#include "test_framework.hpp"
++
++namespace can_fixture_test {
++
++namespace {
++
++using can_fixture::Endianness;
++using can_fixture::kMaxFrameBytes;
++using can_fixture::SignalDef;
++
 +/**
 + * @brief Verify decodeMultiplexedPhysical selector match, mismatch, and guard checks.
 + * @req REQ-CODEC-008
@@ -84,14 +100,8 @@ index bc4e33c..f68c088 100644
 +    CHECK_NEAR(out, -42.5, 1e-6);
 +}
 +
- }  // namespace
- 
- void runCanCodecTests() {
-@@ -138,6 +155,7 @@ void runCanCodecTests() {
-     testBigEndianPackUnpack();
-     testSignedSignalEncodeDecode();
-     testPhysicalScalingAndClamping();
-+    testMultiplexedSignalDecoding();
- }
- 
- }  // namespace can_fixture_test
++}  // namespace
++
++REGISTER_TEST_SUITE(testMultiplexedSignalDecoding);
++
++}  // namespace can_fixture_test

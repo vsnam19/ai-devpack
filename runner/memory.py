@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Mapping, Sequence
+import unicodedata
 import uuid
 
 PACK_ROOT = Path(__file__).resolve().parent.parent
@@ -63,9 +64,24 @@ POLICY_CHANGING_LEXICON: tuple[str, ...] = (
     "team rule",
     "approved by",
     "safety lead",
+    "comment out",
+    "#if 0",
+    "NOLINT",
+    "cppcheck-suppress",
+    "waive",
+    "turn off",
+    "-Werror",
+    "remove assert",
+    "pre-approved",
+    "do not mention",
 )
+
+# Zero-width and format characters stripped before policy-changing lexicon matching.
+_ZERO_WIDTH_RE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+
+# Regex matching inflections and multi-word variants of the policy-changing lexicon.
 _POLICY_CHANGING_RE = re.compile(
-    r"(?i)\b(?:"
+    r"(?i)(?<![A-Za-z0-9_])(?:"
     r"suppress(?:es|ed|ing)?"
     r"|silenc(?:e|es|ed|ing)"
     r"|disabl(?:e|es|ed|ing)"
@@ -79,7 +95,18 @@ _POLICY_CHANGING_RE = re.compile(
     r"|team\s+rules?"
     r"|approved\s+by"
     r"|safety\s+lead"
-    r")\b"
+    r"|comment(?:s|ed|ing)?\s+out"
+    r"|#\s*if\s+0"
+    r"|nolint(?:nextline|begin|end)?"
+    r"|cppcheck-suppress(?:-[a-z0-9_]+)?"
+    r"|waiv(?:e|es|ed|ing|er)"
+    r"|turn(?:s|ed|ing)?\s+off"
+    r"|-werror"
+    r"|remov(?:e|es|ed|ing)\s+assert(?:s|ions?)?"
+    r"|pre-?approved"
+    r"|do\s+not\s+mention"
+    r"|don['\u2019]?t\s+mention"
+    r")(?![A-Za-z0-9_])"
 )
 APPROVAL_REQUIRED_TYPES: tuple[str, ...] = ("decision", "fact")
 
@@ -415,11 +442,19 @@ def validate_status(status: str) -> str:
     return cleaned
 
 
+def _normalize_policy_text(text: str) -> str:
+    """Normalize text with NFKC and strip zero-width/format characters before lexicon checks."""
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+    return _ZERO_WIDTH_RE.sub("", normalized)
+
+
 def contains_policy_changing_language(text: str) -> str | None:
     """Return the matched policy-changing phrase if ``text`` attempts to alter rules/gates."""
     if not text:
         return None
-    match = _POLICY_CHANGING_RE.search(text)
+    cleaned = _normalize_policy_text(text)
+    match = _POLICY_CHANGING_RE.search(cleaned)
     return match.group(0) if match else None
 
 
@@ -1017,15 +1052,23 @@ def _match_entry(entry: MemoryEntry, signals: Mapping[str, set[str]]) -> tuple[i
 
 
 def format_entry_block(entry: MemoryEntry) -> str:
-    """Format a single memory entry for prompt injection, citing source and metadata."""
-    tags_str = ", ".join(entry.tags) if entry.tags else "(none)"
+    """Format a single memory entry for prompt injection inside a fenced verbatim text block."""
+    tags_str = ", ".join(t.replace("`", "\\`") for t in entry.tags) if entry.tags else "(none)"
+    safe_source = entry.source.replace("`", "\\`")
     meta_line = (
         f"- **[{entry.id}]** (type: `{entry.entry_type}`, scope: `{entry.scope}`, "
-        f"source: `{entry.source}`, created: `{entry.created or 'unknown'}`, tags: `{tags_str}`)"
+        f"source: `{safe_source}`, created: `{entry.created or 'unknown'}`, tags: `{tags_str}`)"
     )
-    body_lines = [line.rstrip() for line in entry.body.strip().splitlines()]
-    indented = "\n".join(f"  {line}" if line else "" for line in body_lines)
-    return f"{meta_line}\n{indented}"
+    escaped_body = entry.body.strip().replace("\r\n", "\n").replace("\r", "\n").replace("`", "\\`")
+    body_lines: list[str] = []
+    for raw_ln in escaped_body.splitlines():
+        ln = raw_ln.rstrip()
+        if ln.lstrip().startswith("#"):
+            idx = len(ln) - len(ln.lstrip())
+            ln = ln[:idx] + "\\" + ln[idx:]
+        body_lines.append(ln)
+    fenced_lines = ["  ```text", *(f"  {line}" if line else "  " for line in body_lines), "  ```"]
+    return f"{meta_line}\n" + "\n".join(fenced_lines)
 
 
 def format_injected_memory(entries: Sequence[MemoryEntry]) -> str:

@@ -5,6 +5,22 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-23
+
+### Security
+- **Out-of-process gcov test proof & framework tamper protection (`enforcement/checks/test_proof.py`, `enforcement/gate/project_checks.py`, `eval/fixture/tests/test_framework.hpp`, `eval/fixture/tests/test_main.cpp`, `eval/fixture/build_and_test.sh`, `eval/lib/safe_git.sh`, `eval/tasks/**/check.sh`)**:
+  Replaced trust in in-process `DEVPACK_TESTS_COMPLETED` stdout lines with out-of-process `gcov -j` line-coverage verification over pristine test sources (`CHECK*` lines executed `>= 1` and completion summary executed, exiting `3` `TOOL_MISSING` if `gcov` is absent), with `--coverage` applied only to test translation units and pack `test_framework.hpp` force-included via `-include` and `-DDEVPACK_FRAMEWORK_GUARD`. Worker attempts to define or shadow framework guard/macros/symbols fail `TEST-FRAMEWORK-TAMPER` lint and compilation.
+- **Preprocessed token-stream `PROCESS-TERMINATION` & suppression deviation gates (`enforcement/lint/preflight_lint.py`, `enforcement/static/cppcheck_check.py`, `enforcement/checks/deviations.py`, `runner/devpack_dispatch.py`)**:
+  Evaluated `PROCESS-TERMINATION` over the compiler-preprocessed token stream (`g++ -E`) covering termination/syscall/dynamic-load/process-spawn/jump/ctor-dtor/`_Pragma` identifiers and forbidden literals across all worker-changed files without test-path exemption. Disabled `--inline-suppr` by default, flagged worker-added `cppcheck-suppress`/`NOLINT`/`#pragma`/`_Pragma` diagnostics without verified `Deviation: DEV-<n>` as `SUPPRESSION-WITHOUT-DEVIATION`, and rejected rule-less entries in `DEVPACK_DEVIATIONS`.
+- **Strict test lock & new test file eval tasks (`enforcement/checks/test_lock.py`, `eval/tasks/`, `eval/orchestrator_goals/01-link-fault-recovery/`)**:
+  Tightened `test_lock.py` so protected test files allow no insertions, deletions, or modifications unless named in `DEVPACK_DEVIATIONS`, and updated eval tasks that add tests to target dedicated new tests/test_*.cpp files registered via `REGISTER_TEST_SUITE(...)`.
+- **Untracked enumeration without `--exclude-standard` (`enforcement/checks/scope_check.py`)**:
+  Stopped passing `--exclude-standard` to `git ls-files --others`, applying only base-commit `.gitignore` snapshots, build directories, and pack excludes, while flagging any `.gitignore` edit/creation as `gate-touched`.
+- **Docker grader isolation & wrapper-nonce harness errors (`eval/run_eval.py`)**:
+  Executed task, memory, and orchestrator graders inside Docker isolation (`--network=none`, read-only pack mount, no credentials) by default, ran lint and `cppcheck` before any worker code executes, and keyed `harness_error` classification strictly on grader-wrapper exit code `2` verified against a per-run out-of-workdir nonce.
+- **Memory note fencing & normalized lexicon (`runner/memory.py`)**:
+  Rendered auto-accepted `handoff`/`known-gap` notes inside verbatim fenced ```` ```text ```` blocks with backticks and headings escaped, and extended policy-changing lexicon detection with Unicode NFKC normalization and zero-width character stripping.
+
 ### Security
 - **Docker `.git` mount sources no longer chosen by repository content (`runner/agent_exec.py`, `runner/tests/test_docker_git_mounts.py`)**:
   A `.git` symlink is refused, a real `.git` directory is mounted read-only, and a worktree `.git`
