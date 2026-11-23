@@ -847,13 +847,100 @@ class DevpackDispatchTests(unittest.TestCase):
                 )
                 self.assertIn("cfg/suppr.txt", trusted.protected_rel_paths)
 
-    def _run_trusted_suppressions_job(self, base: Path, *, tamper: bool) -> tuple[dict, list[dict], str]:
-        """Dispatch a job whose trusted config names sibling suppressions.txt; return (payload, cppcheck calls, trusted text)."""
+    def _make_devpack_repo(self, wt: Path, committed: dict[str, str]) -> None:
+        """Create a clean repo whose only config is ``.devpack/project.toml``, plus the committed ``committed`` files."""
+        _init_git_repo(wt)
+        (wt / "preflight.toml").unlink()
+        (wt / ".devpack").mkdir()
+        (wt / ".devpack" / "project.toml").write_text(
+            '[cppcheck]\nsuppressions_file = "cfg/suppr.txt"\n', encoding="utf-8"
+        )
+        for rel, text in committed.items():
+            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            (wt / rel).write_text(text, encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "devpack config"], cwd=wt, check=True)
+
+    def test_root_level_suppressions_found_for_devpack_config(self) -> None:
+        """Config in .devpack/ naming cfg/suppr.txt snapshots the committed root-level file, not the working tree."""
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "wt"
+            self._make_devpack_repo(wt, {"cfg/suppr.txt": "unusedFunction:src/legacy.cpp\n"})
+            (wt / "cfg" / "suppr.txt").write_text("nullPointer:src/mod.cpp\n", encoding="utf-8")
+
+            with tempfile.TemporaryDirectory() as snap:
+                trusted = devpack_dispatch.resolve_trusted_gate_config(wt, Path(snap), base_ref="HEAD")
+                self.assertEqual(b"unusedFunction:src/legacy.cpp\n", (Path(snap) / "cfg" / "suppr.txt").read_bytes())
+                self.assertEqual("cfg/suppr.txt", trusted.suppressions_rel_path)
+                self.assertEqual(
+                    hashlib.sha256(b"unusedFunction:src/legacy.cpp\n").hexdigest(),
+                    trusted.suppressions_sha256,
+                )
+
+    def test_config_relative_sibling_suppressions_still_resolve(self) -> None:
+        """A suppression file beside the config (no root-level copy) is snapshotted from the config directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "wt"
+            self._make_devpack_repo(wt, {".devpack/suppr.txt": "unusedFunction:src/legacy.cpp\n"})
+            (wt / ".devpack" / "project.toml").write_text(
+                '[cppcheck]\nsuppressions_file = "suppr.txt"\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "commit", "-q", "-am", "point at sibling"], cwd=wt, check=True)
+
+            with tempfile.TemporaryDirectory() as snap:
+                trusted = devpack_dispatch.resolve_trusted_gate_config(wt, Path(snap), base_ref="HEAD")
+                self.assertEqual(b"unusedFunction:src/legacy.cpp\n", (Path(snap) / "suppr.txt").read_bytes())
+                self.assertEqual("suppr.txt", trusted.suppressions_rel_path)
+                self.assertIsNotNone(trusted.suppressions_sha256)
+
+    def test_repo_root_copy_wins_over_config_sibling(self) -> None:
+        """When both the repo root and the config directory hold the file, the repo-root copy is snapshotted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "wt"
+            self._make_devpack_repo(
+                wt,
+                {"cfg/suppr.txt": "root-copy\n", ".devpack/cfg/suppr.txt": "config-copy\n"},
+            )
+
+            with tempfile.TemporaryDirectory() as snap:
+                trusted = devpack_dispatch.resolve_trusted_gate_config(wt, Path(snap), base_ref="HEAD")
+                self.assertEqual(b"root-copy\n", (Path(snap) / "cfg" / "suppr.txt").read_bytes())
+                self.assertEqual("cfg/suppr.txt", trusted.suppressions_rel_path)
+
+    def test_untracked_working_tree_suppressions_are_never_snapshotted(self) -> None:
+        """A suppression file that exists only in the working tree is not trusted: no copy, no hash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "wt"
+            self._make_devpack_repo(wt, {})
+            (wt / "cfg").mkdir()
+            (wt / "cfg" / "suppr.txt").write_text("nullPointer:src/mod.cpp\n", encoding="utf-8")
+
+            with tempfile.TemporaryDirectory() as snap:
+                trusted = devpack_dispatch.resolve_trusted_gate_config(wt, Path(snap), base_ref="HEAD")
+                self.assertFalse((Path(snap) / "cfg" / "suppr.txt").exists())
+                self.assertIsNone(trusted.suppressions_sha256)
+                self.assertEqual("cfg/suppr.txt", trusted.suppressions_rel_path)
+
+    def _run_trusted_suppressions_job(
+        self,
+        base: Path,
+        *,
+        tamper: bool,
+        cfg_rel: str = "preflight.toml",
+        suppr_rel: str = "suppressions.txt",
+    ) -> tuple[dict, list[dict], str]:
+        """Dispatch a job whose trusted config names a suppression file; return (payload, cppcheck calls, trusted text)."""
         wt = base / "wt"
         _init_git_repo(wt)
+        if cfg_rel != "preflight.toml":
+            (wt / "preflight.toml").unlink()
         trusted_list = "unusedFunction:src/legacy.cpp\n"
-        (wt / "preflight.toml").write_text('[cppcheck]\nsuppressions_file = "suppressions.txt"\n', encoding="utf-8")
-        (wt / "suppressions.txt").write_text(trusted_list, encoding="utf-8")
+        (wt / cfg_rel).parent.mkdir(parents=True, exist_ok=True)
+        (wt / cfg_rel).write_text(f'[cppcheck]\nsuppressions_file = "{suppr_rel}"\n', encoding="utf-8")
+        (wt / suppr_rel).parent.mkdir(parents=True, exist_ok=True)
+        (wt / suppr_rel).write_text(trusted_list, encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
         subprocess.run(["git", "commit", "-q", "-m", "trusted suppressions"], cwd=wt, check=True)
 
@@ -869,7 +956,7 @@ class DevpackDispatchTests(unittest.TestCase):
             "int oneValue() { return 2 - 1; }\n"
         )
         tamper_line = (
-            "pathlib.Path('suppressions.txt').write_text('nullPointer:src/mod.cpp\\n', encoding='utf-8')\n"
+            f"pathlib.Path({suppr_rel!r}).write_text('nullPointer:src/mod.cpp\\n', encoding='utf-8')\n"
             if tamper
             else ""
         )
@@ -926,6 +1013,21 @@ class DevpackDispatchTests(unittest.TestCase):
             self.assertEqual(trusted_list, calls[-1]["suppressions_text"])
             run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
             self.assertEqual("suppressions.txt", run_meta["gate_suppressions_path"])
+
+    def test_devpack_config_with_root_level_suppressions_passes_gate(self) -> None:
+        """.devpack/project.toml naming a committed root-level cfg/suppr.txt reaches cppcheck via the snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data, calls, trusted_list = self._run_trusted_suppressions_job(
+                Path(tmp),
+                tamper=False,
+                cfg_rel=".devpack/project.toml",
+                suppr_rel="cfg/suppr.txt",
+            )
+            self.assertEqual(0, data["_rc"])
+            self.assertEqual("ok", data["gate"])
+            self.assertEqual(trusted_list, calls[-1]["suppressions_text"])
+            run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("cfg/suppr.txt", run_meta["gate_suppressions_path"])
 
 
 if __name__ == "__main__":

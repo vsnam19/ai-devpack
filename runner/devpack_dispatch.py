@@ -202,12 +202,18 @@ def _read_trusted_sibling(
     source_fs_dir: Path | None,
     rel_ref: str,
 ) -> bytes | None:
-    """Read ``rel_ref`` relative to the trusted config's own directory, never from the working tree.
+    """Read ``rel_ref`` from trusted sources only, in the order ``_resolve_suppressions_file`` uses.
 
-    ``base:<path>`` sources read the git blob beside the config in ``base_ref``; external
-    project configs and pack configs read beside the file in their trusted directory.
-    Returns None when no trusted copy exists (including pre-run snapshots, which hold no copy).
+    Repo root first: the git blob at ``rel_ref`` from the repository root in ``base_ref``.
+    Then the config's own directory: ``base:<path>`` sources read the blob beside the config in
+    ``base_ref``; external project configs and pack configs read beside the file in their trusted
+    directory. The working tree is never read. Returns None when no trusted copy exists (including
+    pre-run snapshots, which hold no copy).
     """
+    if base_ref:
+        root_bytes = _git_show_regular_blob(workdir, base_ref, posixpath.normpath(rel_ref))
+        if root_bytes is not None:
+            return root_bytes
     if source.startswith("base:") and base_ref:
         cfg_dir = posixpath.dirname(source[len("base:"):])
         return _git_show_regular_blob(workdir, base_ref, posixpath.normpath(posixpath.join(cfg_dir, rel_ref)))
