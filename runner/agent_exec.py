@@ -91,6 +91,12 @@ LOCAL_ISOLATION_WARNING = (
     "WARNING: running with isolation='local' (unsandboxed host filesystem and "
     "network access; sandbox deviation per policy/sandbox.md)."
 )
+WORKDIR_SANDBOX_OPT_OUT_WARNING = (
+    "WARNING: ignoring allow_unsandboxed_local in workdir .devpack/project.toml "
+    "(repo-controlled sandbox opt-out is disabled; use --allow-unsandboxed-local "
+    "or DEVPACK_OPERATOR_CONFIG)."
+)
+OPERATOR_CONFIG_ENV = "DEVPACK_OPERATOR_CONFIG"
 
 # Assemble host-home regex from fragments so forbidden literal substrings never appear.
 _HOME_PREFIX = "/" + "ho" + "me/"
@@ -745,6 +751,7 @@ def load_project_config(
         "runs_root": "runs",
         "default_engines": {},
         "allow_unsandboxed_local": False,
+        "ignored_allow_unsandboxed_local": False,
         "require_qualification": False,
         "workspace": {},
         "components": [],
@@ -785,7 +792,9 @@ def load_project_config(
     raw_defaults = raw.get("default_engines", {})
     if isinstance(raw_defaults, dict):
         defaults["default_engines"] = {str(k): str(v) for k, v in raw_defaults.items()}
-    defaults["allow_unsandboxed_local"] = bool(raw.get("allow_unsandboxed_local", False))
+    if bool(raw.get("allow_unsandboxed_local", False)):
+        defaults["ignored_allow_unsandboxed_local"] = True
+    defaults["allow_unsandboxed_local"] = False
     defaults["require_qualification"] = bool(raw.get("require_qualification", False))
     raw_ws = raw.get("workspace", {})
     if isinstance(raw_ws, dict):
@@ -830,35 +839,120 @@ def check_data_class_allowed(engine: EngineConfig, data_class: str) -> tuple[boo
     return True, ""
 
 
-def check_local_isolation_allowed(
-    isolation: str,
+def load_operator_config(
+    operator_config_path: Path | str | None = None,
     *,
-    allow_unsandboxed_local: bool = False,
+    workdir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Load operator-owned sandbox configuration from outside ``workdir``.
+
+    Reads ``operator_config_path`` or ``os.environ['DEVPACK_OPERATOR_CONFIG']``.
+    Refuses paths inside ``workdir`` (or symlinks resolving into ``workdir``).
+    """
+    raw_path = (
+        str(operator_config_path).strip()
+        if operator_config_path is not None and str(operator_config_path).strip()
+        else os.environ.get(OPERATOR_CONFIG_ENV, "").strip()
+    )
+    if not raw_path:
+        return {"allow_unsandboxed_local": False, "config_found": False, "path": ""}
+
+    candidate = Path(raw_path)
+    resolved = candidate.resolve()
+    if workdir is not None:
+        wd_res = Path(workdir).resolve()
+        if resolved == wd_res or resolved.is_relative_to(wd_res):
+            raise ValueError(
+                f"{OPERATOR_CONFIG_ENV} ({resolved}) must be outside workdir ({wd_res})"
+            )
+    if not resolved.is_file():
+        raise ValueError(f"{OPERATOR_CONFIG_ENV} file not found: {resolved}")
+
+    text = resolved.read_text(encoding="utf-8")
+    if tomllib is not None:
+        try:
+            raw = tomllib.loads(text)
+        except Exception as exc:
+            raise ValueError(f"Failed to parse TOML in {resolved}: {exc}") from exc
+    else:  # pragma: no cover
+        raw = _minimal_toml_loads(text)
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"Invalid TOML operator configuration in {resolved}")
+
+    sandbox_tbl = raw.get("sandbox")
+    broker_tbl = raw.get("broker")
+    allow_local = bool(raw.get("allow_unsandboxed_local", False))
+    if isinstance(sandbox_tbl, dict) and bool(sandbox_tbl.get("allow_unsandboxed_local", False)):
+        allow_local = True
+    if isinstance(broker_tbl, dict) and bool(broker_tbl.get("allow_unsandboxed_local", False)):
+        allow_local = True
+    return {
+        "allow_unsandboxed_local": allow_local,
+        "config_found": True,
+        "path": str(resolved),
+    }
+
+
+def detect_ignored_workdir_sandbox_opt_out(
+    *,
     workdir: Path | str | None = None,
     project_config: Mapping[str, Any] | None = None,
-) -> tuple[bool, str]:
-    """Enforce fail-safe sandbox policy for ``isolation='local'`` (refuse unless explicitly allowed)."""
-    if isolation == "docker":
-        return True, ""
-    if isolation != "local":
-        raise ValueError(f"Unsupported isolation mode: {isolation}")
-
+) -> str:
+    """Return warning text when a workdir ``project.toml`` attempts ``allow_unsandboxed_local``."""
     cfg = dict(project_config) if project_config is not None else {}
     if not cfg and workdir is not None:
         try:
             cfg = load_project_config(workdir)
         except ValueError:
             cfg = {}
+    if bool(cfg.get("ignored_allow_unsandboxed_local", False)):
+        return WORKDIR_SANDBOX_OPT_OUT_WARNING
+    return ""
 
-    if allow_unsandboxed_local or bool(cfg.get("allow_unsandboxed_local", False)):
-        return True, LOCAL_ISOLATION_WARNING
 
-    return (
-        False,
-        "Refused: isolation='local' runs unsandboxed on the host filesystem and network "
-        "(policy/sandbox.md). Use --isolation docker (default), or pass "
-        "--allow-unsandboxed-local / set allow_unsandboxed_local = true in .devpack/project.toml.",
+def check_local_isolation_allowed(
+    isolation: str,
+    *,
+    allow_unsandboxed_local: bool = False,
+    workdir: Path | str | None = None,
+    project_config: Mapping[str, Any] | None = None,
+    operator_config_path: Path | str | None = None,
+) -> tuple[bool, str]:
+    """Enforce fail-safe sandbox policy for ``isolation='local'`` (refuse unless explicitly allowed).
+
+    Workdir ``.devpack/project.toml`` ``allow_unsandboxed_local`` is never honoured; when
+    present, a warning is returned in ``message`` for recording in ``run.json``.
+    """
+    ignored_warn = detect_ignored_workdir_sandbox_opt_out(
+        workdir=workdir,
+        project_config=project_config,
     )
+    if isolation == "docker":
+        return True, ignored_warn
+    if isolation != "local":
+        raise ValueError(f"Unsupported isolation mode: {isolation}")
+
+    try:
+        op_cfg = load_operator_config(operator_config_path, workdir=workdir)
+    except ValueError as exc:
+        err = f"Refused: invalid operator config: {exc}"
+        if ignored_warn:
+            err = f"{ignored_warn}\n{err}"
+        return False, err
+
+    if allow_unsandboxed_local or bool(op_cfg.get("allow_unsandboxed_local", False)):
+        msg = f"{ignored_warn}\n{LOCAL_ISOLATION_WARNING}" if ignored_warn else LOCAL_ISOLATION_WARNING
+        return True, msg
+
+    refusal = (
+        "Refused: isolation='local' runs unsandboxed on the host filesystem and network "
+        "(policy/sandbox.md). Use --isolation docker (default), pass "
+        "--allow-unsandboxed-local, or set allow_unsandboxed_local = true in DEVPACK_OPERATOR_CONFIG."
+    )
+    if ignored_warn:
+        refusal = f"{ignored_warn}\n{refusal}"
+    return False, refusal
 
 
 def load_quality_checklist(repo_root: Path | str | None = None) -> str:
@@ -1022,6 +1116,7 @@ class AgentRequest:
     memory_config: MemoryConfig | None = None
     memory_task_text: str | None = None
     code_map: str = ""
+    operator_config_path: Path | None = None
 
     def __init__(
         self,
@@ -1058,6 +1153,7 @@ class AgentRequest:
         memory_config: MemoryConfig | None = None,
         memory_task_text: str | None = None,
         code_map: str = "",
+        operator_config_path: Path | str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize AgentRequest with support for SPEC parameter aliases (timeout, engine_config, prompt_text)."""
@@ -1122,6 +1218,11 @@ class AgentRequest:
         self.memory_config = memory_config
         self.memory_task_text = memory_task_text
         self.code_map = str(code_map or "")
+        self.operator_config_path = (
+            Path(operator_config_path)
+            if operator_config_path is not None and str(operator_config_path)
+            else None
+        )
 
     @property
     def timeout(self) -> int:
@@ -1372,6 +1473,46 @@ def _resolve_local_engine_env(
     }
 
 
+def _parse_worktree_gitdir(dot_git_file: Path, workdir: Path) -> Path | None:
+    """Resolve the ``gitdir:`` target from a worktree ``.git`` pointer file."""
+    text = dot_git_file.read_text(encoding="utf-8", errors="replace")
+    raw_gitdir = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("gitdir:"):
+            raw_gitdir = stripped.split(":", 1)[1].strip()
+            break
+    if not raw_gitdir:
+        raise HarnessError(f"Malformed .git pointer file: {dot_git_file}")
+    gd_path = Path(raw_gitdir)
+    return (workdir / gd_path).resolve() if not gd_path.is_absolute() else gd_path.resolve()
+
+
+def _docker_git_ro_mounts(resolved_workdir: Path) -> list[str]:
+    """Return read-only ``-v`` mount flags for ``.git`` (and worktree gitdir) in Docker mode."""
+    git_entry = resolved_workdir / ".git"
+    if not git_entry.exists() and not git_entry.is_symlink():
+        return []
+    if git_entry.is_symlink() and not git_entry.exists():
+        raise HarnessError(f"Broken .git symlink in workdir: {git_entry}")
+
+    resolved_git = git_entry.resolve() if git_entry.is_symlink() else git_entry
+    mounts = ["-v", f"{resolved_git}:{DOCKER_TASK_DIR}/.git:ro"]
+    if resolved_git.is_file():
+        gitdir_path = _parse_worktree_gitdir(resolved_git, resolved_workdir)
+        if gitdir_path is not None:
+            resolved_wd = resolved_workdir.resolve()
+            if gitdir_path == resolved_wd:
+                raise HarnessError(f"Invalid worktree gitdir pointing to workdir: {gitdir_path}")
+            if gitdir_path.exists():
+                if gitdir_path.is_relative_to(resolved_wd):
+                    rel_gd = gitdir_path.relative_to(resolved_wd).as_posix()
+                    mounts.extend(["-v", f"{gitdir_path}:{DOCKER_TASK_DIR}/{rel_gd}:ro"])
+                else:
+                    mounts.extend(["-v", f"{gitdir_path}:{gitdir_path}:ro"])
+    return mounts
+
+
 def build_invocation(
     request_or_engine: AgentRequest | EngineConfig,
     prompt: str = "",
@@ -1540,8 +1681,7 @@ def build_invocation(
         f"{resolved_workdir}:{DOCKER_TASK_DIR}:rw",
         "-v",
         f"{resolved_cfg}:/workspace/cfg:ro",
-        *(["-v", f"{resolved_workdir / '.git'}:{DOCKER_TASK_DIR}/.git:ro"]
-          if isinstance(request_or_engine, AgentRequest) and request_or_engine.role == "broker-worker" else []),
+        *_docker_git_ro_mounts(resolved_workdir),
         image_tag,
         *_build_claude_tail(agent_bin_in_container),
     ]
@@ -2669,11 +2809,20 @@ def run_agent(request: AgentRequest) -> AgentResult:
         request.isolation,
         allow_unsandboxed_local=request.allow_unsandboxed_local,
         workdir=request.workdir,
+        operator_config_path=request.operator_config_path,
     )
+    ignored_opt_out = WORKDIR_SANDBOX_OPT_OUT_WARNING in iso_msg
     if not iso_allowed:
         sys.stderr.write(iso_msg + "\n")
         jsonl_path.write_text("", encoding="utf-8")
-        update_run_json(request.run_dir, isolation=request.isolation, outcome="refused")
+        refused_updates: dict[str, Any] = {
+            "isolation": request.isolation,
+            "outcome": "refused",
+        }
+        if ignored_opt_out:
+            refused_updates["sandbox_warning"] = iso_msg
+            refused_updates["ignored_workdir_sandbox_opt_out"] = True
+        update_run_json(request.run_dir, **refused_updates)
         return _write_meta_and_return(
             AgentResult(
                 status="harness_error",
@@ -2681,9 +2830,15 @@ def run_agent(request: AgentRequest) -> AgentResult:
                 error=iso_msg,
             )
         )
-    if request.isolation == "local" and iso_msg:
+    if iso_msg:
         sys.stderr.write(iso_msg + "\n")
-        update_run_json(request.run_dir, isolation="local", sandbox_warning=iso_msg)
+        warn_updates: dict[str, Any] = {
+            "isolation": request.isolation,
+            "sandbox_warning": iso_msg,
+        }
+        if ignored_opt_out:
+            warn_updates["ignored_workdir_sandbox_opt_out"] = True
+        update_run_json(request.run_dir, **warn_updates)
 
     # Set up temporary isolation directories if not already provided by caller
     created_temp_iso: Path | None = None

@@ -20,6 +20,7 @@ _REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 from runner.workspace_scope import resolve_workspace_scope  # noqa: E402
 
 GATE_PROTECTED_FILENAMES: frozenset[str] = frozenset({"preflight.toml", ".clang-tidy", "gate.toml"})
@@ -105,38 +106,33 @@ def matches_any_glob(rel_posix_path: str, compiled_globs: list[re.Pattern[str]])
 
 def get_changed_files(repo_root: pathlib.Path, base_ref: str) -> tuple[list[str] | None, str | None]:
     """Return sorted list of files changed since ``base_ref`` (committed, staged, working tree, or untracked)."""
-    verify = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{base_ref}^{{commit}}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if verify.returncode != 0:
-        err = verify.stderr.strip() or f"invalid base ref '{base_ref}'"
-        return None, err
-
-    changed: set[str] = set()
-    diff_cmds = [
-        ["git", "-C", str(repo_root), "diff", "--name-only", base_ref],
-        ["git", "-C", str(repo_root), "diff", "--name-only", f"{base_ref}..HEAD"],
-        ["git", "-C", str(repo_root), "diff", "--cached", "--name-only"],
-        ["git", "-C", str(repo_root), "ls-files", "--others", "--exclude-standard"],
-    ]
-    for cmd in diff_cmds:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    try:
+        verify = run_git(
+            ["rev-parse", "--verify", f"{base_ref}^{{commit}}"],
+            repo_root=repo_root,
             check=False,
         )
-        if proc.returncode != 0:
-            return None, proc.stderr.strip() or "git diff failed"
-        for line in proc.stdout.splitlines():
-            cleaned = line.strip()
-            if cleaned:
-                changed.add(cleaned)
+        if verify.returncode != 0:
+            err = verify.stderr.strip() or f"invalid base ref '{base_ref}'"
+            return None, err
+
+        changed: set[str] = set()
+        diff_cmds = [
+            ["diff", "--name-only", base_ref],
+            ["diff", "--name-only", f"{base_ref}..HEAD"],
+            ["diff", "--cached", "--name-only"],
+            ["ls-files", "--others", "--exclude-standard"],
+        ]
+        for cmd in diff_cmds:
+            proc = run_git(cmd, repo_root=repo_root, check=False)
+            if proc.returncode != 0:
+                return None, proc.stderr.strip() or "git diff failed"
+            for line in proc.stdout.splitlines():
+                cleaned = line.strip()
+                if cleaned:
+                    changed.add(cleaned)
+    except GitSecurityError as exc:
+        return None, str(exc)
 
     return sorted(changed), None
 

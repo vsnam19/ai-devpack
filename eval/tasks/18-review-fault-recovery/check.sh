@@ -58,10 +58,14 @@ fi
 
 TEST_LOCK="$DEVPACK_ROOT/enforcement/checks/test_lock.py"
 SCOPE_CHECK="$DEVPACK_ROOT/enforcement/checks/scope_check.py"
-if [[ ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" ]]; then
-    echo "GRADER_MISCONFIGURED: missing enforcement scripts under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
+SAFE_GIT_SH="$DEVPACK_ROOT/eval/lib/safe_git.sh"
+if [[ ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" || ! -f "$SAFE_GIT_SH" ]]; then
+    echo "GRADER_MISCONFIGURED: missing enforcement scripts or safe_git.sh under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
     exit 2
 fi
+
+# shellcheck source=/dev/null
+source "$SAFE_GIT_SH"
 
 TASK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REVIEW_PATCH="$TASK_DIR/review.patch"
@@ -79,7 +83,7 @@ if [[ ! -d "$WORKDIR" ]]; then
 fi
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 
-if ! git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if ! safe_git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "FAIL: workdir is not a git repository: $WORKDIR" >&2
     exit 1
 fi
@@ -94,9 +98,9 @@ if [[ -f "$WORKDIR/STOP_REPORT.md" ]]; then
     exit 1
 fi
 
-BASE_REF="$(git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
+BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
 if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="$(git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
+    BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
 fi
 if [[ -z "$BASE_REF" ]]; then
     BASE_REF="HEAD"
@@ -111,7 +115,7 @@ TMP_PATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/devpack-review-18.XXXXXX")"
 # shellcheck disable=SC2064
 trap "rm -rf '$TMP_PATCH_DIR'" EXIT
 cp -r "$WORKDIR/." "$TMP_PATCH_DIR/work/"
-if ! git -C "$TMP_PATCH_DIR/work" apply "$REVIEW_PATCH"; then
+if ! safe_git -C "$TMP_PATCH_DIR/work" apply "$REVIEW_PATCH"; then
     echo "FAIL: review.patch failed to apply to fixture" >&2
     exit 1
 fi

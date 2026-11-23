@@ -704,6 +704,72 @@ class DevpackRunUnitTests(unittest.TestCase):
             self.assertIn("[cppcheck]", fix_prompt)
             self.assertIn("nullPointer", fix_prompt)
 
+    def test_runner_fails_with_git_metadata_tampered_when_agent_edits_git_config(self) -> None:
+        """If implementer plants core.fsmonitor in .git/config, devpack_run fails with git_metadata_tampered without creating marker."""
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            wt.mkdir()
+            (wt / "src").mkdir()
+            (wt / "src" / "a.cpp").write_text("int a() { return 1; }\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=wt, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=wt, check=True)
+
+            marker = base / "runner_pwned.txt"
+            fake_claude = base / "fake_claude.py"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib\n"
+                "cfg = pathlib.Path('.git/config')\n"
+                f"cfg.write_text(cfg.read_text(encoding='utf-8') + '\\n[core]\\n\\tfsmonitor = touch {marker}\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'num_turns': 1, 'result': 'done'}))\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_claude, stat.S_IRWXU)
+
+            config_path = base / "engines.toml"
+            config_path.write_text(
+                "version = 2\n"
+                'gate_cmd = ["true"]\n'
+                "[engines.haiku]\n"
+                'model = "haiku"\n'
+                'class = "cloud"\n'
+                "[roles]\n"
+                'implementer = "haiku"\n'
+                'reviewer = "haiku"\n'
+                'fixer = "haiku"\n',
+                encoding="utf-8",
+            )
+
+            runs_root = base / "runs"
+            rc = devpack_run.main(
+                [
+                    "--config", str(config_path),
+                    "--worktree", str(wt),
+                    "--runs-root", str(runs_root),
+                    "--agent-bin", str(fake_claude),
+                    "--task-id", "tamper-test",
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(1, rc)
+            self.assertFalse(marker.exists())
+            rdir = next(runs_root.iterdir())
+            summary = json.loads((rdir / "run_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual("violation", summary["scope"])
+            self.assertEqual("git_metadata_tampered", summary["scope_violation"])
+            self.assertTrue(summary["git_metadata_tampered"])
+            run_json = json.loads((rdir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("git_metadata_tampered", run_json["scope_violation"])
+            self.assertEqual(64, len(run_json["git_config_sha256"]))
+            self.assertIsInstance(run_json["git_hooks_listing"], list)
+
 
 if __name__ == "__main__":
     unittest.main()

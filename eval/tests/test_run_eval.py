@@ -957,6 +957,80 @@ class HarnessErrorTests(unittest.TestCase):
             self.assertIn("GRADER_MISCONFIGURED", proc_missing.stderr)
             self.assertIn("TOOL_MISSING", proc_missing.stderr)
 
+    def test_eval_trial_fails_with_git_metadata_tampered_and_skips_marker(self) -> None:
+        """If an eval agent writes core.fsmonitor to .git/config, run_single_trial fails with git_metadata_tampered."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            task = run_eval.load_and_validate_tasks(tasks_dir, "all")[0]
+            marker = base / "eval_pwned.txt"
+            agent = _write_agent(
+                base,
+                "cfg = pathlib.Path('.git/config')\n"
+                f"cfg.write_text(cfg.read_text(encoding='utf-8') + '\\n[core]\\n\\tfsmonitor = touch {marker}\\n', encoding='utf-8')\n"
+                + _OK_JSON.replace("RESULT", "'done'").replace("DENIALS", "[]"),
+            )
+            cred = base / "creds.json"
+            cred.write_text("{}", encoding="utf-8")
+            result = run_eval.run_single_trial(
+                task=task,
+                model="haiku",
+                run_index=1,
+                run_root=base / "wr",
+                fixture_dir=fixture_dir,
+                credentials_path=cred,
+                isolation="local",
+                agent_bin=str(agent),
+                timeout_s=30,
+                allow_unsandboxed_local=True,
+                runs_root=base / "runs",
+            )
+            self.assertFalse(result.passed)
+            self.assertFalse(result.harness_error)
+            self.assertIn("git_metadata_tampered", result.error)
+            self.assertFalse(marker.exists())
+            run_dir = next((base / "runs").iterdir())
+            run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("git_metadata_tampered", run_json["scope_violation"])
+            self.assertTrue(run_json["git_metadata_tampered"])
+            self.assertEqual(64, len(run_json["git_config_sha256"]))
+            self.assertIsInstance(run_json["git_hooks_listing"], list)
+
+    def test_shell_graders_use_safe_git_and_export_hardened_env(self) -> None:
+        """Grep check: shell graders must source eval/lib/safe_git.sh and never invoke bare git."""
+        import re
+
+        repo_root = EVAL_DIR.parent
+        safe_git_sh = repo_root / "eval" / "lib" / "safe_git.sh"
+        self.assertTrue(safe_git_sh.is_file())
+        helper_text = safe_git_sh.read_text(encoding="utf-8")
+        self.assertIn("export GIT_CONFIG_NOSYSTEM=1", helper_text)
+        self.assertIn("export GIT_CONFIG_GLOBAL=/dev/null", helper_text)
+        self.assertIn("export GIT_TERMINAL_PROMPT=0", helper_text)
+        self.assertIn("-c core.fsmonitor=", helper_text)
+        self.assertIn("-c core.hooksPath=/dev/null", helper_text)
+
+        shell_graders = [
+            repo_root / "eval" / "tasks" / "v2_check.sh",
+            repo_root / "eval" / "tasks" / "18-review-fault-recovery" / "check.sh",
+            repo_root / "eval" / "orchestrator_goals" / "01-link-fault-recovery" / "check.sh",
+            *sorted((repo_root / "eval" / "memory_tasks").glob("*/check.sh")),
+        ]
+        bare_git_rx = re.compile(r"(?:^|[;&|(])\s*(?:!\s*)?git\s")
+        for script in shell_graders:
+            text = script.read_text(encoding="utf-8")
+            self.assertIn("safe_git.sh", text, f"{script} must source safe_git.sh")
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                stripped = line.lstrip()
+                if stripped.startswith("#"):
+                    continue
+                # Strip quoted string literals (e.g. echo "FAIL: not a git repo") before checking commands.
+                no_quotes = re.sub(r'"[^"]*"|\'[^\']*\'', "", line)
+                self.assertIsNone(
+                    bare_git_rx.search(no_quotes),
+                    f"Bare git invocation in {script}:{lineno}: {line}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

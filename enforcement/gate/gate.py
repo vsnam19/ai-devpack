@@ -34,6 +34,7 @@ _REPO_ROOT_STR = str(pathlib.Path(__file__).resolve().parents[2])
 if _REPO_ROOT_STR not in sys.path:
     sys.path.insert(0, _REPO_ROOT_STR)
 
+from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 from runner.workspace_scope import resolve_workspace_scope  # noqa: E402
 
 
@@ -45,15 +46,13 @@ def get_utc_timestamp() -> str:
 def get_git_head(repo_root: pathlib.Path) -> str | None:
     """Return the 40-character git HEAD SHA for ``repo_root``, or None if not a git repo."""
     try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
+        proc = run_git(
+            ["rev-parse", "HEAD"],
+            repo_root=repo_root,
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, GitSecurityError):
         return None
     if proc.returncode == 0:
         sha = proc.stdout.strip()

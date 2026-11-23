@@ -66,11 +66,15 @@ CPPCHECK_CHECK="$DEVPACK_ROOT/enforcement/static/cppcheck_check.py"
 PREFLIGHT_CFG="$DEVPACK_ROOT/eval/fixture/preflight.toml"
 TEST_LOCK="$DEVPACK_ROOT/enforcement/checks/test_lock.py"
 SCOPE_CHECK="$DEVPACK_ROOT/enforcement/checks/scope_check.py"
+SAFE_GIT_SH="$DEVPACK_ROOT/eval/lib/safe_git.sh"
 
-if [[ ! -f "$PREFLIGHT_LINT" || ! -f "$CPPCHECK_CHECK" || ! -f "$PREFLIGHT_CFG" || ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" ]]; then
-    echo "GRADER_MISCONFIGURED: missing enforcement scripts or preflight.toml under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
+if [[ ! -f "$PREFLIGHT_LINT" || ! -f "$CPPCHECK_CHECK" || ! -f "$PREFLIGHT_CFG" || ! -f "$TEST_LOCK" || ! -f "$SCOPE_CHECK" || ! -f "$SAFE_GIT_SH" ]]; then
+    echo "GRADER_MISCONFIGURED: missing enforcement scripts, preflight.toml, or safe_git.sh under DEVPACK_ROOT=$DEVPACK_ROOT" >&2
     exit 2
 fi
+
+# shellcheck source=/dev/null
+source "$SAFE_GIT_SH"
 
 TASKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TASK_DIR="$TASKS_DIR/$task_id"
@@ -88,7 +92,7 @@ if [[ ! -d "$WORKDIR" ]]; then
 fi
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 
-if ! git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if ! safe_git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "FAIL: workdir is not a git repository: $WORKDIR" >&2
     exit 1
 fi
@@ -156,9 +160,9 @@ if find "$WORKDIR" -name '.eval_v2_*' -print -quit | grep -q .; then
 fi
 
 # Resolve post-setup baseline commit (supports committed or uncommitted agent changes)
-BASE_REF="$(git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
+BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
 if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="$(git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
+    BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
 fi
 if [[ -z "$BASE_REF" ]]; then
     BASE_REF="HEAD"
@@ -174,8 +178,8 @@ python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**'
 # Require at least one changed or newly created file relative to post-setup baseline
 mapfile -t CHANGED_ALL < <(
     {
-        git -C "$WORKDIR" diff --name-only "$BASE_REF"
-        git -C "$WORKDIR" ls-files --others --exclude-standard
+        safe_git -C "$WORKDIR" diff --name-only "$BASE_REF"
+        safe_git -C "$WORKDIR" ls-files --others --exclude-standard
     } | sort -u
 )
 if [[ "${#CHANGED_ALL[@]}" -eq 0 ]]; then
@@ -276,8 +280,8 @@ fi
 # 6. Run preflight lint and cppcheck static analysis on changed src/ and include/ files
 mapfile -t CHANGED_CPP_FILES < <(
     {
-        git -C "$WORKDIR" diff --name-only "$BASE_REF" -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
-        git -C "$WORKDIR" ls-files --others --exclude-standard -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
+        safe_git -C "$WORKDIR" diff --name-only "$BASE_REF" -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
+        safe_git -C "$WORKDIR" ls-files --others --exclude-standard -- 'include/*.hpp' 'include/*.h' 'src/*.cpp' 'src/*.c'
     } | sort -u
 )
 if [[ "${#CHANGED_CPP_FILES[@]}" -gt 0 ]]; then

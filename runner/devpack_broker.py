@@ -26,9 +26,19 @@ import uuid
 PACK_ROOT = Path(__file__).resolve().parent.parent
 if str(PACK_ROOT) not in sys.path:
     sys.path.insert(0, str(PACK_ROOT))
-from runner.agent_exec import DOCKER_IMAGE_TAG, check_data_class_allowed, load_engines, load_project_config, new_run_dir, redact_sensitive_text, update_run_json
+from runner.agent_exec import (
+    DOCKER_IMAGE_TAG,
+    WORKDIR_SANDBOX_OPT_OUT_WARNING,
+    check_data_class_allowed,
+    load_engines,
+    load_project_config,
+    new_run_dir,
+    redact_sensitive_text,
+    update_run_json,
+)
 from runner.brief_lint import has_errors as brief_has_errors, lint_brief_text
 from runner.devpack_dispatch import dispatch_job, _render_run_dir_quietly
+from runner.safe_git import run_git
 from runner.workspace_scope import load_workspace_config, parse_toml_with_arrays
 
 CLIENT_SOURCE = Path(__file__).with_name('devpack_submit.py')
@@ -321,7 +331,7 @@ class Broker:
                            'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
                 for args in (['init', '-q', '--template='], ['add', '-A'],
                              ['-c', 'user.name=Broker', '-c', 'user.email=broker@example.invalid', 'commit', '-qm', 'worker base', '--allow-empty']):
-                    subprocess.run(['git', *args], cwd=work, env=git_env, check=True, capture_output=True)
+                    run_git(args, cwd=work, env=git_env, check=True)
                 prompt = sandbox / 'brief.md'
                 prompt.write_bytes(brief)
                 project = sandbox / 'project.toml'
@@ -375,6 +385,20 @@ class Broker:
         payload = json.loads(redact_sensitive_text(json.dumps(payload)))
         write_json(run / (request_id + '.response.json'), payload)
         run_updates = {'outcome': 'pass' if code == 0 else 'fail', 'response': payload}
+        if self.project.get('ignored_allow_unsandboxed_local'):
+            run_updates['ignored_workdir_sandbox_opt_out'] = True
+            existing_warn = ''
+            run_json_file = run / 'run.json'
+            if run_json_file.is_file():
+                try:
+                    existing_warn = str(json.loads(run_json_file.read_text(encoding='utf-8')).get('sandbox_warning', ''))
+                except (OSError, ValueError):
+                    existing_warn = ''
+            run_updates['sandbox_warning'] = (
+                f"{WORKDIR_SANDBOX_OPT_OUT_WARNING}\n{existing_warn}".strip()
+                if existing_warn
+                else WORKDIR_SANDBOX_OPT_OUT_WARNING
+            )
         if brief_findings:
             run_updates['brief_lint'] = brief_findings
         update_run_json(run, **run_updates)

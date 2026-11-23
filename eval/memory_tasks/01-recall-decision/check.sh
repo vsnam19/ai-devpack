@@ -30,6 +30,14 @@ if [[ -z "${DEVPACK_ROOT:-}" ]]; then
     exit 2
 fi
 
+SAFE_GIT_SH="$DEVPACK_ROOT/eval/lib/safe_git.sh"
+if [[ ! -f "$SAFE_GIT_SH" ]]; then
+    echo "GRADER_MISCONFIGURED: missing $SAFE_GIT_SH" >&2
+    exit 2
+fi
+# shellcheck source=/dev/null
+source "$SAFE_GIT_SH"
+
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 TASK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
