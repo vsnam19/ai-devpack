@@ -24,6 +24,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import functools
 import json
 import os
 from pathlib import Path
@@ -79,8 +80,6 @@ from runner.agent_exec import (  # noqa: E402
     new_run_dir,
     parse_agent_json_output,
     parse_stream,
-    redact_sensitive_text,
-    redact_structure,
     resolve_engine,
     resolve_engine_profile_path,
     run_agent,
@@ -89,6 +88,11 @@ from runner.agent_exec import (  # noqa: E402
 )
 from runner.devpack_dispatch import run_cppcheck_on_changed, run_preflight_lint_on_changed  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
+from runner.redaction import (  # noqa: E402
+    collect_credential_secrets,
+    redact_sensitive_text,
+    redact_structure,
+)
 from runner.safe_git import (  # noqa: E402
     GitSecurityError,
     check_git_metadata_unchanged,
@@ -102,6 +106,21 @@ STDERR_TAIL_MAX_CHARS = 2000
 ORCHESTRATOR_PACK_PATH = Path(".devpack/pack")
 
 REQUIRED_TASK_FILES = ("task.md", "check.sh", "setup.patch", "solution.patch")
+
+
+def _redact_eval_text(
+    text: str,
+    *,
+    extra_secrets: Sequence[str],
+    path_replacements: Sequence[tuple[str, str]],
+) -> str:
+    """Redact trial secrets, patterns, and workspace paths using ``runner.redaction``."""
+    return redact_sensitive_text(
+        text,
+        extra_secrets=extra_secrets,
+        path_replacements=path_replacements,
+        home_placeholder="$HOME",
+    )
 
 
 @dataclass(frozen=True)
@@ -945,6 +964,10 @@ def prepare_isolated_trial_dir(
     _run_git(["apply", str(task.setup_patch)])
     _run_git(["add", "-A"])
     _run_git(["commit", "-q", "-m", "chore: apply setup.patch"])
+    rev_proc = run_git(["rev-parse", "HEAD"], repo_root=work_dir, cwd=work_dir, env=git_env, check=True)
+    baseline_sha = rev_proc.stdout.strip()
+    baseline_file = trial_root / "baseline.sha"
+    baseline_file.write_text(baseline_sha + "\n", encoding="utf-8")
 
     prompt_text, skip_reason = build_task_prompt_text(
         task,
@@ -988,6 +1011,9 @@ def prepare_isolated_trial_dir(
         "prompt_file": prompt_file,
         "settings_path": settings_path,
         "credentials_copy": cred_dest,
+        "trial_root": trial_root,
+        "baseline_sha": baseline_sha,
+        "baseline_file": baseline_file,
     }
 
 
@@ -1061,17 +1087,26 @@ def compute_pass_pow_k(passes: int, total: int, k: int | None = None) -> float:
     return (passes / total) ** exponent
 
 
-def _resolve_baseline_ref(work_dir: Path) -> str:
-    """Return the post-setup baseline commit SHA for ``work_dir``."""
-    for grep_pat in ("^chore: apply setup\\.patch$", "^chore: base fixture$"):
-        proc = run_git(
-            ["log", "--format=%H", f"--grep={grep_pat}", "-n", "1"],
-            repo_root=work_dir,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout.strip()
-    return "HEAD"
+def _resolve_baseline_ref(
+    work_dir: Path,
+    trial_dir: Path | None = None,
+    *,
+    baseline_sha: str = "",
+) -> str:
+    """Return the external baseline commit SHA recorded by the harness; never search commit messages."""
+    sha = (baseline_sha or "").strip()
+    if not sha and trial_dir is not None:
+        bfile = trial_dir / "baseline.sha"
+        if bfile.is_file():
+            sha = bfile.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    if not sha:
+        sha = os.environ.get("DEVPACK_BASELINE_SHA", "").strip()
+    if not sha:
+        raise RuntimeError("GRADER_MISCONFIGURED: missing external DEVPACK_BASELINE_SHA / baseline.sha")
+    proc = run_git(["cat-file", "-e", f"{sha}^{{commit}}"], repo_root=work_dir, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"GRADER_MISCONFIGURED: baseline SHA '{sha}' not found in {work_dir}")
+    return sha
 
 
 def _run_check_script(
@@ -1080,16 +1115,31 @@ def _run_check_script(
     home_dir: Path,
     tmp_dir: Path,
     timeout_s: int,
+    *,
+    trial_dir: Path | None = None,
+    baseline_sha: str = "",
 ) -> tuple[int, str]:
-    """Execute ``check_sh --workdir <work_dir>`` with ``DEVPACK_ROOT`` set."""
+    """Execute ``check_sh --workdir <work_dir>`` with ``DEVPACK_ROOT`` and ``DEVPACK_BASELINE_SHA`` set."""
+    resolved_sha = (baseline_sha or "").strip()
+    if not resolved_sha and trial_dir is not None:
+        bfile = trial_dir / "baseline.sha"
+        if bfile.is_file():
+            resolved_sha = bfile.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    if not resolved_sha:
+        resolved_sha = os.environ.get("DEVPACK_BASELINE_SHA", "").strip()
+    if not resolved_sha:
+        return 2, "GRADER_MISCONFIGURED: missing external DEVPACK_BASELINE_SHA / baseline.sha"
     check_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home_dir),
         "TMPDIR": str(tmp_dir),
         "DEVPACK_ROOT": str(REPO_ROOT),
+        "DEVPACK_BASELINE_SHA": resolved_sha,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
+    if trial_dir is not None:
+        check_env["TRIAL_DIR"] = str(trial_dir)
     try:
         check_proc = subprocess.run(
             ["bash", str(check_sh), "--workdir", str(work_dir)],
@@ -1299,14 +1349,11 @@ def _run_trial_body(
     )
     agent_res = run_agent(request)
 
-    def _redact(text: str) -> str:
-        """Redact a string using this run's secrets and path replacements."""
-        return redact_sensitive_text(
-            text,
-            extra_secrets=extra_secrets,
-            path_replacements=path_replacements,
-            home_placeholder="$HOME",
-        )
+    _redact = functools.partial(
+        _redact_eval_text,
+        extra_secrets=extra_secrets,
+        path_replacements=path_replacements,
+    )
 
     excerpt = _redact(agent_res.final_text)[:EXCERPT_MAX_CHARS]
     denials_out = redact_structure(
@@ -1387,7 +1434,11 @@ def _run_trial_body(
     static_findings_first: int | None = None
     static_clean_final: bool | None = None
     if not is_harness_err and not timed_out:
-        base_ref = _resolve_baseline_ref(work_dir)
+        base_ref = _resolve_baseline_ref(
+            work_dir,
+            trial_dir=paths["trial_root"],
+            baseline_sha=str(paths.get("baseline_sha", "")),
+        )
         changed_files, _ = get_changed_files(work_dir, base_ref)
         lint_ok, lint_count, _lint_out = run_preflight_lint_on_changed(
             work_dir, changed_files or [], pack_root=REPO_ROOT
@@ -1408,6 +1459,8 @@ def _run_trial_body(
         paths["home_dir"],
         paths["tmp_dir"],
         timeout_s,
+        trial_dir=paths["trial_root"],
+        baseline_sha=str(paths.get("baseline_sha", "")),
     )
     if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
         is_harness_err = True
@@ -1728,20 +1781,19 @@ def run_runner_trial(
                 paths["home_dir"],
                 paths["tmp_dir"],
                 timeout_s,
+                trial_dir=paths["trial_root"],
+                baseline_sha=str(paths.get("baseline_sha", "")),
             )
             if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
                 is_harness_err = True
                 if not harness_reason:
                     harness_reason = f"grader misconfigured (exit {check_rc}): {check_out}"
 
-        def _redact(text: str) -> str:
-            """Redact secrets and paths from text."""
-            return redact_sensitive_text(
-                text,
-                extra_secrets=extra_secrets,
-                path_replacements=path_replacements,
-                home_placeholder="$HOME",
-            )
+        _redact = functools.partial(
+            _redact_eval_text,
+            extra_secrets=extra_secrets,
+            path_replacements=path_replacements,
+        )
 
         redacted_check_out = _redact(check_out)
         passed = check_rc == 0 and not is_harness_err and not timed_out
@@ -1903,6 +1955,10 @@ def run_orchestrator_trial(
             )
             if proc.returncode != 0:
                 raise RuntimeError(f"git {' '.join(args_git)} failed: {proc.stderr.strip()}")
+        orch_base_sha = run_git(
+            ["rev-parse", "HEAD"], repo_root=work_dir, cwd=work_dir, env=git_env, check=True
+        ).stdout.strip()
+        (trial_root / "baseline.sha").write_text(orch_base_sha + "\n", encoding="utf-8")
 
         # The broker installs only a credential-free client under this path.
         (work_dir / ".devpack").mkdir(exist_ok=True)
@@ -2005,14 +2061,11 @@ def run_orchestrator_trial(
             broker_log.close()
             (work_dir / ".devpack/broker.json").unlink(missing_ok=True)
 
-        def _redact(text: str) -> str:
-            """Redact secrets and paths from text."""
-            return redact_sensitive_text(
-                text,
-                extra_secrets=extra_secrets,
-                path_replacements=path_replacements,
-                home_placeholder="$HOME",
-            )
+        _redact = functools.partial(
+            _redact_eval_text,
+            extra_secrets=extra_secrets,
+            path_replacements=path_replacements,
+        )
 
         timed_out = agent_res.status == "timeout"
         is_harness_err = agent_res.status == "harness_error"
@@ -2043,6 +2096,8 @@ def run_orchestrator_trial(
                 home_dir,
                 tmp_dir,
                 timeout_s,
+                trial_dir=trial_root,
+                baseline_sha=orch_base_sha,
             )
             if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
                 is_harness_err = True
@@ -2300,6 +2355,10 @@ def run_memory_trial(
             ["commit", "-q", "-m", "chore: base fixture"],
         ):
             run_git(args, repo_root=work_dir, cwd=work_dir, env=git_env, check=True)
+        mem_base_sha = run_git(
+            ["rev-parse", "HEAD"], repo_root=work_dir, cwd=work_dir, env=git_env, check=True
+        ).stdout.strip()
+        (trial_root / "baseline.sha").write_text(mem_base_sha + "\n", encoding="utf-8")
 
         (work_dir / ".claude").mkdir(parents=True, exist_ok=True)
         (work_dir / ".claude" / "settings.json").write_text(
@@ -2328,14 +2387,11 @@ def run_memory_trial(
         else:
             resolved_profile = resolve_engine_profile_path(engine.name, REPO_ROOT)
 
-        def _redact(text: str) -> str:
-            """Redact sensitive values using trial secrets and path replacements."""
-            return redact_sensitive_text(
-                text,
-                extra_secrets=extra_secrets,
-                path_replacements=path_replacements,
-                home_placeholder="$HOME",
-            )
+        _redact = functools.partial(
+            _redact_eval_text,
+            extra_secrets=extra_secrets,
+            path_replacements=path_replacements,
+        )
 
         total_cost = 0.0
         total_turns = 0
@@ -2390,6 +2446,7 @@ def run_memory_trial(
                 memory_enabled=mem_enabled,
                 memory_root=mem_root,
                 memory_config=memory_config,
+                memory_task_id=seq.seq_id,
             )
             step_base_ref = _commit_step_baseline(work_dir, git_env)
             git_snap = snapshot_git_metadata(work_dir)
@@ -2496,6 +2553,7 @@ def run_memory_trial(
                         mem_root,
                         agent_res.final_text,
                         source=f"run:{trial_run_dir.name}-step{step_idx}",
+                        task_id=seq.seq_id,
                         extra_secrets=extra_secrets,
                     )
                     prior_proposed_ids.extend(e.id for e in prop_res.accepted)
@@ -2513,6 +2571,8 @@ def run_memory_trial(
                 home_dir,
                 tmp_dir,
                 timeout_s,
+                trial_dir=trial_root,
+                baseline_sha=mem_base_sha,
             )
             if check_rc == 2 or "GRADER_MISCONFIGURED" in check_out:
                 any_harness_err = True

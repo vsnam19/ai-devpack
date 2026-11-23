@@ -68,7 +68,6 @@ CXXFLAGS=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachabl
 if [[ "$USE_CMAKE" -eq 1 ]] && command -v cmake >/dev/null 2>&1; then
     cmake -S "$FIXTURE_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null
     cmake --build "$BUILD_DIR" --parallel 2 >/dev/null
-    "$BUILD_DIR/fixture_tests"
 else
     "$CXX_BIN" "${CXXFLAGS[@]}" \
         -I"$FIXTURE_ROOT/include" \
@@ -83,5 +82,41 @@ else
         "$FIXTURE_ROOT/tests/test_dtc_debouncer.cpp" \
         "$FIXTURE_ROOT/tests/test_main.cpp" \
         -o "$BUILD_DIR/fixture_tests"
-    "$BUILD_DIR/fixture_tests"
+fi
+
+expected_checks="$(
+    grep -hEo '(^|[^A-Za-z0-9_])CHECK(_EQ|_TRUE|_FALSE|_NEAR)?[[:space:]]*\(' \
+        "$FIXTURE_ROOT/tests"/*.cpp 2>/dev/null | wc -l || true
+)"
+if [[ "$expected_checks" -lt 186 && -f "$FIXTURE_ROOT/tests/test_can_codec.cpp" ]]; then
+    expected_checks=186
+fi
+if [[ "$expected_checks" -lt 1 ]]; then
+    expected_checks=1
+fi
+
+TEST_OUT_FILE="$BUILD_DIR/fixture_tests.out"
+set +e
+"$BUILD_DIR/fixture_tests" >"$TEST_OUT_FILE"
+test_rc=$?
+set -e
+cat "$TEST_OUT_FILE"
+if [[ "$test_rc" -ne 0 ]]; then
+    exit "$test_rc"
+fi
+
+last_proof_line="$(awk 'NF{line=$0} END{print line}' "$TEST_OUT_FILE" | tr -d '\r')"
+if [[ ! "$last_proof_line" =~ ^DEVPACK_TESTS_COMPLETED\ checks=([0-9]+)\ failed=([0-9]+)$ ]]; then
+    echo "FAIL: fixture_tests did not emit final DEVPACK_TESTS_COMPLETED line" >&2
+    exit 1
+fi
+reported_checks="${BASH_REMATCH[1]}"
+reported_failed="${BASH_REMATCH[2]}"
+if [[ "$reported_failed" -ne 0 ]]; then
+    echo "FAIL: fixture_tests reported failed=$reported_failed" >&2
+    exit 1
+fi
+if [[ "$reported_checks" -lt "$expected_checks" ]]; then
+    echo "FAIL: fixture_tests ran only $reported_checks check(s); expected at least $expected_checks" >&2
+    exit 1
 fi

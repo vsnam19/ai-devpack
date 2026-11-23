@@ -92,7 +92,10 @@ inline int printSummaryAndExitCode() {
     const TestCounters& state = counters<Tag>();
     const std::size_t passedChecks = state.totalChecks - state.failedChecks;
     std::cout << "TEST SUMMARY: " << passedChecks << "/" << state.totalChecks
-              << " checks passed (" << state.failedChecks << " failed)\n";
+              << " checks passed (" << state.failedChecks << " failed)\n"
+              << "DEVPACK_TESTS_COMPLETED checks=" << state.totalChecks
+              << " failed=" << state.failedChecks << "\n"
+              << std::flush;
     if (state.totalChecks == 0U || state.failedChecks > 0U) {
         return 1;
     }

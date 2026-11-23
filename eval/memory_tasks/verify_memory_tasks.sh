@@ -88,10 +88,11 @@ for seq_dir in "$MEM_TASKS_ROOT"/*/; do
         git add -A
         git commit -q -m "chore: base fixture"
     )
+    base_sha="$(git -C "$work_dir" rev-parse HEAD)"
 
     # 1. Baseline must fail check.sh
     baseline_ok=1
-    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$seq_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$seq_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
         baseline_ok=0
     fi
 
@@ -102,12 +103,12 @@ for seq_dir in "$MEM_TASKS_ROOT"/*/; do
         cp -r "$seq_dir/seed_memory/." "$mem_dir/"
     fi
     if [[ -f "$seq_dir/step1_proposals.md" ]]; then
-        python3 - "$PACK_ROOT" "$mem_dir" "$seq_dir/step1_proposals.md" <<'PY'
+        python3 - "$PACK_ROOT" "$mem_dir" "$seq_dir/step1_proposals.md" "$seq_id" <<'PY'
 import pathlib, sys
 sys.path.insert(0, sys.argv[1])
 from runner.memory import process_memory_proposals
 prop_text = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
-res = process_memory_proposals(sys.argv[2], prop_text, source="run:verify-step1")
+res = process_memory_proposals(sys.argv[2], prop_text, source="run:verify-step1", task_id=sys.argv[4])
 assert res.accepted, "expected auto-accepted handoff proposal"
 PY
     fi
@@ -144,7 +145,7 @@ for skey in step_keys:
         expected.append("mem-dtc-freeze-sentinel")
     forbidden = set(step.get("forbidden_ids", []))
 
-    res = retrieve_memory(mem_dir, prompt_text, role=role, engine=engine)
+    res = retrieve_memory(mem_dir, prompt_text, role=role, engine=engine, task_id=seq_dir.name)
     got = set(res.ids)
     for eid in expected:
         assert eid in got, f"{seq_dir.name}/{skey}: missing expected_id {eid} (got {res.ids})"
@@ -171,7 +172,7 @@ PY
     fi
     if [[ -n "$neg_patch" ]]; then
         git -C "$work_dir" apply "$neg_patch"
-        if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$seq_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+        if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$seq_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
             neg_status="PASS(BAD)"
         else
             neg_status="FAIL(OK)"
@@ -183,7 +184,7 @@ PY
     # 5. Reference solution.patch must PASS check.sh
     solve_status="FAIL(BAD)"
     git -C "$work_dir" apply "$seq_dir/solution.patch"
-    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" bash "$seq_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
+    if (cd "$work_dir" && DEVPACK_ROOT="$PACK_ROOT" DEVPACK_BASELINE_SHA="$base_sha" bash "$seq_dir/check.sh" --workdir "$work_dir" >/dev/null 2>&1); then
         solve_status="PASS(OK)"
     fi
 

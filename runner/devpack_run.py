@@ -69,8 +69,12 @@ from devpack_dispatch import (  # noqa: E402
     run_cppcheck_on_changed,
     run_preflight_lint_on_changed,
 )
+from enforcement.checks.deviations import verify_deviation  # noqa: E402
 from enforcement.checks.scope_check import get_changed_files, is_gate_protected_path  # noqa: E402
 from memory import memory_root_for, process_memory_proposals  # noqa: E402
+from redaction import collect_credential_secrets, redact_sensitive_text, redact_value  # noqa: E402
+
+MAX_FIX_ROUNDS_CAP = 2
 from safe_git import (  # noqa: E402
     GitSecurityError,
     check_git_metadata_unchanged,
@@ -172,6 +176,7 @@ def load_task_data(
         "INPUT_COMMIT": "HEAD",
         "REQ_IDS": "REQ-001",
         "INPUT_FILES": allowed_files or "src/",
+        "ALLOWED_FILES": allowed_files.strip(),
         "CONTEXT_DOCS": "AGENTS.md",
         "EXPECTED_OUTPUT_LIST": "- Implement and verify changes with unit tests.",
         "MAX_CHANGED_LINES": "200",
@@ -364,20 +369,44 @@ def compute_worktree_diff(worktree: Path) -> str:
     return ""
 
 
-def write_step_log(log_dir: Path, step_index: int, step_name: str, payload: dict[str, Any]) -> Path:
-    """Write a numbered JSON log file for a single workflow step."""
+def write_step_log(
+    log_dir: Path,
+    step_index: int,
+    step_name: str,
+    payload: dict[str, Any],
+    *,
+    credentials_path: Path | None = None,
+) -> Path:
+    """Write a numbered JSON log file for a single workflow step with redacted strings."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"step_{step_index:02d}_{step_name}.json"
-    log_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    cred_secrets = collect_credential_secrets(credentials_path)
+    safe_payload = redact_value(
+        payload,
+        extra_secrets=cred_secrets,
+        credentials_path=credentials_path,
+    )
+    log_path.write_text(json.dumps(safe_payload, indent=2) + "\n", encoding="utf-8")
     return log_path
 
 
-def write_gate_step_file(run_dir: Path, step_index: int, gate_text: str) -> Path:
+def write_gate_step_file(
+    run_dir: Path,
+    step_index: int,
+    gate_text: str,
+    *,
+    credentials_path: Path | None = None,
+) -> Path:
     """Write ``steps/NN-gate.txt`` inside ``run_dir`` with redacted gate output."""
     steps_dir = run_dir / "steps"
     steps_dir.mkdir(parents=True, exist_ok=True)
     gate_path = steps_dir / f"{step_index:02d}-gate.txt"
-    redacted = redact_sensitive_text(gate_text)
+    cred_secrets = collect_credential_secrets(credentials_path)
+    redacted = redact_sensitive_text(
+        gate_text,
+        extra_secrets=cred_secrets,
+        credentials_path=credentials_path,
+    )
     if redacted and not redacted.endswith("\n"):
         redacted += "\n"
     gate_path.write_text(redacted, encoding="utf-8")
@@ -466,6 +495,148 @@ def _resolve_git_base_ref(worktree: Path) -> str | None:
     return None
 
 
+def _parse_allowed_globs(
+    context: Mapping[str, str],
+    allow_globs: Sequence[str] | None = None,
+    ws_scope: Any = None,
+) -> list[str]:
+    """Return explicit allowed file globs from ``allow_globs``, ``context``, or active workspace components."""
+    if allow_globs is not None:
+        return [str(g).strip() for g in allow_globs if str(g).strip()]
+    raw = (context.get("ALLOWED_FILES") or "").strip()
+    if not raw and ws_scope is not None and getattr(ws_scope, "configured", False):
+        comp_globs = [
+            f"{comp.repo_rel_path.rstrip('/')}/**"
+            for comp in getattr(ws_scope, "active_components", ())
+            if getattr(comp, "repo_rel_path", "")
+        ]
+        if comp_globs:
+            return comp_globs
+    raw = raw or (context.get("ALLOWED_GLOB_1") or "").strip()
+    if not raw:
+        return ["src/*"]
+    return [tok for tok in re.split(r"[\s,]+", raw) if tok]
+
+
+def _enforce_step_scope_and_test_lock(
+    *,
+    worktree: Path,
+    base_ref: str | None,
+    allow_globs: Sequence[str],
+    protected_globs: Sequence[str],
+    pack_root: Path,
+    control_before: Mapping[str, str],
+    ws_scope: Any,
+    timeout_s: int = 60,
+) -> tuple[bool, str, str, list[str], str]:
+    """Run ``scope_check.py --allow`` and ``test_lock.py --no-deviation`` after an agent step.
+
+    Returns ``(ok, scope_status, test_lock_status, gate_touched, detail_text)``.
+    """
+    if base_ref is None:
+        return True, "ok", "skipped", [], ""
+
+    changed_files, changed_err = get_changed_files(worktree, base_ref)
+    if changed_files is None:
+        detail = changed_err or "failed to enumerate changed files"
+        return False, "violation", "fail", [], f"SCOPE_VIOLATION: {detail}"
+
+    with tempfile.TemporaryDirectory(prefix="devpack-run-step-cfg-") as cfg_tmp:
+        trusted_cfg = resolve_trusted_gate_config(
+            worktree,
+            Path(cfg_tmp),
+            base_ref=base_ref,
+            pack_root=pack_root,
+        )
+        control_after = _control_snapshot(worktree)
+        control_changes = sorted(
+            name
+            for name in control_before.keys() | control_after.keys()
+            if control_before.get(name) != control_after.get(name)
+        )
+        gate_touched = sorted(
+            {
+                p
+                for p in changed_files
+                if not (p == ".devpack" or p.startswith(".devpack/"))
+                and is_gate_protected_path(p, trusted_cfg.protected_rel_paths)
+            }
+            | {
+                p
+                for p in control_changes
+                if is_gate_protected_path(p, trusted_cfg.protected_rel_paths)
+            }
+        )
+
+        scope_status = "ok"
+        test_lock_status = "ok"
+        details: list[str] = []
+
+        if gate_touched:
+            scope_status = "violation"
+            details.append(
+                "[gate_touched]\n"
+                + "\n".join(
+                    f"SCOPE_VIOLATION: {p} is gate-touched "
+                    "(gate/lint/cppcheck configuration cannot be modified by workers)"
+                    for p in gate_touched
+                )
+            )
+        if ws_scope.configured:
+            outside_ws = [p for p in changed_files if ws_scope.outside_workspace(p)]
+            if outside_ws:
+                scope_status = "violation"
+                details.append(
+                    "[workspace_scope]\n"
+                    + "\n".join(
+                        f"SCOPE_VIOLATION: {p} is outside workspace root ({ws_scope.workspace_root_rel})"
+                        for p in outside_ws
+                    )
+                )
+
+        if scope_status == "ok" and allow_globs:
+            scope_script = pack_root / "enforcement" / "checks" / "scope_check.py"
+            scope_cmd = [
+                "python3",
+                str(scope_script),
+                "--repo",
+                str(worktree),
+                "--base",
+                base_ref,
+                "--allow",
+                *allow_globs,
+            ]
+            for extra_gate in trusted_cfg.protected_rel_paths:
+                scope_cmd.extend(["--gate-config-file", extra_gate])
+            s_rc, s_out, s_err, _ = execute_command(scope_cmd, cwd=worktree, timeout_s=timeout_s)
+            s_comb = (s_out + ("\n" + s_err if s_err else "")).strip()
+            if s_rc != 0:
+                scope_status = "violation"
+                details.append(f"[scope_check]\n{s_comb or 'SCOPE_VIOLATION'}")
+
+        if protected_globs:
+            tl_script = pack_root / "enforcement" / "checks" / "test_lock.py"
+            tl_cmd = [
+                "python3",
+                str(tl_script),
+                "--repo",
+                str(worktree),
+                "--base",
+                base_ref,
+                "--no-deviation",
+                "--protected",
+                *protected_globs,
+            ]
+            tl_rc, tl_out, tl_err, _ = execute_command(tl_cmd, cwd=worktree, timeout_s=timeout_s)
+            tl_comb = (tl_out + ("\n" + tl_err if tl_err else "")).strip()
+            if tl_rc != 0:
+                test_lock_status = "fail"
+                details.append(f"[test_lock]\n{tl_comb or 'TEST_LOCK_VIOLATION'}")
+
+    ok = scope_status == "ok" and test_lock_status == "ok"
+    return ok, scope_status, test_lock_status, gate_touched, "\n\n".join(details)
+
+
 def run_task_workflow(
     config: EnginesConfig | dict[str, Any],
     context: dict[str, str],
@@ -496,6 +667,9 @@ def run_task_workflow(
     skills_enabled: bool = False,
     components: str | Sequence[str] | None = None,
     all_components: bool = False,
+    allow_globs: Sequence[str] | None = None,
+    protected_globs: Sequence[str] = ("tests/**",),
+    deviation_id: str = "",
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -533,6 +707,21 @@ def run_task_workflow(
         if max_fix_rounds_override is not None
         else default_max_rounds
     )
+    if max_fix_rounds < 0:
+        raise ValueError(f"max_fix_rounds must be >= 0, got {max_fix_rounds}")
+    if max_fix_rounds > MAX_FIX_ROUNDS_CAP:
+        entry, dev_reason = verify_deviation(
+            deviation_id,
+            rule="max_fix_rounds",
+            worktree_roots=(worktree,),
+        )
+        if entry is None:
+            raise ValueError(
+                f"max_fix_rounds={max_fix_rounds} exceeds hard cap of {MAX_FIX_ROUNDS_CAP}: "
+                f"{dev_reason} (pass --deviation <ID> matching DEVPACK_DEVIATIONS)"
+            )
+    resolved_allow_globs = _parse_allowed_globs(context, allow_globs, ws_scope=ws_scope)
+    resolved_protected_globs = [str(g).strip() for g in protected_globs if str(g).strip()]
 
     impl_engine = _coerce_role_engine(config, "implementer")
     rev_engine = _coerce_role_engine(config, "reviewer")
@@ -676,6 +865,46 @@ def run_task_workflow(
     pending_proposal_texts: list[str] = []
     git_tampered = False
     git_tamper_reason = ""
+    scope_status = "ok"
+    test_lock_status = "ok" if base_ref is not None else "skipped"
+    step_gate_touched: list[str] = []
+    enforcement_failed = False
+
+    def _check_post_step_enforcement() -> bool:
+        """Verify git integrity, scope_check, and test_lock immediately after an agent step."""
+        nonlocal scope_status, test_lock_status, step_gate_touched
+        nonlocal final_status, escalation_reason, enforcement_failed
+        if git_tampered:
+            scope_status = "violation"
+            final_status = "git_metadata_tampered"
+            escalation_reason = git_tamper_reason
+            enforcement_failed = True
+            return False
+        step_ok, s_status, tl_status, g_touched, detail_text = _enforce_step_scope_and_test_lock(
+            worktree=worktree,
+            base_ref=base_ref,
+            allow_globs=resolved_allow_globs,
+            protected_globs=resolved_protected_globs,
+            pack_root=lint_pack_root,
+            control_before=control_before,
+            ws_scope=ws_scope,
+        )
+        scope_status = s_status
+        test_lock_status = tl_status
+        if g_touched:
+            step_gate_touched = sorted(set(step_gate_touched) | set(g_touched))
+        if not step_ok:
+            write_gate_step_file(
+                active_run_dir,
+                step_index,
+                detail_text,
+                credentials_path=credentials_path,
+            )
+            final_status = "fail"
+            escalation_reason = detail_text or "Post-step scope or test_lock violation"
+            enforcement_failed = True
+            return False
+        return True
 
     def _invoke_role(role_name: str, engine: EngineConfig, prompt_text: str) -> agent_exec.AgentResult:
         """Run a role via agent_exec.run_agent and accumulate telemetry."""
@@ -723,6 +952,7 @@ def run_task_workflow(
                 + "\n"
                 + context.get("ALLOWED_GLOB_1", "")
             ),
+            memory_task_id=context.get("TASK_ID", ""),
         )
         res = run_agent(req)
         for mid in res.memory_ids:
@@ -778,12 +1008,17 @@ def run_task_workflow(
     )
     step_logs.append(log_file.name)
 
-    fix_rounds_used = 0
-    final_status = ESCALATE_TO_HUMAN
-    final_verdict = ""
-    escalation_reason = ""
+    if not _check_post_step_enforcement():
+        pass
 
-    while True:
+    fix_rounds_used = 0
+    if not enforcement_failed:
+        final_status = ESCALATE_TO_HUMAN
+    final_verdict = ""
+    if not enforcement_failed:
+        escalation_reason = ""
+
+    while not enforcement_failed:
         if git_tampered:
             final_status = "git_metadata_tampered"
             escalation_reason = git_tamper_reason
@@ -909,6 +1144,7 @@ def run_task_workflow(
             active_run_dir,
             step_index,
             combined_gate_output or f"Gate exited with {gate_rc}",
+            credentials_path=credentials_path,
         )
         log_file = write_step_log(
             log_dir,
@@ -979,6 +1215,8 @@ def run_task_workflow(
                 },
             )
             step_logs.append(log_file.name)
+            if not _check_post_step_enforcement():
+                break
             continue
 
         # Gate passed -> accept queued implementer/fixer memory proposals, then Run Reviewer
@@ -994,6 +1232,7 @@ def run_task_workflow(
                     effective_mem_root,
                     prop_text,
                     source=f"run:{active_run_dir.name}",
+                    task_id=context.get("TASK_ID", ""),
                     stop_report_text=stop_report_text if idx_p == len(pending_proposal_texts) - 1 else "",
                     extra_secrets=extra_secrets,
                 )
@@ -1050,6 +1289,7 @@ def run_task_workflow(
                     effective_mem_root,
                     rev_res.final_text,
                     source=f"run:{active_run_dir.name}",
+                    task_id=context.get("TASK_ID", ""),
                     extra_secrets=extra_secrets,
                 )
                 accepted_proposals.extend(e.id for e in rev_prop.accepted)
@@ -1107,6 +1347,8 @@ def run_task_workflow(
             },
         )
         step_logs.append(log_file.name)
+        if not _check_post_step_enforcement():
+            break
 
     if final_status == ESCALATE_TO_HUMAN:
         step_index += 1
@@ -1126,7 +1368,12 @@ def run_task_workflow(
         )
         step_logs.append(esc_log.name)
 
-    run_json_extra: dict[str, Any] = {}
+    run_json_extra: dict[str, Any] = {
+        "scope": scope_status,
+        "test_lock": test_lock_status,
+    }
+    if step_gate_touched:
+        run_json_extra["gate_touched"] = step_gate_touched
     if git_tampered:
         run_json_extra["scope"] = "violation"
         run_json_extra["scope_violation"] = "git_metadata_tampered"
@@ -1137,7 +1384,7 @@ def run_task_workflow(
         active_run_dir,
         task=context["TASK_ID"],
         engines=role_engine_map,
-        outcome="fail" if git_tampered else final_status,
+        outcome="fail" if (git_tampered or enforcement_failed) else final_status,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
         lint_findings_first_attempt=lint_findings_first_attempt,
@@ -1153,8 +1400,9 @@ def run_task_workflow(
         "task_title": context["TASK_TITLE"],
         "status": final_status,
         "verdict": final_verdict,
-        "scope": "violation" if git_tampered else "ok",
-        "scope_violation": "git_metadata_tampered" if git_tampered else "",
+        "scope": "violation" if git_tampered else scope_status,
+        "scope_violation": "git_metadata_tampered" if git_tampered else ("scope_violation" if scope_status == "violation" else ""),
+        "test_lock": test_lock_status,
         "git_metadata_tampered": git_tampered,
         "components": active_component_names,
         "scan_mode": ws_scope.scan_mode,
@@ -1243,8 +1491,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--allowed-files",
-        default="src/*",
-        help="Allowed file glob(s) for the task",
+        default="",
+        help="Allowed file glob(s) for the task (default: active components or src/*)",
     )
     parser.add_argument(
         "--worktree",
@@ -1270,7 +1518,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-fix-rounds",
         type=int,
         default=None,
-        help="Override max_fix_rounds from config (default: from config, typically 2)",
+        help="Override max_fix_rounds from config (hard-capped at 2 unless --deviation <ID>)",
+    )
+    parser.add_argument(
+        "--deviation",
+        default="",
+        help="Human deviation ID verified against DEVPACK_DEVIATIONS (for --max-fix-rounds > 2)",
     )
     parser.add_argument(
         "--isolation",
@@ -1373,23 +1626,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         log_dir = run_dir
 
-    rc, _summary = run_task_workflow(
-        config=config,
-        context=context,
-        worktree=worktree,
-        log_dir=log_dir,
-        repo_root=repo_root,
-        max_fix_rounds_override=args.max_fix_rounds,
-        dry_run=args.dry_run,
-        run_dir=run_dir,
-        isolation=args.isolation,
-        allow_unsandboxed_local=args.allow_unsandboxed_local,
-        credentials_path=credentials_path,
-        agent_bin=args.agent_bin,
-        skills_enabled=args.skills,
-        components=args.components,
-        all_components=bool(args.all_components),
-    )
+    try:
+        rc, _summary = run_task_workflow(
+            config=config,
+            context=context,
+            worktree=worktree,
+            log_dir=log_dir,
+            repo_root=repo_root,
+            max_fix_rounds_override=args.max_fix_rounds,
+            dry_run=args.dry_run,
+            run_dir=run_dir,
+            isolation=args.isolation,
+            allow_unsandboxed_local=args.allow_unsandboxed_local,
+            credentials_path=credentials_path,
+            agent_bin=args.agent_bin,
+            skills_enabled=args.skills,
+            components=args.components,
+            all_components=bool(args.all_components),
+            deviation_id=args.deviation,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     return rc
 
 

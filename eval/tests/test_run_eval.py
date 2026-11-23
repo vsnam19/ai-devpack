@@ -772,7 +772,10 @@ class HarnessErrorTests(unittest.TestCase):
             subprocess.run(["git", "add", "-A"], cwd=w, check=True)
             subprocess.run(["git", "commit", "-q", "-m", "chore: base fixture"], cwd=w, check=True)
 
-            env = {**os.environ, "DEVPACK_ROOT": str(REPO_ROOT)}
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=w, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            env = {**os.environ, "DEVPACK_ROOT": str(REPO_ROOT), "DEVPACK_BASELINE_SHA": base_sha}
             r_fail = subprocess.run(
                 ["bash", str(goal_dir / "check.sh"), "--workdir", str(w)],
                 env=env, capture_output=True, text=True, check=False,
@@ -895,6 +898,9 @@ class HarnessErrorTests(unittest.TestCase):
             subprocess.run(["git", "apply", str(task_dir / "setup.patch")], cwd=work, check=True)
             subprocess.run(["git", "add", "-A"], cwd=work, check=True)
             subprocess.run(["git", "commit", "-q", "-m", "chore: apply setup.patch"], cwd=work, check=True)
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=work, check=True, capture_output=True, text=True
+            ).stdout.strip()
             subprocess.run(["git", "apply", str(task_dir / "solution.patch")], cwd=work, check=True)
 
             # Inject a nullPointer dereference into a clean solution function
@@ -910,7 +916,11 @@ class HarnessErrorTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            env_with_cppcheck = {**os.environ, "DEVPACK_ROOT": str(REPO_ROOT)}
+            env_with_cppcheck = {
+                **os.environ,
+                "DEVPACK_ROOT": str(REPO_ROOT),
+                "DEVPACK_BASELINE_SHA": base_sha,
+            }
             proc_fail = subprocess.run(
                 ["bash", str(task_dir / "check.sh"), "--workdir", str(work)],
                 env=env_with_cppcheck,
@@ -938,6 +948,7 @@ class HarnessErrorTests(unittest.TestCase):
                 "HOME": str(base / "home"),
                 "TMPDIR": str(base),
                 "DEVPACK_ROOT": str(REPO_ROOT),
+                "DEVPACK_BASELINE_SHA": base_sha,
                 "LANG": "C.UTF-8",
                 "LC_ALL": "C.UTF-8",
             }

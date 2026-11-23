@@ -154,9 +154,15 @@ bash tests/run_all.sh
 # run the offline pack gate (expect GATE_OK); the receipt is a JSON file
 python3 enforcement/gate/gate.py --config enforcement/gate/gate.example.toml --receipt /tmp/devpack_receipt.json
 
-# run one task through the local runner (implement -> gate -> review -> fix, max 2 rounds)
+# run one task through the local runner (implement -> scope/test_lock -> gate -> review -> fix, max 2 rounds)
 python3 runner/devpack_run.py --config runner/engines.example.toml --task-id task-001 \
   --title "Short title" --goal "One-paragraph goal" --allowed-files "src/*.cpp" --dry-run
+
+# governed paths enforced automatically after every implementer/fixer step in both
+# devpack_run.py and devpack_dispatch.py:
+#   - Allowed edits: --allow / --allowed-files (checked via enforcement/checks/scope_check.py)
+#   - Protected tests: tests/** (checked via enforcement/checks/test_lock.py --no-deviation)
+#   - Gate-protected config/control files: .devpack/**, enforcement/**, preflight.toml, .clang-tidy, gate*.toml
 
 # evaluation dry-runs (no model calls)
 python3 eval/run_eval.py --dry-run --mode single --tier all --engines sonnet,haiku --k 1

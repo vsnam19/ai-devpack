@@ -271,7 +271,7 @@ class MemoryStoreAndRetrievalTests(unittest.TestCase):
                 budget_tokens=800,
             )
             self.assertEqual(["mem-mod", "mem-handoff"], res_impl.ids)
-            self.assertIn("## Relevant project memory", res_impl.formatted_prompt)
+            self.assertIn(memory.INJECTED_MEMORY_HEADING, res_impl.formatted_prompt)
             self.assertIn("source:", res_impl.formatted_prompt)
             self.assertIn("take precedence on conflict", res_impl.formatted_prompt)
             self.assertLessEqual(res_impl.total_tokens, 800)
@@ -317,14 +317,18 @@ class MemoryStoreAndRetrievalTests(unittest.TestCase):
             self.assertLessEqual(len(res_tight.ids), 1)
 
     def test_proposal_parsing_and_post_gate_processing(self) -> None:
-        """Verify markdown & JSON proposal parsing, handoff/known-gap auto-accept, and decision pending."""
+        """Verify markdown & JSON proposal parsing, same-task handoff/known-gap auto-accept, and decision pending."""
         text = (
             "Done implementing.\n\n"
             "## Memory proposals\n"
             "- type: handoff\n"
-            "  scope: module:src/mod.cpp\n"
+            "  scope: task:task-001\n"
             "  tags: REQ-1, mod\n"
             "  summary: Left invariant intact.\n"
+            "- type: handoff\n"
+            "  scope: module:src/mod.cpp\n"
+            "  tags: REQ-1, mod\n"
+            "  summary: Non-task scope must remain pending.\n"
             "- type: decision\n"
             "  scope: project\n"
             "  tags: REQ-1\n"
@@ -334,7 +338,7 @@ class MemoryStoreAndRetrievalTests(unittest.TestCase):
             "# STOP\n\n"
             "## Memory proposals\n"
             "```json\n"
-            '[{"type": "known-gap", "scope": "project", "tags": ["REQ-2"], "summary": "Missing hardware timer mock."}]\n'
+            '[{"type": "known-gap", "scope": "task:task-001", "tags": ["REQ-2"], "summary": "Missing hardware timer mock."}]\n'
             "```\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -343,14 +347,14 @@ class MemoryStoreAndRetrievalTests(unittest.TestCase):
                 mem_root,
                 text,
                 source="run:test-run-1",
+                task_id="task-001",
                 stop_report_text=stop_text,
             )
             self.assertEqual(2, len(res.accepted))
             self.assertEqual({"handoff", "known-gap"}, {e.entry_type for e in res.accepted})
             self.assertTrue(all(e.status == "active" for e in res.accepted))
-            self.assertEqual(1, len(res.pending))
-            self.assertEqual("decision", res.pending[0].entry_type)
-            self.assertEqual("pending", res.pending[0].status)
+            self.assertEqual(2, len(res.pending))
+            self.assertTrue(all(e.status == "pending" for e in res.pending))
 
             # Empty/None proposal section yields 0 proposals
             self.assertEqual([], memory.parse_memory_proposals("## Memory proposals\nNone.\n"))
@@ -398,7 +402,7 @@ class MemorySupersedeGuardTests(unittest.TestCase):
                 self.assertEqual("superseded", memory.find_memory_entry(mem_root, target_id).status)
 
     def test_handoff_superseding_handoff_is_auto_accepted(self) -> None:
-        """A handoff superseding only a handoff keeps the auto-accept behaviour and retires the old handoff."""
+        """A same-task handoff superseding only a handoff keeps auto-accept and retires the old handoff."""
         with tempfile.TemporaryDirectory() as tmp:
             mem_root = memory.memory_root_for(Path(tmp))
             self._seed(mem_root, "mem-handoff-old", "handoff", "Old progress note.")
@@ -406,12 +410,14 @@ class MemorySupersedeGuardTests(unittest.TestCase):
                 "## Memory proposals\n"
                 "- type: handoff\n"
                 "  id: mem-handoff-new\n"
-                "  scope: project\n"
+                "  scope: task:task-sup-3\n"
                 "  tags: REQ-1\n"
                 "  supersedes: mem-handoff-old\n"
                 "  summary: Newer progress note.\n"
             )
-            res = memory.process_memory_proposals(mem_root, text, source="run:test-run-3")
+            res = memory.process_memory_proposals(
+                mem_root, text, source="run:test-run-3", task_id="task-sup-3"
+            )
             self.assertEqual([], res.rejected)
             self.assertEqual(["mem-handoff-new"], [e.id for e in res.accepted])
             self.assertEqual([], res.pending)
@@ -508,7 +514,7 @@ class MemoryRunnerIntegrationTests(unittest.TestCase):
             self.assertGreater(res.memory_tokens, 0)
 
             prompt_saved = (run_dir / "steps" / "01-implementer-haiku.prompt.md").read_text(encoding="utf-8")
-            self.assertIn("## Relevant project memory", prompt_saved)
+            self.assertIn(memory.INJECTED_MEMORY_HEADING, prompt_saved)
             self.assertIn("mem-exec-1", prompt_saved)
 
             meta_saved = json.loads((run_dir / "steps" / "01-implementer-haiku.meta.json").read_text(encoding="utf-8"))
@@ -560,7 +566,7 @@ class MemoryRunnerIntegrationTests(unittest.TestCase):
                 "/**\\n * @brief Value.\\n * @return Two.\\n */\\n"
                 "int val() { return 2; }\\n', encoding='utf-8')\n"
                 "final_txt = ('Done.\\n\\n## Memory proposals\\n'\n"
-                "             '- type: handoff\\n  scope: project\\n  tags: REQ-MOD-1\\n'\n"
+                "             '- type: handoff\\n  scope: task:job\\n  tags: REQ-MOD-1\\n'\n"
                 "             '  summary: Updated val() to 2.\\n'\n"
                 "             '- type: decision\\n  scope: project\\n  tags: REQ-MOD-1\\n'\n"
                 "             '  summary: Keep val() positive.\\n')\n"

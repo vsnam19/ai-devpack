@@ -58,10 +58,19 @@ def verify_all_goals() -> int:
             ):
                 subprocess.run(git_cmd, cwd=work_dir, check=True, capture_output=True)
 
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=work_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            goal_env = {**env, "DEVPACK_BASELINE_SHA": base_sha}
+
             before = subprocess.run(
                 ["bash", str(goal.check_sh), "--workdir", str(work_dir)],
                 cwd=work_dir,
-                env=env,
+                env=goal_env,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -86,7 +95,7 @@ def verify_all_goals() -> int:
             after = subprocess.run(
                 ["bash", str(goal.check_sh), "--workdir", str(work_dir)],
                 cwd=work_dir,
-                env=env,
+                env=goal_env,
                 capture_output=True,
                 text=True,
                 check=False,

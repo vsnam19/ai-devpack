@@ -31,25 +31,24 @@ REPO_ROOT = RUNNER_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from enforcement.checks import secret_pii_check  # noqa: E402
-
 try:
-    import tomllib  # type: ignore[attr-defined]
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
-    tomllib = None  # type: ignore[assignment]
-
-try:
-    from runner.agent_exec import (  # noqa: E402
-        _minimal_toml_loads,
+    from runner.agent_exec import _minimal_toml_loads  # noqa: E402
+    from runner.redaction import (  # noqa: E402
+        Redactor,
         collect_os_identities,
+        extract_credential_file_secrets as _extract_credential_file_secrets,
         redact_os_identities,
+        redact_text,
         redact_value,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct runner/ invocation
-    from agent_exec import (  # type: ignore[no-redef]  # noqa: E402
-        _minimal_toml_loads,
+    from agent_exec import _minimal_toml_loads  # type: ignore[no-redef]  # noqa: E402
+    from redaction import (  # type: ignore[no-redef]  # noqa: E402
+        Redactor,
         collect_os_identities,
+        extract_credential_file_secrets as _extract_credential_file_secrets,
         redact_os_identities,
+        redact_text,
         redact_value,
     )
 
@@ -85,50 +84,6 @@ _CPP_IGNORED_IDENTS = frozenset(
 _CPP_SKIP_DIRS = frozenset({".git", "__pycache__", ".worktrees", "runs", "build", ".devpack"})
 
 TRUNCATE_LIMIT_BYTES = 4096
-
-# Construct home prefix dynamically so literal forbidden pattern never appears in source.
-_LINUX_HOME_PREFIX = "/" + "ho" + "me"
-_HOME_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:" + _LINUX_HOME_PREFIX + r"|/Users)/[A-Za-z0-9_.-]+"
-)
-
-# Private key block matcher (multi-line) for complete block redaction.
-_BEGIN_WORD = "-----BEGIN"
-_END_WORD = "-----END"
-_PRIV_KEY_SUFFIX = "PRIVATE" + " KEY-----"
-_PRIVATE_KEY_BLOCK_RE = re.compile(
-    rf"{_BEGIN_WORD}\s+(?:[A-Z0-9 ]+\s+)?{_PRIV_KEY_SUFFIX}[\s\S]*?{_END_WORD}\s+(?:[A-Z0-9 ]+\s+)?{_PRIV_KEY_SUFFIX}"
-)
-
-# Credential-looking token patterns.
-_BEARER_TOKEN_RE = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
-_PREFIXED_TOKEN_RE = re.compile(
-    r"\b(?:"
-    r"sk-ant-[A-Za-z0-9_-]{8,}"
-    r"|sk-[A-Za-z0-9_-]{16,}"
-    r"|ghp_[A-Za-z0-9]{16,}"
-    r"|gho_[A-Za-z0-9]{16,}"
-    r"|github_pat_[A-Za-z0-9_]{16,}"
-    r"|glpat-[A-Za-z0-9_-]{12,}"
-    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
-    r")\b"
-)
-_CRED_ASSIGN_RE = re.compile(
-    r"(?i)\b((?:[a-z0-9_]*_)?(?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token"
-    r"|client[_-]?secret|secret[_-]?key|private[_-]?key|bearer[_-]?token|secret|token))"
-    r"(\s*[:=]\s*['\"]?)(?![0-9]+\b)([A-Za-z0-9._~+/=-]{8,})(['\"]?)"
-)
-_JSON_CRED_RE = re.compile(
-    r"(?i)(['\"](?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token"
-    r"|client[_-]?secret|secret[_-]?key|private[_-]?key|sessionKey|claudeAiOauth"
-    r"|password|passwd|secret|token)['\"]\s*:\s*['\"])([^'\"\s]{6,})(['\"])"
-)
-
-_DEFAULT_AUTH_ENV_NAMES = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "DEVPACK_LOCAL_AUTH_TOKEN",
-)
 
 _STEP_PREFIX_RE = re.compile(r"^(\d+)[-_](.+)$")
 _KNOWN_EVENT_TYPES = {"system", "assistant", "user", "result"}
@@ -206,156 +161,6 @@ class RunRecord:
     total_protocol_errors: int = 0
     verdict_line: str = ""
     steps: list[StepRecord] = field(default_factory=list)
-
-
-class Redactor:
-    """Redacts secrets, PII patterns, environment token values, credentials, and home paths."""
-
-    def __init__(
-        self,
-        redact_env_names: Sequence[str] | None = None,
-        patterns_file: pathlib.Path | str | None = None,
-        extra_literals: Sequence[str] | None = None,
-    ) -> None:
-        """Initialize redaction rules from secret_pii_check, environment variables, and patterns."""
-        self.rules: list[tuple[str, re.Pattern[str]]] = list(
-            secret_pii_check.get_builtin_rules()
-        )
-
-        resolved_patterns = patterns_file or os.environ.get("DEVPACK_SECRET_PATTERNS")
-        if resolved_patterns:
-            p_path = pathlib.Path(resolved_patterns)
-            if p_path.is_file():
-                custom_rules, _ = secret_pii_check.load_external_patterns(p_path)
-                if custom_rules:
-                    self.rules.extend(custom_rules)
-
-        literals: list[str] = []
-        env_names: list[str] = list(_DEFAULT_AUTH_ENV_NAMES)
-        if redact_env_names:
-            for item in redact_env_names:
-                for part in item.split(","):
-                    cleaned = part.strip()
-                    if cleaned and cleaned not in env_names:
-                        env_names.append(cleaned)
-
-        for env_name in env_names:
-            val = os.environ.get(env_name, "")
-            if val and val.strip():
-                literals.append(val.strip())
-                if val != val.strip():
-                    literals.append(val)
-
-        cred_file = os.environ.get("DEVPACK_CLAUDE_CREDENTIALS", "")
-        if cred_file:
-            cred_path = pathlib.Path(cred_file)
-            if cred_path.is_file():
-                try:
-                    raw_cred = cred_path.read_text(encoding="utf-8", errors="replace")
-                    literals.extend(_extract_credential_file_secrets(raw_cred))
-                except OSError:
-                    pass
-
-        if extra_literals:
-            for item in extra_literals:
-                if item and item.strip():
-                    literals.append(item.strip())
-
-        # Sort longer literals first to avoid partial prefix replacements.
-        self.secret_literals: list[str] = sorted(
-            {lit for lit in literals if len(lit) >= 4},
-            key=len,
-            reverse=True,
-        )
-
-        current_home = os.path.expanduser("~")
-        self.current_home: str | None = (
-            current_home.rstrip("/")
-            if current_home and current_home not in ("~", "/")
-            else None
-        )
-        self._os_identities = collect_os_identities()
-
-    def redact(self, text: str) -> str:
-        """Return a redacted copy of ``text`` with secrets, home paths, and OS IDs scrubbed."""
-        if not text:
-            return text
-
-        out = text
-
-        for secret_val in self.secret_literals:
-            if secret_val in out:
-                out = out.replace(secret_val, "[REDACTED]")
-
-        out = _PRIVATE_KEY_BLOCK_RE.sub("[REDACTED]", out)
-
-        for _, rx in self.rules:
-            out = rx.sub("[REDACTED]", out)
-
-        out = _BEARER_TOKEN_RE.sub(r"\1[REDACTED]", out)
-        out = _PREFIXED_TOKEN_RE.sub("[REDACTED]", out)
-        out = _JSON_CRED_RE.sub(r"\1[REDACTED]\3", out)
-        out = _CRED_ASSIGN_RE.sub(r"\1\2[REDACTED]\4", out)
-
-        if self.current_home and self.current_home in out:
-            out = out.replace(self.current_home, "~")
-        out = _HOME_PATH_RE.sub("~", out)
-        out = redact_os_identities(out, self._os_identities)
-
-        return out
-
-    def redact_value(self, value: Any) -> Any:
-        """Recursively redact strings and dict keys in ``value`` with no exemptions."""
-        return redact_value(value, _text_fn=self.redact)
-
-
-def _extract_credential_file_secrets(raw_text: str) -> list[str]:
-    """Extract secret string values from a JSON or plain-text credential file."""
-    found: list[str] = []
-    stripped = raw_text.strip()
-    if not stripped:
-        return found
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        for line in stripped.splitlines():
-            clean = line.strip()
-            if len(clean) >= 8:
-                found.append(clean)
-        return found
-
-    def _walk(node: Any) -> None:
-        """Recursively collect string leaves that look like tokens or secrets."""
-        if isinstance(node, dict):
-            for k, v in node.items():
-                k_low = str(k).lower()
-                if isinstance(v, str) and len(v) >= 8 and any(
-                    word in k_low for word in ("token", "key", "secret", "password", "auth")
-                ):
-                    found.append(v)
-                else:
-                    _walk(v)
-        elif isinstance(node, list):
-            for elem in node:
-                _walk(elem)
-
-    _walk(parsed)
-    return found
-
-
-def redact_text(
-    text: str,
-    redact_env_names: Sequence[str] | None = None,
-    patterns_file: pathlib.Path | str | None = None,
-    extra_literals: Sequence[str] | None = None,
-) -> str:
-    """Convenience function to redact a string using ``Redactor``."""
-    redactor = Redactor(
-        redact_env_names=redact_env_names,
-        patterns_file=patterns_file,
-        extra_literals=extra_literals,
-    )
-    return redactor.redact(text)
 
 
 def truncate_text(text: str, full: bool = False, limit: int = TRUNCATE_LIMIT_BYTES) -> str:

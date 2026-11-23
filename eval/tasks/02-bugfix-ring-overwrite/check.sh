@@ -66,10 +66,17 @@ else
     exit 1
 fi
 
+SAFE_GIT_SH="${DEVPACK_ROOT:+$DEVPACK_ROOT/eval/lib/safe_git.sh}"
+if [[ -z "$SAFE_GIT_SH" || ! -f "$SAFE_GIT_SH" ]]; then
+    SAFE_GIT_SH="$SCRIPT_DIR/../../lib/safe_git.sh"
+fi
+# shellcheck source=/dev/null
+source "$SAFE_GIT_SH"
+
 BASELINE_HASHES=(
     "CMakeLists.txt:f4c74df4499acb3025e609acb21428e38c5336ca59b26d3728c73d4d0da33c75"
     "include/dtc_debouncer.hpp:90c8aee02c289431b8992b2f8cb76f1481d56413222fb34d20ca93ffff68dc80"
-    "build_and_test.sh:13e19b315d23b8d1628358818b61c97dd7d95cd5ac79447a52c839dbb1122137"
+    "build_and_test.sh:f87d8c42f649a0d0a11f7fd6e48068da4ac661edb5463e424ca259e6551a6af0"
     "include/can_codec.hpp:153417bd1a1c0526f9b4542bf7e19653683e3d408ad9503642d14ec8a6773511"
     "include/link_state_machine.hpp:6a73630a93bbbacbdbd19ba4314e4e63d079e2993b193bf53312d04fd9e8bf30"
     "include/ring_buffer.hpp:14512341e1c335f111ef9c7a59443d145efe8206aebe9e27ef50c7b58a416a96"
@@ -78,7 +85,7 @@ BASELINE_HASHES=(
     "src/link_state_machine.cpp:72114142bb41abd99fb4e9bd47594fd529c4cae92981474bc037b4a3b2b2d992"
     "src/ring_buffer.cpp:4cbf91d31ac38108a0df7d8fa8b37d48a00be462ac13e31d76fe2e2541c39f21"
     "tests/test_can_codec.cpp:a5d01a92642a5068c00e2688127a712b1f70b8d7096dc67329aa53384124a710"
-    "tests/test_framework.hpp:0d8622584df89748e00d604c27a3a17b44d738b181f410983e3837f7f607be83"
+    "tests/test_framework.hpp:63c415272ae5a24fc8cb35dbdd59f94b94f3aba0c36782194e87f641aa7fac78"
     "tests/test_link_state_machine.cpp:6ee4c883cd46d9a1cc414e807a840b3c269d6ff3df23e92b02eb77601ec094a9"
     "src/dtc_debouncer.cpp:46678c09a3ac7c083d5f12cf8320f08b7340ef72e9ec9899e1e23a4aa117ef45"
     "tests/test_dtc_debouncer.cpp:fb5c745929072ea96d588c7802dda277d02876d3caeb64e1ed215180b744d117"
@@ -149,7 +156,12 @@ if [[ "$CHANGED_COUNT" -eq 0 ]]; then
 fi
 
 # 2. Build and run fixture unit tests
-bash "$WORKDIR/build_and_test.sh" --no-cmake >/dev/null
+FIXTURE_TESTS_DIR="${DEVPACK_ROOT:+$DEVPACK_ROOT/eval/fixture/tests}"
+[[ -n "$FIXTURE_TESTS_DIR" && -d "$FIXTURE_TESTS_DIR" ]] || FIXTURE_TESTS_DIR="$SCRIPT_DIR/../../fixture/tests"
+[[ -d "$FIXTURE_TESTS_DIR" ]] || FIXTURE_TESTS_DIR="$WORKDIR/tests"
+expected_visible="$(count_expected_checks "$FIXTURE_TESTS_DIR"/*.cpp)"
+run_verified_test_binary "visible build_and_test" "$expected_visible" \
+    bash "$WORKDIR/build_and_test.sh" --no-cmake
 
 # 3. Compile and run hidden test suite
 TMP_GRADE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/devpack-grade-02-bugfix-ring-overwrite.XXXXXX")"
@@ -171,7 +183,8 @@ CXXFLAGS=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachabl
     "$WORKDIR/src/dtc_debouncer.cpp" \
     "$HIDDEN_DIR/hidden_test.cpp" \
     -o "$TMP_GRADE_DIR/hidden_test"
-"$TMP_GRADE_DIR/hidden_test" >/dev/null
+expected_hidden="$(count_expected_checks "$HIDDEN_DIR/hidden_test.cpp")"
+run_verified_test_binary "hidden_test" "$expected_hidden" "$TMP_GRADE_DIR/hidden_test"
 
 # 4. Task-specific checks
 

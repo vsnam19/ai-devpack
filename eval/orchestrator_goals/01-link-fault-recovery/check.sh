@@ -83,12 +83,8 @@ if ! safe_git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; the
     exit 1
 fi
 
-BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: apply setup\.patch$' -n 1 || true)"
-if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="$(safe_git -C "$WORKDIR" log --format=%H --grep='^chore: base fixture$' -n 1 || true)"
-fi
-if [[ -z "$BASE_REF" ]]; then
-    BASE_REF="HEAD"
+if ! BASE_REF="$(require_baseline_sha "$WORKDIR" "${TRIAL_DIR:-}")"; then
+    exit 2
 fi
 
 ALLOWED_FILES=(
@@ -113,7 +109,9 @@ if ! grep -q 'recoverFromFault' "$WORKDIR/tests/test_link_state_machine.cpp" ||
 fi
 
 # Visible fixture build + tests
-bash "$WORKDIR/build_and_test.sh" --no-cmake >/dev/null
+expected_visible="$(count_expected_checks "$DEVPACK_ROOT/eval/fixture/tests"/*.cpp)"
+run_verified_test_binary "visible build_and_test" "$expected_visible" \
+    bash "$WORKDIR/build_and_test.sh" --no-cmake
 
 # Hidden REQ-LINK-006 test compilation + run
 TMP_GRADE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/devpack-grade-goal01.XXXXXX")"
@@ -131,7 +129,8 @@ CXXFLAGS=(-std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachabl
     "${fixture_srcs[@]}" \
     "$HIDDEN_SRC" \
     -o "$TMP_GRADE_DIR/hidden_test"
-"$TMP_GRADE_DIR/hidden_test" >/dev/null
+expected_hidden="$(grep -chE '^[[:space:]]*checkCond[[:space:]]*\(' "$HIDDEN_SRC" 2>/dev/null || true)"
+run_verified_test_binary "hidden_test (REQ-LINK-006)" "$expected_hidden" "$TMP_GRADE_DIR/hidden_test"
 
 # Preflight lint on changed C/C++ files
 mapfile -t CHANGED_CPP_FILES < <(

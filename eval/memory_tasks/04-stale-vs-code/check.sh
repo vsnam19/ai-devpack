@@ -54,7 +54,9 @@ grep -q 'REQ-CODEC-008' "$WORKDIR/MEMORY_CONFLICTS.md" || {
     exit 1
 }
 
-bash "$WORKDIR/build_and_test.sh" --no-cmake >/dev/null
+expected_visible="$(count_expected_checks "$DEVPACK_ROOT/eval/fixture/tests"/*.cpp)"
+run_verified_test_binary "visible build_and_test (04-stale-vs-code)" "$expected_visible" \
+    bash "$WORKDIR/build_and_test.sh" --no-cmake
 
 TMP_GRADE="$(mktemp -d "${TMPDIR:-/tmp}/devpack-mem-grade-04.XXXXXX")"
 # shellcheck disable=SC2064
@@ -68,7 +70,8 @@ mapfile -t hidden_srcs < <(find "$TMP_GRADE/work/hidden_tests" -maxdepth 1 -type
 "${CXX:-g++}" -std=c++17 -Wall -Wextra -Werror -Wpedantic -Wswitch-enum -Wunreachable-code -fno-exceptions -fno-rtti \
     -I"$TMP_GRADE/work/hidden_tests" -I"$TMP_GRADE/work/include" -I"$TMP_GRADE/work/tests" \
     "${fixture_srcs[@]}" "${hidden_srcs[@]}" -o "$TMP_GRADE/hidden_test"
-"$TMP_GRADE/hidden_test" >/dev/null
+expected_hidden="$(count_expected_checks "${hidden_srcs[@]}")"
+run_verified_test_binary "hidden_test (04-stale-vs-code)" "$expected_hidden" "$TMP_GRADE/hidden_test"
 
 python3 "$DEVPACK_ROOT/enforcement/lint/preflight_lint.py" --no-cache \
     --repo-root "$WORKDIR" --config "$DEVPACK_ROOT/eval/fixture/preflight.toml" \

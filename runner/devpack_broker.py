@@ -360,6 +360,7 @@ class Broker:
                         brief_lint_findings=brief_findings,
                         components=components,
                         all_components=all_components,
+                        task_id=Path(request['brief']).stem,
                     )
                 if payload.get('gate') == 'ok' and payload.get('scope') == 'ok' and sandbox_memory.is_dir():
                     changed_mem = [

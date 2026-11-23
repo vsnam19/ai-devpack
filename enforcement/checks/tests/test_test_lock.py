@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import pathlib
 import subprocess
 import sys
@@ -233,7 +234,7 @@ class TestTestLock(unittest.TestCase):
         self.assertIn("protected test file renamed", out)
 
     def test_deviation_in_head_commit_message_allows_change(self) -> None:
-        """A decreased assertion count is allowed if HEAD commit message contains 'Deviation: <ID>'."""
+        """A decreased assertion count is allowed only when matching an external human registry."""
         (self.repo_dir / "tests" / "test_codec.cpp").write_text(
             "void test_decode() {\n"
             "    ASSERT_EQ(1, 1);\n"
@@ -254,21 +255,43 @@ class TestTestLock(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
-        code, out, _ = self._run_lock(
-            [
-                "--repo",
-                str(self.repo_dir),
-                "--base",
-                "HEAD~1",
-                "--protected",
-                "tests/**",
-            ]
+        # Without external DEVPACK_DEVIATIONS registry, commit-message Deviation is rejected.
+        code_no_reg, _, err_no_reg = self._run_lock(
+            ["--repo", str(self.repo_dir), "--base", "HEAD~1", "--protected", "tests/**"]
         )
+        self.assertEqual(code_no_reg, 1)
+        self.assertIn("TEST_LOCK_DEVIATION_REJECTED", err_no_reg)
+
+        with tempfile.TemporaryDirectory() as reg_dir:
+            reg = pathlib.Path(reg_dir) / "deviations.json"
+            reg.write_text(
+                '{"deviations":[{"id":"DEV-404","files":["tests/test_codec.cpp"],'
+                '"approved_by":"tech-lead","expires":"2099-12-31"}]}',
+                encoding="utf-8",
+            )
+            old_env = os.environ.get("DEVPACK_DEVIATIONS")
+            os.environ["DEVPACK_DEVIATIONS"] = str(reg)
+            try:
+                code, out, _ = self._run_lock(
+                    [
+                        "--repo",
+                        str(self.repo_dir),
+                        "--base",
+                        "HEAD~1",
+                        "--protected",
+                        "tests/**",
+                    ]
+                )
+            finally:
+                if old_env is None:
+                    os.environ.pop("DEVPACK_DEVIATIONS", None)
+                else:
+                    os.environ["DEVPACK_DEVIATIONS"] = old_env
         self.assertEqual(code, 0)
         self.assertIn("Deviation: DEV-404", out)
 
     def test_no_deviation_flag_ignores_head_deviation_trailer(self) -> None:
-        """A removed protected line passes with 'Deviation: <ID>' on HEAD by default, and fails with --no-deviation."""
+        """--no-deviation ignores HEAD 'Deviation: <ID>' trailers even when registered."""
         (self.repo_dir / "tests" / "test_codec.cpp").write_text(
             "void test_decode() {\n"
             "    ASSERT_EQ(1, 1);\n"
@@ -298,14 +321,29 @@ class TestTestLock(unittest.TestCase):
             "tests/**",
         ]
 
-        code, out, _ = self._run_lock(protected_args)
-        self.assertEqual(code, 0)
-        self.assertIn("Deviation: DEV-777", out)
+        with tempfile.TemporaryDirectory() as reg_dir:
+            reg = pathlib.Path(reg_dir) / "deviations.json"
+            reg.write_text(
+                '{"deviations":[{"id":"DEV-777","files":["tests/test_codec.cpp"],'
+                '"approved_by":"tech-lead","expires":"2099-12-31"}]}',
+                encoding="utf-8",
+            )
+            old_env = os.environ.get("DEVPACK_DEVIATIONS")
+            os.environ["DEVPACK_DEVIATIONS"] = str(reg)
+            try:
+                code, out, _ = self._run_lock(protected_args)
+                self.assertEqual(code, 0)
+                self.assertIn("Deviation: DEV-777", out)
 
-        code, out, _ = self._run_lock(protected_args + ["--no-deviation"])
-        self.assertEqual(code, 1)
-        self.assertIn("existing non-comment test lines modified or deleted", out)
-        self.assertNotIn("Deviation", out)
+                code, out, _ = self._run_lock(protected_args + ["--no-deviation"])
+                self.assertEqual(code, 1)
+                self.assertIn("existing non-comment test lines modified or deleted", out)
+                self.assertNotIn("Deviation", out)
+            finally:
+                if old_env is None:
+                    os.environ.pop("DEVPACK_DEVIATIONS", None)
+                else:
+                    os.environ["DEVPACK_DEVIATIONS"] = old_env
 
     def test_custom_assert_regex_is_respected(self) -> None:
         """Custom --assert-regex detects decrease of custom assertion macro tokens."""
