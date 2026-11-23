@@ -1092,9 +1092,12 @@ def compute_pass_hat_k(passes: int, total: int, k: int | None = None) -> float |
 
 
 def compute_pass_hat_k_unbiased(passes: int, total: int, k: int) -> float | None:
-    """Compute unbiased pass^k estimator C(c, k) / C(n, k) when n >= k, else None."""
-    if total < 1 or k < 1:
-        raise ValueError("total and k must be >= 1")
+    """Compute unbiased pass^k estimator C(c, k) / C(n, k) when n >= k, else None.
+
+    Zero valid runs (total == 0) is a legitimate state (all harness errors) and returns None.
+    """
+    if total < 0 or k < 1:
+        raise ValueError("total must be >= 0 and k must be >= 1")
     if passes < 0 or passes > total:
         raise ValueError("passes must be between 0 and total")
     if total < k:
@@ -3701,7 +3704,7 @@ def evaluate_and_record_qualification(
 
         failures: list[str] = []
         if mean_pass_hat_3 is None:
-            failures.append("smoke pass^3_unbiased=n/a (n<3)")
+            failures.append("insufficient_valid_runs: smoke pass^3_unbiased=n/a (n<3)")
         elif mean_pass_hat_3 < 0.8:
             failures.append(f"smoke pass^3_unbiased={mean_pass_hat_3:.4f} < 0.8")
         if total_proto_errors != 0:

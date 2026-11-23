@@ -105,6 +105,57 @@ class RunEvalUnitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             run_eval.compute_pass_hat_k(6, 5)
 
+    def test_unbiased_pass_hat_k_zero_valid_runs_returns_none(self) -> None:
+        """Verify zero valid runs yields n/a (None) for the unbiased estimator instead of raising."""
+        self.assertIsNone(run_eval.compute_pass_hat_k_unbiased(0, 0, k=3))
+        self.assertIsNone(run_eval.compute_pass_hat_k_unbiased(0, 0, k=1))
+        with self.assertRaises(ValueError):
+            run_eval.compute_pass_hat_k_unbiased(0, -1, k=3)
+        with self.assertRaises(ValueError):
+            run_eval.compute_pass_hat_k_unbiased(0, 3, k=0)
+
+    def test_qualification_all_harness_errors_is_unqualified_without_crash(self) -> None:
+        """Verify a smoke task with zero valid runs records unqualified/insufficient_valid_runs, no exception."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            qual_file = base / "qualification.json"
+            qual_file.write_text(
+                json.dumps({"version": 1, "engines": {"local": {"status": "qualified"}}}),
+                encoding="utf-8",
+            )
+            summary = run_eval.TaskModelSummary(
+                task_id="01-mini-bugfix",
+                category="bugfix",
+                model="local",
+                k=3,
+                passes=0,
+                pass_at_1=None,
+                pass_hat_k=None,
+                pass_hat_k_unbiased=None,
+                pass_at_k_unbiased=None,
+                mean_cost_usd=None,
+                mean_turns=None,
+                mean_duration_s=0.0,
+                tier="smoke",
+                harness_errors=3,
+                valid_runs=0,
+            )
+            qual_ok, messages = run_eval.evaluate_and_record_qualification(
+                tier="smoke",
+                mode="single",
+                unit_labels=["local"],
+                engine_map={"local": mock.Mock()},
+                task_summaries=[summary],
+                qualification_file=qual_file,
+                eval_summary_path=base / "summary.md",
+                repo_root=base,
+            )
+            self.assertFalse(qual_ok)
+            self.assertTrue(any("unqualified" in m for m in messages))
+            rec = json.loads(qual_file.read_text(encoding="utf-8"))["engines"]["local"]
+            self.assertEqual("unqualified", rec["status"])
+            self.assertIn("insufficient_valid_runs", rec["unqualified_reason"])
+
     def test_dry_run_validates_tasks_and_does_not_call_agent(self) -> None:
         """Verify --dry-run exits 0, lists task x model plan, and invokes no subprocesses."""
         with tempfile.TemporaryDirectory() as tmp:
