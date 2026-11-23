@@ -593,15 +593,38 @@ def resolve_cppcheck_binary(cppcheck_bin: str) -> str | None:
     return shutil.which(cppcheck_bin)
 
 
-def _resolve_relative_to_base(raw_path: str, base_dir: Path, repo_root: Path) -> Path:
-    """Resolve a configured relative path against ``base_dir`` or ``repo_root``."""
+def _resolve_within_repo(raw_path: str, repo_root: Path) -> Path:
+    """Resolve an include path against the analysed ``repo_root`` and reject paths that escape it.
+
+    Relative paths are joined to ``repo_root``; absolute paths are accepted only when they already lie
+    inside it. Raises ``ValueError`` (a usage error) otherwise. The config directory is never consulted,
+    so a pack's pristine headers cannot shadow the trial tree's headers.
+    """
+    p = Path(raw_path)
+    candidate = (p if p.is_absolute() else repo_root / p).resolve()
+    if not candidate.is_relative_to(repo_root):
+        raise ValueError(
+            f"include path '{raw_path}' resolves outside the analysed repo root {repo_root}"
+        )
+    return candidate
+
+
+def _resolve_suppressions_file(raw_path: str, config_dir: Path, repo_root: Path) -> Path:
+    """Resolve ``suppressions_file``: repo root first, then the config directory (pack-provided lists).
+
+    Absolute paths must lie inside ``repo_root``. A missing file is returned as the repo-root candidate
+    so the caller reports it.
+    """
     p = Path(raw_path)
     if p.is_absolute():
-        return p
-    cand = (base_dir / p).resolve()
-    if cand.exists():
-        return cand
-    return (repo_root / p).resolve()
+        return _resolve_within_repo(raw_path, repo_root)
+    repo_candidate = (repo_root / p).resolve()
+    if repo_candidate.is_relative_to(repo_root) and repo_candidate.is_file():
+        return repo_candidate
+    config_candidate = (config_dir / p).resolve()
+    if config_candidate.is_file():
+        return config_candidate
+    return repo_candidate
 
 
 def run_cppcheck_check(
@@ -688,16 +711,12 @@ def run_cppcheck_check(
     cmd.extend(["--xml", "--xml-version=2"])
 
     for raw_inc in config.include_dirs:
-        inc_path = _resolve_relative_to_base(raw_inc, cfg_base_dir, effective_root)
+        inc_path = _resolve_within_repo(raw_inc, effective_root)
         if inc_path.is_dir() or raw_inc in extra_include_dirs:
-            try:
-                inc_arg = inc_path.relative_to(effective_root).as_posix()
-            except ValueError:
-                inc_arg = str(inc_path)
-            cmd.extend(["-I", inc_arg])
+            cmd.extend(["-I", inc_path.relative_to(effective_root).as_posix()])
 
     if config.suppressions_file:
-        suppr_path = _resolve_relative_to_base(config.suppressions_file, cfg_base_dir, effective_root)
+        suppr_path = _resolve_suppressions_file(config.suppressions_file, cfg_base_dir, effective_root)
         if not suppr_path.is_file():
             raise ValueError(f"cppcheck suppressions file does not exist: {config.suppressions_file}")
         cmd.append(f"--suppressions-list={suppr_path}")
@@ -832,7 +851,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="repo_root",
         type=Path,
         default=None,
-        help="Repository root for normalizing paths and loading preflight.toml (default: cwd)",
+        help=(
+            "Analysed repository root: relative include paths resolve here, paths are normalized "
+            "against it, and preflight.toml is loaded from it when --config is absent (default: cwd)"
+        ),
     )
     parser.add_argument(
         "--config",
