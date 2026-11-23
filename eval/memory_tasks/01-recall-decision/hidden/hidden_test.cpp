@@ -13,13 +13,13 @@ int main() {
     const DtcConfig cfg{4, -2, 2, 1, 2U};
     DtcDebouncer debouncer(cfg);
     CHECK_EQ(debouncer.freezeSentinelCode(), static_cast<std::uint8_t>(0x00U));
-    CHECK(debouncer.isFreezeSentinelMatch(static_cast<std::uint8_t>(0xA5U)));
+    CHECK(debouncer.isFreezeSentinelMatch(static_cast<std::uint8_t>(0xD3U)));
     CHECK(!debouncer.isFreezeSentinelMatch(static_cast<std::uint8_t>(0x00U)));
     CHECK(!debouncer.isFreezeSentinelMatch(static_cast<std::uint8_t>(0x01U)));
 
     (void)debouncer.reportSample(true);
     (void)debouncer.reportSample(true);
     CHECK(debouncer.isConfirmed());
-    CHECK_EQ(debouncer.freezeSentinelCode(), static_cast<std::uint8_t>(0xA5U));
+    CHECK_EQ(debouncer.freezeSentinelCode(), static_cast<std::uint8_t>(0xD3U));
     return can_fixture_test::printSummaryAndExitCode();
 }

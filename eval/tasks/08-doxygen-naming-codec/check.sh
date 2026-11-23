@@ -175,18 +175,16 @@ workdir = pathlib.Path(sys.argv[1])
 hdr = (workdir / "include/can_codec.hpp").read_text(encoding="utf-8")
 src = (workdir / "src/can_codec.cpp").read_text(encoding="utf-8")
 
-for name, content in [("include/can_codec.hpp", hdr), ("src/can_codec.cpp", src)]:
-    if "@file" not in content or "@brief" not in content:
-        print(f"FAIL: missing @file or @brief in {name}", file=sys.stderr)
-        sys.exit(1)
-    if re.search(r"@param\b(?!\s*\[(?:in|out|in,out)\])", content):
-        print(f"FAIL: bare @param without [in]/[out]/[in,out] in {name}", file=sys.stderr)
-        sys.exit(1)
-    stripped = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", content)
-    for bad in ("tmp", "temp", "val", "var", "foo", "bar", "baz", "obj", "dat", "buf", "ptr"):
-        if re.search(rf"\b{bad}\b", stripped):
-            print(f"FAIL: non-meaningful identifier '{bad}' found in {name}", file=sys.stderr)
-            sys.exit(1)
+DENYLIST = {"tmp", "temp", "val", "var", "foo", "bar", "baz", "obj", "dat", "buf", "ptr"}
+CAMEL_CASE_RE = re.compile(r"^[a-z][a-zA-Z0-9]*$")
+LOOP_INDICES = {"i", "j", "k"}
+CONTROL_PREFIXES = ("if", "else", "while", "switch", "case", "default", "return", "break", "continue", "using", "namespace", "typedef", "static_assert", "#")
+VAR_DECL_RE = re.compile(
+    r"^(?:(?:const|constexpr|static|mutable)\s+)*"
+    r"(?:auto\b|(?:(?:unsigned|signed|long|short)\s+)*(?:std::)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*(?:\s*<[^;{}]+>)?)"
+    r"(?:\s*[*&]+|\s+[*&]*)\s*([A-Za-z_]\w*)\s*(?:=|;|\[|\(|\{|$)"
+)
+
 
 def strip_comments_keep_len(text: str) -> str:
     return re.sub(
@@ -194,6 +192,21 @@ def strip_comments_keep_len(text: str) -> str:
         lambda m: re.sub(r"[^\n]", " ", m.group(0)),
         text,
     )
+
+
+def validate_meaningful_name(ident: str, kind: str, filename: str, *, allow_loop: bool = False) -> None:
+    if allow_loop and ident in LOOP_INDICES:
+        return
+    if len(ident) < 3:
+        print(f"FAIL: non-meaningful short {kind} '{ident}' (< 3 chars) in {filename}", file=sys.stderr)
+        sys.exit(1)
+    if ident.lower() in DENYLIST:
+        print(f"FAIL: non-meaningful {kind} '{ident}' (denylisted) in {filename}", file=sys.stderr)
+        sys.exit(1)
+    if not CAMEL_CASE_RE.fullmatch(ident):
+        print(f"FAIL: non-camelCase {kind} '{ident}' in {filename}", file=sys.stderr)
+        sys.exit(1)
+
 
 def extract_param_names(param_str: str) -> list[str]:
     stripped = param_str.strip()
@@ -204,10 +217,58 @@ def extract_param_names(param_str: str) -> list[str]:
     for p in parts:
         p_no_default = p.split("=", 1)[0].strip()
         tokens = re.findall(r"[A-Za-z_]\w*", p_no_default)
-        if not tokens:
+        if len(tokens) < 2:
             return []
         names.append(tokens[-1])
     return names
+
+
+for name, content in [("include/can_codec.hpp", hdr), ("src/can_codec.cpp", src)]:
+    if "@file" not in content or "@brief" not in content:
+        print(f"FAIL: missing @file or @brief in {name}", file=sys.stderr)
+        sys.exit(1)
+    if re.search(r"@param\b(?!\s*\[(?:in|out|in,out)\])", content):
+        print(f"FAIL: bare @param without [in]/[out]/[in,out] in {name}", file=sys.stderr)
+        sys.exit(1)
+
+src_code = strip_comments_keep_len(src)
+for fn_m in re.finditer(
+    r"(?:^|\n)[ \t]*(?:[\w:<>*&\s]+?\s+)?([A-Za-z_]\w*)\s*\(([^()]*)\)\s*(?:const\s*)?(?:noexcept\s*)?(?::[^{]*)?\{",
+    src_code,
+):
+    if fn_m.group(1) in ("if", "for", "while", "switch", "catch"):
+        continue
+    for pname in extract_param_names(fn_m.group(2)):
+        validate_meaningful_name(pname, "parameter", "src/can_codec.cpp")
+
+    # Scan statements inside this function body up to matching '}'
+    idx = fn_m.end()
+    depth = 1
+    body_start = idx
+    while idx < len(src_code) and depth > 0:
+        if src_code[idx] == "{":
+            depth += 1
+        elif src_code[idx] == "}":
+            depth -= 1
+        idx += 1
+    body = src_code[body_start : idx - 1]
+    for stmt in re.split(r"[;{}]", body):
+        s = " ".join(stmt.split())
+        if not s:
+            continue
+        if s.startswith("for ") or s.startswith("for("):
+            inner = s[s.find("(") + 1 :] if "(" in s else ""
+            m_var = VAR_DECL_RE.match(inner.strip())
+            if m_var:
+                validate_meaningful_name(m_var.group(1), "loop variable", "src/can_codec.cpp", allow_loop=True)
+            continue
+        if any(s == kw or s.startswith(kw + " ") or s.startswith(kw + "(") for kw in CONTROL_PREFIXES):
+            continue
+        m_var = VAR_DECL_RE.match(s)
+        if m_var:
+            vname = m_var.group(1)
+            if vname not in ("true", "false", "nullptr", "else"):
+                validate_meaningful_name(vname, "variable", "src/can_codec.cpp")
 
 hdr_code = strip_comments_keep_len(hdr)
 doc_blocks = list(re.finditer(r"/\*\*([\s\S]*?)\*/", hdr))
@@ -221,8 +282,9 @@ targets = [
     ("decodePhysical", False),
 ]
 
+prefix_re = r"(?:(?:\[\[[^\]]*\]\]|inline|constexpr|static)\s+)*"
 for fn_name, is_void in targets:
-    decl_re = re.compile(rf"(?:^|\n)[ \t]*(?:bool|std::int64_t)\s+{fn_name}\s*\(([\s\S]*?)\)\s*noexcept\s*;")
+    decl_re = re.compile(rf"(?:^|\n)[ \t]*{prefix_re}(?:bool|std::int64_t)\s+{fn_name}\s*\(([\s\S]*?)\)\s*noexcept\s*;")
     dm = decl_re.search(hdr_code)
     if not dm:
         print(f"FAIL: missing declaration for {fn_name} in include/can_codec.hpp", file=sys.stderr)
@@ -247,6 +309,8 @@ for fn_name, is_void in targets:
         print(f"FAIL: missing @return on non-void {fn_name}", file=sys.stderr)
         sys.exit(1)
     decl_params = extract_param_names(dm.group(1))
+    for pname in decl_params:
+        validate_meaningful_name(pname, "parameter", "include/can_codec.hpp")
     doc_params = re.findall(r"@param\s*\[(?:in|out|in,out)\]\s+([A-Za-z_]\w*)", doc_block)
     if doc_params != decl_params:
         print(f"FAIL: @param names {doc_params} do not match declared parameters {decl_params} on {fn_name}", file=sys.stderr)

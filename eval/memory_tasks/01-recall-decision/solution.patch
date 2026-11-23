@@ -32,13 +32,13 @@ index ed31f39..7ffe3d3 100644
  
 +std::uint8_t DtcDebouncer::freezeSentinelCode() const noexcept {
 +    if (m_isLatched) {
-+        return static_cast<std::uint8_t>(0xA5U);
++        return static_cast<std::uint8_t>(0xD3U);
 +    }
 +    return static_cast<std::uint8_t>(0x00U);
 +}
 +
 +bool DtcDebouncer::isFreezeSentinelMatch(std::uint8_t candidateCode) const noexcept {
-+    return candidateCode == static_cast<std::uint8_t>(0xA5U);
++    return candidateCode == static_cast<std::uint8_t>(0xD3U);
 +}
 +
  }  // namespace can_fixture

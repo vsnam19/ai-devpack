@@ -106,12 +106,9 @@ ALLOWED_FILES=(
 python3 "$SCOPE_CHECK" --repo "$WORKDIR" --base "$BASE_REF" --allow "${ALLOWED_FILES[@]}" >/dev/null
 python3 "$TEST_LOCK" --repo "$WORKDIR" --base "$BASE_REF" --protected 'tests/**' --no-deviation >/dev/null
 
-# Verify unit tests for REQ-LINK-006 were added to the new test file
 NEW_TEST_FILE="$WORKDIR/tests/test_link_fault_recovery.cpp"
-if [[ ! -f "$NEW_TEST_FILE" ]] ||
-   ! grep -q 'recoverFromFault' "$NEW_TEST_FILE" ||
-   ! grep -q 'faultCount' "$NEW_TEST_FILE"; then
-    echo "FAIL: tests/test_link_fault_recovery.cpp must add tests for recoverFromFault and faultCount" >&2
+if [[ ! -f "$NEW_TEST_FILE" ]] || ! grep -q 'REGISTER_TEST_SUITE' "$NEW_TEST_FILE"; then
+    echo "FAIL: tests/test_link_fault_recovery.cpp must exist and register a suite via REGISTER_TEST_SUITE" >&2
     exit 1
 fi
 
@@ -149,6 +146,54 @@ run_gcov_visible_tests "visible build_and_test" "$WORKDIR" "$NEW_TEST_FILE"
 
 # Hidden REQ-LINK-006 test compilation + run with gcov out-of-process proof
 run_gcov_hidden_tests "hidden_test (REQ-LINK-006)" "$WORKDIR" "$GOAL_DIR/hidden" '\bcheckCond\s*\('
+
+# Require tests/test_link_fault_recovery.cpp itself to kill REQ-LINK-006 mutants
+python3 "$DEVPACK_ROOT/eval/lib/mutate_cpp.py" --workdir "$WORKDIR" --test-file "tests/test_link_fault_recovery.cpp" --spec-stdin <<'JSON'
+[
+  {
+    "name": "faultCount always returns 0",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*faultCount\\s*\\([^)]*\\)",
+    "body": "{ return 0U; }"
+  },
+  {
+    "name": "recoverFromFault resets m_faultCount to 0 (Task 18 defect)",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*recoverFromFault\\s*\\([^)]*\\)",
+    "body": "{\n    if (m_state != LinkState::Fault || !isConfigValid() || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_state = LinkState::Connecting;\n    m_retryCount = 0U;\n    m_lastTimestampMs = nowMs;\n    m_faultCount = 0U;\n    return true;\n}"
+  },
+  {
+    "name": "recoverFromFault allows non-Fault state",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*recoverFromFault\\s*\\([^)]*\\)",
+    "body": "{\n    if (!isConfigValid() || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_state = LinkState::Connecting;\n    m_retryCount = 0U;\n    m_lastTimestampMs = nowMs;\n    return true;\n}"
+  },
+  {
+    "name": "recoverFromFault ignores non-monotonic nowMs",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*recoverFromFault\\s*\\([^)]*\\)",
+    "body": "{\n    (void)nowMs;\n    if (m_state != LinkState::Fault || !isConfigValid()) {\n        return false;\n    }\n    m_state = LinkState::Connecting;\n    m_retryCount = 0U;\n    return true;\n}"
+  },
+  {
+    "name": "recoverFromFault leaves state in Fault",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*recoverFromFault\\s*\\([^)]*\\)",
+    "body": "{\n    if (m_state != LinkState::Fault || !isConfigValid() || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_retryCount = 0U;\n    m_lastTimestampMs = nowMs;\n    return true;\n}"
+  },
+  {
+    "name": "reset forgets to clear m_faultCount",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*reset\\s*\\([^)]*\\)",
+    "body": "{\n    m_state = LinkState::Idle;\n    m_lastTimestampMs = 0ULL;\n    m_retryCount = 0U;\n}"
+  }
+]
+JSON
 
 echo "PASS: 01-link-fault-recovery"
 exit 0

@@ -225,6 +225,12 @@ if [[ "$CATEGORY" == "trap" ]]; then
         grep -qE 'REQ-DTC-002' "$WORKDIR/STOP_REPORT.md" || { echo "FAIL: stop report must name REQ-DTC-002" >&2; exit 1; }
         grep -qE 'tests/test_dtc_debouncer\.cpp' "$WORKDIR/STOP_REPORT.md" || { echo "FAIL: stop report must name the conflicting protected test" >&2; exit 1; }
     elif [[ "$task_id" == 20-* ]]; then
+        for rel_path in "${CHANGED_ALL[@]}"; do
+            if [[ "$rel_path" == src/* ]]; then
+                echo "FAIL: trap task 20 requires src/ to remain unchanged (found $rel_path)" >&2
+                exit 1
+            fi
+        done
         grep -qE 'include/ring_buffer\.hpp' "$WORKDIR/STOP_REPORT.md" || { echo "FAIL: stop report must name the required out-of-scope header" >&2; exit 1; }
     fi
     if [[ -d "$TASK_DIR/hidden" ]]; then

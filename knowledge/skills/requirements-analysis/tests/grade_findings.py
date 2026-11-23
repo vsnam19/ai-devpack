@@ -14,12 +14,16 @@ import re
 import sys
 
 
+TESTS_DIR = Path(__file__).resolve().parent
+
+
 @dataclass(frozen=True)
 class CaseSpec:
     """Expected defects, clean requirements, and report checks for one fixture."""
 
     clean_ids: tuple[str, ...]
     seeded_patterns: tuple[tuple[str, str], ...]
+    seeded_defect_classes: dict[str, tuple[str, ...]]
     min_recall: int
     required_keywords: tuple[str, ...] = ()
 
@@ -32,6 +36,11 @@ CASES: dict[str, CaseSpec] = {
             ("REQ-COM-003", r"\bREQ-COM-003\b"),
             ("REQ-COM-004", r"\bREQ-COM-004\b"),
         ),
+        seeded_defect_classes={
+            "REQ-COM-002": ("q5", "q6", "q8", "q11", "ambiguous", "vague", "unverifiable", "incomplete", "missing timing", "missing tolerance", "missing error"),
+            "REQ-COM-003": ("q6", "q8", "q11", "incomplete", "missing unit", "missing timing", "missing tolerance", "missing error", "unverifiable"),
+            "REQ-COM-004": ("q6", "q8", "q11", "open placeholder", "tbd", "incomplete", "unverifiable", "missing fault", "missing error"),
+        },
         min_recall=2,
     ),
     "dtc-debouncer": CaseSpec(
@@ -41,6 +50,11 @@ CASES: dict[str, CaseSpec] = {
             ("REQ-DTC-012", r"\bREQ-DTC-012\b"),
             ("REQ-DTC-013", r"\bREQ-DTC-013\b"),
         ),
+        seeded_defect_classes={
+            "REQ-DTC-011": ("q15", "q9", "set-level conflict", "conflict", "inconsistent"),
+            "REQ-DTC-012": ("q15", "q9", "set-level conflict", "conflict", "inconsistent"),
+            "REQ-DTC-013": ("q5", "q6", "q8", "q10", "q11", "ambiguous", "vague", "unverifiable", "incomplete", "non-conforming", "missing error"),
+        },
         min_recall=2,
         required_keywords=("conflict",),
     ),
@@ -51,6 +65,11 @@ CASES: dict[str, CaseSpec] = {
             ("REQ-CAN-022", r"\bREQ-CAN-022\b"),
             ("TMP-1", r"\bTMP-0*1\b"),
         ),
+        seeded_defect_classes={
+            "REQ-CAN-021": ("q6", "q8", "q11", "incomplete", "missing range", "missing error", "missing fault", "unverifiable"),
+            "REQ-CAN-022": ("q2", "q5", "q6", "q8", "q10", "non-atomic", "not singular", "ambiguous", "vague", "hidden timing", "escape clause", "unverifiable", "incomplete", "non-conforming"),
+            "TMP-1": ("q1", "q3", "q5", "q6", "q13", "q14", "missing or duplicate id", "missing unique id", "missing initial", "incomplete", "ambiguous", "vague", "missing status", "missing asil", "missing traceability", "traceability", "unlinked"),
+        },
         min_recall=2,
         required_keywords=("TMP-",),
     ),
@@ -167,12 +186,41 @@ def _strip_outer_quotes(text: str) -> str:
     return stripped
 
 
+PLACEHOLDER_CELL_WORDS = {"tbd", "todo", "placeholder", "none", "n/a", "unknown", "lorem", "ipsum"}
+
+
 def _has_checklist_defect_type(defect_type: str) -> bool:
     """Return True if defect_type names at least one checklist rule ID or vocabulary term."""
     lowered = defect_type.lower()
     if CHECKLIST_RULE_PATTERN.search(defect_type):
         return True
     return any(term in lowered for term in CHECKLIST_VOCAB_TERMS)
+
+
+def _matches_allowed_defect_class(defect_type: str, allowed: tuple[str, ...]) -> bool:
+    """Return True if defect_type matches at least one allowed defect class for a seeded ID."""
+    lowered = defect_type.lower()
+    for term in allowed:
+        if re.fullmatch(r"q(?:1[0-5]|[1-9])", term):
+            if re.search(rf"\b{re.escape(term)}\b", lowered):
+                return True
+        elif term in lowered:
+            return True
+    return False
+
+
+def _is_nontrivial_explanation(text: str) -> bool:
+    """Return True if a why/question cell has >= 5 words, >= 3 distinct words, and is not a placeholder."""
+    words = re.findall(r"[A-Za-z0-9_'-]+", text)
+    if len(words) < 5:
+        return False
+    distinct = {word.lower() for word in words}
+    if len(distinct) < 3:
+        return False
+    stripped = text.strip().lower().rstrip(".?!")
+    if stripped in PLACEHOLDER_CELL_WORDS or distinct <= PLACEHOLDER_CELL_WORDS:
+        return False
+    return True
 
 
 def _parse_spec_sections(spec_text: str) -> tuple[str, dict[str, str], list[str]]:
@@ -329,7 +377,7 @@ def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
     if case_name not in CASES:
         raise KeyError(f"Unknown case: {case_name}")
     spec = CASES[case_name]
-    source_path = candidate_dir / "spec.md"
+    source_path = TESTS_DIR / "fixtures" / case_name / "input" / "spec.md"
     findings_path = candidate_dir / "review" / "findings.md"
     if not source_path.is_file():
         raise FileNotFoundError(f"Source specification missing: {source_path}")
@@ -372,10 +420,24 @@ def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
             if not row[field] or row[field].lower() in {"none", "n/a", "-"}:
                 failures.append(f"Row {row_index} ({row['id'] or 'unknown'}) has empty {field}")
 
+        for cell_name in ("why", "question"):
+            if row[cell_name] and not _is_nontrivial_explanation(row[cell_name]):
+                failures.append(
+                    f"Row {row_index} ({row['id']}) {cell_name} cell is trivial or placeholder (requires >= 5 non-placeholder words)"
+                )
+
         if row["defect_type"] and not _has_checklist_defect_type(row["defect_type"]):
             failures.append(
                 f"Row {row_index} ({row['id']}) defect type '{row['defect_type']}' is not from the checklist vocabulary"
             )
+        elif row["defect_type"]:
+            for label, pattern in spec.seeded_patterns:
+                if re.search(pattern, row["id"], re.IGNORECASE):
+                    allowed = spec.seeded_defect_classes.get(label, ())
+                    if allowed and not _matches_allowed_defect_class(row["defect_type"], allowed):
+                        failures.append(
+                            f"Row {row_index} ({row['id']}) defect type '{row['defect_type']}' does not match allowed defect classes for {label}: {', '.join(allowed)}"
+                        )
 
         clean_quote = _normalize_ws(_strip_outer_quotes(row["quote"]))
         if len(clean_quote) < 10 or len(clean_quote.split()) < 2:

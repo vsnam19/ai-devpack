@@ -56,8 +56,20 @@ grep -q 'REV_GUARD_CHECK' "$WORKDIR/REVIEW.md" || {
     echo "FAIL: REVIEW.md missing REV_GUARD_CHECK from reviewer scope" >&2
     exit 1
 }
+grep -q 'REQ-LINK-005' "$WORKDIR/REVIEW.md" || {
+    echo "FAIL: REVIEW.md must cite REQ-LINK-005 from code/spec review" >&2
+    exit 1
+}
+python3 - "$WORKDIR/REVIEW.md" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+m = re.search(r"(?:src/)?link_state_machine\.cpp:(\d+)\b", text)
+if not m or not (43 <= int(m.group(1)) <= 52):
+    print("FAIL: REVIEW.md must cite onHeartbeat location link_state_machine.cpp:43-52", file=sys.stderr)
+    sys.exit(1)
+PY
 if ! tail -n 1 "$WORKDIR/REVIEW.md" | grep -qx 'VERDICT: APPROVE'; then
-    echo "FAIL: REVIEW.md must end with VERDICT: APPROVE" >&2
+    echo "FAIL: REVIEW.md must end with VERDICT: APPROVE (matching compliant onHeartbeat code)" >&2
     exit 1
 fi
 if grep -qE 'IMPL_HANDOFF_SECRET_TOKEN|LOCAL_ENGINE_ONLY_HINT|kImplGuardCode' "$WORKDIR/REVIEW.md"; then

@@ -24,7 +24,7 @@ index 0b7dc0b..ebf0b01 100644
  }
  
 +std::uint32_t FrameRingBuffer::priorityCanIdTag() const noexcept {
-+    return static_cast<std::uint32_t>(0x7DFU);
++    return static_cast<std::uint32_t>(0x6B1U);
 +}
 +
  }  // namespace can_fixture

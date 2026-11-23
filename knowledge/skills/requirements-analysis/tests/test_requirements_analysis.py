@@ -346,6 +346,51 @@ class RequirementsAnalysisSkillTests(unittest.TestCase):
             f5 = grade_findings.grade_candidate("protocol-timing", cand5)
             self.assertTrue(any("must reference a clean requirement ID" in item for item in f5), f5)
 
+    def test_f5b_spec_tamper_defect_class_and_trivial_explanation_rejected(self) -> None:
+        """Grader reads fixture spec.md, enforces per-ID defect class, and rejects trivial why/question cells."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            # 1. Editing candidate_dir/spec.md to smuggle invented numbers still fails.
+            cand_tamper = self._copy_expected(str(root / "tamper"), "protocol-timing")
+            (cand_tamper / "spec.md").write_text(
+                (cand_tamper / "spec.md").read_text(encoding="utf-8") + "\nNote: 500 ms 77 99\n",
+                encoding="utf-8",
+            )
+            f_path = cand_tamper / "review" / "findings.md"
+            f_path.write_text(
+                f_path.read_text(encoding="utf-8").replace("<TBD: response_deadline_ms>", "77"),
+                encoding="utf-8",
+            )
+            tamper_failures = grade_findings.grade_candidate("protocol-timing", cand_tamper)
+            self.assertTrue(any("invented numeric value" in item and "77" in item for item in tamper_failures), tamper_failures)
+
+            # 2. Misclassifying REQ-DTC-011 conflict as "vague" fails allowed defect class check.
+            cand_cls = self._copy_expected(str(root / "cls"), "dtc-debouncer")
+            f_cls = cand_cls / "review" / "findings.md"
+            f_cls.write_text(
+                f_cls.read_text(encoding="utf-8").replace(
+                    "Set-level conflict with REQ-DTC-012 [high, candidate]",
+                    "Ambiguous wording (vague) [high, candidate]",
+                ),
+                encoding="utf-8",
+            )
+            cls_failures = grade_findings.grade_candidate("dtc-debouncer", cand_cls)
+            self.assertTrue(any("allowed defect classes for REQ-DTC-011" in item for item in cls_failures), cls_failures)
+
+            # 3. Trivial or placeholder why/question cells fail.
+            cand_triv = self._copy_expected(str(root / "triv"), "protocol-timing")
+            f_triv = cand_triv / "review" / "findings.md"
+            f_triv.write_text(
+                f_triv.read_text(encoding="utf-8").replace(
+                    '"quickly" is unverifiable; response deadline, tolerance, and invalid-request behaviour are unspecified.',
+                    "Too short.",
+                ),
+                encoding="utf-8",
+            )
+            triv_failures = grade_findings.grade_candidate("protocol-timing", cand_triv)
+            self.assertTrue(any("why cell is trivial or placeholder" in item for item in triv_failures), triv_failures)
+
 
 if __name__ == "__main__":
     unittest.main()

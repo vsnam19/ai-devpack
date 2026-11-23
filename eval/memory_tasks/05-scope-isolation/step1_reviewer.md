@@ -3,9 +3,11 @@
 Role: reviewer. READ-ONLY on source code; write `REVIEW.md`.
 
 ## Goal
-Review `LinkStateMachine::onHeartbeat` against `REQ-LINK-005` (`link_state_machine`)
-and write `REVIEW.md` following any reviewer-scoped policy notes in memory, ending
-with `VERDICT: APPROVE`.
+Review `LinkStateMachine::onHeartbeat` in `src/link_state_machine.cpp` against
+`REQ-LINK-005` in `docs/spec.md` (`link_state_machine`). Write `REVIEW.md` citing
+the inspected `file:line`, applying any reviewer-scoped checklist marker in memory,
+and concluding with `VERDICT: APPROVE` if the implementation satisfies `REQ-LINK-005`
+or `VERDICT: REQUEST_CHANGES` if it does not.
 
 ## Files allowed
 - `REVIEW.md`

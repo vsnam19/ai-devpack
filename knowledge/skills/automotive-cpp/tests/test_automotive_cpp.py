@@ -146,6 +146,28 @@ class AutomotiveCppSkillTests(unittest.TestCase):
                     )
                     self.assertNotEqual(res.returncode, 0, f"{case_name} accepted injection {inj_idx}")
 
+    def test_heap_grader_rejects_wrong_max_window_size(self) -> None:
+        """heap-exceptions-casts grader rejects a candidate that defines kMaxWindowSize = 10U."""
+        env = {**os.environ, "DEVPACK_ROOT": str(REPO_ROOT)}
+        with tempfile.TemporaryDirectory() as temp:
+            cand = Path(temp) / "wrong_window"
+            shutil.copytree(TESTS_DIR / "expected" / "heap-exceptions-casts", cand)
+            hdr = cand / "sample_filter.hpp"
+            hdr.write_text(
+                hdr.read_text(encoding="utf-8").replace("kMaxWindowSize = 8U;", "kMaxWindowSize = 10U;"),
+                encoding="utf-8",
+            )
+            res = subprocess.run(
+                ["bash", "check.sh", str(cand)],
+                cwd=TESTS_DIR / "graders" / "heap-exceptions-casts",
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertIn("kMaxWindowSize", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

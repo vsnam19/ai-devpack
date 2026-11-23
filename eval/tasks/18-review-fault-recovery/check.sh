@@ -174,14 +174,25 @@ cat_idx = next(i for i, h in enumerate(header_cells) if "category" in h)
 sev_idx = next(i for i, h in enumerate(header_cells) if "severity" in h)
 loc_idx = next(i for i, h in enumerate(header_cells) if ("file" in h or "line" in h))
 prob_idx = next((i for i, h in enumerate(header_cells) if "problem" in h), None)
+if prob_idx is None:
+    print("FAIL: taxonomy table missing 'problem' column", file=sys.stderr)
+    sys.exit(1)
 
 VALID_FUNC_CATEGORIES = {"COR", "REQ"}
 VALID_BLOCKING_SEVERITIES = {"blocker", "major"}
-LOC_RE = re.compile(r"src/link_state_machine\.cpp:(\d+)(?:-(\d+))?")
+LOC_RE = re.compile(r"(?:src/)?link_state_machine\.cpp:(\d+)(?:-(\d+))?")
 MAX_LINE_SPAN = 15
+DEFECT_TARGET_RE = re.compile(r"\bm_faultCount\b|\bfaultCount\b|\bfault\s+count\b|\bREQ-LINK-006\b", re.IGNORECASE)
+DEFECT_ACTION_RE = re.compile(
+    r"\b(?:reset|resets|resetting|clear|clears|clearing|zero|zeros|zeroed|zeroing|"
+    r"preserv\w*|overwrit\w*|wip\w*|lose|loses|lost|violat\w*|must\s+not|should\s+not|"
+    r"not\s+reset|increments?\s+without\s+bound)\b|=\s*0U?\b",
+    re.IGNORECASE,
+)
 
 matched_row_idx = None
 blocker_row_indices = []
+non_blocker_row_indices = []
 for row_idx, row in enumerate(table_rows[2:]):
     cells = [c.strip() for c in row.strip("|").split("|")]
     if len(cells) < len(header_cells):
@@ -190,10 +201,12 @@ for row_idx, row in enumerate(table_rows[2:]):
     severity = cells[sev_idx].strip("` ").lower()
     if severity == "blocker":
         blocker_row_indices.append(row_idx)
+    else:
+        non_blocker_row_indices.append(row_idx)
     if matched_row_idx is not None:
         continue
     loc = cells[loc_idx]
-    prob_text = cells[prob_idx] if prob_idx is not None else " ".join(cells)
+    prob_text = cells[prob_idx]
     row_text = " ".join(cells)
 
     if category not in VALID_FUNC_CATEGORIES:
@@ -202,10 +215,10 @@ for row_idx, row in enumerate(table_rows[2:]):
         continue
     if "recoverFromFault" not in row_text:
         continue
-    if "m_faultCount" not in prob_text and "REQ-LINK-006" not in prob_text:
+    if not (DEFECT_TARGET_RE.search(prob_text) and DEFECT_ACTION_RE.search(prob_text)):
         continue
 
-    m = LOC_RE.search(loc) or LOC_RE.search(row_text)
+    m = LOC_RE.search(loc)
     if not m:
         continue
     start_ln = int(m.group(1))
@@ -218,8 +231,8 @@ for row_idx, row in enumerate(table_rows[2:]):
 if matched_row_idx is None:
     print(
         "FAIL: REVIEW.md must contain a blocker/major COR or REQ finding in the taxonomy table "
-        "naming recoverFromFault, m_faultCount or REQ-LINK-006, and a <=15-line range overlapping "
-        "src/link_state_machine.cpp:128-134",
+        "naming recoverFromFault, stating the m_faultCount / REQ-LINK-006 defect in the Problem cell, "
+        "and citing a <=15-line range overlapping (src/)link_state_machine.cpp:128-134",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -228,6 +241,14 @@ extra_blockers = sum(1 for idx in blocker_row_indices if idx != matched_row_idx)
 if extra_blockers > 2:
     print(
         f"FAIL: REVIEW.md contains {extra_blockers} extra blocker rows (max 2 allowed)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+extra_non_blockers = sum(1 for idx in non_blocker_row_indices if idx != matched_row_idx)
+if extra_non_blockers > 3:
+    print(
+        f"FAIL: REVIEW.md contains {extra_non_blockers} extra non-blocker rows (max 3 allowed)",
         file=sys.stderr,
     )
     sys.exit(1)

@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from skilltest.skilltest import load_config
@@ -373,6 +374,187 @@ class SkilltestCliTests(unittest.TestCase):
             self.assertAlmostEqual(1.0, trig["recall"])
             self.assertAlmostEqual(1.0, trig["precision"])
             self.assertIsNone(trig["per_case_rate"]["pos2"])
+
+    def test_f5b_case_check_frontmatter_test_matrix_and_review_taxonomy(self) -> None:
+        """Verify order-independent/10-word frontmatter, non-trivial test-matrix grader, and review-taxonomy checks."""
+        case_check = ROOT / "skilltest" / "case_check.py"
+        env_base = {**os.environ, "DEVPACK_ROOT": str(ROOT)}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            # 1. frontmatter-draft: description before name + quoted values passes; <10 words fails.
+            fm_good = root / "fm_good" / "signal-helper"
+            fm_good.mkdir(parents=True)
+            (fm_good / "SKILL.md").write_text(
+                "---\ndescription: 'Format a clear signal report when asked to summarize signal data.'\nname: \"signal-helper\"\n---\n# Body\n",
+                encoding="utf-8",
+            )
+            res_good = subprocess.run(
+                ["python3", str(case_check), "skill-authoring", "frontmatter-draft", str(fm_good.parent)],
+                env=env_base, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(0, res_good.returncode, res_good.stdout + res_good.stderr)
+
+            fm_short = root / "fm_short" / "signal-helper"
+            fm_short.mkdir(parents=True)
+            (fm_short / "SKILL.md").write_text(
+                "---\nname: signal-helper\ndescription: Short description.\n---\n# Body\n",
+                encoding="utf-8",
+            )
+            res_short = subprocess.run(
+                ["python3", str(case_check), "skill-authoring", "frontmatter-draft", str(fm_short.parent)],
+                env=env_base, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(0, res_short.returncode)
+
+            # 2. test-matrix: a grader check.sh that just does `exit 0` fails.
+            tm_bad = root / "tm_bad"
+            shutil.copytree(ROOT / "knowledge/skills/skill-authoring/tests/expected/test-matrix", tm_bad)
+            (tm_bad / "signal-helper/tests/graders/summary/check.sh").write_text(
+                "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8",
+            )
+            res_tm = subprocess.run(
+                ["python3", str(case_check), "skill-authoring", "test-matrix", str(tm_bad)],
+                env=env_base, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(0, res_tm.returncode)
+
+            # 3. review-taxonomy: capitalized severity + trailing blank line passes; line 999 / lorem ipsum fails.
+            rev_env = {
+                **env_base,
+                "SKILLTEST_EXPECTED_CATEGORY": "COR",
+                "SKILLTEST_EXPECTED_SEVERITY": "major",
+                "SKILLTEST_EXPECTED_VERDICT": "REQUEST_CHANGES",
+            }
+            rev_ok = root / "rev_ok"
+            shutil.copytree(ROOT / "knowledge/skills/review-taxonomy/tests/expected/bounds-review", rev_ok)
+            shutil.copy2(
+                ROOT / "knowledge/skills/review-taxonomy/tests/fixtures/bounds-review/input/module.cpp",
+                rev_ok / "module.cpp",
+            )
+            (rev_ok / "REVIEW.md").write_text(
+                "| ID | Category | Severity | file:line | Problem (with evidence) | Required fix |\n"
+                "|---|---|---|---|---|---|\n"
+                "| R1 | COR | Major | module.cpp:1 | Unchecked array index access on values[index]. | Check index bounds. |\n"
+                "VERDICT: REQUEST_CHANGES\n\n\n",
+                encoding="utf-8",
+            )
+            res_rev_ok = subprocess.run(
+                ["python3", str(case_check), "review-taxonomy", "bounds-review", str(rev_ok)],
+                env=rev_env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(0, res_rev_ok.returncode, res_rev_ok.stdout + res_rev_ok.stderr)
+
+            (rev_ok / "REVIEW.md").write_text(
+                "| ID | Category | Severity | file:line | Problem (with evidence) | Required fix |\n"
+                "|---|---|---|---|---|---|\n"
+                "| R1 | COR | major | module.cpp:999 | Lorem ipsum dolor sit amet. | Fix it. |\n"
+                "VERDICT: REQUEST_CHANGES\n",
+                encoding="utf-8",
+            )
+            res_rev_bad = subprocess.run(
+                ["python3", str(case_check), "review-taxonomy", "bounds-review", str(rev_ok)],
+                env=rev_env, capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(0, res_rev_bad.returncode)
+
+    def test_f5b_content_hash_contamination_and_per_case_stats(self) -> None:
+        """Contamination uses SHA-256 file content hashes and behaviour CI is per-case (never pooled)."""
+        from skilltest.skilltest import _execute_trial
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            skill = root / "my-skill"
+            for name in ("case-a", "case-b"):
+                (skill / "tests/fixtures" / name / "input").mkdir(parents=True)
+                (skill / "tests/graders" / name).mkdir(parents=True)
+                (skill / "tests/fixtures" / name / "input/a.txt").write_text("in\n", encoding="utf-8")
+                (skill / "tests/graders" / name / "check.sh").write_text(
+                    "#!/usr/bin/env bash\ntest -f \"${@: -1}/OUT.txt\"\n", encoding="utf-8",
+                )
+            (skill / "SKILL.md").write_text(
+                "---\nname: my-skill\ndescription: Reusable test skill for verifying per-case stats and content hashes.\n---\nBody.\n",
+                encoding="utf-8",
+            )
+            (skill / "tests/skilltest.toml").write_text(
+                '[[trigger]]\nname = "p1"\nprompt = "p1"\nexpect = true\n'
+                '[[trigger]]\nname = "p2"\nprompt = "p2"\nexpect = true\n'
+                '[[trigger]]\nname = "n1"\nprompt = "n1"\nexpect = false\n'
+                '[[trigger]]\nname = "n2"\nprompt = "n2"\nexpect = false\n'
+                '[[behaviour]]\nname = "case-a"\nfixture = "fixtures/case-a/input"\ngrader = "graders/case-a"\nprompt = "do case-a"\ncheck = "bash check.sh"\n'
+                '[[behaviour]]\nname = "case-b"\nfixture = "fixtures/case-b/input"\ngrader = "graders/case-b"\nprompt = "do case-b"\ncheck = "bash check.sh"\n',
+                encoding="utf-8",
+            )
+
+            # Worker writing its own helper named check.sh (different content) is NOT contaminated.
+            fake_helper = root / "fake_helper.py"
+            fake_helper.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib\n"
+                "pathlib.Path('check.sh').write_text('#!/usr/bin/env bash\\necho helper\\n', encoding='utf-8')\n"
+                "pathlib.Path('OUT.txt').write_text('ok\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type':'result','result':'done','duration_ms':1}))\n",
+                encoding="utf-8",
+            )
+            fake_helper.chmod(0o755)
+            _, passed_helper, _ = _execute_trial(
+                skill, "haiku", "do case-a", True, root / "run_helper",
+                skill / "tests/fixtures/case-a/input", str(fake_helper), "local",
+                "bash check.sh", skill / "tests/graders/case-a", allow_unsandboxed_local=True,
+            )
+            self.assertTrue(passed_helper)
+
+            # Copying grader file bytes under a different name IS contaminated.
+            grader_bytes = (skill / "tests/graders/case-a/check.sh").read_text(encoding="utf-8")
+            fake_leak = root / "fake_leak.py"
+            fake_leak.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib\n"
+                f"pathlib.Path('copied_grader.sh').write_text({grader_bytes!r}, encoding='utf-8')\n"
+                "pathlib.Path('OUT.txt').write_text('ok\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type':'result','result':'done','duration_ms':1}))\n",
+                encoding="utf-8",
+            )
+            fake_leak.chmod(0o755)
+            _, passed_leak, telem_leak = _execute_trial(
+                skill, "haiku", "do case-a", True, root / "run_leak",
+                skill / "tests/fixtures/case-a/input", str(fake_leak), "local",
+                "bash check.sh", skill / "tests/graders/case-a", allow_unsandboxed_local=True,
+            )
+            self.assertFalse(passed_leak)
+            self.assertIn("grader material", telem_leak["reason"])
+
+            # Per-case behaviour stats with k=3 across two cases: per_case has CIs; combined delta_ci_95 is None.
+            fake_ab = root / "fake_ab.py"
+            fake_ab.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "prompt = sys.argv[-1]\n"
+                "if pathlib.Path('.claude/skills/my-skill/SKILL.md').is_file():\n"
+                "    pathlib.Path('OUT.txt').write_text('ok\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type':'result','result':'done','duration_ms':1}))\n",
+                encoding="utf-8",
+            )
+            fake_ab.chmod(0o755)
+            results_dir = root / "results_ab"
+            rc = self.run_cli(
+                "run", str(skill), "--engines", "haiku", "--k", "3",
+                "--isolation", "local", "--allow-unsandboxed-local",
+                "--agent-bin", str(fake_ab), "--results-root", str(results_dir),
+            )
+            self.assertEqual(0, rc.returncode, rc.stderr)
+            summary = json.loads(next(results_dir.rglob("summary.json")).read_text(encoding="utf-8"))
+            beh = summary["behaviour"]["haiku"]
+            self.assertIsNone(beh["delta_ci_95"])
+            self.assertIn("not pooled", beh["note"])
+            self.assertEqual(set(beh["per_case"].keys()), {"case-a", "case-b"})
+            for cname in ("case-a", "case-b"):
+                self.assertEqual("benefit", beh["per_case"][cname]["verdict"])
+                self.assertIsNotNone(beh["per_case"][cname]["delta_ci_95"])
+            summary_md = next(results_dir.rglob("summary.md")).read_text(encoding="utf-8")
+            self.assertIn("not pooled", summary_md)
+            self.assertIn("case-a:", summary_md)
+            self.assertIn("case-b:", summary_md)
 
 
 if __name__ == "__main__":

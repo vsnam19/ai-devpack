@@ -195,6 +195,54 @@ if not re.search(r"@param\[in\]\s+candidateValue\b", hdr):
     sys.exit(1)
 PY
 
+MUTATE_PY="${DEVPACK_ROOT:+$DEVPACK_ROOT/eval/lib/mutate_cpp.py}"
+if [[ -z "$MUTATE_PY" || ! -f "$MUTATE_PY" ]]; then
+    MUTATE_PY="$SCRIPT_DIR/../../lib/mutate_cpp.py"
+fi
+
+# Require the worker's NEW test file (tests/test_codec_raw_range.cpp) alone to kill
+# mutants covering unsigned negative rejection, unsigned upper bound, unsigned inclusivity,
+# signed vs unsigned handling, and signed upper/lower boundaries.
+python3 "$MUTATE_PY" --workdir "$WORKDIR" --test-file "tests/test_codec_raw_range.cpp" --spec-stdin <<'JSON'
+[
+  {
+    "name": "unsigned allows negative candidateValue",
+    "file": "src/can_codec.cpp",
+    "mode": "replace_body",
+    "func_regex": "(?:can_fixture\\s*::\\s*)?\\bisRawInRange\\s*\\([^)]*\\)",
+    "body": "{\n    if (!isValidSignal(signal)) { return false; }\n    if (!signal.isSigned) {\n        if (candidateValue < 0) { return true; }\n        if (signal.bitLength >= 63U) { return true; }\n        return static_cast<std::uint64_t>(candidateValue) <= ((1ULL << signal.bitLength) - 1ULL);\n    }\n    if (signal.bitLength >= 64U) { return true; }\n    const std::int64_t minSigned = -(1LL << (signal.bitLength - 1U));\n    const std::int64_t maxSigned = (1LL << (signal.bitLength - 1U)) - 1LL;\n    return (candidateValue >= minSigned) && (candidateValue <= maxSigned);\n}"
+  },
+  {
+    "name": "unsigned accepts value above maxUnsigned",
+    "file": "src/can_codec.cpp",
+    "mode": "replace_body",
+    "func_regex": "(?:can_fixture\\s*::\\s*)?\\bisRawInRange\\s*\\([^)]*\\)",
+    "body": "{\n    if (!isValidSignal(signal)) { return false; }\n    if (!signal.isSigned) {\n        return candidateValue >= 0;\n    }\n    if (signal.bitLength >= 64U) { return true; }\n    const std::int64_t minSigned = -(1LL << (signal.bitLength - 1U));\n    const std::int64_t maxSigned = (1LL << (signal.bitLength - 1U)) - 1LL;\n    return (candidateValue >= minSigned) && (candidateValue <= maxSigned);\n}"
+  },
+  {
+    "name": "unsigned rejects maxUnsigned boundary",
+    "file": "src/can_codec.cpp",
+    "mode": "replace_body",
+    "func_regex": "(?:can_fixture\\s*::\\s*)?\\bisRawInRange\\s*\\([^)]*\\)",
+    "body": "{\n    if (!isValidSignal(signal)) { return false; }\n    if (!signal.isSigned) {\n        if (candidateValue < 0) { return false; }\n        if (signal.bitLength >= 63U) { return true; }\n        return static_cast<std::uint64_t>(candidateValue) < ((1ULL << signal.bitLength) - 1ULL);\n    }\n    if (signal.bitLength >= 64U) { return true; }\n    const std::int64_t minSigned = -(1LL << (signal.bitLength - 1U));\n    const std::int64_t maxSigned = (1LL << (signal.bitLength - 1U)) - 1LL;\n    return (candidateValue >= minSigned) && (candidateValue <= maxSigned);\n}"
+  },
+  {
+    "name": "ignores signal.isSigned and treats signed as unsigned",
+    "file": "src/can_codec.cpp",
+    "mode": "replace_body",
+    "func_regex": "(?:can_fixture\\s*::\\s*)?\\bisRawInRange\\s*\\([^)]*\\)",
+    "body": "{\n    if (!isValidSignal(signal)) { return false; }\n    if (candidateValue < 0) { return false; }\n    if (signal.bitLength >= 63U) { return true; }\n    return static_cast<std::uint64_t>(candidateValue) <= ((1ULL << signal.bitLength) - 1ULL);\n}"
+  },
+  {
+    "name": "signed off-by-one on lower and upper boundaries",
+    "file": "src/can_codec.cpp",
+    "mode": "replace_body",
+    "func_regex": "(?:can_fixture\\s*::\\s*)?\\bisRawInRange\\s*\\([^)]*\\)",
+    "body": "{\n    if (!isValidSignal(signal)) { return false; }\n    if (!signal.isSigned) {\n        if (candidateValue < 0) { return false; }\n        if (signal.bitLength >= 63U) { return true; }\n        return static_cast<std::uint64_t>(candidateValue) <= ((1ULL << signal.bitLength) - 1ULL);\n    }\n    if (signal.bitLength >= 64U) { return true; }\n    const std::int64_t minSigned = -(1LL << (signal.bitLength - 1U)) - 1LL;\n    const std::int64_t maxSigned = (1LL << (signal.bitLength - 1U));\n    return (candidateValue >= minSigned) && (candidateValue <= maxSigned);\n}"
+  }
+]
+JSON
+
 
 echo "PASS: 07-small-feature-codec-raw-range"
 exit 0

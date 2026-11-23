@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -26,10 +27,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None  # type: ignore[assignment]
+from skilltest.frontmatter import _minimal_toml_loads, load_config, parse_frontmatter, tomllib  # noqa: F401
 
 from runner.agent_exec import (
     AgentRequest,
@@ -47,85 +45,6 @@ MAX_DESCRIPTION_LENGTH = 1024
 MAX_BODY_LINES = 200
 ABSOLUTE_PATH_PATTERN = re.compile(r"(?:^|[\s`(])(?:/(?:Users|home|opt|usr|var|etc|tmp|mnt)/|[A-Za-z]:[\\\\/])")
 MARKDOWN_LINK_PATTERN = re.compile(r"\]\(([^)]+)\)")
-
-
-def _minimal_toml_loads(text: str) -> dict[str, Any]:
-    """Parse flat TOML scalars and arrays of tables used by skilltest on Python 3.10.
-
-    Support quoted strings, booleans, and integers; reject unsupported syntax.
-    """
-    root: dict[str, Any] = {}
-    current = root
-    for line_number, line in enumerate(text.splitlines(), 1):
-        quote = None
-        escaped = False
-        for index, char in enumerate(line):
-            if escaped:
-                escaped = False
-            elif char == "\\" and quote == '"':
-                escaped = True
-            elif char == quote:
-                quote = None
-            elif quote is None and char in ("'", '"'):
-                quote = char
-            elif quote is None and char == '#':
-                line = line[:index]
-                break
-        line = line.strip()
-        if not line:
-            continue
-        table = re.fullmatch(r"\[\[([A-Za-z_][\w-]*)\]\]", line)
-        if table:
-            current = {}
-            root.setdefault(table[1], []).append(current)
-            continue
-        entry = re.fullmatch(r"([A-Za-z_][\w-]*)\s*=\s*(.+)", line)
-        if not entry:
-            raise ValueError(f"unsupported TOML at line {line_number}")
-        key, value = entry.groups()
-        if key in current:
-            raise ValueError(f"duplicate TOML key at line {line_number}")
-        if value in ('true', 'false'):
-            parsed = value == 'true'
-        elif re.fullmatch(r'[+-]?[0-9]+', value):
-            parsed = int(value)
-        elif value.startswith('"') and value.endswith('"'):
-            parsed = json.loads(value)
-        elif value.startswith("'") and value.endswith("'"):
-            parsed = value[1:-1]
-        else:
-            raise ValueError(f"unsupported TOML value at line {line_number}")
-        current[key] = parsed
-    return root
-
-
-def load_config(skill_dir: Path) -> dict[str, Any]:
-    """Load a skill test configuration with a Python 3.10 stdlib fallback."""
-    config = skill_dir / "tests" / "skilltest.toml"
-    if not config.is_file():
-        return {}
-    text = config.read_text(encoding="utf-8")
-    return tomllib.loads(text) if tomllib is not None else _minimal_toml_loads(text)
-
-
-def parse_frontmatter(text: str) -> tuple[dict[str, str], list[str], list[str]]:
-    """Parse compact YAML-like frontmatter and return metadata, body, and errors."""
-    errors: list[str] = []
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return {}, lines, ["missing frontmatter"]
-    try:
-        closing = lines.index("---", 1)
-    except ValueError:
-        return {}, lines, ["unterminated frontmatter"]
-    meta: dict[str, str] = {}
-    for line in lines[1:closing]:
-        if ":" not in line:
-            errors.append("invalid frontmatter entry")
-            continue
-        key, value = line.split(":", 1)
-        meta[key.strip()] = value.strip().strip('"')
-    return meta, lines[closing + 1 :], errors
 
 
 def lint_skill(skill_dir: Path) -> list[str]:
@@ -397,8 +316,20 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
                 outcome = "pass" if passed else "fail"
                 reason = "" if passed else f"FAIL: expected triggered={expected_trigger}, observed {triggered}"
             else:
-                grader_names = {path.name for path in grader.rglob("*") if path.is_file()} if grader else set()
-                contaminated = any(path.name in grader_names for path in workdir.rglob("*") if path.is_file())
+                grader_hashes = (
+                    {
+                        hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in grader.rglob("*")
+                        if path.is_file() and path.stat().st_size > 0
+                    }
+                    if grader
+                    else set()
+                )
+                contaminated = any(
+                    hashlib.sha256(path.read_bytes()).hexdigest() in grader_hashes
+                    for path in workdir.rglob("*")
+                    if path.is_file() and path.stat().st_size > 0
+                )
                 if contaminated:
                     outcome = "fail"
                     reason = "FAIL: grader material found in candidate workspace"
@@ -521,17 +452,59 @@ def run_experiment(args: argparse.Namespace) -> int:
         }
     report["trigger"] = trigger_report
     behaviour_report: dict[str, Any] = {}
+    case_names = [case["name"] for case in config["behaviour"]]
     for engine in engines:
         with_trials = [t for t in trials if t["engine"] == engine and t["arm"] == "with_skill"]
         without_trials = [t for t in trials if t["engine"] == engine and t["arm"] == "without_skill"]
+        per_case: dict[str, Any] = {}
+        for case_name in case_names:
+            c_with = [t for t in with_trials if t["case"] == case_name]
+            c_without = [t for t in without_trials if t["case"] == case_name]
+            c_with_valid = [t["passed"] for t in c_with if t["telemetry"].get("outcome") != "error"]
+            c_without_valid = [t["passed"] for t in c_without if t["telemetry"].get("outcome") != "error"]
+            c_with_err = len(c_with) - len(c_with_valid)
+            c_without_err = len(c_without) - len(c_without_valid)
+            c_beh = aggregate_behaviour(c_with_valid, c_without_valid)
+            c_beh["with_skill_errors"] = c_with_err
+            c_beh["without_skill_errors"] = c_without_err
+            c_beh["errors"] = c_with_err + c_without_err
+            per_case[case_name] = c_beh
+
         with_valid = [t["passed"] for t in with_trials if t["telemetry"].get("outcome") != "error"]
         without_valid = [t["passed"] for t in without_trials if t["telemetry"].get("outcome") != "error"]
         with_errors = len(with_trials) - len(with_valid)
         without_errors = len(without_trials) - len(without_valid)
-        beh = aggregate_behaviour(with_valid, without_valid)
-        beh["with_skill_errors"] = with_errors
-        beh["without_skill_errors"] = without_errors
-        beh["errors"] = with_errors + without_errors
+        if len(per_case) == 1:
+            only_case = next(iter(per_case.values()))
+            beh = dict(only_case)
+            beh["note"] = "Single behaviour case; combined summary equals per-case statistics."
+        else:
+            with_rate = sum(1 for item in with_valid if item) / len(with_valid) if with_valid else 0.0
+            without_rate = sum(1 for item in without_valid if item) / len(without_valid) if without_valid else 0.0
+            case_verdicts = [c["verdict"] for c in per_case.values()]
+            if case_verdicts and all(v == "ceiling" for v in case_verdicts):
+                combined_verdict = "ceiling"
+            elif case_verdicts and all(v in ("benefit", "ceiling") for v in case_verdicts) and any(v == "benefit" for v in case_verdicts):
+                combined_verdict = "benefit"
+            elif case_verdicts and all(v in ("no_benefit", "ceiling") for v in case_verdicts) and any(v == "no_benefit" for v in case_verdicts):
+                combined_verdict = "no_benefit"
+            else:
+                combined_verdict = "inconclusive"
+            beh = {
+                "with_skill_rate": with_rate,
+                "without_skill_rate": without_rate,
+                "with_k": len(with_valid),
+                "without_k": len(without_valid),
+                "delta": round(with_rate - without_rate, 6),
+                "delta_ci_95": None,
+                "verdict": combined_verdict,
+                "no_measurable_benefit": combined_verdict != "benefit",
+                "with_skill_errors": with_errors,
+                "without_skill_errors": without_errors,
+                "errors": with_errors + without_errors,
+                "note": "Combined descriptive rates only; distinct fixtures are not pooled into one binomial CI (see per_case).",
+            }
+        beh["per_case"] = per_case
         behaviour_report[engine] = beh
     report["behaviour"] = behaviour_report
     (output / "summary.json").write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
@@ -541,13 +514,20 @@ def run_experiment(args: argparse.Namespace) -> int:
         f"valid={item['valid']}, errors={item['errors']}, per-case={item['per_case_rate']}"
         for engine, item in report["trigger"].items()
     ]
-    lines += ["", "## Behaviour"]
-    lines += [
-        f"- {engine}: with={item['with_skill_rate']:.2f}, without={item['without_skill_rate']:.2f}, "
-        f"delta={item['delta']:.2f}, ci_95={item['delta_ci_95']}, verdict={item['verdict']}, "
-        f"errors={item['errors']}; no measurable benefit={item['no_measurable_benefit']}"
-        for engine, item in report["behaviour"].items()
-    ]
+    lines += ["", "## Behaviour", "", "Note: Per-case Newcombe-Wilson 95% CIs are computed separately; combined CIs are not pooled across distinct fixtures."]
+    for engine, item in report["behaviour"].items():
+        ci_text = item["delta_ci_95"] if item["delta_ci_95"] is not None else "n/a (not pooled across cases)"
+        lines.append(
+            f"- {engine} (combined): with={item['with_skill_rate']:.2f}, without={item['without_skill_rate']:.2f}, "
+            f"delta={item['delta']:.2f}, ci_95={ci_text}, verdict={item['verdict']}, "
+            f"errors={item['errors']}; no measurable benefit={item['no_measurable_benefit']}"
+        )
+        for case_name, c_item in item["per_case"].items():
+            lines.append(
+                f"  - {case_name}: with={c_item['with_skill_rate']:.2f}, without={c_item['without_skill_rate']:.2f}, "
+                f"delta={c_item['delta']:.2f}, ci_95={c_item['delta_ci_95']}, verdict={c_item['verdict']}, "
+                f"errors={c_item['errors']}"
+            )
     lines += ["", "## Trials"]
     lines += [f"- {trial['engine']} {trial['arm']} {trial['case']}: {trial['telemetry']['outcome']}; {trial['reason'] or 'Passed'}" for trial in trials]
     (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
