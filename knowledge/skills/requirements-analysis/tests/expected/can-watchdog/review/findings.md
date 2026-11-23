@@ -1,7 +1,7 @@
 # Requirements Findings: CAN Watchdog and Signal Supervision
 
 Document: `spec.md`
-Requirements inventoried: `REQ-CAN-020`, `REQ-CAN-021`, `REQ-CAN-022`, `TMP-1` (temporary ID `TMP-1` assigned to the unnumbered startup initialization requirement).
+Requirements inventoried: `REQ-CAN-020`, `REQ-CAN-021`, `REQ-CAN-022`, `REQ-CAN-023`, `TMP-1` (temporary ID `TMP-1` assigned to the unnumbered startup initialization requirement).
 
 ## Findings table
 
@@ -26,6 +26,8 @@ Requirements inventoried: `REQ-CAN-020`, `REQ-CAN-021`, `REQ-CAN-022`, `TMP-1` (
 
 - `REQ-CAN-020` (ready):
   - Boundary/error injection: call `packRaw()` with `frameBytes == nullptr` (length `8`) and with non-null buffer at boundary lengths `frameLength = 0` and `frameLength = 7`; verify return value `false` and unchanged buffer bytes.
+- `REQ-CAN-023` (ready):
+  - Boundary: call `isValidSignal()` with `bitLength == 0` and `startBit + bitLength == 65` (vs valid `64`) and verify return value `false`.
 - REQ-CAN-021: BLOCKED (open question) — see findings row REQ-CAN-021
 - REQ-CAN-022: BLOCKED (open question) — see findings row REQ-CAN-022
 - TMP-1: BLOCKED (open question) — see findings row TMP-1

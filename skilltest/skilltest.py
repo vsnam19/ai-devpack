@@ -11,6 +11,7 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -206,7 +207,7 @@ def lint_skill(skill_dir: Path) -> list[str]:
 
 
 def transcript_triggered(transcript: str, skill_name: str) -> bool:
-    """Identify a Skill selection or a read of this skill's installed markdown file."""
+    """Identify a Skill tool call matching skill_name exactly or a Read of its SKILL.md."""
     suffix = f".claude/skills/{skill_name}/SKILL.md"
     for line in transcript.splitlines():
         try:
@@ -219,21 +220,101 @@ def transcript_triggered(transcript: str, skill_name: str) -> bool:
                 continue
             tool = block.get("name")
             inputs = block.get("input", {})
-            encoded = json.dumps(inputs)
-            if tool == "Skill" and skill_name in encoded:
-                return True
-            if tool == "Read" and suffix in encoded:
-                return True
+            if not isinstance(inputs, dict):
+                continue
+            if tool == "Skill":
+                called = str(
+                    inputs.get("skill") or inputs.get("name") or inputs.get("skill_name") or ""
+                ).strip()
+                if called == skill_name:
+                    return True
+            if tool == "Read":
+                raw_path = str(
+                    inputs.get("file_path") or inputs.get("path") or ""
+                ).replace("\\", "/").strip()
+                if raw_path == suffix or raw_path.endswith("/" + suffix):
+                    return True
     return False
 
 
+def _wilson_interval(successes: int, total: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    """Compute the 95% Wilson score confidence interval for a binomial proportion."""
+    if total <= 0:
+        return 0.0, 1.0
+    p = successes / total
+    z2 = z * z
+    denom = 1.0 + z2 / total
+    center = (p + z2 / (2.0 * total)) / denom
+    half = (z * math.sqrt((p * (1.0 - p) / total) + (z2 / (4.0 * total * total)))) / denom
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def _newcombe_delta_ci(
+    x1: int, n1: int, x2: int, n2: int, z: float = 1.959963984540054
+) -> tuple[float, float]:
+    """Compute Newcombe's Wilson 95% confidence interval for the proportion difference p1 - p2."""
+    p1 = x1 / n1
+    p2 = x2 / n2
+    l1, u1 = _wilson_interval(x1, n1, z)
+    l2, u2 = _wilson_interval(x2, n2, z)
+    delta = p1 - p2
+    low = delta - math.sqrt((p1 - l1) ** 2 + (u2 - p2) ** 2)
+    high = delta + math.sqrt((u1 - p1) ** 2 + (p2 - l2) ** 2)
+    return max(-1.0, low), min(1.0, high)
+
+
 def aggregate_behaviour(with_skill: list[bool], without_skill: list[bool]) -> dict[str, Any]:
-    """Calculate A/B rates, delta, and the required no-benefit verdict."""
-    with_rate = sum(with_skill) / len(with_skill) if with_skill else 0.0
-    without_rate = sum(without_skill) / len(without_skill) if without_skill else 0.0
+    """Calculate A/B rates, Newcombe-Wilson 95% delta CI, and benefit/inconclusive/ceiling verdict."""
+    n_with = len(with_skill)
+    n_without = len(without_skill)
+    x_with = sum(1 for item in with_skill if item)
+    x_without = sum(1 for item in without_skill if item)
+    with_rate = x_with / n_with if n_with else 0.0
+    without_rate = x_without / n_without if n_without else 0.0
     delta = round(with_rate - without_rate, 6)
-    return {"with_skill_rate": with_rate, "without_skill_rate": without_rate,
-            "delta": delta, "no_measurable_benefit": delta <= 0.0}
+    ci_95: list[float] | None = None
+    if n_with > 0 and n_without > 0:
+        lo, hi = _newcombe_delta_ci(x_with, n_with, x_without, n_without)
+        ci_95 = [round(lo, 6), round(hi, 6)]
+    if n_with < 3 or n_without < 3:
+        verdict = "inconclusive"
+    elif with_rate == 1.0 and without_rate == 1.0:
+        verdict = "ceiling"
+    else:
+        assert ci_95 is not None
+        if ci_95[0] > 0.0:
+            verdict = "benefit"
+        elif ci_95[1] < 0.0:
+            verdict = "no_benefit"
+        else:
+            verdict = "inconclusive"
+    return {
+        "with_skill_rate": with_rate,
+        "without_skill_rate": without_rate,
+        "with_k": n_with,
+        "without_k": n_without,
+        "delta": delta,
+        "delta_ci_95": ci_95,
+        "verdict": verdict,
+        "no_measurable_benefit": verdict != "benefit",
+    }
+
+
+def _is_skill_deprecated(skill_dir: Path) -> bool:
+    """Return True if SKILL.md frontmatter or body marks the skill deprecated."""
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.is_file():
+        return True
+    text = skill_md.read_text(encoding="utf-8")
+    meta, body, _ = parse_frontmatter(text)
+    if meta.get("deprecated", "").strip().lower() in ("true", "yes", "1"):
+        return True
+    if "deprecated" in meta.get("status", "").strip().lower():
+        return True
+    for line in body:
+        if re.match(r"^\s*deprecated\s*:", line, re.IGNORECASE):
+            return True
+    return False
 
 
 def _copy_skill(skill_dir: Path, workdir: Path, name: str) -> None:
@@ -241,6 +322,26 @@ def _copy_skill(skill_dir: Path, workdir: Path, name: str) -> None:
     target = workdir / ".claude" / "skills" / name
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(skill_dir, target, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+
+
+def _install_trigger_skills(skill_dir: Path, workdir: Path) -> list[str]:
+    """Install skill_dir and all non-deprecated sibling skills for trigger competition."""
+    installed: list[str] = []
+    skills_root = skill_dir.parent
+    candidates = (
+        sorted(p for p in skills_root.iterdir() if p.is_dir() and (p / "SKILL.md").is_file())
+        if skills_root.is_dir()
+        else []
+    )
+    target_resolved = skill_dir.resolve()
+    if not any(p.resolve() == target_resolved for p in candidates):
+        candidates.append(skill_dir)
+    for candidate in candidates:
+        if candidate.resolve() != target_resolved and _is_skill_deprecated(candidate):
+            continue
+        _copy_skill(candidate, workdir, candidate.name)
+        installed.append(candidate.name)
+    return installed
 
 
 def _trial_run_dir(root: Path, label: str) -> Path:
@@ -273,7 +374,10 @@ def _execute_trial(skill_dir: Path, engine: str, prompt: str, enabled: bool, run
             if fixture is not None:
                 shutil.copytree(fixture, workdir, dirs_exist_ok=True)
             if enabled:
-                _copy_skill(skill_dir, workdir, skill_dir.name)
+                if check_command is None:
+                    _install_trigger_skills(skill_dir, workdir)
+                else:
+                    _copy_skill(skill_dir, workdir, skill_dir.name)
             result = run_agent(AgentRequest(
                 engine=load_engines(engines_config).get_engine(engine), prompt=prompt, workdir=workdir,
                 run_dir=run_dir, step_name="skilltest", role="skilltest", skills_enabled=enabled,
@@ -386,29 +490,57 @@ def run_experiment(args: argparse.Namespace) -> int:
     trigger_report: dict[str, Any] = {}
     for engine in engines:
         samples = [trial for trial in trials if trial["engine"] == engine and trial["arm"] == "trigger"]
-        true_positive = sum(1 for trial in samples if trial["expected"] and trial["triggered"])
-        false_positive = sum(1 for trial in samples if not trial["expected"] and trial["triggered"])
-        false_negative = sum(1 for trial in samples if trial["expected"] and not trial["triggered"])
-        case_rates = {name: sum(item["triggered"] for item in samples if item["case"] == name) /
-                      sum(1 for item in samples if item["case"] == name)
-                      for name in sorted({item["case"] for item in samples})}
+        valid_samples = [trial for trial in samples if trial["telemetry"].get("outcome") != "error"]
+        error_count = len(samples) - len(valid_samples)
+        true_positive = sum(1 for trial in valid_samples if trial["expected"] and trial["triggered"])
+        false_positive = sum(1 for trial in valid_samples if not trial["expected"] and trial["triggered"])
+        false_negative = sum(1 for trial in valid_samples if trial["expected"] and not trial["triggered"])
+        case_rates: dict[str, float | None] = {}
+        for name in sorted({item["case"] for item in samples}):
+            case_valid = [item for item in valid_samples if item["case"] == name]
+            case_rates[name] = (
+                sum(1 for item in case_valid if item["triggered"]) / len(case_valid)
+                if case_valid
+                else None
+            )
         trigger_report[engine] = {
             "precision": true_positive / (true_positive + false_positive)
             if true_positive + false_positive else 0.0,
             "recall": true_positive / (true_positive + false_negative)
             if true_positive + false_negative else 0.0,
+            "valid": len(valid_samples),
+            "errors": error_count,
             "per_case_rate": case_rates,
         }
     report["trigger"] = trigger_report
-    report["behaviour"] = {engine: aggregate_behaviour(
-        [trial["passed"] for trial in trials if trial["engine"] == engine and trial["arm"] == "with_skill"],
-        [trial["passed"] for trial in trials if trial["engine"] == engine and trial["arm"] == "without_skill"],
-    ) for engine in engines}
+    behaviour_report: dict[str, Any] = {}
+    for engine in engines:
+        with_trials = [t for t in trials if t["engine"] == engine and t["arm"] == "with_skill"]
+        without_trials = [t for t in trials if t["engine"] == engine and t["arm"] == "without_skill"]
+        with_valid = [t["passed"] for t in with_trials if t["telemetry"].get("outcome") != "error"]
+        without_valid = [t["passed"] for t in without_trials if t["telemetry"].get("outcome") != "error"]
+        with_errors = len(with_trials) - len(with_valid)
+        without_errors = len(without_trials) - len(without_valid)
+        beh = aggregate_behaviour(with_valid, without_valid)
+        beh["with_skill_errors"] = with_errors
+        beh["without_skill_errors"] = without_errors
+        beh["errors"] = with_errors + without_errors
+        behaviour_report[engine] = beh
+    report["behaviour"] = behaviour_report
     (output / "summary.json").write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
     lines = [f"# Skilltest: {skill_dir.name}", "", f"Trials: {len(trials)}", "", "## Trigger"]
-    lines += [f"- {engine}: precision={item['precision']:.2f}, recall={item['recall']:.2f}, per-case={item['per_case_rate']}" for engine, item in report["trigger"].items()]
+    lines += [
+        f"- {engine}: precision={item['precision']:.2f}, recall={item['recall']:.2f}, "
+        f"valid={item['valid']}, errors={item['errors']}, per-case={item['per_case_rate']}"
+        for engine, item in report["trigger"].items()
+    ]
     lines += ["", "## Behaviour"]
-    lines += [f"- {engine}: with={item['with_skill_rate']:.2f}, without={item['without_skill_rate']:.2f}, delta={item['delta']:.2f}; no measurable benefit={item['no_measurable_benefit']}" for engine, item in report["behaviour"].items()]
+    lines += [
+        f"- {engine}: with={item['with_skill_rate']:.2f}, without={item['without_skill_rate']:.2f}, "
+        f"delta={item['delta']:.2f}, ci_95={item['delta_ci_95']}, verdict={item['verdict']}, "
+        f"errors={item['errors']}; no measurable benefit={item['no_measurable_benefit']}"
+        for engine, item in report["behaviour"].items()
+    ]
     lines += ["", "## Trials"]
     lines += [f"- {trial['engine']} {trial['arm']} {trial['case']}: {trial['telemetry']['outcome']}; {trial['reason'] or 'Passed'}" for trial in trials]
     (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -1,0 +1,14 @@
+diff --git a/REVIEW.md b/REVIEW.md
+new file mode 100644
+index 0000000..0000002
+--- /dev/null
++++ b/REVIEW.md
+@@ -0,0 +1,8 @@
++| ID | Category | Severity | file:line | Problem | Fix |
++| --- | --- | --- | --- | --- | --- |
++| F1 | COR | blocker | src/link_state_machine.cpp:131 | `recoverFromFault` resets `m_faultCount = 0U;` violating REQ-LINK-006. | Remove `m_faultCount = 0U;`. |
++| B1 | COR | blocker | src/link_state_machine.cpp:10 | Bogus blocker 1. | Ignore. |
++| B2 | COR | blocker | src/link_state_machine.cpp:20 | Bogus blocker 2. | Ignore. |
++| B3 | COR | blocker | src/link_state_machine.cpp:30 | Bogus blocker 3. | Ignore. |
++
++VERDICT: REQUEST_CHANGES

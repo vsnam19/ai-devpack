@@ -77,24 +77,84 @@ class RunEvalUnitTests(unittest.TestCase):
     """Test suite verifying isolation, pass^k math, redaction, docker error handling, and dry-run."""
 
     def test_pass_at_1_and_pass_hat_k_math(self) -> None:
-        """Verify pass@1, strict pass^k (all-k pass), and Bernoulli pass^k math."""
+        """Verify pass@1, strict pass^k (n==k only), and unbiased pass^k / pass@k estimators."""
         self.assertAlmostEqual(1.0, run_eval.compute_pass_at_1(5, 5))
-        self.assertAlmostEqual(1.0, run_eval.compute_pass_hat_k(5, 5))
-        self.assertAlmostEqual(1.0, run_eval.compute_pass_pow_k(5, 5))
+        self.assertAlmostEqual(1.0, run_eval.compute_pass_hat_k(5, 5, k=5))
+        self.assertIsNone(run_eval.compute_pass_hat_k(3, 3, k=5))
+        self.assertAlmostEqual(1.0, run_eval.compute_pass_hat_k_unbiased(5, 5, k=5))
+        self.assertAlmostEqual(1.0, run_eval.compute_pass_at_k_unbiased(5, 5, k=5))
 
         self.assertAlmostEqual(0.0, run_eval.compute_pass_at_1(0, 5))
-        self.assertAlmostEqual(0.0, run_eval.compute_pass_hat_k(0, 5))
-        self.assertAlmostEqual(0.0, run_eval.compute_pass_pow_k(0, 5))
+        self.assertAlmostEqual(0.0, run_eval.compute_pass_hat_k(0, 5, k=5))
+        self.assertAlmostEqual(0.0, run_eval.compute_pass_hat_k_unbiased(0, 5, k=5))
+        self.assertAlmostEqual(0.0, run_eval.compute_pass_at_k_unbiased(0, 5, k=5))
 
         self.assertAlmostEqual(0.75, run_eval.compute_pass_at_1(3, 4))
-        self.assertAlmostEqual(0.0, run_eval.compute_pass_hat_k(3, 4))
-        self.assertAlmostEqual(0.75**3, run_eval.compute_pass_pow_k(3, 4, k=3))
-        self.assertAlmostEqual(0.75**4, run_eval.compute_pass_pow_k(3, 4))
+        self.assertAlmostEqual(0.0, run_eval.compute_pass_hat_k(3, 4, k=4))
+        self.assertIsNone(run_eval.compute_pass_hat_k_unbiased(3, 4, k=5))
+        self.assertIsNone(run_eval.compute_pass_at_k_unbiased(3, 4, k=5))
+        # C(3,3)/C(4,3) = 1/4 = 0.25; 1 - C(1,3)/C(4,3) = 1.0
+        self.assertAlmostEqual(0.25, run_eval.compute_pass_hat_k_unbiased(3, 4, k=3))
+        self.assertAlmostEqual(1.0, run_eval.compute_pass_at_k_unbiased(3, 4, k=3))
+        # C(3,2)/C(5,2) = 3/10 = 0.3; 1 - C(2,2)/C(5,2) = 1 - 1/10 = 0.9
+        self.assertAlmostEqual(0.3, run_eval.compute_pass_hat_k_unbiased(3, 5, k=2))
+        self.assertAlmostEqual(0.9, run_eval.compute_pass_at_k_unbiased(3, 5, k=2))
 
         with self.assertRaises(ValueError):
             run_eval.compute_pass_at_1(0, 0)
         with self.assertRaises(ValueError):
             run_eval.compute_pass_hat_k(6, 5)
+
+    def test_unbiased_pass_hat_k_zero_valid_runs_returns_none(self) -> None:
+        """Verify zero valid runs yields n/a (None) for the unbiased estimator instead of raising."""
+        self.assertIsNone(run_eval.compute_pass_hat_k_unbiased(0, 0, k=3))
+        self.assertIsNone(run_eval.compute_pass_hat_k_unbiased(0, 0, k=1))
+        with self.assertRaises(ValueError):
+            run_eval.compute_pass_hat_k_unbiased(0, -1, k=3)
+        with self.assertRaises(ValueError):
+            run_eval.compute_pass_hat_k_unbiased(0, 3, k=0)
+
+    def test_qualification_all_harness_errors_is_unqualified_without_crash(self) -> None:
+        """Verify a smoke task with zero valid runs records unqualified/insufficient_valid_runs, no exception."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            qual_file = base / "qualification.json"
+            qual_file.write_text(
+                json.dumps({"version": 1, "engines": {"local": {"status": "qualified"}}}),
+                encoding="utf-8",
+            )
+            summary = run_eval.TaskModelSummary(
+                task_id="01-mini-bugfix",
+                category="bugfix",
+                model="local",
+                k=3,
+                passes=0,
+                pass_at_1=None,
+                pass_hat_k=None,
+                pass_hat_k_unbiased=None,
+                pass_at_k_unbiased=None,
+                mean_cost_usd=None,
+                mean_turns=None,
+                mean_duration_s=0.0,
+                tier="smoke",
+                harness_errors=3,
+                valid_runs=0,
+            )
+            qual_ok, messages = run_eval.evaluate_and_record_qualification(
+                tier="smoke",
+                mode="single",
+                unit_labels=["local"],
+                engine_map={"local": mock.Mock()},
+                task_summaries=[summary],
+                qualification_file=qual_file,
+                eval_summary_path=base / "summary.md",
+                repo_root=base,
+            )
+            self.assertFalse(qual_ok)
+            self.assertTrue(any("unqualified" in m for m in messages))
+            rec = json.loads(qual_file.read_text(encoding="utf-8"))["engines"]["local"]
+            self.assertEqual("unqualified", rec["status"])
+            self.assertIn("insufficient_valid_runs", rec["unqualified_reason"])
 
     def test_dry_run_validates_tasks_and_does_not_call_agent(self) -> None:
         """Verify --dry-run exits 0, lists task x model plan, and invokes no subprocesses."""
@@ -848,7 +908,7 @@ class HarnessErrorTests(unittest.TestCase):
                 self.assertEqual(64, len(rec["config_hash"]))
                 self.assertTrue(rec["date"])
                 self.assertIn("summary.md", rec["eval_summary_path"])
-                self.assertGreaterEqual(rec["metrics"]["pass_pow_3"], 0.8)
+                self.assertGreaterEqual(rec["metrics"]["pass_hat_3_unbiased"], 0.8)
                 self.assertEqual(0, rec["metrics"]["tool_protocol_errors"])
                 self.assertGreaterEqual(rec["metrics"]["lint_clean_final_rate"], 0.9)
 
@@ -1037,10 +1097,107 @@ class HarnessErrorTests(unittest.TestCase):
                     continue
                 # Strip quoted string literals (e.g. echo "FAIL: not a git repo") before checking commands.
                 no_quotes = re.sub(r'"[^"]*"|\'[^\']*\'', "", line)
-                self.assertIsNone(
+                self.assertEqual(
                     bare_git_rx.search(no_quotes),
+                    None,
                     f"Bare git invocation in {script}:{lineno}: {line}",
                 )
+
+    def test_f2_metric_accounting_under_k_lint_final_no_cpp_timeouts_and_runner_gates(self) -> None:
+        """Verify n<k pass^k gating, single-mode lint_findings_final, rounds_to_clean max+1, no-C++, timeouts, and runner per-gate lint."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            task = run_eval.load_and_validate_tasks(tasks_dir, "all")[0]
+
+            # 1. Under-k (k=3 with 1 harness error -> n=2) renders n/a (n<k) and None in JSON.
+            trials_under_k = [
+                run_eval.TrialResult(
+                    task_id=task.task_id, category=task.category, model="haiku",
+                    run_index=1, passed=True, agent_returncode=0, check_returncode=0,
+                    cost_usd=0.01, turns=1, duration_s=1.0, lint_findings_final=0,
+                    lint_clean_final=True, rounds_to_clean=0,
+                ),
+                run_eval.TrialResult(
+                    task_id=task.task_id, category=task.category, model="haiku",
+                    run_index=2, passed=True, agent_returncode=0, check_returncode=0,
+                    cost_usd=0.01, turns=1, duration_s=1.0, lint_findings_final=2,
+                    lint_clean_final=False, rounds_to_clean=1,
+                ),
+                run_eval.TrialResult(
+                    task_id=task.task_id, category=task.category, model="haiku",
+                    run_index=3, passed=False, agent_returncode=1, check_returncode=1,
+                    cost_usd=None, turns=None, duration_s=0.5, harness_error=True,
+                ),
+            ]
+            ts_list, cat_list = run_eval.aggregate_results([task], ["haiku"], 3, trials_under_k)
+            ts = ts_list[0]
+            self.assertEqual(2, ts.valid_runs)
+            self.assertEqual(3, ts.k)
+            self.assertIsNone(ts.pass_hat_k)
+            self.assertIsNone(ts.pass_hat_k_unbiased)
+            self.assertIsNone(ts.pass_at_k_unbiased)
+            self.assertAlmostEqual(1.0, ts.mean_lint_findings_final)
+            self.assertIsNone(ts.mean_lint_findings_first_attempt)
+            self.assertAlmostEqual(0.5, ts.lint_clean_final_rate)
+            self.assertAlmostEqual(0.5, ts.mean_rounds_to_clean)
+            self.assertAlmostEqual(0.5, ts.rounds_to_clean_fail_share)
+            md = run_eval.render_summary_markdown("r", "2026-11-23", "local", 3, ["haiku"], ts_list, cat_list, mode="single")
+            self.assertIn("n/a (n<k)", md)
+            self.assertIn("Lint Final", md)
+            self.assertIn("pass^k_unbiased", md)
+            self.assertIn("pass@k_unbiased", md)
+
+            # 2. No-C++-change trial excluded from lint rates; timeout counted as not clean (max+1).
+            trials_lint = [
+                run_eval.TrialResult(
+                    task_id=task.task_id, category=task.category, model="haiku:sonnet",
+                    run_index=1, passed=True, agent_returncode=0, check_returncode=0,
+                    cost_usd=0.01, turns=None, duration_s=1.0, mode="runner",
+                    no_cpp_change=True,
+                ),
+                run_eval.TrialResult(
+                    task_id=task.task_id, category=task.category, model="haiku:sonnet",
+                    run_index=2, passed=False, agent_returncode=1, check_returncode=1,
+                    cost_usd=0.01, turns=None, duration_s=1.0, mode="runner",
+                    timed_out=True, lint_clean_final=False, rounds_to_clean=3,
+                ),
+                run_eval.TrialResult(
+                    task_id=task.task_id, category=task.category, model="haiku:sonnet",
+                    run_index=3, passed=True, agent_returncode=0, check_returncode=0,
+                    cost_usd=0.01, turns=None, duration_s=1.0, mode="runner",
+                    lint_findings_first_attempt=2, lint_clean_final=True, rounds_to_clean=1,
+                ),
+            ]
+            ts_lint, _ = run_eval.aggregate_results([task], ["haiku:sonnet"], 3, trials_lint)
+            self.assertEqual(1, ts_lint[0].no_cpp_change_runs)
+            self.assertAlmostEqual(0.5, ts_lint[0].lint_clean_final_rate)
+            self.assertAlmostEqual(2.0, ts_lint[0].mean_rounds_to_clean)
+            self.assertAlmostEqual(0.5, ts_lint[0].rounds_to_clean_fail_share)
+
+            # 3. Single-mode end-to-end with no C++ change records no_cpp_change=True and omits lint_findings_first_attempt in results.json.
+            cred = base / "c.json"
+            cred.write_text("{}", encoding="utf-8")
+            agent_nocpp = _write_agent(
+                base,
+                "(cwd / 'NOTES.md').write_text('no cpp change\\n', encoding='utf-8')\n"
+                + _OK_JSON.replace("RESULT", "'done'").replace("DENIALS", "[]"),
+            )
+            out_nocpp = base / "out_nocpp"
+            rc = run_eval.main([
+                "--isolation", "local", "--allow-unsandboxed-local",
+                "--engines", "haiku", "--k", "1", "--tasks", "01-mini-bugfix",
+                "--credentials", str(cred), "--work-root", str(base / "wr_nocpp"),
+                "--fixture-dir", str(fixture_dir), "--tasks-dir", str(tasks_dir),
+                "--agent-bin", str(agent_nocpp), "--out", str(out_nocpp),
+            ])
+            self.assertEqual(0, rc)
+            res_nocpp = json.loads((out_nocpp / "results.json").read_text(encoding="utf-8"))
+            ts_nc = res_nocpp["tasks"][0]
+            self.assertEqual(1, ts_nc["no_cpp_change_runs"])
+            self.assertIsNone(ts_nc["lint_clean_final_rate"])
+            self.assertNotIn("lint_findings_first_attempt", ts_nc["runs"][0])
+            self.assertTrue(ts_nc["runs"][0]["no_cpp_change"])
 
 
 if __name__ == "__main__":

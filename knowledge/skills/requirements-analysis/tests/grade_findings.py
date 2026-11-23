@@ -26,7 +26,7 @@ class CaseSpec:
 
 CASES: dict[str, CaseSpec] = {
     "protocol-timing": CaseSpec(
-        clean_ids=("REQ-COM-001",),
+        clean_ids=("REQ-COM-001", "REQ-COM-005"),
         seeded_patterns=(
             ("REQ-COM-002", r"\bREQ-COM-002\b"),
             ("REQ-COM-003", r"\bREQ-COM-003\b"),
@@ -35,7 +35,7 @@ CASES: dict[str, CaseSpec] = {
         min_recall=2,
     ),
     "dtc-debouncer": CaseSpec(
-        clean_ids=("REQ-DTC-010",),
+        clean_ids=("REQ-DTC-010", "REQ-DTC-014"),
         seeded_patterns=(
             ("REQ-DTC-011", r"\bREQ-DTC-011\b"),
             ("REQ-DTC-012", r"\bREQ-DTC-012\b"),
@@ -45,7 +45,7 @@ CASES: dict[str, CaseSpec] = {
         required_keywords=("conflict",),
     ),
     "can-watchdog": CaseSpec(
-        clean_ids=("REQ-CAN-020",),
+        clean_ids=("REQ-CAN-020", "REQ-CAN-023"),
         seeded_patterns=(
             ("REQ-CAN-021", r"\bREQ-CAN-021\b"),
             ("REQ-CAN-022", r"\bREQ-CAN-022\b"),
@@ -59,12 +59,89 @@ CASES: dict[str, CaseSpec] = {
 ID_TOKEN_PATTERN = re.compile(r"\b(?:REQ|SYS|SWR|TC|TMP)(?:-[A-Z0-9]+)+\b")
 HEX_NUMBER_PATTERN = re.compile(r"\b0x[0-9a-fA-F]+\b")
 DEC_NUMBER_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\b")
+WORD_TOKEN_PATTERN = re.compile(r"\b[a-zA-Z]+\b")
 SEPARATOR_CELL_PATTERN = re.compile(r"^:?-{2,}:?$")
 TEST_IDEAS_HEADING = "## Derived test ideas"
 LIST_MARKER_PATTERN = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 BLOCKED_ENTRY_PATTERN = re.compile(
     r"(?P<id>(?:REQ|SYS|SWR|TC|TMP)(?:-[A-Z0-9]+)+): BLOCKED \(open question\)"
     r"(?: — see findings row (?P=id))?"
+)
+
+NUMBER_WORDS: dict[str, str] = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+    "hundred": "100",
+    "thousand": "1000",
+    "dozen": "12",
+    "half": "0.5",
+}
+
+CHECKLIST_RULE_PATTERN = re.compile(r"\bQ(?:1[0-5]|[1-9])\b", re.IGNORECASE)
+CHECKLIST_VOCAB_TERMS: tuple[str, ...] = (
+    "missing or duplicate id",
+    "missing unique id",
+    "duplicate id",
+    "non-atomic",
+    "not singular",
+    "unnecessary",
+    "unlinked",
+    "wrong abstraction",
+    "ambiguous",
+    "incomplete",
+    "infeasible",
+    "unverifiable",
+    "inconsistent",
+    "non-conforming",
+    "missing error",
+    "degraded",
+    "implementation-biased",
+    "missing status",
+    "missing asil",
+    "missing traceability",
+    "traceability",
+    "set-level conflict",
+    "conflict",
+    "escape clause",
+    "hidden timing",
+    "relative timing",
+    "vague",
+    "missing unit",
+    "missing timing",
+    "missing initial",
+    "missing fault",
+    "missing range",
+    "missing tolerance",
+    "open placeholder",
+    "tbd",
+    "passive voice",
+    "quantifier",
 )
 
 
@@ -74,15 +151,77 @@ class TestIdea:
 
     text: str
     blocked: bool
+    indented: bool = False
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse internal whitespace runs to single spaces and strip ends."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _strip_outer_quotes(text: str) -> str:
+    """Strip one pair of matching outer quotes from a quoted table cell."""
+    stripped = text.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ('"', "'"):
+        return stripped[1:-1].strip()
+    return stripped
+
+
+def _has_checklist_defect_type(defect_type: str) -> bool:
+    """Return True if defect_type names at least one checklist rule ID or vocabulary term."""
+    lowered = defect_type.lower()
+    if CHECKLIST_RULE_PATTERN.search(defect_type):
+        return True
+    return any(term in lowered for term in CHECKLIST_VOCAB_TERMS)
+
+
+def _parse_spec_sections(spec_text: str) -> tuple[str, dict[str, str], list[str]]:
+    """Return normalized full spec text, per-ID section texts, and unnumbered section texts."""
+    sections: dict[str, list[str]] = {}
+    unnumbered: list[str] = []
+    current_ids: list[str] = []
+    in_unnumbered = False
+
+    for line in spec_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            found_ids = ID_TOKEN_PATTERN.findall(stripped)
+            if found_ids:
+                current_ids = found_ids
+                in_unnumbered = False
+                for req_id in found_ids:
+                    sections.setdefault(req_id, []).append(stripped)
+            else:
+                current_ids = []
+                in_unnumbered = True
+                unnumbered.append(stripped)
+            continue
+        if current_ids:
+            for req_id in current_ids:
+                sections[req_id].append(stripped)
+        elif in_unnumbered:
+            unnumbered.append(stripped)
+
+    normalized_sections = {
+        req_id: _normalize_ws(" ".join(parts)) for req_id, parts in sections.items()
+    }
+    return _normalize_ws(spec_text), normalized_sections, [
+        _normalize_ws(part) for part in unnumbered if part.strip()
+    ]
 
 
 def extract_numbers(text: str) -> set[str]:
-    """Return numeric literals from text after stripping requirement and trace IDs."""
+    """Return numeric literals and number words from text after stripping requirement IDs."""
     without_ids = ID_TOKEN_PATTERN.sub(" ", text)
     hex_tokens = {match.group(0).lower() for match in HEX_NUMBER_PATTERN.finditer(without_ids)}
     without_hex = HEX_NUMBER_PATTERN.sub(" ", without_ids)
     dec_tokens = {match.group(0) for match in DEC_NUMBER_PATTERN.finditer(without_hex)}
-    return hex_tokens | dec_tokens
+    word_tokens = {
+        NUMBER_WORDS[match.group(0).lower()]
+        for match in WORD_TOKEN_PATTERN.finditer(without_hex)
+        if match.group(0).lower() in NUMBER_WORDS
+    }
+    return hex_tokens | dec_tokens | word_tokens
 
 
 def _split_markdown_row(line: str) -> list[str]:
@@ -171,6 +310,7 @@ def parse_test_ideas(markdown_text: str) -> list[TestIdea]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        indented = line[:1].isspace()
         content = LIST_MARKER_PATTERN.sub("", line, count=1).strip()
         if not content:
             continue
@@ -178,6 +318,7 @@ def parse_test_ideas(markdown_text: str) -> list[TestIdea]:
             TestIdea(
                 text=content,
                 blocked=BLOCKED_ENTRY_PATTERN.fullmatch(content) is not None,
+                indented=indented,
             )
         )
     return ideas
@@ -205,7 +346,9 @@ def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
         return ["Findings table has no rows"]
 
     failures: list[str] = []
-    source_numbers = extract_numbers(source_path.read_text(encoding="utf-8"))
+    spec_text = source_path.read_text(encoding="utf-8")
+    source_numbers = extract_numbers(spec_text)
+    norm_spec, sections_by_id, unnumbered_sections = _parse_spec_sections(spec_text)
 
     for clean_id in spec.clean_ids:
         clean_re = re.compile(rf"\b{re.escape(clean_id)}\b", re.IGNORECASE)
@@ -228,6 +371,35 @@ def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
         for field in ("id", "defect_type", "quote", "why", "question", "rewrite"):
             if not row[field] or row[field].lower() in {"none", "n/a", "-"}:
                 failures.append(f"Row {row_index} ({row['id'] or 'unknown'}) has empty {field}")
+
+        if row["defect_type"] and not _has_checklist_defect_type(row["defect_type"]):
+            failures.append(
+                f"Row {row_index} ({row['id']}) defect type '{row['defect_type']}' is not from the checklist vocabulary"
+            )
+
+        clean_quote = _normalize_ws(_strip_outer_quotes(row["quote"]))
+        if len(clean_quote) < 10 or len(clean_quote.split()) < 2:
+            failures.append(
+                f"Row {row_index} ({row['id']}) quote is too short to be a verbatim requirement quote"
+            )
+        else:
+            row_ids = ID_TOKEN_PATTERN.findall(row["id"])
+            matched_section = next((sections_by_id[rid] for rid in row_ids if rid in sections_by_id), None)
+            if matched_section is not None:
+                if clean_quote not in matched_section:
+                    failures.append(
+                        f"Row {row_index} ({row['id']}) quote does not appear verbatim in {row_ids[0]}"
+                    )
+            elif any(rid.startswith("TMP-") for rid in row_ids) and unnumbered_sections:
+                if not any(clean_quote in sec for sec in unnumbered_sections):
+                    failures.append(
+                        f"Row {row_index} ({row['id']}) quote does not appear verbatim in an unnumbered requirement"
+                    )
+            elif clean_quote not in norm_spec:
+                failures.append(
+                    f"Row {row_index} ({row['id']}) quote does not appear verbatim in source specification"
+                )
+
         invented = sorted(extract_numbers(row["rewrite"]) - source_numbers)
         if invented:
             failures.append(
@@ -242,25 +414,51 @@ def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
         if row["question"].strip()
         for ref in ID_TOKEN_PATTERN.findall(row["id"])
     }
+    clean_id_set = set(spec.clean_ids)
     try:
         test_ideas = parse_test_ideas(findings_text)
     except ValueError as error:
         failures.append(str(error))
         test_ideas = []
+
+    blocked_ids: set[str] = set()
+    active_parent_clean = False
     for idea_index, idea in enumerate(test_ideas, 1):
-        idea_refs = ", ".join(sorted(set(ID_TOKEN_PATTERN.findall(idea.text)))) or "unknown"
+        idea_tokens = set(ID_TOKEN_PATTERN.findall(idea.text))
+        idea_refs = ", ".join(sorted(idea_tokens)) or "unknown"
         invented_in_idea = sorted(extract_numbers(idea.text) - source_numbers)
         if invented_in_idea:
             failures.append(
                 f"Test idea {idea_index} ({idea_refs}) invented numeric value(s) not in source: {', '.join(invented_in_idea)}"
             )
         if idea.blocked:
+            blocked_match = BLOCKED_ENTRY_PATTERN.fullmatch(idea.text)
+            if blocked_match:
+                blocked_ids.add(blocked_match.group("id"))
+            active_parent_clean = False
             continue
-        for ref in sorted(set(ID_TOKEN_PATTERN.findall(idea.text)) & open_ids):
+        for ref in sorted(idea_tokens & open_ids):
             failures.append(
                 f"Test idea {idea_index} references {ref}, which has an open question; "
                 f"use the exact blocked entry '{ref}: BLOCKED (open question)' instead"
             )
+        has_clean_ref = bool(idea_tokens & clean_id_set)
+        if not idea.indented:
+            active_parent_clean = has_clean_ref and not bool(idea_tokens & open_ids)
+            if not has_clean_ref:
+                failures.append(
+                    f"Test idea {idea_index} must reference a clean requirement ID or use '{TEST_IDEAS_HEADING}' BLOCKED format"
+                )
+        elif not has_clean_ref and not active_parent_clean:
+            failures.append(
+                f"Test idea {idea_index} is not linked to a clean requirement ID"
+            )
+
+    missing_blocked = sorted(open_ids - blocked_ids)
+    if missing_blocked:
+        failures.append(
+            f"Missing exact BLOCKED (open question) entry in '{TEST_IDEAS_HEADING}' for: {', '.join(missing_blocked)}"
+        )
 
     lowered = findings_text.lower()
     for keyword in spec.required_keywords:

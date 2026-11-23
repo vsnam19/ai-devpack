@@ -5,6 +5,12 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Fixed
+- **Eval & skill grader validity (`knowledge/skills/automotive-cpp/`, `knowledge/skills/requirements-analysis/`, `eval/tasks/`, `eval/memory_tasks/01-recall-decision/`)**:
+  Replaced `assert()` with grader-owned `GRADER_CHECK` and rejected `NDEBUG`, diagnostic pragmas, and grader macro tampering in `automotive-cpp` graders; added `modernize-use-auto` (`const auto` cast initialization) and `clang-tidy` enforcement notes to `automotive-cpp/SKILL.md`. Tightened `requirements-analysis/tests/grade_findings.py` with verbatim section quote checks, checklist vocabulary validation, number-word detection, clean-requirement coverage (`>= 2` clean IDs per case), and open-question/ID-link enforcement on derived test ideas. Hardened `08-doxygen-naming-codec` and `09-doxygen-naming-link` nearest-block Doxygen/parameter checks, `18-review-fault-recovery` range/evidence/extra-blocker checks, `10-trap-contradictory-test` `file:line` and unmodified-`src/` checks, `04-add-test-codec-bounds` baseline-relative assertion count and null-pointer guard mutants, and `01-recall-decision` Step 2 baseline reset so Step 2 requires recalled memory.
+- **Metric accounting (`eval/run_eval.py`, `skilltest/skilltest.py`)**:
+  Reported `pass^k` only when `valid_runs == k` (else `n/a (n<k)`), replaced `pass_pow_k` with unbiased `pass^k_unbiased` and `pass@k_unbiased` estimators, renamed single-mode lint count to `lint_findings_final` while recording per-gate lint counts in runner mode, counted `rounds_to_clean` failures/timeouts as `max + 1` with fail share, excluded no-C/C++-change trials from lint rates (reported separately), and counted timeouts as not clean. In `skilltest/skilltest.py`, excluded errored trials from rates while reporting error counts, required `k >= 3` per arm with Newcombe-Wilson 95% delta CI (`benefit` / `inconclusive` / `ceiling`), installed all non-deprecated sibling skills in trigger trials, and switched `Skill` trigger detection to exact name equality.
+
 ## [0.2.1] - 2026-11-23
 
 ### Security

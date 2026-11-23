@@ -36,11 +36,13 @@ python3 <pack>/enforcement/static/cppcheck_check.py --repo-root . <changed files
 - Common IDs and fix patterns: [cppcheck findings](references/rules.md#4-cppcheck-findings-in-embedded-c).
 - Coverity on company CI stays authoritative. A clean cppcheck run does not waive a Coverity finding.
 
-## Enforced rules (checked by `preflight_lint.py`)
+## Enforced rules (checked by `preflight_lint.py` and `clang-tidy`)
+
+`preflight_lint.py` enforces both its built-in MISRA/Doxygen/naming checks and `clang-tidy` (when installed: `bugprone-*` except `easily-swappable-parameters`, `performance-*`, `modernize-*` except `use-trailing-return-type`/`use-nodiscard`, `google-readability-casting`, `readability-braces-around-statements`, `WarningsAsErrors: '*'`, reported as `CLANG-TIDY`):
 
 - **No dynamic memory (`MISRA-21.6.1`, `MISRA-C-21.3`):** Never use `new`, `delete`, `delete[]`, `malloc`, `calloc`, `realloc`, or `free` outside configured allowed paths (placement `new` and `= delete` are allowed).
 - **No exceptions (`NO-EXCEPTIONS`) or RTTI (`NO-RTTI`):** Never use `throw`, `try`, `catch`, `dynamic_cast`, or `typeid`.
-- **No C-style casts (`MISRA-8.2.2`):** Never use `(T)expr` casts (except `(void)expr`); use `static_cast<T>(expr)`.
+- **No C-style casts (`MISRA-8.2.2`) and `auto` on cast init (`modernize-use-auto`):** Never use `(T)expr` casts (except `(void)expr`); use `static_cast<T>(expr)`. When initializing a variable directly from a cast, write `const auto x = static_cast<std::uint16_t>(expr);` (do not repeat the target type on the left, which `clang-tidy` `modernize-use-auto` rejects).
 - **Explicit lambda captures (`MISRA-LAMBDA-CAPTURE`):** Never use `[=]` or `[&]` default captures; list every captured variable (and `this`) explicitly.
 - **Explicit constructors and overrides (`MISRA-15.1.3`, `MISRA-13.3.1`):** Mark single-argument constructors (or multi-arg with defaults from parameter 2) `explicit`; mark overridden virtual methods `override` or `final`.
 - **Control flow (`MISRA-9.4.2`, `MISRA-C-16.4`, `MISRA-9.3.1`, `MISRA-C-15.6`, `MISRA-9.6.1`, `MISRA-C-15.1`):** Include `default:` in every `switch`; wrap every `if`/`else`/`for`/`while`/`do` body in `{}` braces; never use `goto`.

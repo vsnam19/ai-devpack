@@ -11,3 +11,6 @@ IF no heartbeat is received within `50`, THEN the `LinkManager` shall enter `Lin
 
 ## REQ-COM-004: Handshake Retry Limit
 The `LinkManager` shall allow `TBD` consecutive handshake retries before entering `LinkState::Fault`. (Traces to `SYS-COM-04`; Status: `draft`; ASIL: `QM`.)
+
+## REQ-COM-005: Link Reset Behaviour
+WHEN `reset()` is called from any `LinkState`, the `LinkManager` SHALL transition to `LinkState::Idle`, set `retryCount` to `0`, and set `lastTimestampMs` to `0` ms within `1` processing cycle (`<= 10` ms). (Traces to `SYS-COM-05`; Status: `approved`; ASIL: `QM`; Verification: unit test `TC-COM-005` calling `reset()` from `Connecting`, `Active`, `Degraded`, and `Fault`.)

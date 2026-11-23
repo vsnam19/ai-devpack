@@ -1,0 +1,11 @@
+diff --git a/REVIEW.md b/REVIEW.md
+new file mode 100644
+index 0000000..0000001
+--- /dev/null
++++ b/REVIEW.md
+@@ -0,0 +1,5 @@
++| ID | Category | Severity | file:line | Problem | Fix |
++| --- | --- | --- | --- | --- | --- |
++| F1 | COR | blocker | src/link_state_machine.cpp:1-9999 | recoverFromFault looks bad | fix it |
++
++VERDICT: REQUEST_CHANGES

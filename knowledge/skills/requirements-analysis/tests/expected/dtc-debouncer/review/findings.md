@@ -1,7 +1,7 @@
 # Requirements Findings: DTC Debouncer Specification
 
 Document: `spec.md`
-Requirements inventoried: `REQ-DTC-010`, `REQ-DTC-011`, `REQ-DTC-012`, `REQ-DTC-013` (no temporary IDs needed).
+Requirements inventoried: `REQ-DTC-010`, `REQ-DTC-011`, `REQ-DTC-012`, `REQ-DTC-013`, `REQ-DTC-014` (no temporary IDs needed).
 
 ## Findings table
 
@@ -26,6 +26,8 @@ Requirements inventoried: `REQ-DTC-010`, `REQ-DTC-011`, `REQ-DTC-012`, `REQ-DTC-
 
 - `REQ-DTC-010` (ready):
   - State transition: call `reset()` from `DtcState::Pending`, `DtcState::Confirmed`, and `DtcState::Healing`; assert `state() == DtcState::Inactive`, `counter() == 0`, `healingCounter() == 0`, and `isConfirmed() == false`.
+- `REQ-DTC-014` (ready):
+  - Error/guard: construct `DtcDebouncer` with `isConfigValid() == false`; call `reportSample(true)` and `reportSample(false)` and assert `state()`, `counter()`, `healingCounter()`, and `isConfirmed()` remain unchanged.
 - REQ-DTC-011: BLOCKED (open question) — see findings row REQ-DTC-011
 - REQ-DTC-012: BLOCKED (open question) — see findings row REQ-DTC-012
 - REQ-DTC-013: BLOCKED (open question) — see findings row REQ-DTC-013

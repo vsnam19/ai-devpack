@@ -11,3 +11,6 @@ The `CanCodec` shall drop corrupted frames and notify the supervisor as soon as 
 
 ## Unnumbered Requirement: Startup Initialization
 The `CanCodec` shall initialize all signal slots to their default values on startup.
+
+## REQ-CAN-023: Out-of-Bounds Bit Length Rejection
+WHEN `isValidSignal()` is called with `startBit + bitLength > 64` or `bitLength == 0`, the `CanCodec` SHALL return `false`. (Traces to `SYS-CAN-03`; Status: `approved`; ASIL: `A`; Verification: unit test `TC-CAN-023` passing `bitLength == 0` and `startBit + bitLength == 65`.)
