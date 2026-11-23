@@ -794,6 +794,7 @@ def dispatch_job(
     components: str | Sequence[str] | None = None,
     all_components: bool = False,
     task_id: str = "",
+    trusted_git_dir: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
@@ -912,6 +913,7 @@ def dispatch_job(
                                   project_gate_path=original_gate, project_gate_bytes=original_bytes)
         return _dispatch_job_with_trusted_cfg(
             trusted_cfg=trusted_cfg,
+            trusted_git_dir=trusted_git_dir,
             engine=engine,
             engines_cfg=engines_cfg,
             project_cfg=project_cfg,
@@ -963,6 +965,7 @@ def dispatch_job(
 def _dispatch_job_with_trusted_cfg(
     *,
     trusted_cfg: TrustedGateConfig,
+    trusted_git_dir: Path | None,
     engine: EngineConfig,
     engines_cfg: EnginesConfig | None,
     project_cfg: dict[str, Any],
@@ -1244,6 +1247,7 @@ def _dispatch_job_with_trusted_cfg(
         memory_config=engines_cfg.memory if engines_cfg is not None else None,
         memory_task_text=brief_raw,
         memory_task_id=task_id,
+        trusted_git_dir=trusted_git_dir,
     )
     control_before = _control_snapshot(workdir)
     git_snap = snapshot_git_metadata(workdir)

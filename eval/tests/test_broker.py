@@ -211,6 +211,25 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(0, code, payload)
         self.assertEqual([self.brief_text], prompts)
 
+    def test_worker_dispatch_receives_sandbox_repo_as_trusted_git_dir(self):
+        """The broker passes the sandbox repository it created itself as the trusted git dir."""
+        captured = []
+
+        def dispatch(**kwargs):
+            """Record the trusted git dir and confirm it is the sandbox repository's .git directory."""
+            trusted = kwargs['trusted_git_dir']
+            captured.append((trusted, kwargs['workdir'], trusted.is_dir()))
+            return 0, {'status': 'ok', 'scope': 'ok', 'gate': 'ok', 'changed_files': []}
+
+        with mock.patch.object(self.broker_module, 'dispatch_job', side_effect=dispatch):
+            code, payload = self.request()
+        self.assertEqual(0, code, payload)
+        self.assertEqual(1, len(captured))
+        trusted, workdir, is_dir = captured[0]
+        self.assertTrue(is_dir)
+        self.assertEqual('.git', trusted.name)
+        self.assertEqual(Path(workdir).resolve(), trusted.parent)
+
     def test_destination_parent_swap_refused(self):
         """A destination parent replaced just before I/O cannot redirect a write."""
         nested = self.work / 'nested'

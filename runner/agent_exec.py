@@ -69,7 +69,6 @@ try:
         redact_structure,
         redact_value,
     )
-    from runner.safe_git import GitSecurityError, run_git  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: no cover
     import memory as devpack_memory  # type: ignore[no-redef]
     from redaction import (  # type: ignore[no-redef]
@@ -83,12 +82,10 @@ except ModuleNotFoundError:  # pragma: no cover
         redact_structure,
         redact_value,
     )
-    from safe_git import GitSecurityError, run_git  # type: ignore[no-redef]
 
 DEFAULT_CLAUDE_VERSION = "2.1.330"
 DOCKER_IMAGE_TAG = f"devpack-eval:{DEFAULT_CLAUDE_VERSION}"
 DOCKER_TASK_DIR = "/workspace/task"
-_GIT_COMMON_DIR_TIMEOUT_S = 30
 ALLOWED_TOOLS: tuple[str, ...] = ("Read", "Edit", "Write", "Bash", "Glob", "Grep")
 ORCHESTRATOR_TOOLS: tuple[str, ...] = (
     "Read", "Glob", "Grep", "Write(briefs/**)", "Edit(briefs/**)",
@@ -1159,6 +1156,7 @@ class AgentRequest:
     memory_task_id: str = ""
     code_map: str = ""
     operator_config_path: Path | None = None
+    trusted_git_dir: Path | None = None
 
     def __init__(
         self,
@@ -1197,6 +1195,7 @@ class AgentRequest:
         memory_task_id: str = "",
         code_map: str = "",
         operator_config_path: Path | str | None = None,
+        trusted_git_dir: Path | str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize AgentRequest with support for SPEC parameter aliases (timeout, engine_config, prompt_text)."""
@@ -1220,6 +1219,7 @@ class AgentRequest:
         self.engine = engine
         self.prompt = str(prompt)
         self.workdir = Path(workdir)
+        self.trusted_git_dir = Path(trusted_git_dir) if trusted_git_dir is not None else None
         self.run_dir = Path(run_dir) if run_dir is not None else (self.workdir / "runs" / "default")
         self.step_name = str(step_name)
         self.isolation = str(isolation or "docker")
@@ -1549,71 +1549,95 @@ def _parse_worktree_gitdir(dot_git_file: Path, workdir: Path) -> Path | None:
     return Path(os.path.realpath(workdir / gd_path if not gd_path.is_absolute() else gd_path))
 
 
-def _trusted_git_common_dir(workdir: Path) -> Path:
-    """Ask git (hardened, host side) for the common git dir of the checkout at ``workdir``."""
-    try:
-        proc = run_git(
-            ["rev-parse", "--git-common-dir"],
-            repo_root=workdir,
-            timeout=_GIT_COMMON_DIR_TIMEOUT_S,
-        )
-    except (GitSecurityError, OSError, subprocess.SubprocessError) as exc:
-        raise HarnessError(f"Cannot verify worktree git metadata in {workdir}: {exc}") from exc
-    out = proc.stdout.strip() if proc.returncode == 0 else ""
-    if not out:
-        raise HarnessError(f"git rev-parse --git-common-dir failed for workdir: {workdir}")
-    return Path(os.path.realpath(workdir / out))
+@dataclass
+class GitMountDecision:
+    """Outcome of the ``.git`` mount policy for one docker launch.
 
-
-def _resolve_worktree_mount_dirs(dot_git_file: Path, resolved_workdir: Path) -> tuple[Path, Path]:
-    """Return ``(gitdir, common_dir)`` for a worktree pointer, or refuse with ``HarnessError``.
-
-    Accepted only when ``gitdir`` is a directory directly under ``<common_dir>/worktrees/``,
-    contains ``commondir`` and ``HEAD``, and its ``commondir`` file resolves to ``common_dir``.
-    ``common_dir`` comes from git run on the host, not from the pointer file alone.
+    ``mounts`` is the list of docker ``-v`` flag/value tokens to add (empty when nothing is
+    mounted). ``mounted`` is False when the container runs without git metadata, and
+    ``reason`` says why (recorded in ``run.json``).
     """
-    gitdir = _parse_worktree_gitdir(dot_git_file, resolved_workdir)
-    if gitdir is None or not gitdir.is_dir():
-        raise HarnessError(f"Worktree gitdir is not a directory: {gitdir}")
-    common_dir = _trusted_git_common_dir(resolved_workdir)
-    if gitdir.parent != common_dir / "worktrees":
-        raise HarnessError(
-            f"Refusing worktree gitdir outside '{common_dir / 'worktrees'}': {gitdir}"
-        )
+
+    mounts: list[str] = field(default_factory=list)
+    mounted: bool = False
+    reason: str = ""
+
+
+def _resolve_trusted_worktree_dirs(trusted_gitdir: Path) -> tuple[Path, Path]:
+    """Return ``(gitdir, common_dir)`` for a harness-created worktree gitdir.
+
+    The common dir is read from the trusted gitdir's own ``commondir`` file, never from the
+    checkout's ``.git`` pointer. Raises ``HarnessError`` when the trusted directory is not a
+    worktree gitdir directly under ``<common_dir>/worktrees/``.
+    """
+    gitdir = Path(os.path.realpath(trusted_gitdir))
+    if not gitdir.is_dir():
+        raise HarnessError(f"Trusted git dir is not a directory: {gitdir}")
     commondir_file = gitdir / "commondir"
     if not commondir_file.is_file() or not (gitdir / "HEAD").is_file():
-        raise HarnessError(f"Worktree gitdir lacks commondir or HEAD: {gitdir}")
+        raise HarnessError(f"Trusted git dir lacks commondir or HEAD: {gitdir}")
     declared = commondir_file.read_text(encoding="utf-8", errors="replace").strip()
-    if not declared or Path(os.path.realpath(gitdir / declared)) != common_dir:
-        raise HarnessError(f"Worktree commondir does not match git common dir: {gitdir}")
+    if not declared:
+        raise HarnessError(f"Trusted git dir has an empty commondir file: {gitdir}")
+    common_dir = Path(os.path.realpath(gitdir / declared))
+    if gitdir.parent != common_dir / "worktrees":
+        raise HarnessError(
+            f"Trusted git dir is not a worktree gitdir under '{common_dir / 'worktrees'}': {gitdir}"
+        )
     return gitdir, common_dir
 
 
-def _docker_git_ro_mounts(resolved_workdir: Path) -> list[str]:
-    """Return read-only ``-v`` mount flags for ``.git`` in Docker mode (T24 policy).
+def docker_git_mount_decision(
+    resolved_workdir: Path,
+    trusted_git_dir: Path | None = None,
+) -> GitMountDecision:
+    """Decide which host git metadata may be bind-mounted into the container (T24 policy).
+
+    Repository content never chooses a mount source:
 
     * ``.git`` symlink: refused (``HarnessError``), never followed.
     * ``.git`` real directory: mounted read-only at the task ``.git`` path.
-    * ``.git`` pointer file: the worktree gitdir and the common dir are mounted read-only
-      at their own host paths, after ``_resolve_worktree_mount_dirs`` accepts them.
+    * ``.git`` pointer file: mounted only when its realpath ``gitdir`` equals
+      ``trusted_git_dir`` (a path the harness created itself). Then the trusted gitdir and
+      its common dir, computed from the trusted path, are mounted read-only.
+    * Anything else (no ``.git``, no trusted path, pointer to another repository, invalid
+      trusted path): no git metadata is mounted and the reason is returned.
     """
     git_entry = resolved_workdir / ".git"
     if git_entry.is_symlink():
         raise HarnessError(f"Refusing symlinked .git in workdir: {git_entry}")
     if not git_entry.exists():
-        return []
+        return GitMountDecision(reason="workdir has no .git; container runs without git metadata")
     if git_entry.is_dir():
         src = _validate_mount_source(git_entry)
-        return ["-v", f"{src}:{DOCKER_TASK_DIR}/.git:ro"]
+        return GitMountDecision(
+            mounts=["-v", f"{src}:{DOCKER_TASK_DIR}/.git:ro"],
+            mounted=True,
+        )
     if not git_entry.is_file():
         raise HarnessError(f"Unsupported .git entry type in workdir: {git_entry}")
 
-    gitdir, common_dir = _resolve_worktree_mount_dirs(git_entry, resolved_workdir)
+    not_mounted = "worktree .git pointer file; no git metadata mounted"
+    if trusted_git_dir is None:
+        return GitMountDecision(reason=f"{not_mounted} (no trusted git dir supplied by the harness)")
+    try:
+        pointer_target = _parse_worktree_gitdir(git_entry, resolved_workdir)
+    except (HarnessError, OSError) as exc:
+        return GitMountDecision(reason=f"{not_mounted} (unreadable pointer: {exc})")
+    trusted = Path(os.path.realpath(trusted_git_dir))
+    if pointer_target != trusted:
+        return GitMountDecision(
+            reason=f"{not_mounted} (pointer does not name the trusted git dir)",
+        )
+    try:
+        gitdir, common_dir = _resolve_trusted_worktree_dirs(trusted)
+    except HarnessError as exc:
+        return GitMountDecision(reason=f"{not_mounted} ({exc})")
     mounts = ["-v", f"{_validate_mount_source(git_entry)}:{DOCKER_TASK_DIR}/.git:ro"]
     for src in (gitdir, common_dir):
         safe_src = _validate_mount_source(src)
         mounts.extend(["-v", f"{safe_src}:{safe_src}:ro"])
-    return mounts
+    return GitMountDecision(mounts=mounts, mounted=True)
 
 
 def build_invocation(
@@ -1637,6 +1661,7 @@ def build_invocation(
     env_overrides: Mapping[str, str] | None = None,
     output_format: str = "stream-json",
     prompt_file: Path | None = None,
+    git_decision: GitMountDecision | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Construct ``(argv, env)`` for launching an agent in ``local`` or ``docker`` isolation.
 
@@ -1646,11 +1671,13 @@ def build_invocation(
     and ``ANTHROPIC_DEFAULT_SONNET_MODEL``, and ensures ``ANTHROPIC_API_KEY`` is removed.
     Raises ``HarnessError`` if required local engine environment variables are unset.
     """
+    req_trusted: Path | None = None
     if isinstance(request_or_engine, AgentRequest):
         req = request_or_engine
         engine = req.engine
         prompt = req.prompt
         resolved_workdir = req.workdir
+        req_trusted = req.trusted_git_dir
         isolation = req.isolation
         allowed_tools = req.allowed_tools
         disallowed_tools = req.disallowed_tools
@@ -1784,7 +1811,7 @@ def build_invocation(
         f"{_validate_mount_source(resolved_workdir)}:{DOCKER_TASK_DIR}:rw",
         "-v",
         f"{_validate_mount_source(resolved_cfg)}:/workspace/cfg:ro",
-        *_docker_git_ro_mounts(resolved_workdir),
+        *(git_decision or docker_git_mount_decision(resolved_workdir, req_trusted)).mounts,
         image_tag,
         *_build_claude_tail(agent_bin_in_container),
     ]
@@ -2539,12 +2566,23 @@ def run_agent(request: AgentRequest) -> AgentResult:
         )
 
         try:
+            git_decision: GitMountDecision | None = None
+            if effective_request.isolation == "docker":
+                git_decision = docker_git_mount_decision(
+                    effective_request.workdir, effective_request.trusted_git_dir
+                )
+                update_run_json(
+                    request.run_dir,
+                    git_metadata_mounted=git_decision.mounted,
+                    git_metadata_reason=git_decision.reason,
+                )
             argv, env = build_invocation(
                 effective_request,
                 home_dir=home_dir,
                 cfg_dir=cfg_dir,
                 tmp_dir=tmp_dir,
                 prompt_file=prompt_path,
+                git_decision=git_decision,
             )
         except (HarnessError, ValueError) as exc:
             jsonl_path.write_text("", encoding="utf-8")

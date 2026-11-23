@@ -361,6 +361,7 @@ class Broker:
                         components=components,
                         all_components=all_components,
                         task_id=Path(request['brief']).stem,
+                        trusted_git_dir=(work / '.git').resolve(),
                     )
                 if payload.get('gate') == 'ok' and payload.get('scope') == 'ok' and sandbox_memory.is_dir():
                     changed_mem = [

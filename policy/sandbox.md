@@ -13,11 +13,13 @@ deviation (`deviations.md`), never a default (LSN-014).
    directory, no host sockets (container runtime socket, ssh agent), no other repositories.
    Host paths bind-mounted into the container are never chosen by repository content: a `.git`
    symlink is refused; a real `.git` directory is mounted read-only; a worktree `.git` pointer file
-   is followed only when git (run host-side through `runner/safe_git.py`) reports a common dir and the
-   pointed gitdir is a direct child of `<common_dir>/worktrees/` with `commondir` and `HEAD` present and
-   consistent. Only that gitdir and the common dir are mounted, read-only. Any mount source containing
-   `:`, `,` or a newline is refused, so a pointer file cannot redirect a mount to a host directory such as
-   an `.ssh` directory.
+   is mounted only when its realpath gitdir equals the `trusted_git_dir` the harness supplies (a gitdir
+   the harness created itself, e.g. with `git worktree add` or `git init`). Then that gitdir and the
+   common dir, read from the trusted gitdir's own `commondir` file, are mounted read-only. The pointer
+   file is never used to choose a mount source. When no trusted gitdir is available, or the pointer names
+   another gitdir, the container runs without git metadata and `run.json` records
+   `git_metadata_mounted: false` with the reason. Any mount source containing `:`, `,` or a newline is
+   refused, so a pointer file cannot redirect a mount to a host directory such as an `.ssh` directory.
 2. **Least-privilege credentials.** A dedicated, short-lived token per task: read the one
    repository, push to a task branch only, no merge right, no access to CI secrets, no
    production or vehicle access. Credentials are mounted read-only and never written to

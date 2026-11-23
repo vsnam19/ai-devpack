@@ -676,6 +676,7 @@ def run_task_workflow(
     protected_globs: Sequence[str] = ("tests/**",),
     deviation_id: str = "",
     gate_config: Path | None = None,
+    trusted_git_dir: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -987,6 +988,7 @@ def run_task_workflow(
                 + context.get("ALLOWED_GLOB_1", "")
             ),
             memory_task_id=context.get("TASK_ID", ""),
+            trusted_git_dir=trusted_git_dir,
         )
         res = run_agent(req)
         for mid in res.memory_ids:

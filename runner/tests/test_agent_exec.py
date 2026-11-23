@@ -656,6 +656,7 @@ class AgentExecUnitTests(unittest.TestCase):
                     run_dir=base / "runs" / f"wt-{role}",
                     isolation="docker",
                     role=role,
+                    trusted_git_dir=wt_gitdir,
                 )
                 argv_wt, _ = build_invocation(req_wt)
                 mounts_wt = [argv_wt[i + 1] for i, tok in enumerate(argv_wt) if tok == "-v"]
