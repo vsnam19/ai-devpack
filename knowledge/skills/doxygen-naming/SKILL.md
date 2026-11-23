@@ -2,6 +2,7 @@
 name: doxygen-naming
 description: Doxygen comment and naming rules for C/C++ files; use when writing or reviewing declarations.
 ---
+Deprecated: superseded by automotive-cpp
 
 # Doxygen and naming
 

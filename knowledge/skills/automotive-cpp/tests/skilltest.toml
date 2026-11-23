@@ -1,0 +1,50 @@
+[[trigger]]
+name = "automotive-cpp-implement"
+prompt = "Implement this automotive C++17 runtime module without dynamic allocation or exceptions."
+expect = true
+
+[[trigger]]
+name = "automotive-cpp-review"
+prompt = "Review this C++17 embedded header and source for MISRA C++:2023 themes, ISO 26262-6 unit design issues, and Doxygen tags."
+expect = true
+
+[[trigger]]
+name = "automotive-cpp-refactor-doxygen"
+prompt = "Refactor this C++17 signal decoder to use status-based error handling instead of throw/catch and fix its Doxygen param directions."
+expect = true
+
+[[trigger]]
+name = "requirement-analysis"
+prompt = "Analyse these system requirements for ambiguity, atomicity, missing timing bounds, and traceability IDs."
+expect = false
+
+[[trigger]]
+name = "python-telemetry-script"
+prompt = "Write a Python script to parse CSV telemetry logs and add unittest coverage."
+expect = false
+
+[[trigger]]
+name = "markdown-release-notes"
+prompt = "Draft release notes in Markdown from the latest changelog entries."
+expect = false
+
+[[behaviour]]
+name = "heap-exceptions-casts"
+fixture = "fixtures/heap-exceptions-casts/input"
+grader = "graders/heap-exceptions-casts"
+prompt = "Make SampleFilter in sample_filter.hpp and sample_filter.cpp compliant with automotive C++17 rules: remove dynamic allocation, exceptions, and C-style casts, make the single-argument constructor explicit, keep the public API intact, and add complete Doxygen and naming."
+check = "bash check.sh"
+
+[[behaviour]]
+name = "doxygen-directions"
+fixture = "fixtures/doxygen-directions/input"
+grader = "graders/doxygen-directions"
+prompt = "Fix all Doxygen headers, parameter directions ([in], [out], [in,out]), @return tags, and identifier naming in frame_crc.hpp and frame_crc.cpp while preserving the public function name and runtime behaviour."
+check = "bash check.sh"
+
+[[behaviour]]
+name = "error-status-optional"
+fixture = "fixtures/error-status-optional/input"
+grader = "graders/error-status-optional"
+prompt = "Refactor voltage_decoder.hpp and voltage_decoder.cpp so decodeSupplyVoltage reports all failures through DecodeResult and DecodeStatus without exceptions, heap allocation, or C-style casts, and ensure Doxygen and naming comply with automotive C++17 rules."
+check = "bash check.sh"
