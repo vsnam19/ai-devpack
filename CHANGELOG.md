@@ -3,6 +3,16 @@
 All notable changes to ai-devpack are recorded here. Versioning follows
 [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH, see `VERSION`.
 
+## [Unreleased]
+
+### Added
+- **Requirements analysis skill (`knowledge/skills/requirements-analysis/`)**:
+  quality checklist (`knowledge/skills/requirements-analysis/references/checklist.md`),
+  ambiguity lexicon (`knowledge/skills/requirements-analysis/references/ambiguity-lexicon.md`),
+  EARS syntax patterns (`knowledge/skills/requirements-analysis/references/ears.md`),
+  labelled source provenance (`knowledge/skills/requirements-analysis/references/sources.md`),
+  and deterministic `skilltest` trigger and behaviour suites.
+
 ## [0.2.0] - 2026-11-23
 
 ### Added
