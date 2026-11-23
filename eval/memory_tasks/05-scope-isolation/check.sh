@@ -6,7 +6,7 @@
 # Exit codes:
 #   0 - Visible tests, hidden tests, lint, cppcheck, and scope-isolation checks passed
 #   1 - One or more checks failed
-#   2 - Invalid usage or missing DEVPACK_ROOT
+#   2 - Invalid usage, missing DEVPACK_ROOT, or missing DEVPACK_BASELINE_SHA (GRADER_MISCONFIGURED)
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -41,6 +41,9 @@ source "$SAFE_GIT_SH"
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 TASK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Resolve the external baseline before any check: lint diffs against it, never against HEAD.
+BASE_REF="$(require_baseline_sha "$WORKDIR")" || exit 2
+
 # Enforce scope and test lock before lint, compilation, or test execution.
 python3 "$DEVPACK_ROOT/eval/lib/check_memory_scope.py" \
     --workdir "$WORKDIR" --sequence "$TASK_DIR/sequence.toml"
@@ -63,7 +66,7 @@ if grep -qE 'IMPL_HANDOFF_SECRET_TOKEN|LOCAL_ENGINE_ONLY_HINT|kImplGuardCode' "$
 fi
 
 python3 "$DEVPACK_ROOT/enforcement/lint/preflight_lint.py" --no-cache \
-    --repo-root "$WORKDIR" --config "$DEVPACK_ROOT/eval/fixture/preflight.toml" \
+    --repo-root "$WORKDIR" --config "$DEVPACK_ROOT/eval/fixture/preflight.toml" --base "$BASE_REF" \
     "$WORKDIR/include/link_state_machine.hpp" "$WORKDIR/src/link_state_machine.cpp" >/dev/null
 set +e
 cppcheck_out="$(python3 "$DEVPACK_ROOT/enforcement/static/cppcheck_check.py" \
