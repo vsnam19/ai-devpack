@@ -65,6 +65,13 @@ When `[workspace]` is configured with no `[[component]]` tables, direct subdirec
 - `runner/brief_lint.py` errors on `Files allowed` globs outside `workspace.root`.
 - `enforcement/checks/scope_check.py` and `runner/devpack_dispatch.py` refuse any worker
   edit outside `workspace.root` regardless of `--allow` globs.
+- `runner/devpack_dispatch.py` further bounds worker edits to the active component set
+  (the union of selected components and components explicitly named by `--allow` globs).
+  Any changed file dropped by component/exclude filtering is recorded in `run.json` as
+  `out_of_scope_changes` and fails the gate.
+- `runner/devpack_submit.py` and `runner/devpack_broker.py` accept `--components` /
+  `--all-components`, validate component names against the trusted host project config,
+  and copy `[workspace]`, `[[component]]`, and `[scan]` into the sandbox `project.toml`.
 
 ## Selecting components (priority order)
 
@@ -84,9 +91,12 @@ Unknown component names fail closed with an error listing all valid component na
 
 ## Generating `compile_commands.json` for a component
 
-`enforcement/static/cppcheck_check.py` passes `--project=<compile_commands>` (with
-`--suppress=missingIncludeSystem`) when a component's `compile_commands` file exists, and
-falls back to the component's `include_dirs` otherwise.
+`enforcement/static/cppcheck_check.py` builds a filtered temporary compile database
+containing only entries inside the active component and outside `[workspace].exclude`,
+passes `--project=<filtered_compile_commands>` (with `--suppress=missingIncludeSystem`),
+and analyses any component source files missing from the database through the
+`include_dirs` fallback path (reporting the fallback file count). When `compile_commands`
+is absent, all component files use `include_dirs`.
 
 Two common ways to generate `compile_commands.json` in a Yocto build (external to the
 pack; verify against your BitBake/eSDK setup):

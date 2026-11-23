@@ -239,11 +239,16 @@ class WorkspaceScopeTests(unittest.TestCase):
             self.assertFalse(any("poky" in p or "meta-other" in p or "build" in p or "third_party" in p for p in checked_all))
 
     def test_cppcheck_uses_compile_commands_or_include_dirs_and_component_selection(self) -> None:
-        """cppcheck uses --project= for ipc_bus, -I for diag_svc/sensor_hub, adds --suppress=missingIncludeSystem, and isolates components."""
+        """cppcheck uses filtered temp --project= for ipc_bus, -I for diag_svc/sensor_hub, adds --suppress=missingIncludeSystem, and isolates components."""
         calls: list[list[str]] = []
+        captured_dbs: list[list[dict[str, object]]] = []
 
         def fake_run(cmd, **kwargs):
             calls.append(list(cmd))
+            for arg in cmd:
+                if arg.startswith("--project="):
+                    db_path = Path(arg.split("=", 1)[1])
+                    captured_dbs.append(json.loads(db_path.read_text(encoding="utf-8")))
             return subprocess.CompletedProcess(
                 args=cmd,
                 returncode=0,
@@ -261,7 +266,14 @@ class WorkspaceScopeTests(unittest.TestCase):
                 )
         self.assertEqual(0, res_sel.exit_code)
         self.assertEqual(1, len(calls))
-        self.assertIn("--project=build/ipc_bus/compile_commands.json", calls[0])
+        project_args = [arg for arg in calls[0] if arg.startswith("--project=")]
+        self.assertEqual(1, len(project_args))
+        self.assertTrue(project_args[0].endswith("compile_commands.json"))
+        self.assertEqual(1, len(captured_dbs))
+        self.assertEqual(
+            ["meta-org/recipes-org/src/middleware/ipc_bus/src/ipc_bus.cpp"],
+            [entry["file"] for entry in captured_dbs[0]],
+        )
         self.assertIn("--suppress=missingIncludeSystem", calls[0])
 
         # Real cppcheck check if installed on PATH
@@ -535,6 +547,118 @@ class WorkspaceScopeTests(unittest.TestCase):
             rj = json.loads((run_dirs[0] / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(["sensor_hub"], rj["components"])
             self.assertEqual("selected", rj["scan_mode"])
+
+    def test_active_component_edit_enforcement_and_allow_glob_union(self) -> None:
+        """Edits outside active components fail scope and gate with out_of_scope_changes; explicit allow globs add components to active set."""
+        scope_sel = workspace_scope.resolve_workspace_scope(YOCTO_FIXTURE, components="ipc_bus", env={})
+        # Workspace-wide globs must not silently expand active components
+        scope_wide = scope_sel.with_allow_globs(["meta-org/recipes-org/src/**", "**", "meta-org/recipes-org/src/services/*"])
+        self.assertEqual(["ipc_bus"], [c.name for c in scope_wide.active_components])
+        # Explicit component glob adds diag_svc to active set
+        scope_union = scope_sel.with_allow_globs(["services/diag_svc/**"])
+        self.assertEqual(["ipc_bus", "diag_svc"], [c.name for c in scope_union.active_components])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_from_fixture(wt)
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nEdit component.\n", encoding="utf-8")
+            runs_root = base / "runs"
+
+            # 1. --components ipc_bus with workspace-wide allow glob; worker edits diag_svc -> scope violation + gate fail + out_of_scope_changes
+            diag_agent = _write_fake_agent(
+                base / "diag_agent.py",
+                "p = pathlib.Path('meta-org/recipes-org/src/services/diag_svc/src/diag_svc.cpp')\n"
+                "p.write_text('int broken() { int* q = nullptr; return *q; }\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'is_error': False, 'total_cost_usd': 0.01, 'num_turns': 1, 'result': 'done'}))\n",
+            )
+            out1 = io.StringIO()
+            with contextlib.redirect_stdout(out1), contextlib.redirect_stderr(io.StringIO()):
+                rc1 = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "meta-org/recipes-org/src/**",
+                    "--components", "ipc_bus",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--agent-bin", str(diag_agent),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ])
+            self.assertEqual(1, rc1)
+            payload1 = json.loads(out1.getvalue().strip())
+            self.assertEqual("violation", payload1["scope"])
+            self.assertEqual("fail", payload1["gate"])
+            self.assertEqual(
+                ["meta-org/recipes-org/src/services/diag_svc/src/diag_svc.cpp"],
+                payload1["out_of_scope_changes"],
+            )
+            run1_json = json.loads((Path(payload1["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                ["meta-org/recipes-org/src/services/diag_svc/src/diag_svc.cpp"],
+                run1_json["out_of_scope_changes"],
+            )
+            gate1_txt = (Path(payload1["run_dir"]) / "steps" / "02-gate.txt").read_text(encoding="utf-8")
+            self.assertIn("out_of_scope_changes", gate1_txt)
+
+            # Revert diag_svc before next test
+            subprocess.run(["git", "checkout", "--", "meta-org"], cwd=wt, check=True, capture_output=True)
+
+            # 2. --components ipc_bus with --allow services/diag_svc/** explicitly naming diag_svc -> adds diag_svc to active set and catches lint defect!
+            out2 = io.StringIO()
+            with contextlib.redirect_stdout(out2), contextlib.redirect_stderr(io.StringIO()):
+                rc2 = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "services/diag_svc/**",
+                    "--components", "ipc_bus",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--agent-bin", str(diag_agent),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ])
+            self.assertEqual(1, rc2)
+            payload2 = json.loads(out2.getvalue().strip())
+            self.assertEqual("ok", payload2["scope"])
+            self.assertEqual("fail", payload2["gate"])
+            self.assertEqual(["ipc_bus", "diag_svc"], payload2["components"])
+            self.assertEqual([], payload2["out_of_scope_changes"])
+            self.assertGreater(payload2["lint_findings"], 0)
+
+            subprocess.run(["git", "checkout", "--", "meta-org"], cwd=wt, check=True, capture_output=True)
+
+            # 3. Editing an excluded file inside an active component is recorded as out_of_scope_changes and fails the gate
+            vendor_agent = _write_fake_agent(
+                base / "vendor_agent.py",
+                "p = pathlib.Path('meta-org/recipes-org/src/middleware/ipc_bus/third_party/vendor_stub.cpp')\n"
+                "p.write_text('int stub() { return 1; }\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'is_error': False, 'total_cost_usd': 0.01, 'num_turns': 1, 'result': 'done'}))\n",
+            )
+            out3 = io.StringIO()
+            with contextlib.redirect_stdout(out3), contextlib.redirect_stderr(io.StringIO()):
+                rc3 = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "middleware/ipc_bus/**",
+                    "--components", "ipc_bus",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--agent-bin", str(vendor_agent),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ])
+            self.assertEqual(1, rc3)
+            payload3 = json.loads(out3.getvalue().strip())
+            self.assertEqual("fail", payload3["gate"])
+            self.assertEqual(
+                ["meta-org/recipes-org/src/middleware/ipc_bus/third_party/vendor_stub.cpp"],
+                payload3["out_of_scope_changes"],
+            )
 
 
 if __name__ == "__main__":

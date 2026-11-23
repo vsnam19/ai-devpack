@@ -289,3 +289,172 @@ class BrokerTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.broker_module.copy_back(source, self.work, Path('link/missing.txt'))
         self.assertEqual('protected', (outside / 'file.txt').read_text())
+
+    def test_workspace_components_forwarded_and_project_config_copied_to_sandbox(self):
+        """--submit forwards components/all_components, broker validates names, and copies workspace config into sandbox."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            work = base / 'yocto'
+            work.mkdir()
+            for sub in (
+                'meta-org/src/ipc_bus/include',
+                'meta-org/src/ipc_bus/src',
+                'meta-org/src/diag_svc/include',
+                'meta-org/src/diag_svc/src',
+                'briefs',
+                '.devpack',
+            ):
+                (work / sub).mkdir(parents=True)
+            (work / '.gitignore').write_text('.devpack/\nbriefs/\nruns/\n', encoding='utf-8')
+            (work / 'preflight.toml').write_text('[general]\nstd = "c++17"\n', encoding='utf-8')
+            (work / '.devpack/project.toml').write_text(
+                'data_class = "internal"\n'
+                'allow_unsandboxed_local = true\n\n'
+                '[workspace]\n'
+                'root = "meta-org/src"\n'
+                'exclude = ["**/third_party/**"]\n\n'
+                '[[component]]\n'
+                'name = "ipc_bus"\n'
+                'path = "ipc_bus"\n'
+                'include_dirs = ["ipc_bus/include"]\n\n'
+                '[[component]]\n'
+                'name = "diag_svc"\n'
+                'path = "diag_svc"\n'
+                'include_dirs = ["diag_svc/include"]\n\n'
+                '[scan]\n'
+                'default = "selected"\n'
+                'selected = ["ipc_bus"]\n',
+                encoding='utf-8',
+            )
+            (work / 'meta-org/src/ipc_bus/src/ipc.cpp').write_text(
+                '/**\n * @file ipc.cpp\n * @brief IPC module.\n */\n'
+                '/**\n * @brief Get zero.\n * @return Zero.\n */\n'
+                'int getZero() { return 0; }\n',
+                encoding='utf-8',
+            )
+            (work / 'meta-org/src/diag_svc/src/diag.cpp').write_text(
+                '/**\n * @file diag.cpp\n * @brief Diag module.\n */\n'
+                '/**\n * @brief Get one.\n * @return One.\n */\n'
+                'int getOne() { return 1; }\n',
+                encoding='utf-8',
+            )
+            (work / 'briefs/diag.md').write_text(
+                valid_brief('Update diag_svc/src/diag.cpp', ['diag_svc/**']),
+                encoding='utf-8',
+            )
+            (work / 'briefs/wide.md').write_text(
+                valid_brief('Update meta-org/src/diag_svc/src/diag.cpp', ['meta-org/src/**']),
+                encoding='utf-8',
+            )
+            for args in (['init', '-q'], ['add', '.'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base']):
+                subprocess.run(['git', *args], cwd=work, check=True, capture_output=True)
+
+            worker = base / 'ws-worker'
+            worker.write_text(
+                '#!/usr/bin/env python3\nimport json, pathlib\n'
+                'p = pathlib.Path("meta-org/src/diag_svc/src/diag.cpp")\n'
+                'p.write_text(p.read_text(encoding="utf-8").replace("return 1;", "return 2;"), encoding="utf-8")\n'
+                'print(json.dumps({"type":"result","result":"updated diag"}))\n',
+                encoding='utf-8',
+            )
+            worker.chmod(0o755)
+            broker = self.broker_module.Broker(
+                work, base / 'runs', credentials_path=self.credentials,
+                isolation='local', allow_unsandboxed_local=True, agent_bin=str(worker), gate_cmd='true',
+            )
+            self.addCleanup(broker.close)
+
+            # 1. Unknown component and mutually exclusive options are refused before running worker
+            for bad_req in (
+                {'engine': 'haiku', 'brief': 'briefs/diag.md', 'allow': ['diag_svc/**'], 'components': ['unknown_comp']},
+                {'engine': 'haiku', 'brief': 'briefs/diag.md', 'allow': ['diag_svc/**'], 'components': ['diag_svc'], 'all_components': True},
+                {'engine': 'haiku', 'brief': 'briefs/diag.md', 'allow': ['diag_svc/**'], 'extra_key': True},
+            ):
+                code, payload = broker.execute(bad_req)
+                self.assertEqual(1, code, bad_req)
+                self.assertEqual('refused', payload['status'])
+            self.assertIn('return 1;', (work / 'meta-org/src/diag_svc/src/diag.cpp').read_text(encoding='utf-8'))
+
+            # 2. Out-of-active-component edit via broker (--components ipc_bus, workspace-wide allow) is rejected and not copied back
+            import time
+            cmd_bad = [
+                'python3', str(ROOT / 'runner/devpack_dispatch.py'),
+                '--submit', '--engine', 'haiku', '--brief', 'briefs/wide.md',
+                '--workdir', str(work), '--allow', 'meta-org/src/**',
+                '--components', 'ipc_bus', '--timeout', '5',
+            ]
+            proc_bad = subprocess.Popen(cmd_bad, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while proc_bad.poll() is None and time.monotonic() < deadline:
+                    broker.poll()
+                    time.sleep(0.02)
+                out_bad, err_bad = proc_bad.communicate(timeout=2)
+            finally:
+                if proc_bad.poll() is None:
+                    proc_bad.kill()
+                    proc_bad.communicate()
+            self.assertEqual(1, proc_bad.returncode, out_bad + err_bad)
+            res_bad = json.loads(out_bad.strip())
+            self.assertEqual('violation', res_bad['scope'])
+            self.assertEqual('fail', res_bad['gate'])
+            self.assertIn('return 1;', (work / 'meta-org/src/diag_svc/src/diag.cpp').read_text(encoding='utf-8'))
+
+            # 3. --submit --components diag_svc forwards component, copies workspace config into sandbox project.toml, passes, and copies back
+            cmd_ok = [
+                'python3', str(ROOT / 'runner/devpack_dispatch.py'),
+                '--submit', '--engine', 'haiku', '--brief', 'briefs/diag.md',
+                '--workdir', str(work), '--allow', 'diag_svc/**',
+                '--components', 'diag_svc', '--timeout', '5',
+            ]
+            proc_ok = subprocess.Popen(cmd_ok, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while proc_ok.poll() is None and time.monotonic() < deadline:
+                    broker.poll()
+                    time.sleep(0.02)
+                out_ok, err_ok = proc_ok.communicate(timeout=2)
+            finally:
+                if proc_ok.poll() is None:
+                    proc_ok.kill()
+                    proc_ok.communicate()
+            self.assertEqual(0, proc_ok.returncode, out_ok + err_ok)
+            res_ok = json.loads(out_ok.strip())
+            self.assertEqual('ok', res_ok['status'])
+            self.assertEqual('ok', res_ok['gate'])
+            self.assertEqual('ok', res_ok['scope'])
+            self.assertEqual(['diag_svc'], res_ok['components'])
+            self.assertEqual('selected', res_ok['scan_mode'])
+            self.assertIn('return 2;', (work / 'meta-org/src/diag_svc/src/diag.cpp').read_text(encoding='utf-8'))
+
+            # 4. --submit --all-components forwards all_components=True and activates all configured components
+            cmd_all = [
+                'python3', str(ROOT / 'runner/devpack_dispatch.py'),
+                '--submit', '--engine', 'haiku', '--brief', 'briefs/diag.md',
+                '--workdir', str(work), '--allow', 'diag_svc/**',
+                '--all-components', '--timeout', '5',
+            ]
+            proc_all = subprocess.Popen(cmd_all, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while proc_all.poll() is None and time.monotonic() < deadline:
+                    broker.poll()
+                    time.sleep(0.02)
+                out_all, err_all = proc_all.communicate(timeout=2)
+            finally:
+                if proc_all.poll() is None:
+                    proc_all.kill()
+                    proc_all.communicate()
+            self.assertEqual(0, proc_all.returncode, out_all + err_all)
+            res_all = json.loads(out_all.strip())
+            self.assertEqual('all', res_all['scan_mode'])
+            self.assertEqual(['ipc_bus', 'diag_svc'], res_all['components'])
+
+    def test_broker_refuses_symlink_project_toml(self):
+        """A symlinked .devpack/project.toml is refused at broker startup."""
+        self.broker.close()
+        outside_cfg = self.root / 'outside_project.toml'
+        outside_cfg.write_text('data_class = "internal"\n', encoding='utf-8')
+        (self.work / '.devpack/project.toml').symlink_to(outside_cfg)
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.broker_module.Broker(self.work, self.root / 'runs2')

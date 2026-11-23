@@ -30,7 +30,8 @@ Keep this path identical in the prompt and `.claude/settings.json`.
      --submit --engine <haiku|local> \
      --brief briefs/<task-id>.md \
      --workdir . \
-     --allow '<glob1>' --allow '<glob2>'
+     --allow '<glob1>' --allow '<glob2>' \
+     [--components <a,b> | --all-components]
    ```
    The broker owns the gate and launch options. Never pass credentials, executable paths, or engine configs.
 5. Read the **single JSON line** printed on stdout first:
@@ -51,4 +52,4 @@ Keep this path identical in the prompt and `.claude/settings.json`.
 - Native sub-agents (`implementer-haiku`, `reviewer-sonnet`) share ONE API endpoint; use `devpack_dispatch.py` whenever mixing cloud orchestration with local workers.
 
 ## Workspace component scope
-When `.devpack/project.toml` defines `[workspace]`, list valid components with `python3 runner/workspace_scope.py list` (or read `[[component]]` / `[scan]`) and select only the component(s) the task owns. Keep every `Files allowed` glob inside `workspace.root` (never `poky/`, other `meta-*` layers, or `build/`), and pass `--components <a,b>` (or `--all-components` when cross-cutting) to dispatch so checks, lint, and static analysis stay bounded to active components.
+When `.devpack/project.toml` defines `[workspace]`, read `[[component]]` / `[scan]` in `.devpack/project.toml` and select only the component(s) the task owns. Keep every `Files allowed` glob inside `workspace.root` (never `poky/`, other `meta-*` layers, or `build/`), and pass `--components <a,b>` (or `--all-components` when cross-cutting) with `--submit` so the broker bounds checks, lint, and static analysis to active components.

@@ -252,6 +252,37 @@ def _path_within_prefix(rel_path: str, prefix_rel: str) -> bool:
     return rel_path == prefix_rel or rel_path.startswith(prefix_rel + "/")
 
 
+def _glob_literal_prefix(repo_rel_glob: str) -> str:
+    """Return the non-wildcard directory/file prefix of a normalized repo-relative glob."""
+    norm = repo_rel_glob.strip().replace("\\", "/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    norm = norm.lstrip("/")
+    if not norm:
+        return ""
+    wildcard_idx = len(norm)
+    for ch in "*?[{":
+        pos = norm.find(ch)
+        if 0 <= pos < wildcard_idx:
+            wildcard_idx = pos
+    if wildcard_idx == len(norm):
+        return norm.rstrip("/")
+    raw_prefix = norm[:wildcard_idx]
+    if not raw_prefix.endswith("/"):
+        return raw_prefix.rsplit("/", 1)[0] if "/" in raw_prefix else ""
+    return raw_prefix.rstrip("/")
+
+
+def _glob_explicitly_names_component(repo_rel_glob: str, comp: "ComponentSpec") -> bool:
+    """Return True if ``repo_rel_glob`` explicitly names ``comp``'s path before any wildcard."""
+    if comp.repo_rel_path == ".":
+        return False
+    prefix = _glob_literal_prefix(repo_rel_glob)
+    if not prefix or prefix == ".":
+        return False
+    return _path_within_prefix(prefix, comp.repo_rel_path)
+
+
 def _coerce_str_list(value: Any, field_name: str) -> tuple[str, ...]:
     """Validate and normalize a TOML list of strings."""
     if value is None:
@@ -454,6 +485,58 @@ class WorkspaceScope:
         if not self.configured:
             return [self.repo_root]
         return [comp.abs_path for comp in self.active_components if comp.abs_path.is_dir()]
+
+    def components_touched_by_globs(self, allow_globs: Sequence[str]) -> tuple[ComponentSpec, ...]:
+        """Return configured components whose paths are explicitly named by ``allow_globs``."""
+        if not self.configured or not allow_globs:
+            return ()
+        repo_globs: list[str] = []
+        for raw_pat in allow_globs:
+            norm = raw_pat.strip().replace("\\", "/").lstrip("/")
+            if norm.startswith("./"):
+                norm = norm[2:]
+            if not norm:
+                continue
+            repo_globs.append(norm)
+            if (
+                self.workspace_root_rel != "."
+                and not self.glob_outside_workspace(norm)
+                and norm != self.workspace_root_rel
+                and not norm.startswith(self.workspace_root_rel + "/")
+            ):
+                repo_globs.append(f"{self.workspace_root_rel}/{norm}")
+        touched = [
+            comp
+            for comp in self.all_components
+            if any(_glob_explicitly_names_component(pat, comp) for pat in repo_globs)
+        ]
+        return tuple(touched)
+
+    def with_allow_globs(self, allow_globs: Sequence[str]) -> "WorkspaceScope":
+        """Return a scope whose active set is the union of active components and glob-named ones."""
+        if not self.configured or not allow_globs:
+            return self
+        touched = self.components_touched_by_globs(allow_globs)
+        if not touched:
+            return self
+        active_names = {comp.name for comp in self.active_components}
+        added = [comp for comp in touched if comp.name not in active_names]
+        if not added:
+            return self
+        merged_names = active_names | {comp.name for comp in added}
+        merged = tuple(comp for comp in self.all_components if comp.name in merged_names)
+        return WorkspaceScope(
+            repo_root=self.repo_root,
+            configured=self.configured,
+            workspace_root_rel=self.workspace_root_rel,
+            workspace_root=self.workspace_root,
+            exclude=self.exclude,
+            all_components=self.all_components,
+            active_components=merged,
+            scan_mode=self.scan_mode,
+            scan_default=self.scan_default,
+            default_selected=self.default_selected,
+        )
 
     def resolve_path_in_workspace(self, rel_path: str) -> Path | None:
         """Resolve a relative brief/config path against ``repo_root`` or ``workspace_root``."""

@@ -159,12 +159,22 @@ def run_preflight_lint_on_changed(
     scoped_changed = (
         active_scope.filter(list(changed_files)) if active_scope.configured else list(changed_files)
     )
+    dropped = (
+        [rel for rel in changed_files if rel not in set(scoped_changed)]
+        if active_scope.configured
+        else []
+    )
     lint_targets = [
         str(workdir / rel)
         for rel in scoped_changed
         if rel.lower().endswith(CPP_SUFFIXES) and (workdir / rel).is_file()
     ]
     if not lint_targets:
+        if dropped:
+            msg = "[out_of_scope_changes]\n" + "\n".join(
+                f"OUT_OF_SCOPE_CHANGE: {p} is outside active component scope" for p in dropped
+            )
+            return False, 0, msg
         return True, 0, ""
 
     preflight_script = pack_root / "enforcement" / "lint" / "preflight_lint.py"
@@ -193,6 +203,12 @@ def run_preflight_lint_on_changed(
     rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
     combined = "\n".join(part for part in (out.strip(), err.strip()) if part).strip()
     findings = parse_lint_finding_count(combined, rc)
+    if dropped:
+        drop_msg = "[out_of_scope_changes]\n" + "\n".join(
+            f"OUT_OF_SCOPE_CHANGE: {p} is outside active component scope" for p in dropped
+        )
+        combined = f"{combined}\n{drop_msg}".strip()
+        return False, findings, combined
     return rc == 0, findings, combined
 
 
@@ -230,12 +246,22 @@ def run_cppcheck_on_changed(
     scoped_changed = (
         active_scope.filter(list(changed_files)) if active_scope.configured else list(changed_files)
     )
+    dropped = (
+        [rel for rel in changed_files if rel not in set(scoped_changed)]
+        if active_scope.configured
+        else []
+    )
     static_targets = [
         str(workdir / rel)
         for rel in scoped_changed
         if rel.lower().endswith(CPP_SUFFIXES) and (workdir / rel).is_file()
     ]
     if not static_targets:
+        if dropped:
+            msg = "[out_of_scope_changes]\n" + "\n".join(
+                f"OUT_OF_SCOPE_CHANGE: {p} is outside active component scope" for p in dropped
+            )
+            return False, 0, msg
         return True, 0, ""
 
     cppcheck_script = pack_root / "enforcement" / "static" / "cppcheck_check.py"
@@ -263,6 +289,12 @@ def run_cppcheck_on_changed(
     rc, out, err = _run_subprocess(cmd, workdir, timeout_s=300)
     combined = "\n".join(part for part in (out.strip(), err.strip()) if part).strip()
     blocking = parse_cppcheck_blocking_count(combined, rc)
+    if dropped:
+        drop_msg = "[out_of_scope_changes]\n" + "\n".join(
+            f"OUT_OF_SCOPE_CHANGE: {p} is outside active component scope" for p in dropped
+        )
+        combined = f"{combined}\n{drop_msg}".strip()
+        return False, blocking, combined
     return rc == 0, blocking, combined
 
 
@@ -485,6 +517,8 @@ def dispatch_job(
         components=components,
         all_components=all_components,
     )
+    if ws_scope.configured and allow_globs:
+        ws_scope = ws_scope.with_allow_globs(allow_globs)
     active_component_names = [c.name for c in ws_scope.active_components]
 
     effective_engines_path = engines_config_path
@@ -783,6 +817,12 @@ def dispatch_job(
         changed_files = []
 
     changed_files = sorted(set(changed_files) | set(control_changes))
+    out_of_scope_changes: list[str] = []
+    scoped_changed_files: list[str] = list(changed_files)
+    if ws_scope.configured:
+        scoped_changed_files = ws_scope.filter(list(changed_files))
+        scoped_set = set(scoped_changed_files)
+        out_of_scope_changes = [p for p in changed_files if p not in scoped_set]
 
     # Scope check
     scope_status = "ok"
@@ -790,35 +830,48 @@ def dispatch_job(
     if changed_err:
         scope_status = "violation"
         scope_out = f"SCOPE_ERROR: {changed_err}"
-    elif ws_scope.configured and any(ws_scope.outside_workspace(p) for p in changed_files):
-        outside_paths = [p for p in changed_files if ws_scope.outside_workspace(p)]
-        scope_status = "violation"
-        scope_out = "\n".join(
-            f"SCOPE_VIOLATION: {name} is outside workspace root ({ws_scope.workspace_root_rel})"
-            for name in outside_paths
-        )
-    elif allow_globs:
-        scope_script = pack_root / "enforcement" / "checks" / "scope_check.py"
-        scope_cmd = [
-            "python3",
-            str(scope_script),
-            "--repo",
-            str(workdir),
-            "--base",
-            effective_base,
-            "--allow",
-            *allow_globs,
-        ]
-        if project_config_path is not None:
-            scope_cmd.extend(["--project-config", str(project_config_path)])
-        s_rc, s_out, s_err = _run_subprocess(
-            scope_cmd,
-            workdir,
-            timeout_s=60,
-        )
-        scope_out = (s_out + "\n" + s_err).strip()
-        if s_rc != 0:
-            scope_status = "violation"
+    else:
+        if ws_scope.configured:
+            outside_ws = [p for p in changed_files if ws_scope.outside_workspace(p)]
+            outside_active = [
+                p
+                for p in changed_files
+                if not ws_scope.outside_workspace(p) and not ws_scope.is_in_active_components(p)
+            ]
+            if outside_ws or outside_active:
+                scope_status = "violation"
+                msgs = [
+                    f"SCOPE_VIOLATION: {name} is outside workspace root ({ws_scope.workspace_root_rel})"
+                    for name in outside_ws
+                ]
+                active_label = ", ".join(active_component_names) if active_component_names else "(none)"
+                msgs.extend(
+                    f"SCOPE_VIOLATION: {name} is outside active components ({active_label})"
+                    for name in outside_active
+                )
+                scope_out = "\n".join(msgs)
+        if scope_status == "ok" and allow_globs:
+            scope_script = pack_root / "enforcement" / "checks" / "scope_check.py"
+            scope_cmd = [
+                "python3",
+                str(scope_script),
+                "--repo",
+                str(workdir),
+                "--base",
+                effective_base,
+                "--allow",
+                *allow_globs,
+            ]
+            if project_config_path is not None:
+                scope_cmd.extend(["--project-config", str(project_config_path)])
+            s_rc, s_out, s_err = _run_subprocess(
+                scope_cmd,
+                workdir,
+                timeout_s=60,
+            )
+            scope_out = (s_out + "\n" + s_err).strip()
+            if s_rc != 0:
+                scope_status = "violation"
 
     if control_changes:
         scope_status = "violation"
@@ -837,6 +890,16 @@ def dispatch_job(
             gate_status = "skipped"
         else:
             gate_ok = True
+            if out_of_scope_changes:
+                gate_ok = False
+                gate_logs.append(
+                    "[out_of_scope_changes]\n"
+                    + "\n".join(
+                        f"OUT_OF_SCOPE_CHANGE: {p} is outside active component scope"
+                        for p in out_of_scope_changes
+                    )
+                )
+
             # 1. Protected test lock check
             if protected_globs:
                 tl_script = pack_root / "enforcement" / "checks" / "test_lock.py"
@@ -866,7 +929,7 @@ def dispatch_job(
             # 2. Preflight lint on changed C/C++ files
             lint_ok, lint_findings, lint_out = run_preflight_lint_on_changed(
                 workdir,
-                changed_files,
+                scoped_changed_files,
                 pack_root=pack_root,
                 project_config_path=project_config_path,
                 scope=ws_scope,
@@ -879,7 +942,7 @@ def dispatch_job(
             # 2b. Static analysis (cppcheck) on changed C/C++ files
             static_clean, static_findings, static_out = run_cppcheck_on_changed(
                 workdir,
-                changed_files,
+                scoped_changed_files,
                 pack_root=pack_root,
                 project_config_path=project_config_path,
                 scope=ws_scope,
@@ -931,6 +994,9 @@ def dispatch_job(
         mem_proposal_summary = prop_res.to_dict()
 
     outcome = "pass" if passed else ("timeout" if agent_res.status == "timeout" else "fail")
+    run_extra: dict[str, Any] = {}
+    if ws_scope.configured or out_of_scope_changes:
+        run_extra["out_of_scope_changes"] = out_of_scope_changes
     update_run_json(
         run_dir,
         task=brief_path.stem,
@@ -951,6 +1017,7 @@ def dispatch_job(
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
         finished=datetime.now(timezone.utc).isoformat(),
+        **run_extra,
     )
     _render_run_dir_quietly(run_dir)
 
@@ -977,6 +1044,8 @@ def dispatch_job(
         "components": active_component_names,
         "scan_mode": ws_scope.scan_mode,
     }
+    if ws_scope.configured or out_of_scope_changes:
+        payload["out_of_scope_changes"] = out_of_scope_changes
     if any(mem_proposal_summary.values()):
         payload["memory_proposals"] = mem_proposal_summary
     if agent_res.error:

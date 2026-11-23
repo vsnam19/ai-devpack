@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any, Sequence
 import xml.etree.ElementTree as ET
 
@@ -43,6 +44,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     tomllib = None  # type: ignore[assignment]
 
+SOURCE_SUFFIXES = (".c", ".cpp", ".cc", ".cxx")
 CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
 SKIP_DIRS = {
     ".git",
@@ -234,6 +236,7 @@ class CppcheckRunResult:
 
     exit_code: int
     files_checked: int = 0
+    fallback_files_count: int = 0
     findings: list[CppcheckFinding] = field(default_factory=list)
     blocking_findings: list[CppcheckFinding] = field(default_factory=list)
     non_blocking_findings: list[CppcheckFinding] = field(default_factory=list)
@@ -654,6 +657,45 @@ def _resolve_component_include_dir(
     return _resolve_within_repo(raw_inc, repo_root)
 
 
+def _resolve_compile_db_entry_path(
+    entry: dict[str, Any],
+    cc_path: Path,
+    repo_root: Path,
+) -> tuple[Path | None, dict[str, Any]]:
+    """Resolve an entry's source file path and return ``(resolved_path, normalized_entry)``."""
+    raw_file = str(entry.get("file", "") or "").strip()
+    if not raw_file:
+        return None, entry
+    fp = Path(raw_file)
+    copied = dict(entry)
+    if fp.is_absolute():
+        return fp.resolve(), copied
+
+    raw_dir = str(entry.get("directory", "") or "").strip()
+    if raw_dir:
+        dir_path = Path(raw_dir)
+        if dir_path.is_absolute():
+            return (dir_path / fp).resolve(), copied
+        repo_cand = (repo_root / dir_path / fp).resolve()
+        if repo_cand.exists():
+            return repo_cand, copied
+        cc_cand = (cc_path.parent / dir_path / fp).resolve()
+        if cc_cand.exists():
+            copied["directory"] = str((cc_path.parent / dir_path).resolve())
+            return cc_cand, copied
+        return repo_cand, copied
+
+    repo_cand = (repo_root / fp).resolve()
+    if repo_cand.exists():
+        copied["directory"] = str(repo_root)
+        return repo_cand, copied
+    cc_cand = (cc_path.parent / fp).resolve()
+    if cc_cand.exists():
+        copied["directory"] = str(cc_path.parent)
+        return cc_cand, copied
+    return repo_cand, copied
+
+
 def _load_compile_commands_tus(cc_path: Path, repo_root: Path) -> set[Path]:
     """Return resolved source file paths listed in a ``compile_commands.json`` database."""
     try:
@@ -666,26 +708,64 @@ def _load_compile_commands_tus(cc_path: Path, repo_root: Path) -> set[Path]:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        raw_file = str(entry.get("file", "") or "").strip()
-        if not raw_file:
-            continue
-        fp = Path(raw_file)
-        if fp.is_absolute():
-            tus.add(fp.resolve())
-            continue
-        raw_dir = str(entry.get("directory", "") or "").strip()
-        if raw_dir:
-            dir_path = Path(raw_dir)
-            if dir_path.is_absolute():
-                tus.add((dir_path / fp).resolve())
-                continue
-            for base in (repo_root, cc_path.parent):
-                cand = (base / dir_path / fp).resolve()
-                if cand.exists():
-                    tus.add(cand)
-        tus.add((repo_root / fp).resolve())
-        tus.add((cc_path.parent / fp).resolve())
+        resolved_fp, _ = _resolve_compile_db_entry_path(entry, cc_path, repo_root)
+        if resolved_fp is not None:
+            tus.add(resolved_fp)
     return tus
+
+
+def _build_filtered_compile_db(
+    cc_path: Path,
+    repo_root: Path,
+    ws_scope: WorkspaceScope,
+    comp: ComponentSpec,
+    *,
+    allowed_files: set[Path] | None = None,
+) -> tuple[list[dict[str, Any]], set[Path]]:
+    """Filter ``cc_path`` entries to files inside ``comp`` (active, non-excluded)."""
+    try:
+        entries = json.loads(cc_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [], set()
+    if not isinstance(entries, list):
+        return [], set()
+
+    filtered: list[dict[str, Any]] = []
+    matched_tus: set[Path] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        resolved_fp, normalized_entry = _resolve_compile_db_entry_path(entry, cc_path, repo_root)
+        if resolved_fp is None:
+            continue
+        if ws_scope.outside_workspace(resolved_fp) or ws_scope.is_excluded(resolved_fp):
+            continue
+        if ws_scope.component_for_path(resolved_fp) != comp:
+            continue
+        if allowed_files is not None and resolved_fp not in allowed_files:
+            continue
+        filtered.append(normalized_entry)
+        matched_tus.add(resolved_fp)
+    return filtered, matched_tus
+
+
+def _append_component_include_args(
+    cmd: list[str],
+    comp: ComponentSpec,
+    config: CppcheckConfig,
+    ws_scope: WorkspaceScope,
+    effective_root: Path,
+    extra_include_dirs: Sequence[str],
+) -> None:
+    """Append resolved ``-I`` flags for component fallback or non-compile-DB scans."""
+    inc_sources = list(comp.include_dirs) if comp.include_dirs else list(config.include_dirs)
+    for raw_inc in extra_include_dirs:
+        if raw_inc not in inc_sources:
+            inc_sources.append(raw_inc)
+    for raw_inc in inc_sources:
+        inc_path = _resolve_component_include_dir(raw_inc, comp, ws_scope, effective_root)
+        if inc_path.is_dir() or raw_inc in extra_include_dirs:
+            cmd.extend(["-I", inc_path.relative_to(effective_root).as_posix()])
 
 
 def _expand_workspace_cpp_targets(
@@ -907,6 +987,7 @@ def run_cppcheck_check(
     parsed: list[CppcheckFinding] = []
     raw_xml_parts: list[str] = []
     raw_stdout_parts: list[str] = []
+    fallback_files_count = 0
 
     if ws_scope.configured:
         grouped: dict[str, tuple[ComponentSpec, list[Path]]] = {}
@@ -929,11 +1010,52 @@ def run_cppcheck_check(
                     cc_path = cand_cc
 
             if cc_path is not None:
-                cc_tus = _load_compile_commands_tus(cc_path, effective_root)
-                cc_rel = _rel_str(cc_path)
-                if not subset_scan:
+                allowed_set = {fp.resolve() for fp in comp_files} if subset_scan else None
+                filtered_entries, cc_tus = _build_filtered_compile_db(
+                    cc_path,
+                    effective_root,
+                    ws_scope,
+                    comp,
+                    allowed_files=allowed_set,
+                )
+                if filtered_entries:
+                    with tempfile.TemporaryDirectory(prefix="devpack-cppcheck-") as cc_tmp_dir:
+                        temp_cc = Path(cc_tmp_dir) / "compile_commands.json"
+                        temp_cc.write_text(json.dumps(filtered_entries, indent=2), encoding="utf-8")
+                        cmd = _build_base_cmd()
+                        cmd.append(f"--project={temp_cc}")
+                        comp_findings, r_xml, r_out = _invoke_cppcheck_cmd(
+                            cmd, effective_root, timeout_s
+                        )
+                    raw_xml_parts.append(r_xml)
+                    raw_stdout_parts.append(r_out)
+                    for f in comp_findings:
+                        if (
+                            not ws_scope.outside_workspace(f.file)
+                            and not ws_scope.is_excluded(f.file)
+                            and ws_scope.component_for_path(f.file) == comp
+                            and (not subset_scan or f.file in target_rel_set)
+                        ):
+                            parsed.append(f)
+
+                if subset_scan:
+                    unmatched_files = [fp for fp in comp_files if fp.resolve() not in cc_tus]
+                elif filtered_entries:
+                    unmatched_files = [
+                        fp
+                        for fp in comp_files
+                        if fp.suffix.lower() in SOURCE_SUFFIXES and fp.resolve() not in cc_tus
+                    ]
+                else:
+                    unmatched_files = list(comp_files)
+
+                if unmatched_files:
+                    fallback_files_count += len(unmatched_files)
                     cmd = _build_base_cmd()
-                    cmd.append(f"--project={cc_rel}")
+                    _append_component_include_args(
+                        cmd, comp, config, ws_scope, effective_root, extra_include_dirs
+                    )
+                    cmd.extend(_rel_str(fp) for fp in unmatched_files)
                     comp_findings, r_xml, r_out = _invoke_cppcheck_cmd(
                         cmd, effective_root, timeout_s
                     )
@@ -941,54 +1063,16 @@ def run_cppcheck_check(
                     raw_stdout_parts.append(r_out)
                     for f in comp_findings:
                         if (
-                            not ws_scope.is_excluded(f.file)
+                            not ws_scope.outside_workspace(f.file)
+                            and not ws_scope.is_excluded(f.file)
                             and ws_scope.component_for_path(f.file) == comp
                         ):
                             parsed.append(f)
-                else:
-                    matched_tus = [fp for fp in comp_files if fp.resolve() in cc_tus]
-                    unmatched_files = [fp for fp in comp_files if fp.resolve() not in cc_tus]
-                    if matched_tus:
-                        cmd = _build_base_cmd()
-                        cmd.append(f"--project={cc_rel}")
-                        cmd.append("--file-filter=+")
-                        cmd.extend(_rel_str(fp) for fp in matched_tus)
-                        comp_findings, r_xml, r_out = _invoke_cppcheck_cmd(
-                            cmd, effective_root, timeout_s
-                        )
-                        raw_xml_parts.append(r_xml)
-                        raw_stdout_parts.append(r_out)
-                        for f in comp_findings:
-                            if f.file in target_rel_set and not ws_scope.is_excluded(f.file):
-                                parsed.append(f)
-                    if unmatched_files:
-                        cmd = _build_base_cmd()
-                        inc_sources = comp.include_dirs or config.include_dirs
-                        for raw_inc in inc_sources:
-                            inc_path = _resolve_component_include_dir(
-                                raw_inc, comp, ws_scope, effective_root
-                            )
-                            if inc_path.is_dir() or raw_inc in extra_include_dirs:
-                                cmd.extend(["-I", inc_path.relative_to(effective_root).as_posix()])
-                        cmd.extend(_rel_str(fp) for fp in unmatched_files)
-                        comp_findings, r_xml, r_out = _invoke_cppcheck_cmd(
-                            cmd, effective_root, timeout_s
-                        )
-                        raw_xml_parts.append(r_xml)
-                        raw_stdout_parts.append(r_out)
-                        parsed.extend(comp_findings)
             else:
                 cmd = _build_base_cmd()
-                inc_sources = list(comp.include_dirs) if comp.include_dirs else list(config.include_dirs)
-                for raw_inc in extra_include_dirs:
-                    if raw_inc not in inc_sources:
-                        inc_sources.append(raw_inc)
-                for raw_inc in inc_sources:
-                    inc_path = _resolve_component_include_dir(
-                        raw_inc, comp, ws_scope, effective_root
-                    )
-                    if inc_path.is_dir() or raw_inc in extra_include_dirs:
-                        cmd.extend(["-I", inc_path.relative_to(effective_root).as_posix()])
+                _append_component_include_args(
+                    cmd, comp, config, ws_scope, effective_root, extra_include_dirs
+                )
                 cmd.extend(_rel_str(fp) for fp in comp_files)
                 comp_findings, r_xml, r_out = _invoke_cppcheck_cmd(
                     cmd, effective_root, timeout_s
@@ -1026,6 +1110,7 @@ def run_cppcheck_check(
     return CppcheckRunResult(
         exit_code=exit_code,
         files_checked=len(target_files),
+        fallback_files_count=fallback_files_count,
         findings=active_findings,
         blocking_findings=blocking,
         non_blocking_findings=non_blocking,
@@ -1042,6 +1127,7 @@ def format_result_json(result: CppcheckRunResult) -> str:
     payload: dict[str, Any] = {
         "tool": "cppcheck",
         "files_checked": result.files_checked,
+        "fallback_files": result.fallback_files_count,
         "total_findings": len(result.findings),
         "blocking_findings": len(result.blocking_findings),
         "non_blocking_findings": len(result.non_blocking_findings),
@@ -1077,6 +1163,11 @@ def format_result_text(result: CppcheckRunResult) -> str:
             )
     else:
         lines.append("[PASS] cppcheck")
+    if result.fallback_files_count > 0:
+        lines.append(
+            f"Note: {result.fallback_files_count} file(s) missing from compile_commands.json "
+            "analysed via include_dirs fallback."
+        )
     lines.append(
         f"\nSummary: {result.files_checked} file(s) checked, {len(result.findings)} finding(s) "
         f"({len(result.blocking_findings)} blocking, {len(result.non_blocking_findings)} non-blocking, "
