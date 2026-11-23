@@ -14,6 +14,12 @@ All notable changes to ai-devpack are recorded here. Versioning follows
   `knowledge/skills/automotive-cpp/references/iso26262-unit-design.md`,
   `knowledge/skills/automotive-cpp/references/sources.md`, and
   `knowledge/skills/automotive-cpp/tests/skilltest.toml` with 3 behaviour cases).
+- **Requirements analysis skill (`knowledge/skills/requirements-analysis/`)**:
+  quality checklist (`knowledge/skills/requirements-analysis/references/checklist.md`),
+  ambiguity lexicon (`knowledge/skills/requirements-analysis/references/ambiguity-lexicon.md`),
+  EARS syntax patterns (`knowledge/skills/requirements-analysis/references/ears.md`),
+  labelled source provenance (`knowledge/skills/requirements-analysis/references/sources.md`),
+  and deterministic `skilltest` trigger and behaviour suites.
 
 ### Deprecated
 - `knowledge/skills/misra-cpp-2023/` and `knowledge/skills/doxygen-naming/` are marked

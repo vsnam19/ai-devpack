@@ -1,0 +1,50 @@
+[[trigger]]
+name = "review requirements"
+prompt = "Review these system requirements and list clarification questions for the stakeholder."
+expect = true
+[[trigger]]
+name = "testability check"
+prompt = "Is this CAN state-machine spec testable and complete?"
+expect = true
+[[trigger]]
+name = "derive test cases"
+prompt = "Derive test cases from REQ-LINK-001 through REQ-LINK-004 and flag any blocked items."
+expect = true
+[[trigger]]
+name = "audit diagnostic spec"
+prompt = "Audit this diagnostic debouncer specification for ambiguities, conflicts, and missing error paths."
+expect = true
+[[trigger]]
+name = "implement cpp"
+prompt = "Implement the CAN frame ring buffer in C++17."
+expect = false
+[[trigger]]
+name = "misra review"
+prompt = "Check this C++17 source file for MISRA C++:2023 rule violations."
+expect = false
+[[trigger]]
+name = "release notes"
+prompt = "Draft release notes and a changelog from the merged commits."
+expect = false
+[[trigger]]
+name = "write skill"
+prompt = "Create a new agent skill with SKILL.md and skilltest cases."
+expect = false
+[[behaviour]]
+name = "protocol-timing"
+fixture = "fixtures/protocol-timing/input"
+grader = "graders/protocol-timing"
+prompt = "Analyse the requirements in spec.md and write your findings table, set-level gaps and conflicts, open questions, and derived test ideas to review/findings.md. Do not invent missing numbers."
+check = "bash check.sh"
+[[behaviour]]
+name = "dtc-debouncer"
+fixture = "fixtures/dtc-debouncer/input"
+grader = "graders/dtc-debouncer"
+prompt = "Review the diagnostic requirements in spec.md for defects, conflicts, and missing error behaviour, and write your complete analysis to review/findings.md without inventing missing values."
+check = "bash check.sh"
+[[behaviour]]
+name = "can-watchdog"
+fixture = "fixtures/can-watchdog/input"
+grader = "graders/can-watchdog"
+prompt = "Inspect spec.md against requirements quality criteria, assign temporary IDs (TMP-n) to any unnumbered requirements, and write the findings table, open questions, and derived test ideas to review/findings.md."
+check = "bash check.sh"
