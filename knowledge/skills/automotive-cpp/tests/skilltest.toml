@@ -48,3 +48,8 @@ fixture = "fixtures/error-status-optional/input"
 grader = "graders/error-status-optional"
 prompt = "Refactor voltage_decoder.hpp and voltage_decoder.cpp so decodeSupplyVoltage reports all failures through DecodeResult and DecodeStatus without exceptions, heap allocation, or C-style casts, and ensure Doxygen and naming comply with automotive C++17 rules."
 check = "bash check.sh"
+
+[[trigger]]
+name = "automotive-cpp-cppcheck-nullpointer"
+prompt = "cppcheck reports nullPointer in my C++ file, fix it"
+expect = true
