@@ -60,6 +60,16 @@ ID_TOKEN_PATTERN = re.compile(r"\b(?:REQ|SYS|SWR|TC|TMP)(?:-[A-Z0-9]+)+\b")
 HEX_NUMBER_PATTERN = re.compile(r"\b0x[0-9a-fA-F]+\b")
 DEC_NUMBER_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\b")
 SEPARATOR_CELL_PATTERN = re.compile(r"^:?-{2,}:?$")
+TEST_IDEAS_HEADING = "## Derived test ideas"
+BLOCKED_PATTERN = re.compile(r"\bblocked\b\s*(?:—|--?)\s*waiting on\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class TestIdea:
+    """One top-level bullet of the derived test ideas section with its nested lines."""
+
+    text: str
+    blocked: bool
 
 
 def extract_numbers(text: str) -> set[str]:
@@ -134,6 +144,37 @@ def parse_findings_table(markdown_text: str) -> list[dict[str, str]]:
     raise ValueError("Missing findings table with columns: ID | defect type | quote | why it matters | question to stakeholder | proposed rewrite")
 
 
+def parse_test_ideas(markdown_text: str) -> list[TestIdea]:
+    """Extract the bullets of the `## Derived test ideas` section, each with its nested lines.
+
+    A top-level bullet whose only line states `blocked — waiting on ...` is marked blocked;
+    every other bullet is a test idea that must obey the number and open-question rules.
+    """
+    lines = markdown_text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == TEST_IDEAS_HEADING:
+            start = index + 1
+            break
+    if start is None:
+        raise ValueError(f"Missing '{TEST_IDEAS_HEADING}' section")
+    entries: list[list[str]] = []
+    for line in lines[start:]:
+        if line.startswith("## "):
+            break
+        if line.startswith("- "):
+            entries.append([line])
+        elif line.strip() and entries:
+            entries[-1].append(line)
+    return [
+        TestIdea(
+            text="\n".join(entry),
+            blocked=len(entry) == 1 and bool(BLOCKED_PATTERN.search(entry[0])),
+        )
+        for entry in entries
+    ]
+
+
 def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
     """Return failure reasons for a candidate directory; empty list means pass."""
     if case_name not in CASES:
@@ -186,6 +227,31 @@ def grade_candidate(case_name: str, candidate_dir: Path) -> list[str]:
             )
         if "SHALL" not in row["rewrite"] and "shall" not in row["rewrite"]:
             failures.append(f"Row {row_index} ({row['id']}) proposed rewrite does not use SHALL")
+
+    open_ids = {
+        ref
+        for row in rows
+        if row["question"].strip()
+        for ref in ID_TOKEN_PATTERN.findall(row["id"])
+    }
+    try:
+        test_ideas = parse_test_ideas(findings_text)
+    except ValueError as error:
+        failures.append(str(error))
+        test_ideas = []
+    for idea_index, idea in enumerate(test_ideas, 1):
+        idea_refs = ", ".join(sorted(set(ID_TOKEN_PATTERN.findall(idea.text)))) or "unknown"
+        invented_in_idea = sorted(extract_numbers(idea.text) - source_numbers)
+        if invented_in_idea:
+            failures.append(
+                f"Test idea {idea_index} ({idea_refs}) invented numeric value(s) not in source: {', '.join(invented_in_idea)}"
+            )
+        if idea.blocked:
+            continue
+        for ref in sorted(set(ID_TOKEN_PATTERN.findall(idea.text)) & open_ids):
+            failures.append(
+                f"Test idea {idea_index} references {ref}, which has an open question; use a blocked entry instead"
+            )
 
     lowered = findings_text.lower()
     for keyword in spec.required_keywords:

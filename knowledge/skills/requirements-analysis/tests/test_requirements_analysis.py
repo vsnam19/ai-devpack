@@ -88,6 +88,46 @@ class RequirementsAnalysisSkillTests(unittest.TestCase):
             failures_clean = grade_findings.grade_candidate("protocol-timing", candidate)
             self.assertTrue(any("REQ-COM-001" in item for item in failures_clean), failures_clean)
 
+    def test_grader_rejects_invented_number_in_test_idea(self) -> None:
+        """Grader fails when a derived test idea uses a number that is not in the source."""
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = Path(temp) / "cand"
+            shutil.copytree(TESTS_DIR / "expected" / "protocol-timing", candidate)
+            findings = candidate / "review" / "findings.md"
+            original = findings.read_text(encoding="utf-8")
+            self.assertIn("(`<= 10` ms)", original)
+
+            invented = original.replace("(`<= 10` ms)", "(`<= 25` ms)")
+            findings.write_text(invented, encoding="utf-8")
+            failures = grade_findings.grade_candidate("protocol-timing", candidate)
+            self.assertTrue(
+                any("Test idea" in item and "invented numeric value" in item and "25" in item for item in failures),
+                failures,
+            )
+
+    def test_grader_rejects_test_idea_for_open_question_requirement(self) -> None:
+        """Grader fails when a test idea is written for a requirement that has an open question."""
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = Path(temp) / "cand"
+            shutil.copytree(TESTS_DIR / "expected" / "protocol-timing", candidate)
+            findings = candidate / "review" / "findings.md"
+            original = findings.read_text(encoding="utf-8")
+            blocked_line = "- `REQ-COM-002`: blocked — waiting on `REQ-COM-002` stakeholder answers."
+            self.assertIn(blocked_line, original)
+
+            # Uses only numbers that appear in the source, so only the open-question rule can fire.
+            prescribed = original.replace(
+                blocked_line,
+                "- `REQ-COM-002`: call `startConnect(nowMs)` and check the handshake response within `10` ms.",
+            )
+            findings.write_text(prescribed, encoding="utf-8")
+            failures = grade_findings.grade_candidate("protocol-timing", candidate)
+            self.assertTrue(
+                any("REQ-COM-002" in item and "open question" in item for item in failures),
+                failures,
+            )
+            self.assertFalse(any("invented numeric value" in item for item in failures), failures)
+
     def test_grader_rejects_low_recall(self) -> None:
         """Grader fails when too few seeded defect IDs appear in the findings table."""
         with tempfile.TemporaryDirectory() as temp:

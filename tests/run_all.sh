@@ -3,14 +3,15 @@
 #
 # Usage: bash tests/run_all.sh [--help]
 # Runs `python3 -m unittest discover` for tests, enforcement, eval, runner,
-# skilltest and learning when those directories exist. Runs shellcheck on *.sh if
-# installed, else prints "SKIP shellcheck: not installed".
-# Fails when a directory containing test_*.py files reports "Ran 0 tests".
+# skilltest and learning when those directories exist, and for every
+# knowledge/skills/*/tests directory that contains test_*.py files.
+# Runs shellcheck on *.sh if installed, else prints "SKIP shellcheck: not installed".
+# Fails when a core directory containing test_*.py files reports "Ran 0 tests".
 # Exit codes: 0 all steps passed; 1 at least one step failed; 2 bad usage.
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
 if [[ $# -gt 0 ]]; then
@@ -43,6 +44,20 @@ for dir in tests enforcement eval runner skilltest learning; do
     echo "SKIP unittest: $dir (directory not present)"
   fi
 done
+
+# Skill test suites: run each knowledge/skills/*/tests directory that has test_*.py files.
+# A skill suite that exists but runs 0 tests is not an error here.
+shopt -s nullglob
+for skill_tests in knowledge/skills/*/tests; do
+  if [[ -n "$(find "$skill_tests" -name 'test_*.py' -print -quit)" ]]; then
+    echo "== unittest: $skill_tests"
+    if ! python3 -m unittest discover -s "$skill_tests" -p 'test_*.py'; then
+      echo "FAIL unittest: $skill_tests" >&2
+      status=1
+    fi
+  fi
+done
+shopt -u nullglob
 
 if command -v shellcheck >/dev/null 2>&1; then
   echo "== shellcheck"
