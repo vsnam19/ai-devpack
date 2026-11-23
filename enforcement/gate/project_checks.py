@@ -340,6 +340,57 @@ def _is_component_test_path(fp: Path, repo: Path, component: ComponentSpec) -> b
     return name.startswith("test_") or name.endswith("_test.cpp") or name.endswith("_test.c")
 
 
+def _exact_compile_db_object(compile_commands: Path | None, src: Path, build_dir: Path) -> Path | None:
+    """Return the object that compile_commands.json records as ``output`` for exactly ``src``.
+
+    Matching uses only the resolved source path, never a filename prefix or a modification time
+    guess, so two sources that share a stem (``a/driver.cpp`` and ``b/driver.cpp``) can never
+    swap objects. Returns ``None`` (caller fails closed with SYMBOL-OBJECT-UNRESOLVED) unless:
+    the database has exactly one entry for ``src`` with an ``output`` field, that object lies
+    inside ``build_dir``, it exists, and it is not older than ``src`` (a stale object would not
+    reflect the worker's edit).
+    """
+    if compile_commands is None or not compile_commands.is_file():
+        return None
+    try:
+        entries = json.loads(compile_commands.read_text(encoding="utf-8"))
+        src_res = src.resolve()
+        build_res = build_dir.resolve()
+    except (OSError, ValueError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    outputs: set[Path] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        raw_file = str(entry.get("file", "")).strip()
+        raw_out = str(entry.get("output", "")).strip()
+        if not raw_file or not raw_out:
+            continue
+        raw_dir = str(entry.get("directory", "")).strip()
+        base = Path(raw_dir) if raw_dir else compile_commands.parent
+        file_path = Path(raw_file) if Path(raw_file).is_absolute() else base / raw_file
+        out_path = Path(raw_out) if Path(raw_out).is_absolute() else base / raw_out
+        try:
+            if file_path.resolve() != src_res:
+                continue
+            outputs.add(out_path.resolve())
+        except OSError:
+            continue
+    if len(outputs) != 1:
+        return None
+    (obj,) = outputs
+    try:
+        if not obj.is_file() or not obj.is_relative_to(build_res):
+            return None
+        if obj.stat().st_mtime < src.stat().st_mtime:
+            return None
+    except OSError:
+        return None
+    return obj
+
+
 def _run_component_symbol_check(
     repo: Path,
     component: ComponentSpec,
@@ -435,21 +486,17 @@ def _run_component_symbol_check(
             if ok:
                 worker_objs.append(obj)
             else:
-                # Fall back to freshly built object in component build_dir if present (e.g. external SDK headers)
-                existing_o = next(
-                    (
-                        p
-                        for p in sorted(build_dir.rglob(f"{src.stem}*.o"))
-                        if p.is_file() and p.stat().st_mtime >= src.stat().st_mtime
-                    ),
-                    None,
-                ) if build_dir.is_dir() else None
-                if existing_o is not None:
-                    worker_objs.append(existing_o)
+                # Fall back only to the object the build recorded for exactly this source (e.g. external SDK headers).
+                exact_o = _exact_compile_db_object(cc_path, src, build_dir)
+                if exact_o is not None:
+                    worker_objs.append(exact_o)
                 elif err.startswith("TOOL_MISSING:"):
                     return 3, err
                 else:
-                    return 1, f"FAIL: symbol_check compile failed for {component.name}/{src.name}: {err}"
+                    return 1, (
+                        f"FAIL: SYMBOL-OBJECT-UNRESOLVED: symbol_check compile failed for {component.name}/{src.name} "
+                        f"and compile_commands.json has no fresh exact output object for it: {err}"
+                    )
 
         for idx, src in enumerate(worker_test_srcs, start=1):
             obj = tmp_path / f"wt_{idx}_{src.stem}.o"

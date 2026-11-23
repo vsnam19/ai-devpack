@@ -536,6 +536,22 @@ def check_worker_objects(
     )
 
 
+_INCLUDE_DIR_SEPARATED_FLAGS: tuple[str, ...] = ("-I", "-isystem", "-iquote")
+_INCLUDE_DIR_JOINED_FLAGS: tuple[str, ...] = ("-isystem", "-iquote", "-I")
+
+
+def _rebase_compile_db_path(value: str, raw_dir: str) -> str:
+    """Resolve a relative include directory against the compile DB entry ``directory``.
+
+    Used for both the separated (``-I dir``) and joined (``-Idir``) spellings so that a
+    relative include means the same thing whichever form the build system emitted.
+    """
+    p = Path(value)
+    if not p.is_absolute() and raw_dir:
+        p = Path(raw_dir) / p
+    return str(p)
+
+
 def _load_compile_db_flags(compile_commands: Path | None, src: Path) -> list[str]:
     """Extract safe -I/-D/-std compile flags for ``src`` from ``compile_commands.json`` if present."""
     if compile_commands is None or not compile_commands.is_file():
@@ -573,14 +589,17 @@ def _load_compile_db_flags(compile_commands: Path | None, src: Path) -> list[str
         i = 0
         while i < len(tokens):
             tok = tokens[i]
-            if tok in ("-I", "-isystem") and i + 1 < len(tokens):
-                p = Path(tokens[i + 1])
-                if not p.is_absolute() and raw_dir:
-                    p = Path(raw_dir) / p
-                extracted.extend([tok, str(p)])
+            if tok in _INCLUDE_DIR_SEPARATED_FLAGS and i + 1 < len(tokens):
+                extracted.extend([tok, _rebase_compile_db_path(tokens[i + 1], raw_dir)])
                 i += 2
                 continue
-            if tok.startswith(("-I", "-D", "-U", "-std=")):
+            joined = next(
+                (flag for flag in _INCLUDE_DIR_JOINED_FLAGS if tok.startswith(flag) and len(tok) > len(flag)),
+                None,
+            )
+            if joined is not None:
+                extracted.append(joined + _rebase_compile_db_path(tok[len(joined):], raw_dir))
+            elif tok.startswith(("-D", "-U", "-std=")):
                 extracted.append(tok)
             i += 1
         return extracted

@@ -2734,6 +2734,8 @@ _FRAMEWORK_REGISTRY_FN_RE = re.compile(
 )
 _INCLUDE_PATH_DIRECTIVE_RE = re.compile(r'^\s*#\s*include\s*(?:"([^"]+)"|<([^>]+)>)')
 _FRAMEWORK_HEADER_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"[^"]*test_framework\.hpp"')
+_FRAMEWORK_DEFINE_HEAD_RE = re.compile(r"^\s*#\s*define\s+[A-Za-z_]\w*")
+_IDENT_WORD_RE = re.compile(r"[A-Za-z_]\w*")
 _OOM_OUTPUT_RE = re.compile(
     r"virtual memory exhausted|cannot allocate memory|out of memory|"
     r"terminate called after throwing an instance of 'std::bad_alloc'|"
@@ -3082,7 +3084,7 @@ def _collect_include_dirs_from_flags(flags: Sequence[str]) -> set[str]:
     return dirs
 
 
-def _preprocess_repo_lines(
+def _preprocess_repo_origin_lines(
     path: pathlib.Path,
     raw_text: str,
     *,
@@ -3097,8 +3099,13 @@ def _preprocess_repo_lines(
     effective_flags: Sequence[str] | None = None,
     compile_commands: pathlib.Path | None = None,
     tool_env: RuntimeToolEnv | None = None,
-) -> list[tuple[int, str]]:
-    """Run ``g++ -E`` with resource limits (no silent fallback) and return repo-local lines."""
+) -> list[tuple[int, str, str]]:
+    """Run ``g++ -E`` with resource limits (no silent fallback) and return repo-local lines.
+
+    Each returned tuple is ``(report_line, text, origin)`` where ``origin`` is the resolved
+    file named by the preprocessor line marker that was active for the line (``<stdin>`` for the
+    stripped target). Macro-expanded text is attributed to the file holding the invocation.
+    """
     compiler_bin = shutil.which("g++" if not is_c else "gcc") or shutil.which(
         "clang++" if not is_c else "clang"
     )
@@ -3191,7 +3198,7 @@ def _preprocess_repo_lines(
         first_line = err_detail.splitlines()[0] if err_detail else f"exit code {proc.returncode}"
         raise PreprocessFailedError(f"preprocessor failed ({first_line})")
 
-    collected: list[tuple[int, str]] = []
+    collected: list[tuple[int, str, str]] = []
     cur_file = str(resolved_target)
     cur_line = 1
     keep = True
@@ -3210,7 +3217,7 @@ def _preprocess_repo_lines(
                     report_ln = cur_line if pathlib.Path(cur_file).resolve() == resolved_target else 1
                 except OSError:
                     report_ln = 1
-            collected.append((report_ln, line))
+            collected.append((report_ln, line, cur_file))
         cur_line += 1
     return collected
 
@@ -3250,13 +3257,36 @@ def _scan_inline_asm_tokens(
     return hits
 
 
+def _resolve_origin_name(origin: str) -> str:
+    """Return the resolved path for a preprocessor line-marker file name; pseudo names pass through."""
+    if origin.startswith("<"):
+        return origin
+    try:
+        return str(pathlib.Path(origin).resolve())
+    except OSError:
+        return origin
+
+
 def _scan_framework_tamper_tokens(
-    preprocessed_lines: Sequence[tuple[int, str]],
+    preprocessed_lines: Sequence[tuple[int, str, str]],
     raw_text: str,
     *,
     check_namespace_and_registry: bool,
+    target_path: pathlib.Path | None = None,
 ) -> list[tuple[int, str]]:
-    """Return ``[(line_num, reason)]`` for framework tamper on joined directives and preprocessed tokens."""
+    """Return ``[(line_num, reason)]`` for framework tamper on joined directives and preprocessed tokens.
+
+    ``preprocessed_lines`` carries the origin file of every line (see
+    ``_preprocess_repo_origin_lines``). Framework identifiers are decided by origin:
+
+    * tokens whose origin is the pack's framework header (resolved path) are exempt, however included;
+    * a framework identifier that the origin file itself spells out is a direct reference or
+      redefinition and is forbidden;
+    * a framework identifier that the origin file does not spell out was produced by macro
+      expansion. Such tokens are exempt only because macro definitions in repo-local files whose
+      bodies name framework symbols, and macro definitions that use token pasting (``##``), are
+      themselves forbidden. What remains expandable is the pack's own macros.
+    """
     hits: list[tuple[int, str]] = []
     seen: set[tuple[int, str]] = set()
 
@@ -3266,36 +3296,72 @@ def _scan_framework_tamper_tokens(
             seen.add(key)
             hits.append(key)
 
+    pack_header_key = str((pathlib.Path(_REPO_ROOT_STR) / "eval" / "fixture" / "tests" / "test_framework.hpp").resolve())
+    target_key = str(target_path.resolve()) if target_path is not None else None
+    framework_idents = _FRAMEWORK_TAMPER_EXACT_IDENTS | _FRAMEWORK_NAMESPACE_EXACT_IDENTS
+
     no_comments = _strip_comments_preserve_strings_and_lines(raw_text)
     for ln, joined in _join_backslash_lines_with_map(no_comments):
         if _FRAMEWORK_TAMPER_MACRO_RE.search(joined):
             _record(ln, "Defining or redefining test framework guard, macros, or framework symbols is forbidden")
         if check_namespace_and_registry and _FRAMEWORK_HEADER_INCLUDE_RE.match(joined):
             _record(ln, "Non-test worker code must not include test_framework.hpp")
+        define_head = _FRAMEWORK_DEFINE_HEAD_RE.match(joined)
+        if define_head is not None:
+            body = joined[define_head.end():]
+            if framework_idents.intersection(_IDENT_WORD_RE.findall(body)):
+                _record(ln, "Defining a macro whose body references test framework symbols is forbidden")
+            if "##" in body:
+                _record(ln, "Token pasting in a macro definition is forbidden (it can build framework identifiers)")
 
-    tokens = _tokenize_preprocessed_lines(preprocessed_lines)
+    origin_words_cache: dict[str, frozenset[str] | None] = {}
+
+    def _spelled_words(origin: str) -> frozenset[str] | None:
+        """Identifiers spelled out in the origin file; ``None`` when the file cannot be read (fail closed)."""
+        if origin in origin_words_cache:
+            return origin_words_cache[origin]
+        if origin == "<stdin>" or origin == target_key:
+            text: str | None = raw_text
+        else:
+            try:
+                text = pathlib.Path(origin).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = None
+        words = (
+            None
+            if text is None
+            else frozenset(_IDENT_WORD_RE.findall(_strip_comments_preserve_strings_and_lines(text)))
+        )
+        origin_words_cache[origin] = words
+        return words
+
+    tokens: list[tuple[int, str, str, str]] = []
+    for ln, line_txt, origin_name in preprocessed_lines:
+        origin = _resolve_origin_name(origin_name)
+        if origin == pack_header_key:
+            continue
+        for tok_ln, kind, val in _tokenize_preprocessed_lines([(ln, line_txt)]):
+            tokens.append((tok_ln, kind, val, origin))
     n = len(tokens)
-    for idx, (ln, kind, val) in enumerate(tokens):
+    for idx, (ln, kind, val, origin) in enumerate(tokens):
         if kind != "id":
             continue
-        if val in _FRAMEWORK_TAMPER_EXACT_IDENTS:
+        is_framework_sym = val in _FRAMEWORK_TAMPER_EXACT_IDENTS or (
+            check_namespace_and_registry and val in _FRAMEWORK_NAMESPACE_EXACT_IDENTS
+        )
+        if is_framework_sym:
+            spelled = _spelled_words(origin)
+            if spelled is None or val in spelled:
+                _record(
+                    ln,
+                    f"Defining or referencing test framework symbol '{val}' is forbidden",
+                )
+            continue
+        if check_namespace_and_registry and val == "namespace" and idx + 1 < n and tokens[idx + 1][1] == "id" and tokens[idx + 1][2] == "can_fixture_test":
             _record(
                 ln,
-                f"Defining or referencing test framework symbol '{val}' is forbidden",
+                "Defining or reopening namespace 'can_fixture_test' is forbidden",
             )
-            continue
-        if check_namespace_and_registry:
-            if val in _FRAMEWORK_NAMESPACE_EXACT_IDENTS:
-                _record(
-                    ln,
-                    f"Defining or referencing test framework namespace/symbol '{val}' is forbidden",
-                )
-                continue
-            if val == "namespace" and idx + 1 < n and tokens[idx + 1][1] == "id" and tokens[idx + 1][2] == "can_fixture_test":
-                _record(
-                    ln,
-                    "Defining or reopening namespace 'can_fixture_test' is forbidden",
-                )
     return hits
 
 
@@ -3586,6 +3652,7 @@ def check_c_or_cpp_file(
     resource_limit_hit = False
     preprocess_failed = False
     preproc_lines: list[tuple[int, str]] | None = None
+    preproc_origin: list[tuple[int, str, str]] | None = None
     preproc_flags = _resolve_effective_compiler_flags(
         path,
         cfg,
@@ -3599,7 +3666,7 @@ def check_c_or_cpp_file(
         or (not is_pristine_framework_file and "TEST-FRAMEWORK-TAMPER" not in disabled and not is_test_dir)
     ):
         try:
-            preproc_lines = _preprocess_repo_lines(
+            preproc_origin = _preprocess_repo_origin_lines(
                 path,
                 raw_text,
                 is_c=is_c,
@@ -3614,6 +3681,7 @@ def check_c_or_cpp_file(
                 compile_commands=compile_commands,
                 tool_env=tool_env,
             )
+            preproc_lines = [(ln, txt) for ln, txt, _origin in preproc_origin]
         except LintResourceLimitError as exc:
             resource_limit_hit = True
             _add_lexical_finding(1, "LINT-RESOURCE-LIMIT", "error", str(exc))
@@ -3655,10 +3723,10 @@ def check_c_or_cpp_file(
         and not is_pristine_framework_file
         and "TEST-FRAMEWORK-TAMPER" not in disabled
     ):
-        tamper_lines = preproc_lines
+        tamper_lines = preproc_origin
         if is_test_dir or tamper_lines is None:
             try:
-                tamper_lines = _preprocess_repo_lines(
+                tamper_lines = _preprocess_repo_origin_lines(
                     path,
                     raw_text,
                     is_c=is_c,
@@ -3689,6 +3757,7 @@ def check_c_or_cpp_file(
                 tamper_lines,
                 raw_text,
                 check_namespace_and_registry=(is_header or not is_test_dir),
+                target_path=path,
             ):
                 _add_lexical_finding(tamper_ln, "TEST-FRAMEWORK-TAMPER", "error", tamper_reason)
 
