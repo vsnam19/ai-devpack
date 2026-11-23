@@ -480,12 +480,15 @@ def run_task_workflow(
     memory_enabled: bool | None = None,
     memory_top_k: int | None = None,
     memory_budget_tokens: int | None = None,
+    skills_enabled: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
     Executes all agent roles (``implementer``, ``reviewer``, ``fixer``) via
     ``agent_exec.run_agent`` and writes all step transcripts and gate logs into
     one shared v0.2 run directory (``kind: task``).
+    ``skills_enabled`` is forwarded to every ``AgentRequest``; when False the
+    agent is launched with ``--disable-slash-commands`` (default behaviour).
     Returns ``(exit_code, summary_dict)``.
     """
     if isinstance(config, EnginesConfig):
@@ -655,6 +658,7 @@ def run_task_workflow(
             memory_root=effective_mem_root,
             memory_top_k=memory_top_k,
             memory_budget_tokens=memory_budget_tokens,
+            skills_enabled=skills_enabled,
             memory_config=mem_cfg,
             memory_task_text=(
                 context.get("ONE_PARAGRAPH_GOAL", "")
@@ -1114,6 +1118,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Agent CLI executable name or path (default: claude)",
     )
     parser.add_argument(
+        "--skills",
+        action="store_true",
+        help="Enable slash commands/skills in agent invocations (default: off, passes --disable-slash-commands)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the step plan and template resolution without running commands",
@@ -1186,6 +1195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_unsandboxed_local=args.allow_unsandboxed_local,
         credentials_path=credentials_path,
         agent_bin=args.agent_bin,
+        skills_enabled=args.skills,
     )
     return rc
 

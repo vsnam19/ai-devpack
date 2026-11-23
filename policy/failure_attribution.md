@@ -63,7 +63,37 @@ computes deterministic heuristic signals (no LLM) from `run.json`, `steps/*.prom
   `{suspected_cause, secondary, confidence ("low"|"medium"|"high"), signals {...}, evidence [{step, line, text}], analyzed_at, confirmed [...]}`.
 - All evidence excerpts and paths pass through `Redactor` (`policy/logging.md`).
 
-## 4. Human confirmation (`runner/devpack_logs.py attribute`)
+## 4. Code index (`runner/repomap.py`) and eval ablation arms (`eval/run_eval.py --ablate`)
+
+Heuristic signals narrow down likely causes, while controlled ablation arms establish
+causal attribution on failing evaluation tasks:
+
+- **Repository code map (`runner/repomap.py`):** stdlib-only deterministic C/C++ indexer
+  (`python3 runner/repomap.py --repo DIR [--task FILE] [--budget 1500]`) outputting a
+  budgeted Markdown index (file tree + public classes, structs, enums, functions, and
+  Doxygen `@brief`s) ranked by identifier and requirement-ID overlap with the task.
+- **Controlled eval arms (`eval/run_eval.py`):**
+  - `--context none|repomap`: injects `runner/repomap.py` output under `## Code map`
+    and records `context` in `run.json`.
+  - `--brief-variant standard|minimal|oracle`: tests `task.md` (`standard`), first goal
+    paragraph only (`minimal`), or `task.md` + human-written `oracle.md` (`oracle`;
+    skips tasks without `oracle.md` with reason `no_oracle`).
+  - `--skills` / skill toggle: compares skills off vs skills on.
+- **`--ablate` attribution rule:** every failed trial runs `devpack_logs analyze` to record
+  `suspected_cause`, and each task failing in the base arm is rerun in `oracle-brief`,
+  `repomap`, and `skill-on` (or `skill-off` when `--skills` was enabled):
+  - Passes only with `oracle-brief` -> `BRIEF`
+  - Passes only with `repomap` -> `CONTEXT`
+  - Passes only with skill toggle -> `SKILL`
+  - Fails under all arms -> `MODEL_OR_TOOL`, split using `analyze` signals into `TOOL`
+    (denied calls, over-context, tool protocol errors), `ENV` (timeout, quota/network),
+    or `MODEL` (clean harness with logic/gate failure).
+- **Reporting & cost note:** `eval/run_eval.py` renders a per-engine `## Failure causes`
+  table (`Engine`, `Cause`, `Count`, `Share`, `Example task`) in `summary.md` and
+  `results.json`. Because `--ablate` reruns up to `3` extra arms per failing `(task, engine)`
+  pair (up to `4x` total trials at `k=1`), verify plans with `--dry-run --ablate` first.
+
+## 5. Human confirmation (`runner/devpack_logs.py attribute`)
 
 Heuristic attribution is advisory until a human confirms or corrects it:
 
@@ -78,20 +108,20 @@ python3 runner/devpack_logs.py attribute runs/<run-id> \
 This validates `--cause` (and optional `--secondary`) against the taxonomy and appends
 `{cause, secondary, note, by, timestamp}` to `attribution.json` under `confirmed`.
 
-## 5. Routing causes to fixes (learning loop)
+## 6. Routing causes to fixes (learning loop)
 
 Confirmed attributions drive targeted fixes rather than blind retries:
 
 | Cause | Fix target |
 |---|---|
 | `BRIEF` | Update brief templates (`workflow/templates/`), `orchestrator/CLAUDE.md`, or `runner/brief_lint.py` checks |
-| `CONTEXT` | Improve repository context / code index injection (`AGENTS.md`, `eval/` context arms) |
+| `CONTEXT` | Improve repository context / code index injection (`AGENTS.md`, `runner/repomap.py`, `eval/` context arms) |
 | `SKILL` | Author or refine skills via `knowledge/skills/` and validate with `skilltest/skilltest.py` |
 | `TOOL` | Fix runner, broker, linter, or sandbox contracts (`runner/`, `enforcement/`) |
 | `MODEL` | Update engine profiles (`knowledge/engine_profiles/`), qualification thresholds (`policy/local_models.md`), or engine/role routing |
 | `ENV` | Exclude from model quality metrics; fix server context/quota/timeout configuration |
 
-## 6. Director jobs and v0.2 build rework retrospective
+## 7. Director jobs and v0.2 build rework retrospective
 
 Director-level orchestration jobs and `agent-hub` incident entries use the **exact same
 six cause labels** (`BRIEF`, `CONTEXT`, `SKILL`, `TOOL`, `MODEL`, `ENV`) so rework across

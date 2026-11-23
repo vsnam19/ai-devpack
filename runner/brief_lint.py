@@ -286,9 +286,11 @@ def _normalize_heading(raw_title: str) -> str:
 def _parse_sections(lines: Sequence[str]) -> list[dict[str, Any]]:
     """Split brief lines into heading-delimited sections, ignoring fenced code blocks."""
     sections: list[dict[str, Any]] = []
+    enclosing_h2_norm = ""
     current: dict[str, Any] = {
         "heading": "",
         "normalized": "",
+        "enclosing_h2": "",
         "level": 0,
         "line": 1,
         "body_lines": [],
@@ -305,9 +307,15 @@ def _parse_sections(lines: Sequence[str]) -> list[dict[str, Any]]:
                 sections.append(current)
                 level = len(m.group(1))
                 raw_title = m.group(2).strip()
+                norm_title = _normalize_heading(raw_title)
+                if level == 1:
+                    enclosing_h2_norm = ""
+                elif level == 2:
+                    enclosing_h2_norm = norm_title
                 current = {
                     "heading": raw_title,
-                    "normalized": _normalize_heading(raw_title),
+                    "normalized": norm_title,
+                    "enclosing_h2": enclosing_h2_norm if level >= 3 else "",
                     "level": level,
                     "line": idx,
                     "body_lines": [],
@@ -323,6 +331,16 @@ def _match_canonical_section(norm: str) -> str | None:
     for canonical, aliases in REQUIRED_HEADINGS:
         if norm in aliases:
             return canonical
+    return None
+
+
+def _effective_canonical_section(sec: Mapping[str, Any]) -> str | None:
+    """Return canonical section for ``sec``, inheriting enclosing ``##`` for ``###``+ subsections."""
+    direct = _match_canonical_section(str(sec.get("normalized", "")))
+    if direct is not None:
+        return direct
+    if int(sec.get("level", 0) or 0) >= 3:
+        return _match_canonical_section(str(sec.get("enclosing_h2", "")))
     return None
 
 
@@ -367,7 +385,7 @@ def _collect_expected_output_paths(
     """Return repo-relative paths mentioned anywhere in the brief's Expected output section."""
     mentioned: set[str] = set()
     for sec in sections:
-        if _match_canonical_section(sec["normalized"]) != "Expected output":
+        if _effective_canonical_section(sec) != "Expected output":
             continue
         in_fence = False
         for _, line in sec["body_lines"]:
@@ -548,7 +566,7 @@ def lint_brief_text(
     expected_paths = _collect_expected_output_paths(sections, repo, top_dirs)
 
     for sec in sections:
-        sec_canon = _match_canonical_section(sec["normalized"])
+        sec_canon = _effective_canonical_section(sec)
         in_fence = False
         for lineno, line in sec["body_lines"]:
             if _FENCE_RE.match(line):

@@ -1802,12 +1802,24 @@ def _collect_cpp_repo_symbols(repo_root: pathlib.Path) -> set[str]:
     return symbols
 
 
+def _split_brief_head(prompt_text: str) -> str:
+    """Return the brief portion of ``prompt_text`` before injected context sections."""
+    head = prompt_text
+    for marker in (
+        "## Code map",
+        "## Code Quality Checklist",
+        "## Known mistakes for this engine",
+        "## Relevant project memory",
+    ):
+        head = head.split(marker, 1)[0]
+    return head
+
+
 def _extract_brief_paths_from_prompt(prompt_text: str) -> set[str]:
     """Extract path-like tokens from the task brief portion of ``prompt_text``."""
     if not prompt_text:
         return set()
-    head = prompt_text.split("## Code Quality Checklist", 1)[0]
-    head = head.split("## Relevant project memory", 1)[0]
+    head = _split_brief_head(prompt_text)
     found: set[str] = set()
     for match in _PROMPT_PATH_RE.finditer(head):
         tok = match.group(1).strip("`'\"(),;[]")
@@ -2034,7 +2046,7 @@ def analyze_run_dir(
             brief_named_paths.update(_extract_brief_paths_from_prompt(step.prompt_text))
 
         if repo_root is not None and step.prompt_text:
-            head_prompt = step.prompt_text.split("## Code Quality Checklist", 1)[0]
+            head_prompt = _split_brief_head(step.prompt_text)
             for p_lineno, p_line in enumerate(head_prompt.splitlines(), start=1):
                 for pm in _PROMPT_PATH_RE.finditer(p_line):
                     cand = pm.group(1).strip("`'\"(),;[]")

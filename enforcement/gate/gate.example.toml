@@ -110,6 +110,18 @@ timeout_s = 120
 required = true
 
 [[check]]
+name = "eval-dry-run-ablate"
+cmd = ["python3", "-B", "eval/run_eval.py", "--dry-run", "--mode", "single", "--engines", "haiku", "--tier", "v2", "--k", "1", "--ablate"]
+timeout_s = 120
+required = true
+
+[[check]]
+name = "repomap-eval-fixture"
+cmd = ["python3", "-B", "runner/repomap.py", "--repo", "eval/fixture", "--task", "eval/tasks/11-vague-link-recovery/task.md", "--budget", "1500"]
+timeout_s = 120
+required = true
+
+[[check]]
 name = "logs-render-fixture"
 cmd = [
   "bash", "-c",
