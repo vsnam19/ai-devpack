@@ -195,6 +195,46 @@ if not re.search(r"@param\[in\]\s+canId\b", hdr):
     sys.exit(1)
 PY
 
+MUTATE_PY="${DEVPACK_ROOT:+$DEVPACK_ROOT/eval/lib/mutate_cpp.py}"
+if [[ -z "$MUTATE_PY" || ! -f "$MUTATE_PY" ]]; then
+    MUTATE_PY="$SCRIPT_DIR/../../lib/mutate_cpp.py"
+fi
+
+# Require the worker's NEW test file (tests/test_ring_count_id.cpp) alone to kill
+# mutants covering count matching, CAN ID filtering, wrap-around, and non-mutation.
+python3 "$MUTATE_PY" --workdir "$WORKDIR" --test-file "tests/test_ring_count_id.cpp" --spec-stdin <<'JSON'
+[
+  {
+    "name": "countByCanId always returns 0",
+    "file": "src/ring_buffer.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bFrameRingBuffer\\s*::\\s*countByCanId\\s*\\([^)]*\\)",
+    "body": "{ (void)canId; return 0U; }"
+  },
+  {
+    "name": "countByCanId ignores canId filter and returns m_count",
+    "file": "src/ring_buffer.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bFrameRingBuffer\\s*::\\s*countByCanId\\s*\\([^)]*\\)",
+    "body": "{ (void)canId; return m_count; }"
+  },
+  {
+    "name": "countByCanId fails on wrap-around modulo m_capacity",
+    "file": "src/ring_buffer.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bFrameRingBuffer\\s*::\\s*countByCanId\\s*\\([^)]*\\)",
+    "body": "{\n    std::size_t matches = 0U;\n    for (std::size_t i = 0U; i < m_count; ++i) {\n        const std::size_t idx = m_tail + i;\n        if (idx < m_capacity && m_storage[idx].canId == canId) {\n            ++matches;\n        }\n    }\n    return matches;\n}"
+  },
+  {
+    "name": "countByCanId mutates buffer state by clearing m_count",
+    "file": "src/ring_buffer.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bFrameRingBuffer\\s*::\\s*countByCanId\\s*\\([^)]*\\)",
+    "body": "{\n    std::size_t matches = 0U;\n    for (std::size_t i = 0U; i < m_count; ++i) {\n        const std::size_t idx = (m_tail + i) % m_capacity;\n        if (m_storage[idx].canId == canId) {\n            ++matches;\n        }\n    }\n    const_cast<FrameRingBuffer*>(this)->m_count = 0U;\n    return matches;\n}"
+  }
+]
+JSON
+
 
 echo "PASS: 06-small-feature-ring-count-id"
 exit 0

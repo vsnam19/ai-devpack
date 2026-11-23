@@ -196,48 +196,60 @@ if check_count < 8:
     sys.exit(1)
 PY
 
-# Mutation 1: fail to reset m_retryCount in onHeartbeat
-cp -r "$WORKDIR/." "$TMP_GRADE_DIR/mutant1"
-python3 - "$TMP_GRADE_DIR/mutant1/src/link_state_machine.cpp" <<'PY'
-import pathlib
-import sys
-p = pathlib.Path(sys.argv[1])
-text = p.read_text(encoding="utf-8")
-target = """bool LinkStateMachine::onHeartbeat(std::uint64_t nowMs) noexcept {
-    if ((m_state != LinkState::Active && m_state != LinkState::Degraded) ||
-        nowMs < m_lastTimestampMs) {
-        return false;
-    }
-    m_state = LinkState::Active;
-    m_lastTimestampMs = nowMs;
-    m_retryCount = 0U;
-    return true;
-}"""
-replacement = target.replace("    m_retryCount = 0U;\n", "")
-assert replacement != target and target in text, "mutant1 replacement failed"
-p.write_text(text.replace(target, replacement, 1), encoding="utf-8")
-PY
-if bash "$TMP_GRADE_DIR/mutant1/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
-    echo "FAIL: tests did not catch mutant 1 (retryCount not reset on heartbeat recovery)" >&2
-    exit 1
+MUTATE_PY="${DEVPACK_ROOT:+$DEVPACK_ROOT/eval/lib/mutate_cpp.py}"
+if [[ -z "$MUTATE_PY" || ! -f "$MUTATE_PY" ]]; then
+    MUTATE_PY="$SCRIPT_DIR/../../lib/mutate_cpp.py"
 fi
 
-# Mutation 2: allow onHeartbeat during Connecting state
-cp -r "$WORKDIR/." "$TMP_GRADE_DIR/mutant2"
-python3 - "$TMP_GRADE_DIR/mutant2/src/link_state_machine.cpp" <<'PY'
-import pathlib
-import sys
-p = pathlib.Path(sys.argv[1])
-text = p.read_text(encoding="utf-8")
-old_cond = "(m_state != LinkState::Active && m_state != LinkState::Degraded)"
-new_cond = "(m_state == LinkState::Idle)"
-assert old_cond in text, "mutant2 target not found"
-p.write_text(text.replace(old_cond, new_cond, 1), encoding="utf-8")
-PY
-if bash "$TMP_GRADE_DIR/mutant2/build_and_test.sh" --no-cmake >/dev/null 2>&1; then
-    echo "FAIL: tests did not catch mutant 2 (onHeartbeat accepted in Connecting/Fault)" >&2
-    exit 1
-fi
+# Require the worker's NEW test file (tests/test_link_recovery.cpp) alone to kill
+# mutants covering every required behaviour: Degraded->Active transition, state update,
+# retryCount reset, and rejection in Idle, Connecting, and Fault.
+python3 "$MUTATE_PY" --workdir "$WORKDIR" --test-file "tests/test_link_recovery.cpp" --spec-stdin <<'JSON'
+[
+  {
+    "name": "reject onHeartbeat in Degraded",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*onHeartbeat\\s*\\([^)]*\\)",
+    "body": "{\n    if (m_state != LinkState::Active || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_state = LinkState::Active;\n    m_lastTimestampMs = nowMs;\n    m_retryCount = 0U;\n    return true;\n}"
+  },
+  {
+    "name": "keep Degraded state on heartbeat instead of transitioning to Active",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*onHeartbeat\\s*\\([^)]*\\)",
+    "body": "{\n    if ((m_state != LinkState::Active && m_state != LinkState::Degraded) || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_lastTimestampMs = nowMs;\n    m_retryCount = 0U;\n    return true;\n}"
+  },
+  {
+    "name": "do not reset m_retryCount in onHeartbeat",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*onHeartbeat\\s*\\([^)]*\\)",
+    "body": "{\n    if ((m_state != LinkState::Active && m_state != LinkState::Degraded) || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_state = LinkState::Active;\n    m_lastTimestampMs = nowMs;\n    return true;\n}"
+  },
+  {
+    "name": "allow onHeartbeat in Idle",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*onHeartbeat\\s*\\([^)]*\\)",
+    "body": "{\n    if ((m_state != LinkState::Active && m_state != LinkState::Degraded && m_state != LinkState::Idle) || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_state = LinkState::Active;\n    m_lastTimestampMs = nowMs;\n    m_retryCount = 0U;\n    return true;\n}"
+  },
+  {
+    "name": "allow onHeartbeat in Connecting",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*onHeartbeat\\s*\\([^)]*\\)",
+    "body": "{\n    if ((m_state != LinkState::Active && m_state != LinkState::Degraded && m_state != LinkState::Connecting) || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_state = LinkState::Active;\n    m_lastTimestampMs = nowMs;\n    m_retryCount = 0U;\n    return true;\n}"
+  },
+  {
+    "name": "allow onHeartbeat in Fault",
+    "file": "src/link_state_machine.cpp",
+    "mode": "replace_body",
+    "func_regex": "\\bLinkStateMachine\\s*::\\s*onHeartbeat\\s*\\([^)]*\\)",
+    "body": "{\n    if ((m_state != LinkState::Active && m_state != LinkState::Degraded && m_state != LinkState::Fault) || nowMs < m_lastTimestampMs) {\n        return false;\n    }\n    m_state = LinkState::Active;\n    m_lastTimestampMs = nowMs;\n    m_retryCount = 0U;\n    return true;\n}"
+  }
+]
+JSON
 
 
 echo "PASS: 05-add-test-link-recovery"

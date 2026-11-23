@@ -364,30 +364,30 @@ class MemoryEvalTests(unittest.TestCase):
             self.assertEqual(0.0, with_memory[0]["memory_recall_rate"])
 
     def test_01_recall_decision_resets_repo_before_step2_so_without_memory_fails(self) -> None:
-        """Memory seq 01 resets Step 2 repo to baseline; agent reading code sees no 0xA5U so memory-off fails and memory-on passes."""
+        """Memory seq 01 resets Step 2 repo to baseline; agent reading code sees no 0xD3U so memory-off fails and memory-on passes."""
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             seq_src = EVAL_DIR / "memory_tasks" / "01-recall-decision"
             mem_tasks = base / "memory_tasks"
             shutil.copytree(seq_src, mem_tasks / "01-recall-decision")
 
-            # Fake agent inspects src/dtc_debouncer.cpp in Step 2; uses 0xA5U ONLY if in memory prompt or in code.
+            # Fake agent inspects src/dtc_debouncer.cpp in Step 2; uses 0xD3U ONLY if in memory prompt or in code.
             fake_agent = _write_exec(
                 base / "fake_claude.py",
                 "#!/usr/bin/env python3\n"
                 "import json, pathlib, sys\n"
                 "prompt = sys.argv[-1]\n"
                 "if 'Step 1:' in prompt:\n"
-                "    # Plant 0xA5U in a scratch file and source to verify reset_repo_before strips it before Step 2.\n"
+                "    # Plant 0xD3U in a scratch file and source to verify reset_repo_before strips it before Step 2.\n"
                 "    pathlib.Path('src/dtc_debouncer.cpp').write_text("
-                "pathlib.Path('src/dtc_debouncer.cpp').read_text(encoding='utf-8') + '\\n// 0xA5U\\n', encoding='utf-8')\n"
+                "pathlib.Path('src/dtc_debouncer.cpp').read_text(encoding='utf-8') + '\\n// 0xD3U\\n', encoding='utf-8')\n"
                 "    out = ('Step 1 complete.\\n\\n## Memory proposals\\n'\n"
                 "           '- type: handoff\\n  id: mem-dtc-freeze-sentinel\\n  scope: task:01-recall-decision\\n'\n"
                 "           '  tags: REQ-DTC-005, dtc_debouncer, freezeSentinelCode, isFreezeSentinelMatch\\n'\n"
-                "           '  summary: Active freeze sentinel code for REQ-DTC-005 in dtc_debouncer is 0xA5U (0x00U when inactive).\\n')\n"
+                "           '  summary: Active freeze sentinel code for REQ-DTC-005 in dtc_debouncer is 0xD3U (0x00U when inactive).\\n')\n"
                 "else:\n"
                 "    code_src = pathlib.Path('src/dtc_debouncer.cpp').read_text(encoding='utf-8')\n"
-                "    sentinel = '0xA5U' if ('0xA5U' in prompt or '0xA5U' in code_src) else '0x01U'\n"
+                "    sentinel = '0xD3U' if ('0xD3U' in prompt or '0xD3U' in code_src) else '0x01U'\n"
                 "    hpp = pathlib.Path('include/dtc_debouncer.hpp')\n"
                 "    hpp.write_text(hpp.read_text(encoding='utf-8').replace(\n"
                 "        'private:',\n"

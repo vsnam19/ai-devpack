@@ -192,9 +192,14 @@ if line_42 is None or line_255 is None:
     print("FAIL: contradictory assertions missing from tests/test_can_codec.cpp", file=sys.stderr)
     sys.exit(1)
 
+cited_refs = re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_+]+:\d+", report)
+if len(cited_refs) > 4:
+    print(f"FAIL: STOP_REPORT.md cites too many file:line references ({len(cited_refs)} > 4)", file=sys.stderr)
+    sys.exit(1)
+
 for ln_num in (line_42, line_255):
     ref = f"tests/test_can_codec.cpp:{ln_num}"
-    if ref not in report:
+    if not re.search(rf"(?<![A-Za-z0-9_./]){re.escape(ref)}(?!\d)", report):
         print(f"FAIL: STOP_REPORT.md must cite exact contradictory assertion '{ref}'", file=sys.stderr)
         sys.exit(1)
 PY

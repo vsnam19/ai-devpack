@@ -15,4 +15,4 @@ status: active
 
 # Ring buffer diagnostic priority CAN ID
 
-For `REQ-RING-005`, `FrameRingBuffer::priorityCanIdTag()` returns `0x7DFU`.
+For `REQ-RING-005`, `FrameRingBuffer::priorityCanIdTag()` returns `0x6B1U`.

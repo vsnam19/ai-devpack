@@ -5,6 +5,21 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Fixed
+- **F5b cross-review grader gaps (`skilltest/case_check.py`, `eval/tasks/07-small-feature-codec-raw-range/`, `eval/orchestrator_goals/01-link-fault-recovery/`, `tests/test_f5b_grader_regressions.py`)**:
+  - The `skill-authoring` `test-matrix` check now also requires each draft grader to exit 0 on the case's reference candidate (`expected/test-matrix/signal-helper/tests/expected/<behaviour>`), in addition to exiting nonzero on the bad fixture; a missing reference fails with "no valid candidate to prove grader acceptance". A grader that is `exit 1` no longer passes.
+  - Task 07 split the combined signed boundary mutant into a lower-only mutant (accepts -129) and an upper-only mutant (accepts 128); each must be killed.
+  - Orchestrator Goal 01 non-monotonic mutant now changes only the `nowMs < m_lastTimestampMs` comparison and keeps the `m_lastTimestampMs = nowMs;` assignment on successful recovery.
+  - Added regression tests `test_skill_authoring_rejects_always_fail_grader`, `test_task07_signed_mutants_split`, and `test_goal01_monotonic_mutant_keeps_timestamp_update`.
+- **Task, orchestrator, skill, and memory grader validity round 2 (`eval/lib/mutate_cpp.py`, `eval/tasks/`, `eval/orchestrator_goals/01-link-fault-recovery/`, `eval/memory_tasks/`, `knowledge/skills/`, `skilltest/`, `eval/run_eval.py`)**:
+  - Isolated worker-authored new test files (`test_link_recovery.cpp`, `test_ring_count_id.cpp`, `test_codec_raw_range.cpp`, `test_link_fault_recovery.cpp`) in Tasks 05/06/07 and Orchestrator Goal 01 so the worker's new test file itself must compile and kill per-behaviour mutants (covering Idle, Fault, and Degraded->Active in Task 05; filtering/wrap-around/non-mutation in Task 06; signed/unsigned bounds in Task 07; and `faultCount`/`recoverFromFault`/`reset` in Orchestrator Goal 01).
+  - Replaced the 11-word denylist in Tasks 08/09 with a camelCase meaningful-identifier allow-pattern (`len >= 3`, not denylisted, camelCase) on header/source parameters, local variables, and private members, and accepted `[[nodiscard]]`, `inline`, `constexpr`, and `static` prefixes in declaration regexes.
+  - Hardened Task 18 to require defect explanation in the Problem cell (not anywhere in the row), accept `(src/)link_state_machine.cpp:N`, and cap extra non-blocker rows at `<= 3`; hardened Task 10 with word-boundary matching and max `4` `file:line` references; enforced unchanged `src/` in Task 20.
+  - Updated `requirements-analysis/tests/grade_findings.py` to read the pristine fixture `spec.md`, enforce per-ID defect class sets, and require non-trivial `why`/`question` cells (`>= 5` non-placeholder words).
+  - Updated `automotive-cpp` `heap-exceptions-casts/grader_test.cpp` to assert `SampleFilter::kMaxWindowSize == 8U` and compare clamped count against literal `8U`.
+  - Updated `skilltest/case_check.py` and `skilltest/skilltest.py` for order-independent/quoted frontmatter with `>= 10`-word descriptions, non-trivial `test-matrix` grader checks that fail on the fixture, case-insensitive/trailing-blank-tolerant/defect-grounded `review-taxonomy` checks, SHA-256 content-hash contamination checks, and per-case behaviour CI reporting without cross-case binomial pooling.
+  - Replaced guessable constants in memory sequences (`0xA5U` -> `0xD3U`, `0x7DFU` -> `0x6B1U`, `0x5AU` -> `0xB9U`), grounded Sequence 05 step 1 `REVIEW.md` in code/spec rather than memory-injected `VERDICT: APPROVE`, and excluded timed-out trials consistently from both `mean_lint_findings_first_attempt` and `mean_lint_findings_final` with reported `lint_missing_timeouts` counts.
+
 ## [0.2.2] - 2026-11-23
 
 ### Security

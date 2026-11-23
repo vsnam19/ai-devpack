@@ -34,7 +34,7 @@ index 000ff0f..59bfbe3 100644
  }
  
 +std::uint8_t LinkStateMachine::heartbeatGuardCode() const noexcept {
-+    return static_cast<std::uint8_t>(0x5AU);
++    return static_cast<std::uint8_t>(0xB9U);
 +}
 +
  }  // namespace can_fixture

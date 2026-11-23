@@ -9,8 +9,164 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from skilltest.frontmatter import load_config, parse_frontmatter  # noqa: E402
+
+
+REVIEW_DEFECT_TERMS: dict[str, tuple[str, ...]] = {
+    "bounds-review": (
+        "bounds",
+        "index",
+        "range",
+        "out-of-bounds",
+        "out of bounds",
+        "values[index]",
+        "unchecked",
+    ),
+    "gate-review": (
+        "gate",
+        "receipt",
+        "check",
+        "verify",
+        "deterministic",
+        "evidence",
+        "skipped",
+    ),
+}
+
+
+def _strip_outer_quotes(value: str) -> str:
+    """Strip matching single or double outer quotes from a frontmatter scalar."""
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ('"', "'"):
+        return stripped[1:-1].strip()
+    return stripped
+
+
+def _check_review_taxonomy(
+    directory: Path,
+    case: str,
+    expected_category: str,
+    expected_severity: str,
+    expected_verdict: str,
+) -> int:
+    """Validate REVIEW.md table format, defect range, problem text, and trailing verdict."""
+    review = directory / "REVIEW.md"
+    if not review.is_file():
+        return 1
+    text = review.read_text(encoding="utf-8")
+    non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not non_empty_lines or non_empty_lines[-1] != f"VERDICT: {expected_verdict}":
+        return 1
+
+    table_rows = [line for line in non_empty_lines if line.startswith("|") and line.endswith("|")]
+    if len(table_rows) < 3:
+        return 1
+    header_cells = [c.strip().lower() for c in table_rows[0].strip("|").split("|")]
+    if not re.match(r"^\|(\s*:?-{2,}:?\s*\|)+$", table_rows[1]):
+        return 1
+
+    def _col(predicate) -> int | None:
+        return next((idx for idx, h in enumerate(header_cells) if predicate(h)), None)
+
+    cat_idx = _col(lambda h: "category" in h)
+    sev_idx = _col(lambda h: "severity" in h)
+    loc_idx = _col(lambda h: "file" in h or "line" in h)
+    prob_idx = _col(lambda h: "problem" in h)
+    fix_idx = _col(lambda h: "fix" in h)
+    if None in (cat_idx, sev_idx, loc_idx, prob_idx, fix_idx):
+        return 1
+
+    module_path = directory / "module.cpp"
+    max_line = max(1, len(module_path.read_text(encoding="utf-8").splitlines())) if module_path.is_file() else 1
+    loc_re = re.compile(r"(?:^|[\s`/])module\.cpp:(\d+)(?:-(\d+))?")
+    defect_terms = REVIEW_DEFECT_TERMS.get(case, ())
+
+    for row in table_rows[2:]:
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        if len(cells) < len(header_cells):
+            continue
+        category = cells[cat_idx].strip("` ").upper()
+        severity = cells[sev_idx].strip("` ").lower()
+        loc = cells[loc_idx]
+        problem = cells[prob_idx].lower()
+        if category != expected_category.upper() or severity != expected_severity.lower():
+            continue
+        m = loc_re.search(loc)
+        if not m:
+            continue
+        start_ln = int(m.group(1))
+        end_ln = int(m.group(2)) if m.group(2) else start_ln
+        if start_ln < 1 or end_ln < start_ln or end_ln > max_line:
+            continue
+        if defect_terms and not any(term in problem for term in defect_terms):
+            continue
+        return 0
+    return 1
+
+
+def _run_grader(cmd: list[str], grader_dir: Path, candidate: Path, root: Path) -> subprocess.CompletedProcess[str]:
+    """Run a draft grader command against one candidate directory."""
+    return subprocess.run(
+        [*cmd, str(candidate)],
+        cwd=grader_dir,
+        env={**os.environ, "DEVPACK_ROOT": str(root)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _check_skill_authoring(draft: Path, case: str, root: Path) -> int:
+    """Validate skill-authoring frontmatter-draft and test-matrix candidate drafts."""
+    if case == "frontmatter-draft":
+        skill_file = draft / "SKILL.md"
+        if not skill_file.is_file():
+            return 1
+        meta, _, fm_errors = parse_frontmatter(skill_file.read_text(encoding="utf-8"))
+        if fm_errors:
+            return 1
+        name = _strip_outer_quotes(meta.get("name", ""))
+        description = _strip_outer_quotes(meta.get("description", ""))
+        if name != "signal-helper":
+            return 1
+        words = re.findall(r"[A-Za-z0-9_'-]+", description)
+        return 0 if len(words) >= 10 else 1
+
+    if case == "test-matrix":
+        if not run(["python3", str(root / "skilltest/skilltest.py"), "lint", str(draft)], draft.parent):
+            return 1
+        config = load_config(draft)
+        cases = config.get("behaviour", [])
+        if not cases:
+            return 1
+        reference = root / "knowledge/skills/skill-authoring/tests/expected" / case / "signal-helper" / "tests" / "expected"
+        for beh in cases:
+            fixture_dir = draft / "tests" / beh["fixture"]
+            grader_dir = draft / "tests" / beh["grader"]
+            cmd = shlex.split(beh["check"])
+            if not fixture_dir.is_dir() or not grader_dir.is_dir() or not cmd:
+                return 1
+            valid_candidate = reference / beh["name"]
+            if not valid_candidate.is_dir():
+                print("no valid candidate to prove grader acceptance", file=sys.stderr)
+                return 1
+            # The grader must accept a known-valid candidate and reject the bad fixture.
+            if _run_grader(cmd, grader_dir, valid_candidate, root).returncode != 0:
+                return 1
+            if _run_grader(cmd, grader_dir, fixture_dir, root).returncode == 0:
+                return 1
+        return 0
+
+    return 2
 
 
 def run(command: list[str], directory: Path) -> bool:
@@ -62,28 +218,21 @@ def main(argv: list[str]) -> int:
         print(f"unknown case: {case}", file=sys.stderr)
         return 2
     if skill == "review-taxonomy":
-        review = directory / "REVIEW.md"
-        text = review.read_text(encoding="utf-8") if review.is_file() else ""
-        required = "| ID | Category | Severity | file:line | Problem (with evidence) | Required fix |"
         expected_category = os.environ.get("SKILLTEST_EXPECTED_CATEGORY")
         expected_severity = os.environ.get("SKILLTEST_EXPECTED_SEVERITY")
         expected_verdict = os.environ.get("SKILLTEST_EXPECTED_VERDICT")
         if not all((expected_category, expected_severity, expected_verdict)):
             print("review expectations are required", file=sys.stderr)
             return 2
-        lines = text.splitlines()
-        expected_row = f"| {expected_category} | {expected_severity} |"
-        return 0 if required in text and expected_row in text and any("module.cpp:" in line for line in lines) and lines and lines[-1] == f"VERDICT: {expected_verdict}" else 1
+        return _check_review_taxonomy(
+            directory, case, expected_category, expected_severity, expected_verdict
+        )
     if skill == "skill-authoring":
         draft = directory / "signal-helper"
-        if case == "frontmatter-draft":
-            skill_file = draft / "SKILL.md"
-            text = skill_file.read_text(encoding="utf-8") if skill_file.is_file() else ""
-            return 0 if text.startswith("---\nname: signal-helper\n") and "description:" in text else 1
-        if case == "test-matrix":
-            return 0 if run(["python3", str(root / "skilltest/skilltest.py"), "lint", str(draft)], directory) else 1
-        print(f"unknown case: {case}", file=sys.stderr)
-        return 2
+        result = _check_skill_authoring(draft, case, root)
+        if result == 2:
+            print(f"unknown case: {case}", file=sys.stderr)
+        return result
     print(f"unknown case: {case}", file=sys.stderr)
     return 2
 

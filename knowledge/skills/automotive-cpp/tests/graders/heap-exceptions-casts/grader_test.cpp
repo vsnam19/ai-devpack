@@ -30,6 +30,8 @@ int main()
 {
     static_assert(!std::is_convertible<std::size_t, SampleFilter>::value,
                   "SampleFilter single-arg constructor must be explicit");
+    static_assert(SampleFilter::kMaxWindowSize == 8U,
+                  "SampleFilter::kMaxWindowSize must be 8U");
 
     SampleFilter emptyFilter(0U);
     std::int32_t avg = 0;
@@ -63,7 +65,7 @@ int main()
     for (std::int32_t i = 0; i < 10; ++i) {
         GRADER_CHECK(clampedFilter.pushSample(100));
     }
-    GRADER_CHECK(clampedFilter.sampleCount() == SampleFilter::kMaxWindowSize);
+    GRADER_CHECK(clampedFilter.sampleCount() == 8U);
     GRADER_CHECK(clampedFilter.computeAverage(avg));
     GRADER_CHECK(avg == 100);
     return 0;

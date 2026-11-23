@@ -8,6 +8,6 @@
 
 int main() {
     can_fixture::FrameRingBuffer ring(4U);
-    CHECK_EQ(ring.priorityCanIdTag(), static_cast<std::uint32_t>(0x7DFU));
+    CHECK_EQ(ring.priorityCanIdTag(), static_cast<std::uint32_t>(0x6B1U));
     return can_fixture_test::printSummaryAndExitCode();
 }

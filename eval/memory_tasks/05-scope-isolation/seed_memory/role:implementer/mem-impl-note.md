@@ -14,4 +14,4 @@ status: active
 
 # Implementer guard constant
 
-For `REQ-LINK-005`, `heartbeatGuardCode()` returns `0x5AU` (`kImplGuardCode`).
+For `REQ-LINK-005`, `heartbeatGuardCode()` returns `0xB9U` (`kImplGuardCode`).

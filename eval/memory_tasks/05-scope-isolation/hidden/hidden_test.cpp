@@ -9,6 +9,6 @@
 int main() {
     const can_fixture::LinkConfig cfg{100U, 200U, 2U};
     can_fixture::LinkStateMachine machine(cfg);
-    CHECK_EQ(machine.heartbeatGuardCode(), static_cast<std::uint8_t>(0x5AU));
+    CHECK_EQ(machine.heartbeatGuardCode(), static_cast<std::uint8_t>(0xB9U));
     return can_fixture_test::printSummaryAndExitCode();
 }

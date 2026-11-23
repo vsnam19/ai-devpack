@@ -1160,20 +1160,26 @@ class HarnessErrorTests(unittest.TestCase):
                     task_id=task.task_id, category=task.category, model="haiku:sonnet",
                     run_index=2, passed=False, agent_returncode=1, check_returncode=1,
                     cost_usd=0.01, turns=None, duration_s=1.0, mode="runner",
-                    timed_out=True, lint_clean_final=False, rounds_to_clean=3,
+                    timed_out=True, lint_findings_first_attempt=9, lint_clean_final=False, rounds_to_clean=3,
                 ),
                 run_eval.TrialResult(
                     task_id=task.task_id, category=task.category, model="haiku:sonnet",
                     run_index=3, passed=True, agent_returncode=0, check_returncode=0,
                     cost_usd=0.01, turns=None, duration_s=1.0, mode="runner",
-                    lint_findings_first_attempt=2, lint_clean_final=True, rounds_to_clean=1,
+                    lint_findings_first_attempt=2, lint_findings_final=0, lint_clean_final=True, rounds_to_clean=1,
                 ),
             ]
-            ts_lint, _ = run_eval.aggregate_results([task], ["haiku:sonnet"], 3, trials_lint)
+            ts_lint, cat_lint = run_eval.aggregate_results([task], ["haiku:sonnet"], 3, trials_lint)
             self.assertEqual(1, ts_lint[0].no_cpp_change_runs)
+            self.assertEqual(1, ts_lint[0].lint_missing_timeouts)
+            self.assertEqual(1, cat_lint[0]["lint_missing_timeouts"])
+            self.assertAlmostEqual(2.0, ts_lint[0].mean_lint_findings_first_attempt)
+            self.assertAlmostEqual(0.0, ts_lint[0].mean_lint_findings_final)
             self.assertAlmostEqual(0.5, ts_lint[0].lint_clean_final_rate)
             self.assertAlmostEqual(2.0, ts_lint[0].mean_rounds_to_clean)
             self.assertAlmostEqual(0.5, ts_lint[0].rounds_to_clean_fail_share)
+            md_lint = run_eval.render_summary_markdown("r", "2026-11-23", "local", 3, ["haiku:sonnet"], ts_lint, cat_lint, mode="runner")
+            self.assertIn("Lint Missing (TO)", md_lint)
 
             # 3. Single-mode end-to-end with no C++ change records no_cpp_change=True and omits lint_findings_first_attempt in results.json.
             cred = base / "c.json"

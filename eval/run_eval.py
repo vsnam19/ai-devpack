@@ -283,6 +283,7 @@ class TaskModelSummary:
     mean_lint_findings_first_attempt: float | None = None
     mean_lint_findings_final: float | None = None
     lint_clean_final_rate: float | None = None
+    lint_missing_timeouts: int = 0
     mean_rounds_to_clean: float | None = None
     rounds_to_clean_fail_share: float | None = None
     no_cpp_change_runs: int = 0
@@ -2073,8 +2074,7 @@ def run_runner_trial(
                 runner_lint_clean = False
                 runner_rounds_clean = max_fix_rounds + 1
                 runner_static_clean = False
-                if gate_lint_records and gate_lint_records[0].get("lint_findings") is not None:
-                    runner_lint_first = int(gate_lint_records[0]["lint_findings"])
+                runner_lint_first = None
             else:
                 base_ref_runner = _resolve_baseline_ref(
                     work_dir,
@@ -3029,15 +3029,16 @@ def aggregate_results(
 
             no_cpp_change_runs = sum(1 for r in valid if r.no_cpp_change)
             lint_eligible = [r for r in valid if not r.no_cpp_change]
+            lint_missing_timeouts = sum(1 for r in lint_eligible if r.timed_out)
             lint_first = [
                 r.lint_findings_first_attempt
                 for r in lint_eligible
-                if r.mode != "single" and r.lint_findings_first_attempt is not None
+                if not r.timed_out and r.mode != "single" and r.lint_findings_first_attempt is not None
             ]
             lint_final = [
                 r.lint_findings_final
                 for r in lint_eligible
-                if r.lint_findings_final is not None
+                if not r.timed_out and r.lint_findings_final is not None
             ]
             lint_clean = [r.lint_clean_final for r in lint_eligible if r.lint_clean_final is not None]
             lint_rounds = [r.rounds_to_clean for r in lint_eligible if r.rounds_to_clean is not None]
@@ -3048,7 +3049,7 @@ def aggregate_results(
             static_first = [
                 r.static_findings_first_attempt
                 for r in lint_eligible
-                if r.static_findings_first_attempt is not None
+                if not r.timed_out and r.static_findings_first_attempt is not None
             ]
             static_clean = [r.static_clean_final for r in lint_eligible if r.static_clean_final is not None]
 
@@ -3139,6 +3140,7 @@ def aggregate_results(
                         if lint_clean
                         else None
                     ),
+                    lint_missing_timeouts=lint_missing_timeouts,
                     mean_rounds_to_clean=(
                         round(sum(lint_rounds) / len(lint_rounds), 4) if lint_rounds else None
                     ),
@@ -3300,6 +3302,7 @@ def aggregate_results(
                     "mean_lint_findings_first_attempt": _mean(cat_lint_first),
                     "mean_lint_findings_final": _mean(cat_lint_final),
                     "lint_clean_final_rate": _mean(cat_lint_clean),
+                    "lint_missing_timeouts": sum(s.lint_missing_timeouts for s in matching),
                     "mean_rounds_to_clean": _mean(cat_rounds_clean),
                     "rounds_to_clean_fail_share": _mean(cat_rounds_fail_share),
                     "no_cpp_change_runs": cat_no_cpp_runs,
@@ -3408,10 +3411,10 @@ def render_summary_markdown(
         "",
         "## Per-Category Summary",
         "",
-        "Pass metrics include timeouts as not passed; harness errors are excluded. Lint rates exclude no-C/C++-change trials (counted in No-C++) and count timeouts as not clean.",
+        "Pass metrics include timeouts as not passed; harness errors are excluded. Lint clean rate excludes no-C/C++-change trials (counted in No-C++) and counts timeouts as not clean; lint finding means exclude timeouts as missing (reported in Lint Missing (TO)).",
         "",
-        f"| Category | Engine | Tasks | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k_unbiased | pass@k_unbiased | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | {lint_col_label} | Lint Clean | Lint Fail Share | No-C++ | Static 1st | Static Clean |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| Category | Engine | Tasks | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k_unbiased | pass@k_unbiased | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | {lint_col_label} | Lint Missing (TO) | Lint Clean | Lint Fail Share | No-C++ | Static 1st | Static Clean |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for cat in category_summaries:
         cost_str = (
@@ -3432,7 +3435,7 @@ def render_summary_markdown(
             f"{_fmt(cat['pass_at_1'])} | {_fmt_k_metric(cat['pass_hat_k'], under_k)} | "
             f"{_fmt_k_metric(cat.get('pass_hat_k_unbiased'), under_k)} | {_fmt_k_metric(cat.get('pass_at_k_unbiased'), under_k)} | "
             f"{cost_str} | {tok_str} | {cat['mean_duration_s']:.2f} | "
-            f"{_fmt(lint_val)} | {_fmt(cat.get('lint_clean_final_rate'))} | "
+            f"{_fmt(lint_val)} | {cat.get('lint_missing_timeouts', 0)} | {_fmt(cat.get('lint_clean_final_rate'))} | "
             f"{_fmt(cat.get('rounds_to_clean_fail_share'))} | {cat.get('no_cpp_change_runs', 0)} | "
             f"{_fmt(cat.get('mean_static_findings_first_attempt'))} | {_fmt(cat.get('static_clean_final_rate'))} |"
         )
@@ -3442,8 +3445,8 @@ def render_summary_markdown(
             "",
             "## Per-Task Summary",
             "",
-            f"| Task | Category | Engine | Passes (c/valid) | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k_unbiased | pass@k_unbiased | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | {lint_col_label} | Lint Clean | Rounds Clean | Lint Fail Share | No-C++ | Static 1st | Static Clean |",
-            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            f"| Task | Category | Engine | Passes (c/valid) | Harness errors | Timeouts | Tool Protocol Errors | pass@1 | pass^k (all-k) | pass^k_unbiased | pass@k_unbiased | Mean Cost (USD) | Mean Tokens (in/out) | Mean Duration (s) | {lint_col_label} | Lint Missing (TO) | Lint Clean | Rounds Clean | Lint Fail Share | No-C++ | Static 1st | Static Clean |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for ts in task_summaries:
@@ -3463,7 +3466,7 @@ def render_summary_markdown(
             f"{_fmt(ts.pass_at_1)} | {_fmt_k_metric(ts.pass_hat_k, under_k)} | "
             f"{_fmt_k_metric(ts.pass_hat_k_unbiased, under_k)} | {_fmt_k_metric(ts.pass_at_k_unbiased, under_k)} | "
             f"{cost_str} | {tok_str} | {ts.mean_duration_s:.2f} | "
-            f"{_fmt(lint_val)} | {_fmt(ts.lint_clean_final_rate)} | {_fmt(ts.mean_rounds_to_clean)} | "
+            f"{_fmt(lint_val)} | {ts.lint_missing_timeouts} | {_fmt(ts.lint_clean_final_rate)} | {_fmt(ts.mean_rounds_to_clean)} | "
             f"{_fmt(ts.rounds_to_clean_fail_share)} | {ts.no_cpp_change_runs} | "
             f"{_fmt(ts.mean_static_findings_first_attempt)} | {_fmt(ts.static_clean_final_rate)} |"
         )
