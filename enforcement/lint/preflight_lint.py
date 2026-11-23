@@ -4319,6 +4319,32 @@ def _resolve_config_from_args(
     return config
 
 
+def _component_configs(
+    args: argparse.Namespace,
+    repository_root: pathlib.Path,
+    scope: WorkspaceScope,
+    default: LintConfig,
+) -> dict[str, LintConfig]:
+    """Resolve component config files once, retaining explicit CLI configuration precedence."""
+    configs: dict[str, LintConfig] = {}
+    if args.config is not None:
+        return configs
+    for component in scope.active_components:
+        path = (repository_root / component.preflight_config if component.preflight_config
+                else component.abs_path / "preflight.toml")
+        if not path.resolve().is_relative_to(repository_root):
+            raise ValueError(f"Component preflight_config escapes repository: {path}")
+        if component.preflight_config and not path.is_file():
+            raise ValueError(f"Component preflight_config not found: {path}")
+        if path.is_file():
+            local_args = argparse.Namespace(**vars(args))
+            local_args.config = path
+            configs[component.name] = _resolve_config_from_args(local_args, repository_root)
+        else:
+            configs[component.name] = default
+    return configs
+
+
 def _expand_workspace_targets(
     raw_targets: Sequence[str],
     repository_root: pathlib.Path,
@@ -4452,6 +4478,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     try:
         config = _resolve_config_from_args(args, repository_root)
+        component_configs = _component_configs(args, repository_root, ws_scope, config)
         plugins = load_plugins(
             config.plugin_paths,
             args.config.resolve().parent if args.config is not None else repository_root,
@@ -4537,6 +4564,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     supported_suffixes = C_EXTS | CPP_EXTS | extra_exts
     target_files = [fp for fp in files if fp.suffix in supported_suffixes]
 
+    def config_for_file(path: pathlib.Path) -> LintConfig:
+        """Select the owning component's resolved coding rules for one input file."""
+        owner = ws_scope.component_for_path(path)
+        return component_configs.get(owner.name, config) if owner else config
+
     reports: list[FileReport] = []
     contexts: dict[int, FingerprintContext] = {}
     total_findings = 0
@@ -4544,7 +4576,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         ordered_results = [
             _run_file_checks_with_context(
                 fp,
-                config,
+                config_for_file(fp),
                 args.compile_commands,
                 args.clang_tidy_config,
                 tool_env,
@@ -4561,7 +4593,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 executor.submit(
                     _run_file_checks_with_context,
                     fp,
-                    config,
+                    config_for_file(fp),
                     args.compile_commands,
                     args.clang_tidy_config,
                     tool_env,

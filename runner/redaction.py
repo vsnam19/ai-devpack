@@ -34,7 +34,6 @@ _PACK_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACK_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACK_ROOT))
 
-from enforcement.checks import secret_pii_check  # noqa: E402
 
 # Construct host-home prefix dynamically so forbidden literal substrings never appear in source.
 _LINUX_HOME_PREFIX = "/" + "ho" + "me"
@@ -217,6 +216,57 @@ def collect_env_auth_secrets(
     return secrets
 
 
+def _base_secret_rules() -> list[tuple[str, re.Pattern[str]]]:
+    """Return built-in secret detection rules as ``(rule_id, compiled_regex)`` pairs."""
+    begin_word = "-----BEGIN"
+    priv_key_word = "PRIVATE" + " KEY-----"
+    pwd_word = "pass" + "word"
+    passwd_word = "pass" + "wd"
+    aws_sec_word = "aws_secret" + "_access_key"
+
+    return [
+        (
+            "private-key-header",
+            re.compile(rf"{begin_word}\s+(?:[A-Z0-9 ]+\s+)?{priv_key_word}"),
+        ),
+        (
+            "aws-access-key-id",
+            re.compile(r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
+        ),
+        (
+            "aws-secret-key",
+            re.compile(rf"(?i)\b{aws_sec_word}\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{{20,}}"),
+        ),
+        (
+            "generic-password",
+            re.compile(
+                rf"(?i)\b(?:{pwd_word}|{passwd_word})\s*[:=]\s*(?!['\"]?\s*(?:$|#))['\"]?[^\s'\";#]+"
+            ),
+        ),
+    ]
+
+
+def get_builtin_secret_rules() -> list[tuple[str, re.Pattern[str]]]:
+    """Return the single shared built-in credential rule set for scanning and redaction."""
+    rules: list[tuple[str, re.Pattern[str]]] = [
+        ("private-key-block", _PRIVATE_KEY_BLOCK_RE),
+    ]
+    rules.extend(_base_secret_rules())
+    rules.extend(
+        [
+            ("prefixed-api-token", _PREFIXED_TOKEN_RE),
+            ("bearer-token", _BEARER_TOKEN_RE),
+            ("json-credential", _JSON_CRED_RE),
+            ("credential-assignment", _CRED_ASSIGN_RE),
+            ("url-userinfo", re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s@]+@")),
+            ("basic-auth", re.compile(r"(?i)\bAuthorization\s*:\s*Basic\s+[A-Za-z0-9+/]+={0,2}")),
+            ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")),
+            ("google-api-key", re.compile(r"\bAIza[A-Za-z0-9_-]{35}\b")),
+        ]
+    )
+    return rules
+
+
 def get_secret_pii_rules(
     *,
     patterns_file: Path | str | None = None,
@@ -224,18 +274,7 @@ def get_secret_pii_rules(
     strict_patterns_file: bool = False,
 ) -> list[tuple[str, re.Pattern[str]]]:
     """Return built-in, token/credential, optional PII, and external pattern rules."""
-    rules: list[tuple[str, re.Pattern[str]]] = [
-        ("private-key-block", _PRIVATE_KEY_BLOCK_RE),
-    ]
-    rules.extend(secret_pii_check.get_builtin_rules())
-    rules.extend(
-        [
-            ("prefixed-api-token", _PREFIXED_TOKEN_RE),
-            ("bearer-token", _BEARER_TOKEN_RE),
-            ("json-credential", _JSON_CRED_RE),
-            ("credential-assignment", _CRED_ASSIGN_RE),
-        ]
-    )
+    rules = get_builtin_secret_rules()
     if include_pii:
         rules.append(("pii-email", _PII_EMAIL_RE))
         rules.append(("host-home-path", _HOME_PATH_RE))
@@ -244,7 +283,8 @@ def get_secret_pii_rules(
     if ext_raw:
         ext_path = Path(ext_raw)
         if ext_path.is_file():
-            loaded, err = secret_pii_check.load_external_patterns(ext_path)
+            from enforcement.checks.secret_pii_check import load_external_patterns
+            loaded, err = load_external_patterns(ext_path)
             if loaded is None:
                 if strict_patterns_file:
                     raise ValueError(f"Failed to load secret patterns file: {err}")

@@ -27,33 +27,9 @@ from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 
 
 def get_builtin_rules() -> list[tuple[str, re.Pattern[str]]]:
-    """Return built-in secret detection rules as ``(rule_id, compiled_regex)`` pairs."""
-    begin_word = "-----BEGIN"
-    priv_key_word = "PRIVATE" + " KEY-----"
-    pwd_word = "pass" + "word"
-    passwd_word = "pass" + "wd"
-    aws_sec_word = "aws_secret" + "_access_key"
-
-    return [
-        (
-            "private-key-header",
-            re.compile(rf"{begin_word}\s+(?:[A-Z0-9 ]+\s+)?{priv_key_word}"),
-        ),
-        (
-            "aws-access-key-id",
-            re.compile(r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
-        ),
-        (
-            "aws-secret-key",
-            re.compile(rf"(?i)\b{aws_sec_word}\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{{20,}}"),
-        ),
-        (
-            "generic-password",
-            re.compile(
-                rf"(?i)\b(?:{pwd_word}|{passwd_word})\s*=\s*(?!['\"]?\s*(?:$|#))['\"]?[^\s'\";#]+"
-            ),
-        ),
-    ]
+    """Return the shared redaction rules for staged and explicit-file scanning."""
+    from runner.redaction import get_builtin_secret_rules
+    return get_builtin_secret_rules()
 
 
 def load_external_patterns(patterns_file: pathlib.Path) -> tuple[list[tuple[str, re.Pattern[str]]] | None, str | None]:

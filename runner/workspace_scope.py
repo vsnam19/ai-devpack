@@ -46,6 +46,11 @@ DISCOVERY_SUFFIXES: frozenset[str] = frozenset({".bb", ".bbappend"})
 VALID_SCAN_DEFAULTS: frozenset[str] = frozenset({"selected", "all"})
 
 
+DEFAULT_PROTECTED_TEST_GLOBS = (
+    "tests/**", "**/tests/**", "**/test/**", "**/*_test.cpp", "**/test_*.cpp",
+)
+
+
 class WorkspaceConfigError(ValueError):
     """Raised when workspace/project configuration is missing, malformed, or escapes containment."""
 
@@ -332,6 +337,8 @@ class ComponentSpec:
     build_cmd: str = ""
     test_cmd: str = ""
     discovered: bool = False
+    test_globs: tuple[str, ...] = ()
+    preflight_config: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize component metadata to a JSON-compatible dictionary."""
@@ -344,6 +351,8 @@ class ComponentSpec:
             "build_cmd": self.build_cmd,
             "test_cmd": self.test_cmd,
             "discovered": self.discovered,
+            "test_globs": list(self.test_globs),
+            "preflight_config": self.preflight_config,
         }
 
 
@@ -798,6 +807,9 @@ def load_workspace_config(
                 raise WorkspaceConfigError(str(exc)) from exc
             build_cmd = str(entry.get("build_cmd", "") or "").strip()
             test_cmd = str(entry.get("test_cmd", "") or "").strip()
+            preflight_raw = entry.get("preflight_config", "")
+            if not isinstance(preflight_raw, str):
+                raise WorkspaceConfigError(f"[[component]] '{name}'.preflight_config must be a string")
             components.append(
                 ComponentSpec(
                     name=name,
@@ -808,6 +820,12 @@ def load_workspace_config(
                     include_dirs=include_dirs,
                     build_cmd=build_cmd,
                     test_cmd=test_cmd,
+                    test_globs=tuple(_normalize_rel_posix(g, field_name="test_globs")
+                                     for g in _coerce_str_list(entry.get("test_globs"), "test_globs")),
+                    preflight_config=(
+                        _normalize_rel_posix(preflight_raw, field_name="preflight_config")
+                        if preflight_raw else ""
+                    ),
                     discovered=False,
                 )
             )
@@ -851,6 +869,24 @@ def load_workspace_config(
         scan_selected=scan_selected,
         config_path=cfg_path,
     )
+
+
+def resolve_protected_test_globs(
+    repo_root: Path | str,
+    extra: Sequence[str] = (),
+    project_config_path: Path | str | None = None,
+) -> tuple[str, ...]:
+    """Combine nested-test defaults, project additions, component-relative globs and CLI additions."""
+    cfg = load_workspace_config(repo_root, project_config_path)
+    globs = list(DEFAULT_PROTECTED_TEST_GLOBS)
+    if cfg.config_path is not None:
+        raw = parse_toml_with_arrays(cfg.config_path.read_text(encoding="utf-8"))
+        globs.extend(_normalize_rel_posix(g, field_name="protected_test_globs")
+                     for g in _coerce_str_list(raw.get("protected_test_globs"), "protected_test_globs"))
+    for component in cfg.components:
+        globs.extend(_join_rel(component.repo_rel_path, glob) for glob in component.test_globs)
+    globs.extend(str(g).strip() for g in extra if str(g).strip())
+    return tuple(dict.fromkeys(globs))
 
 
 def _parse_component_names(raw: str | Sequence[str]) -> list[str]:
