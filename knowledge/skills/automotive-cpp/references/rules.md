@@ -185,3 +185,20 @@ std::int32_t decode(const std::uint8_t* bytes, std::size_t len);
 - **`clang-tidy`:** Official LLVM checks have no `misra-*` or `autosar-*` prefix; enable explicit `cppcoreguidelines-*`, `cert-*`, `bugprone-*`, and `misc-*` checks `[src: LLVM clang-tidy list — verify]`.
 - **`cppcheck`:** The `cppcheck` MISRA addon targets MISRA C 2012 only, not MISRA C++:2023 `[src: cppcheck.sourceforge.io — verify]`.
 - **Undecidable rules:** Static analyzers cannot prove undecidable properties in all cases and can over- or under-report; manual review is required `[src: Qt blog on MISRA undecidability — verify]`.
+
+---
+
+## 4. cppcheck findings in embedded C++
+
+cppcheck runs as an early-warning gate (`enforcement/static/cppcheck_check.py`); Coverity on company CI stays authoritative. Fix the code; a suppression needs an approved `DEV-<nnn>` (see the skill's cppcheck step). Doc links are not verified here, so every source is labelled `verify`.
+
+| cppcheck ID | Typical cause in embedded C++ | Fix pattern |
+|---|---|---|
+| `nullPointer` | A pointer parameter or lookup result is dereferenced without a check. | Validate at the boundary with `nullptr`, return a status (for example `DecodeStatus::NullInput`), and dereference only after the check. `[src: cppcheck manual — verify]` |
+| `uninitvar` | A local or member is read before any assignment, often on an error path. | Initialize at declaration (`std::uint16_t raw{0U};`) and give every branch a value. `[src: cppcheck manual — verify]` |
+| `arrayIndexOutOfBounds` | An index comes from sensor or frame data and is not range-checked against the array size. | Compare the index with the `std::array` size or an explicit length before use; return an out-of-range status. `[src: cppcheck manual — verify]` |
+| `memleak` | Heap allocation without release, or an early return that skips the release. | Remove the allocation: use `std::array` or a fixed-size member. Heap use is forbidden outside configured paths. `[src: cppcheck manual — verify]` |
+| `shiftTooManyBits` | A shift count can be greater than or equal to the width of the operand type. | Bound the shift count first and use an unsigned fixed-width type (`std::uint32_t`). `[src: cppcheck manual — verify]` |
+| `integerOverflow` | Arithmetic on sensor-derived values can exceed the type range. | Range-check before the operation (`if (a > kMax - b)`), or widen the type before multiplying or adding. `[src: cppcheck manual — verify]` |
+| `knownConditionTrueFalse` | A condition is always true or always false, which usually means the logic or a variable is wrong. | Fix the logic that makes the value constant, or delete the dead branch. Do not silence the finding. `[src: cppcheck manual — verify]` |
+| `unusedFunction` | Reported only when all translation units are analysed together. A per-file run can flag a function that another file calls. | Search the call graph across the repository before removing anything. Remove the function only if no caller exists and it is not a public API. `[src: cppcheck manual — verify]` |

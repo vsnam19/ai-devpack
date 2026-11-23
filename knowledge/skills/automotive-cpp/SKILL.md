@@ -17,9 +17,24 @@ Use when implementing, refactoring, documenting, or reviewing automotive C++17 h
 2. Design without dynamic heap allocation, exceptions, or RTTI (`-fno-exceptions -fno-rtti`). Report failures via a status enum, `bool` + `[out]` parameter, or status+value struct (`std::optional`-like type).
 3. Implement using the enforced patterns below.
 4. Add Doxygen (`@file`, `@brief`, `@param[in|out|in,out]`, `@return`) and follow naming rules.
-5. Run preflight lint (`python3 enforcement/lint/preflight_lint.py <changed files>`) and compile with `-std=c++17 -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti`. Fix every finding before moving on.
+5. Run preflight lint (`python3 enforcement/lint/preflight_lint.py <changed files>`), then the cppcheck step below, and compile with `-std=c++17 -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti`. Fix every finding before moving on.
 6. Run the **Reviewer checks (not machine-checked)** below and execute the unit tests.
 7. Report any unavoidable rule conflict with a formal deviation ID (`DEV-<nnn>`, `policy/deviations.md`). Propose deviations in an escalation note; never add silent suppressions.
+
+## Static analysis: cppcheck (after preflight lint)
+
+Run cppcheck (local stand-in for the company Coverity analyser) on every changed C/C++ file:
+
+```bash
+python3 <pack>/enforcement/static/cppcheck_check.py --repo-root . <changed files>
+```
+
+- Exit `0`: clean. Exit `1`: blocking findings (severities in `fail_on`, default `error` and `warning`). Fix every blocking finding, then rerun. `style`, `performance`, and `portability` findings are reported but do not block; fix them when the change touches that code.
+- Exit `2`: usage or configuration error. Correct the invocation; do not edit `preflight.toml` or other gate configuration to pass.
+- Exit `3` (`TOOL_MISSING`): cppcheck is not installed. **Stop and report**; do not skip the step and do not claim the file passed.
+- Fix the code. Do not add a suppression unless a Deviation ID already exists. The only suppression form is `// cppcheck-suppress <id> -- DEV-<nnn>: <justification>`. Never invent a `DEV-<nnn>`; if no approved ID exists, leave the finding in place and describe the proposed suppression in the escalation note.
+- Common IDs and fix patterns: [cppcheck findings](references/rules.md#4-cppcheck-findings-in-embedded-c).
+- Coverity on company CI stays authoritative. A clean cppcheck run does not waive a Coverity finding.
 
 ## Enforced rules (checked by `preflight_lint.py`)
 
