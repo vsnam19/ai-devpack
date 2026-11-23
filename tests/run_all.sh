@@ -31,7 +31,11 @@ for dir in tests enforcement eval runner skilltest learning; do
     if [[ -f "$dir/__init__.py" ]]; then
       discover_args=(-s "$dir" -t . -p 'test_*.py')
     fi
-    if ! python3 -m unittest discover "${discover_args[@]}" 2>&1 | tee "$log"; then
+    scope_env=()
+    if [[ "$dir" == "skilltest" ]]; then
+      scope_env=(DEVPACK_PROJECT_CONFIG=none)
+    fi
+    if ! env "${scope_env[@]}" python3 -m unittest discover "${discover_args[@]}" 2>&1 | tee "$log"; then
       echo "FAIL unittest: $dir" >&2
       status=1
     elif [[ -n "$(find "$dir" -name 'test_*.py' -not -path '*/.git/*' -print -quit)" ]] \
@@ -51,7 +55,7 @@ shopt -s nullglob
 for skill_tests in knowledge/skills/*/tests; do
   if [[ -n "$(find "$skill_tests" -name 'test_*.py' -print -quit)" ]]; then
     echo "== unittest: $skill_tests"
-    if ! python3 -m unittest discover -s "$skill_tests" -p 'test_*.py'; then
+    if ! DEVPACK_PROJECT_CONFIG=none python3 -m unittest discover -s "$skill_tests" -p 'test_*.py'; then
       echo "FAIL unittest: $skill_tests" >&2
       status=1
     fi

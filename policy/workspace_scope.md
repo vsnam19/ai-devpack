@@ -35,6 +35,8 @@ Configure `.devpack/project.toml` from `.devpack/project.example.toml`:
 [workspace]
 root = "meta-org/recipes-org/src"
 exclude = ["**/third_party/**", "**/generated/**"]
+discover = true
+discovery_depth = 4
 
 [[component]]
 name = "ipc_bus"
@@ -45,15 +47,19 @@ build_cmd = "devtool build ipc-bus"
 test_cmd = "ctest --test-dir build/ipc_bus --output-on-failure"
 
 [scan]
-default = "selected"   # "selected" | "all"
+default = "all"        # use "selected" only for a local fast loop
 selected = ["ipc_bus"]
 ```
 
 ### Automatic component discovery
 
-When `[workspace]` is configured with no `[[component]]` tables, direct subdirectories of
-`workspace.root` containing `CMakeLists.txt`, `Makefile`, `meson.build`, `*.bb`, or
-`*.bbappend` are discovered as components automatically using their directory name.
+With `[workspace] discover = true` (the default), discovery descends recursively up
+to `discovery_depth = 4`, stopping at a discovered component. Directories containing
+`CMakeLists.txt`, `Makefile`, `meson.build`, `*.bb`, or `*.bbappend` identify components
+using their directory name. Thus the nested `middleware/ipc_bus`, `services/diag_svc`,
+and `apps/sensor_hub` layout above is discovered when each leaf has a build marker.
+Explicit `[[component]]` entries merge with discovery and supply build/test metadata;
+set `discover = false` to require only explicit components.
 
 ## What is never scanned or edited
 
@@ -116,3 +122,18 @@ pack; verify against your BitBake/eSDK setup):
    - Source the eSDK environment script, configure the component with
      `cmake -S <component-src> -B build/<component> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`,
      and point `[[component]].compile_commands` at `build/<component>/compile_commands.json`.
+
+## Empty scans and CI coverage
+
+Lint, cppcheck, and the gate fail with `NO_FILES_CHECKED` when an expected scan finds
+no files. Explicit files outside active components or matching workspace exclusions
+fail as `OUT_OF_SCOPE`; they are never silently skipped. `--all-components` expands
+component selection while preserving workspace boundaries and exclusions.
+
+Selected scans print `WARNING: N configured components not checked: …` and record
+the omitted components in run metadata/receipts. Use selection for local fast loops;
+CI must pass `--all-components`. An empty changed-C/C++ set may explicitly use
+`--allow-empty`, producing `SKIP: no C/C++ changes`.
+
+Pack self-tests select their own configuration through `DEVPACK_PROJECT_CONFIG=none`
+or `--project-config none`, so a vendored pack never inherits the parent product scope.

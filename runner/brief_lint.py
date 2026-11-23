@@ -245,31 +245,26 @@ def resolve_engine_brief_budget(
     engines_config: Path | None = None,
 ) -> tuple[int, int]:
     """Return ``(brief_token_budget, context_tokens)`` for ``engine``."""
-    cfg_path = engines_config
-    if cfg_path is None:
-        candidate = RUNNER_DIR / "engines.example.toml"
-        if candidate.is_file():
-            cfg_path = candidate
-
+    cfg_path = engines_config if engines_config is not None else RUNNER_DIR / "engines.example.toml"
+    if not cfg_path.is_file():
+        raise ValueError(f"engines config not found: {cfg_path}")
+    data = _load_toml_dict(cfg_path)
+    engines = data.get("engines", {})
+    roles = data.get("roles", {})
+    if engine and engine not in engines and engine not in roles:
+        raise ValueError(f"Unknown engine '{engine}' in engines config: {cfg_path}")
     ctx_tokens = DEFAULT_CONTEXT_TOKENS.get(engine, 200000)
     brief_max = 0
-
-    if cfg_path is not None and cfg_path.is_file():
-        try:
-            data = _load_toml_dict(cfg_path)
-        except Exception:
-            data = {}
-        limits = data.get("limits", {})
-        if isinstance(limits, Mapping) and isinstance(limits.get("brief_tokens_max"), int):
-            brief_max = int(limits["brief_tokens_max"])
-        engines = data.get("engines", {})
-        if isinstance(engines, Mapping) and engine in engines and isinstance(engines[engine], Mapping):
-            spec = engines[engine]
-            raw_ctx = spec.get("context_tokens") or spec.get("min_context_tokens")
-            if isinstance(raw_ctx, int) and raw_ctx > 0:
-                ctx_tokens = int(raw_ctx)
-            if isinstance(spec.get("brief_tokens_max"), int) and int(spec["brief_tokens_max"]) > 0:
-                brief_max = int(spec["brief_tokens_max"])
+    limits = data.get("limits", {})
+    if isinstance(limits, Mapping) and isinstance(limits.get("brief_tokens_max"), int):
+        brief_max = int(limits["brief_tokens_max"])
+    if isinstance(engines, Mapping) and engine in engines and isinstance(engines[engine], Mapping):
+        spec = engines[engine]
+        raw_ctx = spec.get("context_tokens") or spec.get("min_context_tokens")
+        if isinstance(raw_ctx, int) and raw_ctx > 0:
+            ctx_tokens = int(raw_ctx)
+        if isinstance(spec.get("brief_tokens_max"), int) and int(spec["brief_tokens_max"]) > 0:
+            brief_max = int(spec["brief_tokens_max"])
 
     if brief_max > 0:
         return brief_max, ctx_tokens
@@ -559,6 +554,15 @@ def lint_brief_text(
                     }
                 )
 
+            else:
+                prefix = re.split(r"[*?\[]", entry, maxsplit=1)[0].rstrip("/")
+                prefixes = [prefix, f"{ws_scope.workspace_root_rel}/{prefix}"]
+                if any(ws_scope.is_excluded(candidate) for candidate in prefixes):
+                    findings.append({
+                        "rule": "BRIEF-SCOPE-EXCLUDED", "severity": "warning", "line": entry_line,
+                        "message": f"Files-allowed glob '{entry}' names an excluded path.",
+                    })
+
     # 3. BRIEF-TOO-LONG
     est_tokens = estimate_tokens(brief_text)
     budget_tokens, _ = resolve_engine_brief_budget(engine, cfg_path)
@@ -700,6 +704,12 @@ def lint_brief_text(
         if (ws_scope is not None and ws_scope.configured and ws_scope.workspace_root.is_dir())
         else repo
     )
+    created_symbols: set[str] = set()
+    for sec in sections:
+        if _effective_canonical_section(sec) == "Expected output":
+            for _, line in sec["body_lines"]:
+                if re.search(r"\b(create|add|new)\b", line, re.IGNORECASE):
+                    created_symbols.update(re.findall(r"\b[A-Za-z_]\w*\b", line))
     seen_missing_syms: set[tuple[int, str]] = set()
     for sec in sections:
         in_fence = False
@@ -721,7 +731,7 @@ def lint_brief_text(
                     sym_candidates.append(raw_sym)
 
             for sym in sym_candidates:
-                if len(sym) < 3 or sym in _IGNORED_SYMBOLS:
+                if len(sym) < 3 or sym in _IGNORED_SYMBOLS or sym in created_symbols:
                     continue
                 if repo_idents is None:
                     repo_idents = _collect_repo_identifiers(symbol_scan_root)
@@ -848,13 +858,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: engines config not found: {engines_cfg}", file=sys.stderr)
         return 2
 
-    findings = lint_brief(
-        brief_path,
-        repo_root=repo_root,
-        engine=args.engine,
-        engines_config=engines_cfg,
-        author=args.author,
-    )
+    try:
+        findings = lint_brief(
+            brief_path,
+            repo_root=repo_root,
+            engine=args.engine,
+            engines_config=engines_cfg,
+            author=args.author,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(findings, indent=2))
     return 1 if has_errors(findings) else 0
 

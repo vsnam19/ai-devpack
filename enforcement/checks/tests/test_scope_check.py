@@ -199,5 +199,23 @@ class TestScopeCheck(unittest.TestCase):
             self.assertFalse(marker.exists())
 
 
+    def test_workspace_selection_exclusions_and_gate_report_all_violations(self) -> None:
+        """All changed-path restrictions are reported together, including F1 protections."""
+        config = self.repo_dir.parent / "project.toml"
+        config.write_text('[workspace]\nroot="src"\nexclude=["src/active/generated/**"]\n[[component]]\nname="active"\npath="active"\n[[component]]\nname="inactive"\npath="inactive"\n[scan]\nselected=["active"]\n', encoding="utf-8")
+        paths = ["src/active/generated/auto.cpp", "src/inactive/other.cpp", "docs/outside.md", ".devpack/project.toml"]
+        for name in paths:
+            path = self.repo_dir / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("changed\n", encoding="utf-8")
+        code, out, _ = self._run_scope(["--repo", str(self.repo_dir), "--base", "HEAD", "--allow", "**", "--project-config", str(config)])
+        self.assertEqual(code, 1)
+        for path in paths:
+            self.assertIn(path, out)
+        self.assertIn("excluded", out)
+        self.assertIn("active components", out)
+        self.assertIn("gate-touched", out)
+
+
 if __name__ == "__main__":
     unittest.main()

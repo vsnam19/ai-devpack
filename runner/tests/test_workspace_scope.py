@@ -445,6 +445,7 @@ class WorkspaceScopeTests(unittest.TestCase):
                 rc_run_ok = devpack_run.main([
                     "--worktree", str(YOCTO_FIXTURE),
                     "--all-components",
+                    "--gate-config", str(gate_cfg),
                     "--dry-run",
                 ])
             self.assertEqual(0, rc_run_ok)

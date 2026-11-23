@@ -1,34 +1,29 @@
-// Example only: Jenkins declarative pipeline for ai-devpack. Adapt agents and credentials.
-// Every stage calls a local script; a non-zero exit code fails the stage.
+// CI-only vendored installation; provision git, Python 3.11+, clang, cppcheck and build tools.
+// Optional agent stage requires DEVPACK_DIR to select an external trusted installation.
+// devpack_run performs the real implement/gate/read-only-review/bounded-fix loop.
 pipeline {
   agent any
   environment {
-    DEVPACK_DIR = '.'
-    GATE_CONFIG = 'enforcement/gate/gate.example.toml'
+    DEVPACK_DIR = 'devpack'
+    GATE_CONFIG = '.devpack/gate.toml'
+    ENGINES_CONFIG = '.devpack/engines.toml'
+    DEVPACK_BASE = 'origin/main'
   }
   stages {
     stage('preflight') {
       steps {
-        sh 'python3 $DEVPACK_DIR/enforcement/lint/preflight_lint.py --help'
-        sh 'python3 $DEVPACK_DIR/enforcement/checks/secret_pii_check.py --help'
+        sh 'python3 $DEVPACK_DIR/enforcement/gate/project_checks.py --check lint --base "$DEVPACK_BASE" --all-components'
       }
     }
-    stage('implement (sandboxed)') {
+    stage('implement and review (sandboxed)') {
       when { expression { return params.DEVPACK_TASK } }
       steps {
-        // run inside the container defined by policy/sandbox.md
-        sh 'python3 $DEVPACK_DIR/runner/devpack_run.py --task "$DEVPACK_TASK"'
+        sh 'python3 $DEVPACK_DIR/runner/devpack_run.py --config "$ENGINES_CONFIG" --task-file "$DEVPACK_TASK" --gate-config "$GATE_CONFIG" --all-components'
       }
     }
     stage('gate') {
       steps {
-        sh 'python3 $DEVPACK_DIR/enforcement/gate/gate.py --config $GATE_CONFIG'
-      }
-    }
-    stage('review') {
-      when { expression { return params.DEVPACK_TASK } }
-      steps {
-        sh 'python3 $DEVPACK_DIR/runner/devpack_run.py --task "$DEVPACK_TASK" --review-only'
+        sh 'python3 $DEVPACK_DIR/enforcement/gate/gate.py --config "$GATE_CONFIG" --all-components'
       }
     }
     stage('human approval') {
@@ -38,6 +33,6 @@ pipeline {
     }
   }
   parameters {
-    string(name: 'DEVPACK_TASK', defaultValue: '', description: 'Brief file of the task')
+    string(name: 'DEVPACK_TASK', defaultValue: '', description: 'Optional brief; requires external trusted runner')
   }
 }

@@ -127,11 +127,33 @@ Director-level orchestration jobs and `agent-hub` incident entries use the **exa
 six cause labels** (`BRIEF`, `CONTEXT`, `SKILL`, `TOOL`, `MODEL`, `ENV`) so rework across
 build pipelines and eval runs is tracked under one taxonomy.
 
-Recorded v0.2 build rework evidence (documented in `knowledge/lessons.md`):
+Lesson attribution, including the base pack and v0.2 build rework evidence
+(documented in `knowledge/lessons.md`):
 
 | Lesson | Primary cause | Secondary | Evidence summary |
 |---|---|---|---|
+| `LSN-001` | `TOOL` | - | Gate checks must be tested and fail closed |
+| `LSN-002` | `TOOL` | `MODEL` | Permissions must prevent orchestrator product edits |
+| `LSN-003` | `BRIEF` | `MODEL` | Review must enumerate findings exhaustively and bound fix rounds |
+| `LSN-004` | `MODEL` | `BRIEF` | Human-owned business decisions cannot be delegated through retries |
+| `LSN-005` | `TOOL` | `ENV` | Classify failures before bounded retries |
+| `LSN-006` | `TOOL` | `ENV` | Bound heavy workloads and avoid nested locks |
+| `LSN-007` | `TOOL` | `ENV` | Purge stale auto-start applications in persistent runtime storage |
+| `LSN-008` | `CONTEXT` | - | Provider-owned interfaces prevent divergent copies |
+| `LSN-009` | `MODEL` | `BRIEF` | Use complexity budgets and existing minimal code |
+| `LSN-010` | `MODEL` | - | A failing test can reveal a product defect; never weaken it |
+| `LSN-011` | `TOOL` | - | Maintain one versioned linter implementation |
+| `LSN-012` | `SKILL` | `TOOL` | Turn repeated prompt rules into executable checks |
+| `LSN-013` | `TOOL` | - | Preserve internal provenance for audits |
+| `LSN-014` | `TOOL` | `MODEL` | Sandbox untrusted archives and repository content |
+| `LSN-015` | `BRIEF` | `TOOL` | Review documentation before handing it to a team |
 | `LSN-016` | `TOOL` | `MODEL` | Default local server context window truncated prompts and tool schemas, causing plain-text JSON tool calls (`tool_protocol_errors`) |
 | `LSN-017` | `BRIEF` | - | Saturated v0.1 task briefs named exact files and bugs, hiding multi-file and spec-driven capability gaps |
 | `LSN-018` | `BRIEF` | `MODEL` | Weak task graders allowed a builder agent to pass checks using empty seeded defects and marker files |
 | `LSN-019` | `TOOL` | `MODEL` | Evaluation graders honoured self-authored `Deviation:` trailers in `test_lock.py` until `--no-deviation` was enforced |
+| `LSN-020` | `TOOL` | `MODEL` | Gate configuration must be snapshotted from the trusted base, never loaded from worker edits |
+| `LSN-021` | `TOOL` | `MODEL` | Git metadata must be isolated and repository-controlled sandbox opt-outs refused |
+| `LSN-022` | `TOOL` | `MODEL` | Test success requires completion proof; worker process termination is forbidden |
+| `LSN-023` | `TOOL` | `MODEL` | Test lock checks preprocessing directives and compiler-preprocessed assertion counts |
+| `LSN-024` | `TOOL` | `MODEL` | Agent-authored exemptions, baselines, and memory proposals are untrusted |
+| `LSN-025` | `TOOL` | - | One shared redactor protects every persisted and rendered log surface |

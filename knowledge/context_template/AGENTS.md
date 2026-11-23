@@ -3,7 +3,7 @@
 Index only. Details live in the linked files. Read the brief first; this file second.
 
 ## Your role
-- You are the **{{ROLE}}** (implementer | reviewer | fixer) for task **{{TASK_ID}}**.
+- Take your role (implementer, reviewer, or fixer) and task ID from the brief.
 - Work only inside the allowed files listed in the brief. Out-of-scope work is a defect.
 - You never merge, push to protected branches, or change CI, hooks or gate config.
 
@@ -25,8 +25,8 @@ Index only. Details live in the linked files. Read the brief first; this file se
 | ASIL boundaries | {{PACK_DIR}}/policy/asil_boundaries.md |
 | Lessons learned | {{PACK_DIR}}/knowledge/lessons.md |
 | Review taxonomy | {{PACK_DIR}}/knowledge/skills/review-taxonomy/SKILL.md |
-| MISRA C++ guidance | {{PACK_DIR}}/knowledge/skills/misra-cpp-2023/SKILL.md |
-| Doxygen and naming | {{PACK_DIR}}/knowledge/skills/doxygen-naming/SKILL.md |
+| Automotive C/C++ and documentation | {{PACK_DIR}}/knowledge/skills/automotive-cpp/SKILL.md |
+| Requirements analysis | {{PACK_DIR}}/knowledge/skills/requirements-analysis/SKILL.md |
 | Project architecture | {{ARCHITECTURE_DOC}} |
 | Requirements | {{REQUIREMENTS_FILE}} |
 
@@ -35,6 +35,14 @@ Index only. Details live in the linked files. Read the brief first; this file se
 - Build: `{{BUILD_CMD}}`
 - Unit tests: `{{TEST_CMD}}`
 - Gate (CI runs it; you may run it to self-check): `python3 {{PACK_DIR}}/enforcement/gate/gate.py --config {{GATE_CONFIG}}`
+
+## How skills are installed
+Before a task baseline is created, install the pack skills into `.claude/skills/`:
+`python3 {{PACK_DIR}}/runner/agent_exec.py --install-skills .`
+The runner/broker uses those project skills; enable them for runner jobs with:
+`python3 {{PACK_DIR}}/runner/devpack_run.py --task-file briefs/task.md --skills`
+The brief also carries the short coding checklist. Read the relevant installed skill
+before changing code; per-task values always come from the brief.
 
 ## Project conventions
 - Language standard / compiler flags: {{LANG_STANDARD}} / {{COMPILER_FLAGS}}

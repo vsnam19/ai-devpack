@@ -34,6 +34,7 @@ _REPO_ROOT_STR = str(pathlib.Path(__file__).resolve().parents[2])
 if _REPO_ROOT_STR not in sys.path:
     sys.path.insert(0, _REPO_ROOT_STR)
 
+from runner.redaction import redact_text  # noqa: E402
 from runner.safe_git import GitSecurityError, run_git  # noqa: E402
 from runner.workspace_scope import resolve_workspace_scope  # noqa: E402
 
@@ -69,6 +70,7 @@ def write_receipt(
     error: str | None = None,
     components: list[str] | None = None,
     scan_mode: str | None = None,
+    unchecked_components: list[str] | None = None,
 ) -> None:
     """Write the gate execution receipt as formatted JSON to ``receipt_path``."""
     payload: dict[str, Any] = {
@@ -83,6 +85,8 @@ def write_receipt(
         payload["components"] = list(components)
     if scan_mode is not None:
         payload["scan_mode"] = scan_mode
+    if unchecked_components is not None:
+        payload["unchecked_components"] = list(unchecked_components)
     if error is not None:
         payload["error"] = error
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +158,12 @@ def parse_checks_config(config_path: pathlib.Path) -> tuple[list[dict[str, Any]]
     return validated, None, None
 
 
+def redacted_output_tail(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+    """Return the final sixty redacted lines of normal or timeout subprocess output."""
+    pieces = [part.decode("utf-8", errors="replace") if isinstance(part, bytes) else part or "" for part in (stdout, stderr)]
+    return "\n".join(redact_text("\n".join(pieces)).splitlines()[-60:])
+
+
 def run_single_check(
     check: dict[str, Any],
     repo_root: pathlib.Path,
@@ -161,7 +171,7 @@ def run_single_check(
 ) -> dict[str, Any]:
     """Execute one check command in ``repo_root`` and return its result record."""
     name: str = check["name"]
-    cmd: list[str] = check["cmd"]
+    cmd: list[str] = [part.replace("{pack_root}", _REPO_ROOT_STR) for part in check["cmd"]]
     timeout_s: float = check["timeout_s"]
     required: bool = check["required"]
 
@@ -198,7 +208,7 @@ def run_single_check(
             "required": required,
             "reason": f"command not executable ({cmd[0]})",
         }
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         duration_s = round(time.monotonic() - start_time, 6)
         return {
             "name": name,
@@ -207,6 +217,7 @@ def run_single_check(
             "duration_s": duration_s,
             "required": required,
             "reason": f"timeout after {timeout_s:g}s",
+            "output_tail": redacted_output_tail(exc.stdout, exc.stderr),
         }
     except OSError as exc:
         duration_s = round(time.monotonic() - start_time, 6)
@@ -227,6 +238,7 @@ def run_single_check(
             "duration_s": duration_s,
             "required": required,
             "reason": f"non-zero exit ({proc.returncode})",
+            "output_tail": redacted_output_tail(proc.stdout, proc.stderr),
         }
 
     return {
@@ -236,6 +248,18 @@ def run_single_check(
         "duration_s": duration_s,
         "required": required,
     }
+
+
+def workspace_has_cpp_files(scope: Any) -> bool:
+    """Check active component trees without descending into excluded directories or symlinks."""
+    suffixes = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+    for directory in scope.target_dirs():
+        for folder, directories, filenames in os.walk(directory, followlinks=False):
+            base = pathlib.Path(folder)
+            directories[:] = [name for name in directories if not scope.is_excluded(base / name)]
+            if any(pathlib.Path(name).suffix.lower() in suffixes and scope.filter([base / name]) for name in filenames):
+                return True
+    return False
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -285,6 +309,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run workspace-aware checks across all components (sets DEVPACK_COMPONENTS=all).",
     )
+    parser.add_argument("--allow-empty", action="store_true", help="Allow an explicitly empty C/C++ change set.")
     parser.add_argument(
         "--project-config",
         default="",
@@ -300,6 +325,13 @@ def main(argv: list[str] | None = None) -> int:
 
     repo_root = pathlib.Path(args.repo).resolve()
     config_path = pathlib.Path(args.config)
+    if not config_path.is_absolute():
+        project_candidate = repo_root / config_path
+        pack_candidate = pathlib.Path(_REPO_ROOT_STR) / config_path
+        if project_candidate.is_file():
+            config_path = project_candidate
+        elif pack_candidate.is_file():
+            config_path = pack_candidate
     receipt_path = pathlib.Path(args.receipt)
 
     skip_names: list[str] = []
@@ -387,6 +419,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    unchecked_components = [
+        comp.name for comp in ws_scope.all_components if comp not in ws_scope.active_components
+    ]
+    if unchecked_components:
+        print(f"WARNING: {len(unchecked_components)} configured components not checked: {', '.join(unchecked_components)}")
+    if ws_scope.configured and not workspace_has_cpp_files(ws_scope):
+        if args.allow_empty:
+            print("SKIP: no C/C++ changes")
+        else:
+            reason = "NO_FILES_CHECKED: active workspace contains no C/C++ files"
+            print(f"FAIL workspace_scope: {reason}")
+            print("GATE_FAIL workspace_scope")
+            write_receipt(receipt_path, "GATE_FAIL", "workspace_scope", repo_root, [],
+                          error=reason, components=[comp.name for comp in ws_scope.active_components],
+                          scan_mode=ws_scope.scan_mode, unchecked_components=unchecked_components)
+            return 1
+
     child_env: dict[str, str] | None = None
     if args.all_components:
         child_env = dict(os.environ)
@@ -394,6 +443,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.components is not None:
         child_env = dict(os.environ)
         child_env["DEVPACK_COMPONENTS"] = ",".join(c.name for c in ws_scope.active_components)
+
+    if args.project_config:
+        child_env = dict(os.environ) if child_env is None else child_env
+        child_env["DEVPACK_PROJECT_CONFIG"] = str(pathlib.Path(args.project_config).resolve()) if args.project_config != "none" else "none"
 
     receipt_components = (
         [c.name for c in ws_scope.active_components]
@@ -427,8 +480,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             continue
 
-        result = run_single_check(check, repo_root, env=child_env)
+        check_env = child_env
+        # Skill graders infer roots from fixture paths. Pin pack-owned suites so a
+        # vendoring project's policy cannot silently exclude their fixture files.
+        selftest_config = pathlib.Path(_REPO_ROOT_STR) / "enforcement/gate/gate.example.toml"
+        if config_path.resolve() == selftest_config.resolve() and name in {
+            "skilltest-unit-tests", "skilltest-lint", "skill-unit-tests",
+        }:
+            check_env = dict(os.environ) if child_env is None else dict(child_env)
+            check_env["DEVPACK_PROJECT_CONFIG"] = "none"
+        result = run_single_check(check, repo_root, env=check_env)
         results.append(result)
+        if result.get("output_tail"):
+            print(result["output_tail"])
         if result["status"] == "PASS":
             print(f"PASS {name}")
         elif not result.get("required", True):
@@ -450,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
             checks_results=results,
             components=receipt_components,
             scan_mode=receipt_scan_mode,
+            unchecked_components=unchecked_components,
         )
         print("GATE_OK")
         return 0
@@ -462,6 +527,7 @@ def main(argv: list[str] | None = None) -> int:
         checks_results=results,
         components=receipt_components,
         scan_mode=receipt_scan_mode,
+        unchecked_components=unchecked_components,
     )
     print(f"GATE_FAIL {first_failed}")
     return 1

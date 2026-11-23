@@ -1,0 +1,20 @@
+# Snake_case variant: copy to the product repository root as preflight.toml.
+# Changes naming conventions only; all checks retain their strict defaults.
+[general]
+std = "c++17"
+max_params = 5
+
+[doxygen]
+require_file_doxygen = true
+require_param_direction = true
+
+[naming]
+check_meaningful = true
+class_regex = "^[A-Z][A-Za-z0-9]*$"
+function_regex = "^[a-z][a-z0-9_]*$"
+variable_regex = "^[a-z][a-z0-9_]*$"
+parameter_regex = "^[a-z][a-z0-9_]*$"
+member_regex = "^(?:m_)?[a-z][a-z0-9_]*$"
+private_member_regex = "^m_[a-z][a-z0-9_]*$"
+constant_regex = "^[A-Z][A-Z0-9_]*$"
+namespace_regex = "^[a-z][a-z0-9_]*$"

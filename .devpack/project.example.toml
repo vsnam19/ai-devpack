@@ -14,8 +14,10 @@
 # and always refuses "secret".
 data_class = "internal"
 
-# Path (relative to the repository root) to the engines configuration file.
-engines_config = "runner/engines.example.toml"
+# Config paths are relative to this project.toml file (pack-relative defaults
+# resolve against the installed pack). Copy and edit the examples in .devpack/.
+engines_config = "engines.toml"
+gate_config = "gate.toml"
 
 # Directory where v0.2 run logs (runs/<run-id>/) are written (must stay in .gitignore).
 runs_root = "runs"
@@ -57,9 +59,11 @@ fail_on = ["error", "warning"]
 # root = "meta-org/recipes-org/src"      # relative to repo root; everything else is out of scope
 # exclude = ["**/third_party/**", "**/generated/**"]
 #
-# # Optional explicit component list. If no [[component]] is listed, direct
-# # subdirectories of workspace.root containing CMakeLists.txt, Makefile,
-# # meson.build, or *.bb / *.bbappend files are discovered automatically.
+# discover = true                       # merge discovery with explicit entries
+# discovery_depth = 4                   # recursive directory depth, stops at a component
+#
+# # Explicit metadata overrides a discovered component at the same path.
+# # CMakeLists.txt, Makefile, meson.build, *.bb / *.bbappend identify components.
 # [[component]]
 # name = "ipc_bus"
 # path = "middleware/ipc_bus"            # relative to workspace.root
@@ -69,5 +73,5 @@ fail_on = ["error", "warning"]
 # test_cmd = "ctest --test-dir build/ipc_bus --output-on-failure"  # optional
 #
 # [scan]
-# default = "selected"                   # "selected" | "all"
+# default = "all"                        # CI uses --all-components; selected is local-only
 # selected = ["ipc_bus"]

@@ -1,4 +1,4 @@
-gate_receipt.json
+/gate_receipt.json
 evidence/*.json
 .worktrees/
 runs/

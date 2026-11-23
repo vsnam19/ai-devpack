@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 from datetime import datetime, timezone
 import json
@@ -127,6 +127,8 @@ class TrustedGateConfig:
     gate_toml_path: Path | None = None
     suppressions_rel_path: str | None = None
     suppressions_sha256: str | None = None
+    project_gate_path: Path | None = None
+    project_gate_bytes: bytes | None = None
 
 
 def _git_show_regular_blob(workdir: Path, ref: str, rel_path: str) -> bytes | None:
@@ -612,14 +614,9 @@ def _resolve_gate_command(
             str(run_dir / "steps" / "02-gate-receipt.json"),
         ], timeout_s
 
-    if engines_cfg is not None:
-        cfg_cmd = list(engines_cfg.gate_cmd)
-        if cfg_cmd != list(agent_exec.DEFAULT_GATE_CMD):
-            return cfg_cmd, timeout_s
-        if (workdir / "enforcement" / "gate" / "gate.example.toml").is_file():
-            return cfg_cmd, timeout_s
-
-    return None, timeout_s
+    if engines_cfg is not None and list(engines_cfg.gate_cmd) != list(agent_exec.DEFAULT_GATE_CMD):
+        return list(engines_cfg.gate_cmd), timeout_s
+    return agent_exec.resolve_project_gate_command(workdir), timeout_s
 
 
 def _render_run_dir_quietly(
@@ -805,12 +802,12 @@ def dispatch_job(
     if ws_scope.configured and allow_globs:
         ws_scope = ws_scope.with_allow_globs(allow_globs)
     active_component_names = [c.name for c in ws_scope.active_components]
+    if ws_scope.selection_warning():
+        print(ws_scope.selection_warning(), file=sys.stderr)
 
     effective_engines_path = engines_config_path
     if effective_engines_path is None:
-        rel_eng = project_cfg.get("engines_config", "runner/engines.example.toml")
-        candidate = workdir / rel_eng
-        effective_engines_path = candidate if candidate.is_file() else (pack_root / rel_eng)
+        effective_engines_path = Path(project_cfg["engines_config"])
 
     engines_cfg: EnginesConfig | None = None
     if effective_engines_path.is_file():
@@ -884,6 +881,22 @@ def dispatch_job(
             pack_root=pack_root,
             pre_run_project_bytes=pre_run_project_bytes,
         )
+        if (not no_gate and not gate_cmd.strip()
+                and (engines_cfg is None or list(engines_cfg.gate_cmd) == list(agent_exec.DEFAULT_GATE_CMD))
+                and str(project_cfg.get("gate_config", "")).strip()):
+            project_gate_cmd = agent_exec.resolve_project_gate_command(workdir, project_config_path=project_config_path)
+            original_gate = Path(project_gate_cmd[project_gate_cmd.index("--config") + 1])
+            if original_gate.is_symlink():
+                raise ValueError("Project gate_config must be a regular file, not a symlink")
+            original_bytes = original_gate.read_bytes()
+            snapshot_gate = Path(gate_cfg_tmp) / "project-gate.toml"
+            snapshot_gate.write_bytes(original_bytes)
+            gate_refs = trusted_cfg.protected_rel_paths
+            if original_gate.is_relative_to(workdir):
+                gate_refs = (*gate_refs, original_gate.relative_to(workdir).as_posix())
+            trusted_cfg = replace(trusted_cfg, gate_toml_path=snapshot_gate,
+                                  protected_rel_paths=gate_refs,
+                                  project_gate_path=original_gate, project_gate_bytes=original_bytes)
         return _dispatch_job_with_trusted_cfg(
             trusted_cfg=trusted_cfg,
             engine=engine,
@@ -1035,6 +1048,7 @@ def _dispatch_job_with_trusted_cfg(
             "profile_path": str(resolved_profile) if resolved_profile else "",
             "components": active_component_names,
             "scan_mode": ws_scope.scan_mode,
+            "unchecked_components": ws_scope.unchecked_components(),
         }
         if qual_deviation_logged:
             plan["deviation_id"] = cleaned_deviation
@@ -1054,6 +1068,7 @@ def _dispatch_job_with_trusted_cfg(
         isolation=isolation,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
+        unchecked_components=ws_scope.unchecked_components(),
     )
 
     if not data_ok:
@@ -1276,6 +1291,14 @@ def _dispatch_job_with_trusted_cfg(
             if is_gate_protected_path(name, trusted_cfg.protected_rel_paths)
         }
     )
+    if trusted_cfg.project_gate_path is not None and (
+        trusted_cfg.project_gate_path.is_symlink()
+        or not trusted_cfg.project_gate_path.is_file()
+        or trusted_cfg.project_gate_path.read_bytes() != trusted_cfg.project_gate_bytes
+    ):
+        original = trusted_cfg.project_gate_path
+        gate_label = original.relative_to(workdir).as_posix() if original.is_relative_to(workdir) else original.name
+        gate_touched = sorted(set(gate_touched) | {gate_label})
     out_of_scope_changes: list[str] = []
     scoped_changed_files: list[str] = list(changed_files)
     if ws_scope.configured:
@@ -1327,6 +1350,11 @@ def _dispatch_job_with_trusted_cfg(
                 "--allow",
                 *allow_globs,
             ]
+            if ws_scope.configured:
+                if ws_scope.scan_mode == "all":
+                    scope_cmd.append("--all-components")
+                else:
+                    scope_cmd.extend(["--components", ",".join(c.name for c in ws_scope.active_components)])
             for extra_gate in trusted_cfg.protected_rel_paths:
                 scope_cmd.extend(["--gate-config-file", extra_gate])
             if project_config_path is not None:
@@ -1512,6 +1540,7 @@ def _dispatch_job_with_trusted_cfg(
         memory_proposals=mem_proposal_summary,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
+        unchecked_components=ws_scope.unchecked_components(),
         gate_config_source=trusted_cfg.source,
         gate_config_sha256=trusted_cfg.sha256,
         **suppressions_meta,
@@ -1542,6 +1571,7 @@ def _dispatch_job_with_trusted_cfg(
         "memory_tokens": int(agent_res.memory_tokens),
         "components": active_component_names,
         "scan_mode": ws_scope.scan_mode,
+        "unchecked_components": ws_scope.unchecked_components(),
         "gate_config_source": trusted_cfg.source,
         "gate_config_sha256": trusted_cfg.sha256,
         **suppressions_meta,

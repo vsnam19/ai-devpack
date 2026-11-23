@@ -2,6 +2,11 @@
 
 The Sonnet orchestrator decomposes a goal, writes briefs, submits jobs, and reads results. A separate host broker authenticates workers and runs the installed dispatcher. Only a standalone queue client is installed in the project; no host-executed pack code comes from the worker workspace.
 
+Use installation topology A (external pack) from the root `README.md`. Vendored
+`devpack/` is supported only for CI-only adoption and cannot be used for this broker
+topology. Copy engine and project gate templates into trusted project configuration;
+set `engines_config` and `gate_config` relative to `.devpack/project.toml`.
+
 ## Developer setup
 
 Keep the pack installation, engine configuration, worker credentials, and run directory outside the target project. Use a trusted engine configuration based on `runner/engines.example.toml`. Set the project's `data_class` in `.devpack/project.toml` before starting the broker; the broker snapshots this policy at startup. Restart it after changing policy or engines.

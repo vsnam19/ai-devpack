@@ -1,0 +1,30 @@
+# Header: Project gate template; copy to .devpack/gate.toml in the target project.
+# Configure [workspace], [[component]] build_cmd/test_cmd and gate_config in project.toml.
+# Commands execute from the project root. {pack_root} always resolves to this pack's root.
+# CI: gate.py --config .devpack/gate.toml --all-components
+# DEVPACK_BASE selects the trusted comparison commit (default HEAD); CI sets its merge base.
+# This is separate from gate.example.toml, which only tests the pack itself.
+
+[[check]]
+name = "preflight"
+cmd = ["python3", "{pack_root}/enforcement/gate/project_checks.py", "--check", "lint"]
+timeout_s = 600
+required = true
+
+[[check]]
+name = "cppcheck"
+cmd = ["python3", "{pack_root}/enforcement/gate/project_checks.py", "--check", "cppcheck"]
+timeout_s = 600
+required = true
+
+[[check]]
+name = "build"
+cmd = ["python3", "{pack_root}/enforcement/gate/project_checks.py", "--check", "build"]
+timeout_s = 1200
+required = true
+
+[[check]]
+name = "tests"
+cmd = ["python3", "{pack_root}/enforcement/gate/project_checks.py", "--check", "tests"]
+timeout_s = 1200
+required = true

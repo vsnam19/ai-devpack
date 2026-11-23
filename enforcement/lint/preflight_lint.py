@@ -3096,12 +3096,15 @@ def find_repository_root(hint_paths: Iterable[pathlib.Path]) -> pathlib.Path:
     resolved_hints = [path.resolve() for path in hint_paths if path is not None]
     for base in resolved_hints:
         search_chain = [base, *base.parents] if base.is_dir() else [*base.parents]
+        # Project policy and repository boundaries take precedence over a
+        # component's build marker; otherwise explicit files bypass selection.
         for current in search_chain:
-            if (
-                (current / ".git").exists()
-                or (current / "preflight.toml").is_file()
-                or (current / "CMakeLists.txt").is_file()
-            ):
+            if ((current / ".git").exists()
+                    or (current / ".devpack/project.toml").is_file()
+                    or (current / "preflight.toml").is_file()):
+                return current
+        for current in search_chain:
+            if (current / "CMakeLists.txt").is_file():
                 return current
 
     cwd_resolved = pathlib.Path.cwd().resolve()
@@ -4057,6 +4060,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("targets", nargs="*", help="C/C++ files or directories to check")
+    parser.add_argument("--allow-empty", action="store_true", help="Allow an intentionally empty scan")
     parser.add_argument(
         "--config",
         type=pathlib.Path,
@@ -4411,7 +4415,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     else:
         repository_root = pathlib.Path.cwd().resolve()
 
-    if args.project_config is not None and not args.project_config.is_file():
+    if args.project_config is not None and str(args.project_config) != "none" and not args.project_config.is_file():
         print(f"error: project config not found: {args.project_config}", file=sys.stderr)
         return 2
 
@@ -4426,7 +4430,23 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if not args.targets and not ws_scope.configured:
+    warning = ws_scope.selection_warning()
+    if warning:
+        print(warning, file=sys.stderr)
+    outside = []
+    for raw in args.targets:
+        target = pathlib.Path(raw)
+        if not target.is_absolute() and not target.exists():
+            target = repository_root / target
+        if target.is_file() and (ws_scope.is_excluded(target) or
+                                (ws_scope.configured and not ws_scope.is_in_active_components(target))):
+            outside.append(raw)
+    if outside:
+        for raw in outside:
+            print(f"OUT_OF_SCOPE: {raw}", file=sys.stderr)
+        return 1
+
+    if not args.targets and not ws_scope.configured and not args.allow_empty:
         print("error: provide one or more positional target files or directories", file=sys.stderr)
         return 2
 
@@ -4462,14 +4482,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         files = filtered_files
 
     if not files:
-        if ws_scope.configured:
-            if args.json:
-                print(json.dumps({"files_checked": 0, "total_findings": 0, "reports": []}, indent=2))
-            else:
-                print("\nSummary: 0 file(s) checked, 0 finding(s).")
+        if args.allow_empty:
+            print("SKIP: no C/C++ changes")
             return 0
-        print("preflight_lint: no matching C/C++ files found", file=sys.stderr)
-        return 2
+        print("NO_FILES_CHECKED: no matching in-scope C/C++ files found", file=sys.stderr)
+        return 1
 
     if args.repo_root is None:
         repository_root = find_repository_root([*files, *hint_paths])

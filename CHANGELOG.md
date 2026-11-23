@@ -5,6 +5,17 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Fixed
+- Fail closed on unexpectedly empty scans and explicit out-of-scope files; discover
+  nested components recursively and merge explicit metadata with discovery.
+- Warn about unscanned components and record coverage in run and gate receipts.
+- Resolve installed pack/project paths, require a project gate, preserve failing
+  check diagnostics with redaction, and retain F1 protection for gate configuration.
+- Validate engine names and brief references; provide explicit skill installation.
+- Document external broker and CI-only vendored installations, project gates,
+  coding-rule adaptation, and full CI coverage with supported command flags.
+- Isolate pack skill self-tests from host-project scope and validate documented flags.
+
 ## [0.2.1] - 2026-11-23
 
 ### Security
