@@ -387,6 +387,16 @@ def _minimal_toml_loads(text: str) -> dict[str, Any]:
                     break
         if not raw:
             continue
+        if raw.startswith("[[") and raw.endswith("]]"):
+            section_path = [p.strip() for p in raw[2:-2].strip().split(".") if p.strip()]
+            target = root
+            for part in section_path[:-1]:
+                target = target.setdefault(part, {})
+            arr = target.setdefault(section_path[-1], [])
+            entry: dict[str, Any] = {}
+            arr.append(entry)
+            current = entry
+            continue
         if raw.startswith("[") and raw.endswith("]"):
             section_path = raw[1:-1].strip().split(".")
             current = root
@@ -736,6 +746,9 @@ def load_project_config(
         "default_engines": {},
         "allow_unsandboxed_local": False,
         "require_qualification": False,
+        "workspace": {},
+        "components": [],
+        "scan": {},
         "config_found": False,
     }
     if project_config_path is not None and str(project_config_path):
@@ -774,6 +787,21 @@ def load_project_config(
         defaults["default_engines"] = {str(k): str(v) for k, v in raw_defaults.items()}
     defaults["allow_unsandboxed_local"] = bool(raw.get("allow_unsandboxed_local", False))
     defaults["require_qualification"] = bool(raw.get("require_qualification", False))
+    raw_ws = raw.get("workspace", {})
+    if isinstance(raw_ws, dict):
+        defaults["workspace"] = dict(raw_ws)
+    elif "workspace" in raw:
+        raise ValueError(f"[workspace] must be a table in {cfg_path}")
+    raw_comp = raw.get("component", [])
+    if isinstance(raw_comp, list):
+        defaults["components"] = [dict(c) for c in raw_comp if isinstance(c, dict)]
+    elif "component" in raw:
+        raise ValueError(f"[[component]] must be an array of tables in {cfg_path}")
+    raw_scan = raw.get("scan", {})
+    if isinstance(raw_scan, dict):
+        defaults["scan"] = dict(raw_scan)
+    elif "scan" in raw:
+        raise ValueError(f"[scan] must be a table in {cfg_path}")
     defaults["config_found"] = True
     return defaults
 

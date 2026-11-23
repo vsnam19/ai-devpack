@@ -1,0 +1,7 @@
+[
+  {
+    "directory": ".",
+    "command": "g++ -std=c++17 -Imeta-org/recipes-org/src/middleware/ipc_bus/include -c meta-org/recipes-org/src/middleware/ipc_bus/src/ipc_bus.cpp",
+    "file": "meta-org/recipes-org/src/middleware/ipc_bus/src/ipc_bus.cpp"
+  }
+]

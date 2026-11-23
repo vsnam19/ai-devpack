@@ -412,6 +412,124 @@ class CppcheckPathResolutionTests(unittest.TestCase):
             for item in payload["findings"]:
                 self.assertEqual("src/bad.cpp", item["file"])
 
+    def test_full_scan_filters_compile_db_and_analyses_unindexed_sources_via_include_dirs(self) -> None:
+        """Full component scan passes a filtered temp compile DB and analyses missing component sources via include_dirs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            ws = repo / "meta-org" / "src"
+            ipc_inc = ws / "ipc_bus" / "include"
+            ipc_src = ws / "ipc_bus" / "src"
+            ipc_tp = ws / "ipc_bus" / "third_party"
+            diag_src = ws / "diag_svc" / "src"
+            poky_dir = repo / "poky" / "core"
+            build_dir = repo / "build" / "ipc_bus"
+            for d in (ipc_inc, ipc_src, ipc_tp, diag_src, poky_dir, build_dir, repo / ".devpack"):
+                d.mkdir(parents=True)
+
+            (repo / ".devpack" / "project.toml").write_text(
+                '[workspace]\nroot = "meta-org/src"\nexclude = ["**/third_party/**"]\n\n'
+                '[[component]]\nname = "ipc_bus"\npath = "ipc_bus"\n'
+                'compile_commands = "build/ipc_bus/compile_commands.json"\n'
+                'include_dirs = ["ipc_bus/include"]\n\n'
+                '[[component]]\nname = "diag_svc"\npath = "diag_svc"\n\n'
+                '[scan]\ndefault = "selected"\nselected = ["ipc_bus"]\n',
+                encoding="utf-8",
+            )
+            (repo / "preflight.toml").write_text(
+                '[general]\nstd = "c++17"\n\n[cppcheck]\n'
+                'enable = ["warning", "style", "performance", "portability"]\n'
+                'fail_on = ["error", "warning"]\n',
+                encoding="utf-8",
+            )
+            (ipc_inc / "ipc_defs.hpp").write_text("#define BUF_CAP 4\n", encoding="utf-8")
+            (ipc_src / "indexed.cpp").write_text(
+                '#include "ipc_defs.hpp"\nint okFunc() { int a[BUF_CAP] = {0}; return a[0]; }\n',
+                encoding="utf-8",
+            )
+            # Source file present in component but missing from compile_commands.json
+            (ipc_src / "unindexed.cpp").write_text(
+                '#include "ipc_defs.hpp"\n'
+                "int badUnindexed(int flag) {\n"
+                "    int *p = nullptr;\n"
+                "    if (flag > 0) { return *p; }\n"
+                "    int a[BUF_CAP] = {0};\n"
+                "    return a[0];\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            # Out-of-scope / excluded files with bugs that must never be included in the filtered compile DB
+            (ipc_tp / "vendor.cpp").write_text("int vBad() { int *p = nullptr; return *p; }\n", encoding="utf-8")
+            (diag_src / "diag.cpp").write_text("int dBad() { int *p = nullptr; return *p; }\n", encoding="utf-8")
+            (poky_dir / "poky.c").write_text("int pBad() { int *p = 0; return *p; }\n", encoding="utf-8")
+
+            cc_entries = [
+                {
+                    "directory": ".",
+                    "command": "g++ -std=c++17 -Imeta-org/src/ipc_bus/include -c meta-org/src/ipc_bus/src/indexed.cpp",
+                    "file": "meta-org/src/ipc_bus/src/indexed.cpp",
+                },
+                {
+                    "directory": ".",
+                    "command": "g++ -c meta-org/src/ipc_bus/third_party/vendor.cpp",
+                    "file": "meta-org/src/ipc_bus/third_party/vendor.cpp",
+                },
+                {
+                    "directory": ".",
+                    "command": "g++ -c meta-org/src/diag_svc/src/diag.cpp",
+                    "file": "meta-org/src/diag_svc/src/diag.cpp",
+                },
+                {
+                    "directory": ".",
+                    "command": "gcc -c poky/core/poky.c",
+                    "file": "poky/core/poky.c",
+                },
+            ]
+            (build_dir / "compile_commands.json").write_text(json.dumps(cc_entries), encoding="utf-8")
+
+            calls: list[list[str]] = []
+            captured_dbs: list[list[dict[str, object]]] = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                for arg in cmd:
+                    if arg.startswith("--project="):
+                        db_path = Path(arg.split("=", 1)[1])
+                        captured_dbs.append(json.loads(db_path.read_text(encoding="utf-8")))
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr=EMPTY_RESULTS_XML)
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("DEVPACK_COMPONENTS", None)
+                with mock.patch.object(cppcheck_check.subprocess, "run", side_effect=fake_run):
+                    mocked_res = cppcheck_check.run_cppcheck_check(
+                        repo_root=repo,
+                        cppcheck_bin=sys.executable,
+                    )
+
+            self.assertEqual(0, mocked_res.exit_code)
+            self.assertEqual(1, mocked_res.fallback_files_count)
+            self.assertEqual(2, len(calls))
+            self.assertEqual(1, len(captured_dbs))
+            self.assertEqual(
+                ["meta-org/src/ipc_bus/src/indexed.cpp"],
+                [e["file"] for e in captured_dbs[0]],
+            )
+            self.assertIn("meta-org/src/ipc_bus/src/unindexed.cpp", calls[1])
+            self.assertIn("-I", calls[1])
+            self.assertIn("meta-org/src/ipc_bus/include", calls[1])
+            self.assertEqual(1, json.loads(cppcheck_check.format_result_json(mocked_res))["fallback_files"])
+            self.assertIn("1 file(s) missing from compile_commands.json", cppcheck_check.format_result_text(mocked_res))
+
+            if shutil.which("cppcheck") is not None:
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("DEVPACK_COMPONENTS", None)
+                    real_res = cppcheck_check.run_cppcheck_check(repo_root=repo)
+                self.assertEqual(1, real_res.exit_code)
+                self.assertEqual(1, real_res.fallback_files_count)
+                self.assertEqual(
+                    {"meta-org/src/ipc_bus/src/unindexed.cpp"},
+                    {f.file for f in real_res.blocking_findings},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

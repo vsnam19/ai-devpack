@@ -19,15 +19,26 @@ def main(argv=None):
     parser.add_argument('--workdir', required=True)
     parser.add_argument('--allow', action='extend', nargs='+', default=[])
     parser.add_argument('--gate-cmd', default='')
+    parser.add_argument('--components', default=None)
+    parser.add_argument('--all-components', action='store_true')
     parser.add_argument('--timeout', type=float, default=900)
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error('--timeout must be positive')
+    if args.all_components and args.components is not None and args.components.strip():
+        parser.error('cannot specify both --components and --all-components')
     work = Path(args.workdir).resolve()
     queue = work / '.devpack/queue'
     payload = {'engine': args.engine, 'brief': args.brief, 'allow': args.allow}
     if args.gate_cmd:
         payload['gate_cmd'] = args.gate_cmd
+    if args.components is not None:
+        comp_list = [item.strip() for item in args.components.split(',') if item.strip()]
+        if not comp_list:
+            parser.error('--components must specify at least one component name')
+        payload['components'] = comp_list
+    if args.all_components:
+        payload['all_components'] = True
     request_id = uuid.uuid4().hex
     try:
         if not (work / '.devpack/broker.json').is_file() or not queue.is_dir():

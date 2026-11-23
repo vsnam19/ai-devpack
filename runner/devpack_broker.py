@@ -29,6 +29,7 @@ if str(PACK_ROOT) not in sys.path:
 from runner.agent_exec import DOCKER_IMAGE_TAG, check_data_class_allowed, load_engines, load_project_config, new_run_dir, redact_sensitive_text, update_run_json
 from runner.brief_lint import has_errors as brief_has_errors, lint_brief_text
 from runner.devpack_dispatch import dispatch_job, _render_run_dir_quietly
+from runner.workspace_scope import load_workspace_config
 
 CLIENT_SOURCE = Path(__file__).with_name('devpack_submit.py')
 CLIENT_RELATIVE = Path('.devpack/pack/runner/devpack_dispatch.py')
@@ -119,6 +120,41 @@ def copy_back(source_root, destination_root, relative):
             raise
 
 
+def _format_toml_value(value):
+    """Serialize a primitive or list value as valid TOML."""
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, (list, tuple)):
+        return '[' + ', '.join(_format_toml_value(item) for item in value) + ']'
+    raise ValueError(f'unsupported TOML value type: {type(value).__name__}')
+
+
+def _build_sandbox_project_toml(project_cfg):
+    """Render trusted data_class and workspace/component/scan tables for the sandbox."""
+    lines = ['data_class = ' + json.dumps(project_cfg['data_class'])]
+    workspace = project_cfg.get('workspace')
+    if isinstance(workspace, dict) and workspace:
+        lines.extend(['', '[workspace]'])
+        for key, value in workspace.items():
+            lines.append(f'{key} = {_format_toml_value(value)}')
+        for comp in project_cfg.get('components', ()):
+            if not isinstance(comp, dict) or not comp:
+                continue
+            lines.extend(['', '[[component]]'])
+            for key, value in comp.items():
+                lines.append(f'{key} = {_format_toml_value(value)}')
+        scan = project_cfg.get('scan')
+        if isinstance(scan, dict) and scan:
+            lines.extend(['', '[scan]'])
+            for key, value in scan.items():
+                lines.append(f'{key} = {_format_toml_value(value)}')
+    return '\n'.join(lines) + '\n'
+
+
 class Broker:
     """Own immutable launch configuration and execute at most one worker at a time."""
 
@@ -140,16 +176,19 @@ class Broker:
             raise ValueError('engine configuration must be outside workdir')
         self.engines = load_engines(self.engines_path)
         self.allowed_engines = set(allowed_engines or self.engines.engines)
+        control = self.workdir / '.devpack'
+        if control.is_symlink():
+            raise ValueError('control directory must not be a symlink')
+        if (control / 'project.toml').is_symlink():
+            raise ValueError('project config must not be a symlink')
         self.project = load_project_config(self.workdir)
+        self.workspace_config = load_workspace_config(self.workdir)
         self.isolation = isolation
         self.allow_local = allow_unsandboxed_local
         self.agent_bin = agent_bin
         self.gate_cmd = gate_cmd
         self.docker_bin = docker_bin
         self.image_tag = image_tag
-        control = self.workdir / '.devpack'
-        if control.is_symlink():
-            raise ValueError('control directory must not be a symlink')
         control.mkdir(exist_ok=True)
         self.queue = control / 'queue'
         if self.queue.is_symlink():
@@ -188,8 +227,8 @@ class Broker:
             self._lock_file.close()
 
     def _validate(self, request):
-        """Refuse launch overrides, unknown engines, forbidden data classes, and path escapes."""
-        if not isinstance(request, dict) or set(request) - {'engine', 'brief', 'allow', 'gate_cmd'}:
+        """Refuse launch overrides, unknown engines, unknown components, forbidden data classes, and path escapes."""
+        if not isinstance(request, dict) or set(request) - {'engine', 'brief', 'allow', 'gate_cmd', 'components', 'all_components'}:
             raise ValueError('unsupported request fields')
         if self.client_path.is_symlink() or hashlib.sha256(self.client_path.read_bytes()).hexdigest() != self.client_hash:
             raise ValueError('client integrity mismatch')
@@ -207,7 +246,28 @@ class Broker:
             relative_path(glob)
         if request.get('gate_cmd', self.gate_cmd) != self.gate_cmd:
             raise ValueError('gate_cmd must match broker startup configuration')
-        return brief, globs
+        all_components = request.get('all_components', False)
+        if not isinstance(all_components, bool):
+            raise ValueError('all_components must be a boolean')
+        components = None
+        if 'components' in request and request['components'] is not None:
+            raw_components = request['components']
+            if (
+                not isinstance(raw_components, list)
+                or not raw_components
+                or len(raw_components) > 128
+                or any(not isinstance(item, str) or not item.strip() for item in raw_components)
+            ):
+                raise ValueError('components must be a non-empty list of component names')
+            components = [item.strip() for item in raw_components]
+            if all_components:
+                raise ValueError('cannot specify both components and all_components')
+            valid_names = {comp.name for comp in self.workspace_config.components}
+            unknown = [name for name in components if name not in valid_names]
+            if unknown:
+                valid_list = ', '.join(sorted(valid_names)) if valid_names else '(none)'
+                raise ValueError(f"Unknown component(s): {', '.join(unknown)}. Valid components: {valid_list}")
+        return brief, globs, components, all_components
 
     def execute(self, request, request_id=None):
         """Log and execute one request; never accept worker launch configuration from it."""
@@ -222,7 +282,7 @@ class Broker:
         try:
             if not acquired:
                 raise ValueError('broker concurrency limit is 1')
-            brief, globs = self._validate(request)
+            brief, globs, components, all_components = self._validate(request)
             brief_findings = lint_brief_text(
                 brief.decode('utf-8', errors='replace'),
                 repo_root=self.workdir,
@@ -251,7 +311,7 @@ class Broker:
                 prompt = sandbox / 'brief.md'
                 prompt.write_bytes(brief)
                 project = sandbox / 'project.toml'
-                project.write_text('data_class = ' + json.dumps(self.project['data_class']) + '\n', encoding='utf-8')
+                project.write_text(_build_sandbox_project_toml(self.project), encoding='utf-8')
                 # Freeze the engine file for this launch as well as policy resolution.
                 engines = sandbox / 'engines.toml'
                 shutil.copyfile(self.engines_path, engines)
@@ -274,6 +334,8 @@ class Broker:
                         image_tag=self.image_tag or DOCKER_IMAGE_TAG, role='broker-worker', pack_root=PACK_ROOT,
                         memory_root=sandbox_memory,
                         brief_lint_findings=brief_findings,
+                        components=components,
+                        all_components=all_components,
                     )
                 if payload.get('gate') == 'ok' and payload.get('scope') == 'ok' and sandbox_memory.is_dir():
                     changed_mem = [

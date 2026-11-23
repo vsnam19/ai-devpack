@@ -55,6 +55,12 @@ import tempfile
 import tomllib
 from typing import Any
 
+_REPO_ROOT_STR = str(pathlib.Path(__file__).resolve().parents[2])
+if _REPO_ROOT_STR not in sys.path:
+    sys.path.insert(0, _REPO_ROOT_STR)
+
+from runner.workspace_scope import WorkspaceScope, resolve_workspace_scope  # noqa: E402
+
 VERSION = "0.1.0"
 
 C_EXTS = {".c"}
@@ -4068,6 +4074,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip clang-tidy checks on C++ files",
     )
+    parser.add_argument(
+        "--components",
+        default=None,
+        help="Comma-separated workspace component names to check (overrides [scan] defaults)",
+    )
+    parser.add_argument(
+        "--all-components",
+        action="store_true",
+        help="Check all configured/discovered workspace components",
+    )
+    parser.add_argument(
+        "--project-config",
+        type=pathlib.Path,
+        default=None,
+        help="Optional path to project.toml (default: <repo-root>/.devpack/project.toml)",
+    )
     return parser
 
 
@@ -4130,6 +4152,60 @@ def _resolve_config_from_args(
     return config
 
 
+def _expand_workspace_targets(
+    raw_targets: Sequence[str],
+    repository_root: pathlib.Path,
+    ws_scope: WorkspaceScope,
+) -> list[str]:
+    """Expand directory targets against ``ws_scope`` so out-of-workspace trees are never walked."""
+    if not ws_scope.configured:
+        return list(raw_targets)
+    if not raw_targets:
+        return [str(d) for d in ws_scope.target_dirs()]
+
+    expanded: list[str] = []
+    seen: set[str] = set()
+    ws_root_resolved = ws_scope.workspace_root.resolve()
+    for raw in raw_targets:
+        p = pathlib.Path(raw)
+        if not p.is_absolute() and not p.exists():
+            repo_cand = repository_root / p
+            if repo_cand.exists():
+                p = repo_cand
+        if not p.exists():
+            # Preserve missing target so collect_files reports the exact path error.
+            expanded.append(raw)
+            continue
+        p_res = p.resolve()
+        if p_res.is_dir():
+            if ws_root_resolved.is_relative_to(p_res):
+                for comp_dir in ws_scope.target_dirs():
+                    s = str(comp_dir)
+                    if s not in seen:
+                        seen.add(s)
+                        expanded.append(s)
+            elif p_res.is_relative_to(ws_root_resolved):
+                for comp_dir in ws_scope.target_dirs():
+                    comp_res = comp_dir.resolve()
+                    if comp_res.is_relative_to(p_res):
+                        s = str(comp_res)
+                        if s not in seen:
+                            seen.add(s)
+                            expanded.append(s)
+                    elif p_res.is_relative_to(comp_res):
+                        s = str(p_res)
+                        if s not in seen:
+                            seen.add(s)
+                            expanded.append(s)
+            # Directory outside workspace_root is intentionally not walked.
+        else:
+            s = str(p_res)
+            if s not in seen:
+                seen.add(s)
+                expanded.append(s)
+    return expanded
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     """
     @brief CLI entry point for generic C/C++ preflight linting and baseline ratcheting.
@@ -4138,10 +4214,6 @@ def main(argv: Iterable[str] | None = None) -> int:
     """
     parser = build_arg_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-
-    if not args.targets:
-        print("error: provide one or more positional target files or directories", file=sys.stderr)
-        return 2
 
     changed_paths: set[str] | None = None
     if args.changed_files is not None:
@@ -4171,8 +4243,29 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     if args.repo_root is not None:
         repository_root = args.repo_root.resolve()
-    else:
+    elif hint_paths:
         repository_root = find_repository_root(hint_paths)
+    else:
+        repository_root = pathlib.Path.cwd().resolve()
+
+    if args.project_config is not None and not args.project_config.is_file():
+        print(f"error: project config not found: {args.project_config}", file=sys.stderr)
+        return 2
+
+    try:
+        ws_scope = resolve_workspace_scope(
+            repository_root,
+            project_config_path=args.project_config,
+            components=args.components,
+            all_components=bool(args.all_components),
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if not args.targets and not ws_scope.configured:
+        print("error: provide one or more positional target files or directories", file=sys.stderr)
+        return 2
 
     try:
         config = _resolve_config_from_args(args, repository_root)
@@ -4188,7 +4281,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     for plugin in plugins:
         extra_exts.update(plugin.supported_extensions)
 
-    files = collect_files(args.targets, extra_extensions=extra_exts, skip_dirs=config.skip_dirs)
+    effective_targets = _expand_workspace_targets(args.targets, repository_root, ws_scope)
+    files = (
+        collect_files(effective_targets, extra_extensions=extra_exts, skip_dirs=config.skip_dirs)
+        if effective_targets
+        else []
+    )
+    if ws_scope.configured:
+        files = ws_scope.filter(files)
     if config.exclude_globs:
         filtered_files: list[pathlib.Path] = []
         for fp in files:
@@ -4199,6 +4299,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         files = filtered_files
 
     if not files:
+        if ws_scope.configured:
+            if args.json:
+                print(json.dumps({"files_checked": 0, "total_findings": 0, "reports": []}, indent=2))
+            else:
+                print("\nSummary: 0 file(s) checked, 0 finding(s).")
+            return 0
         print("preflight_lint: no matching C/C++ files found", file=sys.stderr)
         return 2
 

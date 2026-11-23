@@ -30,7 +30,8 @@ Keep this path identical in the prompt and `.claude/settings.json`.
      --submit --engine <haiku|local> \
      --brief briefs/<task-id>.md \
      --workdir . \
-     --allow '<glob1>' --allow '<glob2>'
+     --allow '<glob1>' --allow '<glob2>' \
+     [--components <a,b> | --all-components]
    ```
    The broker owns the gate and launch options. Never pass credentials, executable paths, or engine configs.
 5. Read the **single JSON line** printed on stdout first:
@@ -49,3 +50,6 @@ Keep this path identical in the prompt and `.claude/settings.json`.
 - Workers receive a separate product copy without `.devpack/`; creating control files is a scope violation.
 - Worker container isolation (`--isolation docker`) is the default. `--isolation local` is refused unless explicitly authorized (`--allow-unsandboxed-local` or `allow_unsandboxed_local = true`).
 - Native sub-agents (`implementer-haiku`, `reviewer-sonnet`) share ONE API endpoint; use `devpack_dispatch.py` whenever mixing cloud orchestration with local workers.
+
+## Workspace component scope
+When `.devpack/project.toml` defines `[workspace]`, read `[[component]]` / `[scan]` in `.devpack/project.toml` and select only the component(s) the task owns. Keep every `Files allowed` glob inside `workspace.root` (never `poky/`, other `meta-*` layers, or `build/`), and pass `--components <a,b>` (or `--all-components` when cross-cutting) with `--submit` so the broker bounds checks, lint, and static analysis to active components.

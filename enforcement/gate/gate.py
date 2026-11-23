@@ -22,12 +22,19 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import time
 import tomllib
 from typing import Any
+
+_REPO_ROOT_STR = str(pathlib.Path(__file__).resolve().parents[2])
+if _REPO_ROOT_STR not in sys.path:
+    sys.path.insert(0, _REPO_ROOT_STR)
+
+from runner.workspace_scope import resolve_workspace_scope  # noqa: E402
 
 
 def get_utc_timestamp() -> str:
@@ -61,6 +68,8 @@ def write_receipt(
     repo_root: pathlib.Path,
     checks_results: list[dict[str, Any]],
     error: str | None = None,
+    components: list[str] | None = None,
+    scan_mode: str | None = None,
 ) -> None:
     """Write the gate execution receipt as formatted JSON to ``receipt_path``."""
     payload: dict[str, Any] = {
@@ -71,6 +80,10 @@ def write_receipt(
         "timestamp_utc": get_utc_timestamp(),
         "checks": checks_results,
     }
+    if components is not None:
+        payload["components"] = list(components)
+    if scan_mode is not None:
+        payload["scan_mode"] = scan_mode
     if error is not None:
         payload["error"] = error
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,7 +155,11 @@ def parse_checks_config(config_path: pathlib.Path) -> tuple[list[dict[str, Any]]
     return validated, None, None
 
 
-def run_single_check(check: dict[str, Any], repo_root: pathlib.Path) -> dict[str, Any]:
+def run_single_check(
+    check: dict[str, Any],
+    repo_root: pathlib.Path,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Execute one check command in ``repo_root`` and return its result record."""
     name: str = check["name"]
     cmd: list[str] = check["cmd"]
@@ -154,6 +171,7 @@ def run_single_check(check: dict[str, Any], repo_root: pathlib.Path) -> dict[str
         proc = subprocess.run(
             cmd,
             cwd=str(repo_root),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -258,6 +276,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="ID",
         help="Deviation identifier authorizing --skip <NAME>.",
     )
+    parser.add_argument(
+        "--components",
+        default=None,
+        help="Comma-separated workspace component names forwarded via DEVPACK_COMPONENTS.",
+    )
+    parser.add_argument(
+        "--all-components",
+        action="store_true",
+        help="Run workspace-aware checks across all components (sets DEVPACK_COMPONENTS=all).",
+    )
+    parser.add_argument(
+        "--project-config",
+        default="",
+        help="Optional path to project.toml (default: <repo>/.devpack/project.toml).",
+    )
     return parser
 
 
@@ -333,6 +366,47 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    proj_cfg = pathlib.Path(args.project_config) if args.project_config else None
+    try:
+        ws_scope = resolve_workspace_scope(
+            repo_root,
+            project_config_path=proj_cfg,
+            components=args.components,
+            all_components=bool(args.all_components),
+        )
+    except ValueError as exc:
+        reason = str(exc)
+        print(f"FAIL workspace_scope: {reason}")
+        print("GATE_FAIL workspace_scope")
+        write_receipt(
+            receipt_path=receipt_path,
+            gate_status="GATE_FAIL",
+            first_failed="workspace_scope",
+            repo_root=repo_root,
+            checks_results=[],
+            error=reason,
+        )
+        return 1
+
+    child_env: dict[str, str] | None = None
+    if args.all_components:
+        child_env = dict(os.environ)
+        child_env["DEVPACK_COMPONENTS"] = "all"
+    elif args.components is not None:
+        child_env = dict(os.environ)
+        child_env["DEVPACK_COMPONENTS"] = ",".join(c.name for c in ws_scope.active_components)
+
+    receipt_components = (
+        [c.name for c in ws_scope.active_components]
+        if (ws_scope.configured or args.components is not None or args.all_components)
+        else None
+    )
+    receipt_scan_mode = (
+        ws_scope.scan_mode
+        if (ws_scope.configured or args.components is not None or args.all_components)
+        else None
+    )
+
     skip_set = set(skip_names)
     results: list[dict[str, Any]] = []
     first_failed: str | None = None
@@ -354,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             continue
 
-        result = run_single_check(check, repo_root)
+        result = run_single_check(check, repo_root, env=child_env)
         results.append(result)
         if result["status"] == "PASS":
             print(f"PASS {name}")
@@ -375,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
             first_failed=None,
             repo_root=repo_root,
             checks_results=results,
+            components=receipt_components,
+            scan_mode=receipt_scan_mode,
         )
         print("GATE_OK")
         return 0
@@ -385,6 +461,8 @@ def main(argv: list[str] | None = None) -> int:
         first_failed=first_failed,
         repo_root=repo_root,
         checks_results=results,
+        components=receipt_components,
+        scan_mode=receipt_scan_mode,
     )
     print(f"GATE_FAIL {first_failed}")
     return 1

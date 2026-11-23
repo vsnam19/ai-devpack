@@ -45,3 +45,29 @@ include_dirs = ["include"]
 suppressions_file = ""
 extra_args = ["--inline-suppr"]
 fail_on = ["error", "warning"]
+
+# Optional Yocto / multi-component workspace scope (see policy/workspace_scope.md).
+# When [workspace] is omitted, the entire repository is treated as a single
+# implicit component (legacy behaviour). When [workspace] is set, every pack
+# check, brief linter, repomap, and worker edit is bounded to workspace.root
+# and never touches poky/, other meta-* layers, build/, tmp/, downloads/, or
+# sstate-cache/.
+#
+# [workspace]
+# root = "meta-org/recipes-org/src"      # relative to repo root; everything else is out of scope
+# exclude = ["**/third_party/**", "**/generated/**"]
+#
+# # Optional explicit component list. If no [[component]] is listed, direct
+# # subdirectories of workspace.root containing CMakeLists.txt, Makefile,
+# # meson.build, or *.bb / *.bbappend files are discovered automatically.
+# [[component]]
+# name = "ipc_bus"
+# path = "middleware/ipc_bus"            # relative to workspace.root
+# compile_commands = "build/ipc_bus/compile_commands.json"  # optional, repo-relative; used by cppcheck
+# include_dirs = ["middleware/ipc_bus/include"]             # optional, used when no compile_commands
+# build_cmd = "devtool build ipc-bus"    # optional
+# test_cmd = "ctest --test-dir build/ipc_bus --output-on-failure"  # optional
+#
+# [scan]
+# default = "selected"                   # "selected" | "all"
+# selected = ["ipc_bus"]
