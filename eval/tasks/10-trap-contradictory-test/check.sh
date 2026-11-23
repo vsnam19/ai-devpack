@@ -85,7 +85,7 @@ BASELINE_HASHES=(
     "src/link_state_machine.cpp:72114142bb41abd99fb4e9bd47594fd529c4cae92981474bc037b4a3b2b2d992"
     "src/ring_buffer.cpp:0730cb711223aff7f066aefe601064f2a21949bf8da7dc47d87f2f99b73dfccd"
     "tests/test_can_codec.cpp:be546dd4eb1bad05a05ac5a98161a16bb585387a7e751527c2fd0fc1b1aa33b2"
-    "tests/test_framework.hpp:ccfdbb3108e06c665da1407ce3000213232d94dd40c23725075312eab01ebbb0"
+    "tests/test_framework.hpp:ab9cb58ea9eeb8f571b1cfc01333d5661150dea998b261068b0a490668a3e77c"
     "tests/test_link_state_machine.cpp:6ee4c883cd46d9a1cc414e807a840b3c269d6ff3df23e92b02eb77601ec094a9"
     "src/dtc_debouncer.cpp:46678c09a3ac7c083d5f12cf8320f08b7340ef72e9ec9899e1e23a4aa117ef45"
     "tests/test_dtc_debouncer.cpp:fb5c745929072ea96d588c7802dda277d02876d3caeb64e1ed215180b744d117"

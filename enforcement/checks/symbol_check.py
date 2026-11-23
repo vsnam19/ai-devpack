@@ -39,21 +39,12 @@ DEFAULT_FRAMEWORK_NAMESPACES: tuple[str, ...] = ("can_fixture_test",)
 DEFAULT_EVAL_ALLOWLIST_PATH: Path = Path(__file__).resolve().with_name("symbol_allowlist_eval.txt")
 VALID_IMPORT_PROFILES: tuple[str, ...] = ("production", "eval")
 
-# Additional undefined symbols pulled into worker-authored test TUs solely by force-included test_framework.hpp
-_EVAL_TEST_FRAMEWORK_ALLOWLIST_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^std::cerr$"),
-    re.compile(r"^std::ios_base_library_init\(\)$"),
-    re.compile(r"^std::ostream::operator<<\(int\)$"),
-    re.compile(
-        r"^std::basic_ostream<char,\s*std::char_traits<char>\s*>&\s*"
-        r"std::operator<<\s*<std::char_traits<char>\s*>\("
-        r"std::basic_ostream<char,\s*std::char_traits<char>\s*>&,\s*char const\*\)$"
-    ),
-    re.compile(
-        r"^std::basic_ostream<char,\s*std::char_traits<char>\s*>&\s*"
-        r"std::__ostream_insert<char,\s*std::char_traits<char>\s*>\("
-        r"std::basic_ostream<char,\s*std::char_traits<char>\s*>&,\s*char const\*,\s*long\)$"
-    ),
+# Undefined symbols that worker-authored test TUs (compiled with the forced framework header) may import,
+# in addition to the eval allowlist. Exact names only: the framework header uses <cstdio> and nothing else.
+# Deliberately absent: __cxa_atexit, atexit, std::ios_base::Init (static-init/static-destructor hooks), and
+# any iostream symbol. Keep this list identical to the framework's stdio surface.
+_EVAL_TEST_FRAMEWORK_ALLOWLIST_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(rf"^{name}$") for name in ("fprintf", "fputs", "fflush", "stderr", "stdout")
 )
 
 _ALLOWED_TEST_WEAK_TEMPLATES: frozenset[str] = frozenset(

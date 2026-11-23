@@ -3157,8 +3157,9 @@ def _preprocess_repo_origin_lines(
     if compiler_bin is None:
         if allow_missing_tools:
             stripped_keep_strings = _strip_comments_preserve_strings_and_lines(raw_text)
+            # Same (report_line, text, origin) shape as the preprocessed path; the raw text is the target itself.
             return [
-                (idx, ln)
+                (idx, ln, str(resolved_target))
                 for idx, ln in enumerate(stripped_keep_strings.splitlines(), start=1)
                 if ln.strip()
             ]

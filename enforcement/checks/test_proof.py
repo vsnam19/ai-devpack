@@ -346,13 +346,6 @@ def verify_gcov_proof(
             output=output_text,
         )
 
-    if _FAILURE_LINE_RE.search(output_text):
-        return ProofResult(
-            exit_code=1,
-            reason=f"FAIL: {label} printed test failure lines despite exit 0",
-            output=output_text,
-        )
-
     if not test_sources:
         return ProofResult(
             exit_code=1,
@@ -547,6 +540,15 @@ def verify_gcov_proof(
         return ProofResult(
             exit_code=1,
             reason=f"FAIL: {label} found 0 CHECK* lines across pristine test sources",
+            output=output_text,
+        )
+
+    # Output scan runs last so the gcov proof (the authoritative evidence) names the reason when both apply.
+    # Verdict is unchanged: any output with failure lines still fails, even when every gcov check passes.
+    if _FAILURE_LINE_RE.search(output_text):
+        return ProofResult(
+            exit_code=1,
+            reason=f"FAIL: {label} printed test failure lines despite exit 0",
             output=output_text,
         )
 

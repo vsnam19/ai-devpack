@@ -12,7 +12,7 @@
 
 #include <cmath>
 #include <cstddef>
-#include <iostream>
+#include <cstdio>
 
 namespace can_fixture_test {
 
@@ -55,8 +55,7 @@ inline void recordCheckFailure(
     int lineNumber) {
     TestCounters& state = counters<Tag>();
     ++state.failedChecks;  // DEVPACK_FAILURE_PATH
-    std::cerr << "FAIL: " << fileName << ":" << lineNumber
-              << ": " << checkName << "(" << expressionText << ") failed\n";
+    std::fprintf(stderr, "FAIL: %s:%d: %s(%s) failed\n", fileName, lineNumber, checkName, expressionText);
 }
 
 /**
@@ -116,11 +115,12 @@ inline void recordCheckEq(
 template <int Tag = 0>
 inline int printSummaryAndExitCode() {
     const TestCounters& state = counters<Tag>();
-    std::cout << "TEST SUMMARY: " << state.passedChecks << "/" << state.totalChecks
-              << " checks passed (" << state.failedChecks << " failed)\n"
-              << "DEVPACK_TESTS_COMPLETED checks=" << state.totalChecks
-              << " failed=" << state.failedChecks << "\n"
-              << std::flush;
+    std::fprintf(stdout,
+                 "TEST SUMMARY: %zu/%zu checks passed (%zu failed)\n"
+                 "DEVPACK_TESTS_COMPLETED checks=%zu failed=%zu\n",
+                 state.passedChecks, state.totalChecks, state.failedChecks,
+                 state.totalChecks, state.failedChecks);
+    std::fflush(stdout);
     if (state.totalChecks == 0U || state.failedChecks > 0U || state.passedChecks != state.totalChecks) {
         return 1;  // DEVPACK_FAILURE_PATH
     }
