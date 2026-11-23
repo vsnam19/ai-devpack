@@ -48,8 +48,10 @@ import json
 import os
 import pathlib
 import re
+import resource
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -112,6 +114,8 @@ DEFAULT_NON_MEANINGFUL_NAMES = {
 }
 DEFAULT_ALLOWED_LOOP_INDICES = {"i", "j", "k"}
 DEFAULT_MAX_PARAMS = 5
+DEFAULT_SUBPROCESS_TIMEOUT_S = 30
+DEFAULT_MAX_AS_BYTES = 2 * 1024 * 1024 * 1024
 BASELINE_SCHEMA_VERSION = 1
 FINGERPRINT_POLICY_VERSION = 2
 CACHE_SCHEMA_VERSION = 1
@@ -261,6 +265,8 @@ class LintConfig:
     deviation_id: str = ""
     base_ref: str = ""
     changed_paths: set[str] | None = None
+    subprocess_timeout_s: int = DEFAULT_SUBPROCESS_TIMEOUT_S
+    max_as_bytes: int = DEFAULT_MAX_AS_BYTES
 
 
 @dataclass
@@ -425,6 +431,15 @@ def load_config_file(
     if isinstance(max_params_val, bool) or not isinstance(max_params_val, int) or max_params_val < 1:
         raise ValueError(f"max_params must be a positive integer, got {max_params_val!r}")
     config.max_params = max_params_val
+    timeout_val = _get_gen("subprocess_timeout_s", config.subprocess_timeout_s)
+    if isinstance(timeout_val, bool) or not isinstance(timeout_val, int) or timeout_val < 1:
+        raise ValueError(f"subprocess_timeout_s must be a positive integer, got {timeout_val!r}")
+    config.subprocess_timeout_s = timeout_val
+    max_mem_mb_val = _get_gen("max_memory_mb", None)
+    if max_mem_mb_val is not None:
+        if isinstance(max_mem_mb_val, bool) or not isinstance(max_mem_mb_val, int) or max_mem_mb_val < 64:
+            raise ValueError(f"max_memory_mb must be an integer >= 64, got {max_mem_mb_val!r}")
+        config.max_as_bytes = max_mem_mb_val * 1024 * 1024
     config.allow_missing_tools = _require_bool(
         _get_gen("allow_missing_tools", config.allow_missing_tools), "allow_missing_tools"
     )
@@ -2610,18 +2625,132 @@ _FORBIDDEN_TEST_LITERALS: tuple[str, ...] = (
 
 _FRAMEWORK_TAMPER_MACRO_RE = re.compile(
     r"^\s*#\s*(?:define|undef)\s+"
-    r"(CAN_FIXTURE_TEST_FRAMEWORK_HPP|DEVPACK_FRAMEWORK_GUARD|CHECK|CHECK_EQ|CHECK_NEAR|REGISTER_TEST_SUITE)\b"
+    r"(CAN_FIXTURE_TEST_FRAMEWORK_HPP|DEVPACK_FRAMEWORK_GUARD|CHECK|CHECK_EQ|CHECK_NEAR|REGISTER_TEST_SUITE"
+    r"|TestCounters|TestSuiteNode|AutoTestSuiteRegistrar|recordCheck|recordCheckEq|recordCheckFailure"
+    r"|counters|printSummaryAndExitCode|registeredSuiteHead|runRegisteredTestSuites"
+    r"|can_fixture_test|runCanCodecTests|runRingBufferTests|runLinkStateMachineTests|runDtcDebouncerTests)\b"
 )
 _FRAMEWORK_TAMPER_SYMBOLS_RE = re.compile(
     r"(?:\bstruct\s+TestCounters\b"
     r"|\bstruct\s+TestSuiteNode\b|\bstruct\s+AutoTestSuiteRegistrar\b"
-    r"|\b(?:recordCheck|recordCheckEq|counters|printSummaryAndExitCode"
+    r"|\b(?:recordCheck|recordCheckEq|recordCheckFailure|counters|printSummaryAndExitCode"
     r"|registeredSuiteHead|runRegisteredTestSuites)\b)"
 )
+_FRAMEWORK_TAMPER_EXACT_IDENTS: frozenset[str] = frozenset(
+    {
+        "TestCounters",
+        "TestSuiteNode",
+        "AutoTestSuiteRegistrar",
+        "recordCheck",
+        "recordCheckEq",
+        "recordCheckFailure",
+        "counters",
+        "printSummaryAndExitCode",
+        "registeredSuiteHead",
+        "runRegisteredTestSuites",
+    }
+)
+_FRAMEWORK_NAMESPACE_EXACT_IDENTS: frozenset[str] = frozenset(
+    {
+        "can_fixture_test",
+        "runCanCodecTests",
+        "runRingBufferTests",
+        "runLinkStateMachineTests",
+        "runDtcDebouncerTests",
+    }
+)
+_INLINE_ASM_IDENTS: frozenset[str] = frozenset({"asm", "__asm", "__asm__"})
 _FRAMEWORK_NAMESPACE_RE = re.compile(r"\bnamespace\s+can_fixture_test\b")
 _FRAMEWORK_REGISTRY_FN_RE = re.compile(
     r"\b(?:runCanCodecTests|runRingBufferTests|runLinkStateMachineTests|runDtcDebouncerTests)\b"
 )
+_INCLUDE_PATH_DIRECTIVE_RE = re.compile(r'^\s*#\s*include\s*(?:"([^"]+)"|<([^>]+)>)')
+_FRAMEWORK_HEADER_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"[^"]*test_framework\.hpp"')
+_OOM_OUTPUT_RE = re.compile(
+    r"virtual memory exhausted|cannot allocate memory|out of memory|"
+    r"terminate called after throwing an instance of 'std::bad_alloc'|"
+    r"llvm error:\s*out of memory|allocation failed|memory allocation failure",
+    re.IGNORECASE,
+)
+
+
+class LintResourceLimitError(RuntimeError):
+    """Raised when a compiler/preprocessor subprocess hits timeout or memory limits."""
+
+
+class PreprocessFailedError(RuntimeError):
+    """Raised when compiler preprocessing fails closed on a worker file."""
+
+
+class PreprocessorMissingError(RuntimeError):
+    """Raised when no compiler preprocessor binary is installed."""
+
+
+def _make_rlimit_preexec(max_as_bytes: int | None):
+    """Return a preexec_fn clamping ``RLIMIT_AS`` to ``max_as_bytes``."""
+    if max_as_bytes is None or max_as_bytes <= 0:
+        return None
+
+    def _apply_rlimit() -> None:
+        try:
+            _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            if hard == resource.RLIM_INFINITY or hard > max_as_bytes:
+                resource.setrlimit(resource.RLIMIT_AS, (max_as_bytes, max_as_bytes))
+            else:
+                target = min(max_as_bytes, hard)
+                resource.setrlimit(resource.RLIMIT_AS, (target, hard))
+        except (ValueError, OSError):
+            pass
+
+    return _apply_rlimit
+
+
+def _is_oom_or_limit_signal(proc: subprocess.CompletedProcess[str]) -> bool:
+    """Return True if ``proc`` exited due to a resource-limit signal or OOM diagnostic."""
+    if proc.returncode < 0:
+        sig = -proc.returncode
+        limit_sigs = {signal.SIGKILL, signal.SIGSEGV, signal.SIGABRT}
+        if hasattr(signal, "SIGXCPU"):
+            limit_sigs.add(signal.SIGXCPU)
+        if sig in limit_sigs:
+            return True
+    if proc.returncode == 0:
+        return False
+    combined = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    return bool(_OOM_OUTPUT_RE.search(combined))
+
+
+def _run_limited_subprocess(
+    cmd: list[str],
+    *,
+    timeout_s: int,
+    max_as_bytes: int,
+    input_text: str | None = None,
+    stderr_mode: int = subprocess.PIPE,
+) -> subprocess.CompletedProcess[str]:
+    """Run subprocess with timeout and ``RLIMIT_AS``; raise ``LintResourceLimitError`` if exceeded."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=input_text,
+            stdout=subprocess.PIPE,
+            stderr=stderr_mode,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_s,
+            preexec_fn=_make_rlimit_preexec(max_as_bytes),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LintResourceLimitError(
+            f"subprocess timed out after {timeout_s}s: {pathlib.Path(cmd[0]).name}"
+        ) from exc
+    if _is_oom_or_limit_signal(proc):
+        raise LintResourceLimitError(
+            f"subprocess exceeded memory/resource limit (rc={proc.returncode}): {pathlib.Path(cmd[0]).name}"
+        )
+    return proc
 
 _SUPPRESSION_LINE_RE = re.compile(
     r"(?:cppcheck-suppress\b|\bNOLINT(?:NEXTLINE|BEGIN|END)?\b"
@@ -2818,6 +2947,55 @@ def _has_process_termination_deviation(
     return _has_rule_deviation(path, repository_root, deviation_id, "PROCESS-TERMINATION")
 
 
+def _join_backslash_lines_with_map(text: str) -> list[tuple[int, str]]:
+    """Join C/C++ backslash-newline continuations, returning ``[(start_line, joined_line)]``."""
+    out: list[tuple[int, str]] = []
+    lines = text.splitlines()
+    buf: list[str] = []
+    start_ln = 1
+    for idx, line in enumerate(lines, start=1):
+        if not buf:
+            start_ln = idx
+        if line.endswith("\\"):
+            buf.append(line[:-1])
+        else:
+            buf.append(line)
+            out.append((start_ln, "".join(buf)))
+            buf = []
+    if buf:
+        out.append((start_ln, "".join(buf)))
+    return out
+
+
+def _find_absolute_includes(path: pathlib.Path, raw_text: str) -> list[tuple[int, str]]:
+    """Return ``[(line_num, include_target)]`` for absolute or ``/dev/*`` ``#include`` directives."""
+    no_comments = _strip_comments_preserve_strings_and_lines(raw_text)
+    hits: list[tuple[int, str]] = []
+    for ln, joined in _join_backslash_lines_with_map(no_comments):
+        m = _INCLUDE_PATH_DIRECTIVE_RE.match(joined)
+        if not m:
+            continue
+        inc_target = (m.group(1) or m.group(2) or "").strip()
+        if not inc_target:
+            continue
+        is_abs = (
+            inc_target.startswith(("/", "\\"))
+            or bool(re.match(r"^[A-Za-z]:[/\\]", inc_target))
+            or inc_target.startswith("/dev/")
+            or "/dev/" in inc_target
+        )
+        if not is_abs:
+            try:
+                resolved = (path.parent / inc_target).resolve()
+                if str(resolved) == "/dev" or str(resolved).startswith("/dev/"):
+                    is_abs = True
+            except OSError:
+                pass
+        if is_abs:
+            hits.append((ln, inc_target))
+    return hits
+
+
 def _preprocess_repo_lines(
     path: pathlib.Path,
     raw_text: str,
@@ -2826,12 +3004,18 @@ def _preprocess_repo_lines(
     std: str,
     c_std: str,
     repository_root: pathlib.Path | None,
+    timeout_s: int = DEFAULT_SUBPROCESS_TIMEOUT_S,
+    max_as_bytes: int = DEFAULT_MAX_AS_BYTES,
+    strip_framework_include: bool = False,
+    allow_missing_tools: bool = False,
 ) -> list[tuple[int, str]]:
-    """Run ``g++ -E`` (or fallback) and return ``[(source_line_num, text)]`` for repo-local code."""
+    """Run ``g++ -E`` with resource limits (no silent fallback) and return repo-local lines."""
     compiler_bin = shutil.which("g++" if not is_c else "gcc") or shutil.which(
         "clang++" if not is_c else "clang"
     )
     inc_flags = infer_repo_include_flags(path)
+    if str(path.parent) not in [f[2:] for f in inc_flags if f.startswith("-I")]:
+        inc_flags.append(f"-I{path.parent}")
     if repository_root is not None:
         for sub in ("include", "src", "tests"):
             cand = repository_root / sub
@@ -2863,74 +3047,157 @@ def _preprocess_repo_lines(
                 return False
         return res.parent == resolved_target.parent
 
-    if compiler_bin is not None:
-        lang = "c" if is_c else "c++"
-        std_flag = f"-std={c_std if is_c else std}"
-        # Pass 1: full -E with linemarkers, filtering out system headers by file marker
-        cmd = [compiler_bin, "-E", "-x", lang, std_flag, *inc_flags, str(path)]
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            proc = None
-        if proc is not None and proc.returncode == 0 and proc.stdout:
-            collected: list[tuple[int, str]] = []
-            cur_file = str(resolved_target)
-            cur_line = 1
-            keep = True
-            for line in proc.stdout.splitlines():
-                lm = _LINEMARKER_RE.match(line)
-                if lm:
-                    cur_line = int(lm.group(1))
-                    cur_file = lm.group(2)
-                    keep = _is_repo_local_file(cur_file)
-                    continue
-                if keep and line.strip():
-                    report_ln = cur_line if pathlib.Path(cur_file).resolve() == resolved_target else 1
-                    collected.append((report_ln, line))
-                cur_line += 1
-            return collected
+    if compiler_bin is None:
+        if allow_missing_tools:
+            stripped_keep_strings = _strip_comments_preserve_strings_and_lines(raw_text)
+            return [
+                (idx, ln)
+                for idx, ln in enumerate(stripped_keep_strings.splitlines(), start=1)
+                if ln.strip()
+            ]
+        raise PreprocessorMissingError(
+            f"Required preprocessor '{'gcc' if is_c else 'g++'}' is not installed or not on PATH"
+        )
 
-        # Pass 2: strip `#include <...>` system headers and `#include "test_framework.hpp"` so local macros expand
-        no_sys = "\n".join(
-            ""
-            if re.match(r'^\s*#\s*include\s*(?:<[^>]+>|"test_framework\.hpp")', ln)
-            else ln
+    lang = "c" if is_c else "c++"
+    std_flag = f"-std={c_std if is_c else std}"
+    if strip_framework_include:
+        filtered_src = "\n".join(
+            "" if _FRAMEWORK_HEADER_INCLUDE_RE.match(ln) else ln
             for ln in raw_text.splitlines()
         )
-        cmd_p = [compiler_bin, "-E", "-P", "-x", lang, std_flag, *inc_flags, "-"]
+        cmd = [compiler_bin, "-E", "-x", lang, std_flag, *inc_flags, "-"]
         try:
-            proc_p = subprocess.run(
-                cmd_p,
-                input=no_sys,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-                check=False,
+            proc = _run_limited_subprocess(
+                cmd,
+                timeout_s=timeout_s,
+                max_as_bytes=max_as_bytes,
+                input_text=filtered_src,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            proc_p = None
-        if proc_p is not None and proc_p.returncode == 0 and proc_p.stdout.strip():
-            return [(1, ln) for ln in proc_p.stdout.splitlines() if ln.strip()]
+        except OSError as exc:
+            raise PreprocessFailedError(f"preprocessor launch failed: {exc}") from exc
+    else:
+        cmd = [compiler_bin, "-E", "-x", lang, std_flag, *inc_flags, str(path)]
+        try:
+            proc = _run_limited_subprocess(
+                cmd,
+                timeout_s=timeout_s,
+                max_as_bytes=max_as_bytes,
+            )
+        except OSError as exc:
+            raise PreprocessFailedError(f"preprocessor launch failed: {exc}") from exc
 
-    # Fallback: comment-stripped source preserving string literals and exact line numbers
-    stripped_keep_strings = _strip_comments_preserve_strings_and_lines(raw_text)
-    return [
-        (idx, ln)
-        for idx, ln in enumerate(stripped_keep_strings.splitlines(), start=1)
-        if ln.strip()
-    ]
+    if proc.returncode != 0:
+        err_detail = (proc.stderr or proc.stdout or "").strip()
+        first_line = err_detail.splitlines()[0] if err_detail else f"exit code {proc.returncode}"
+        raise PreprocessFailedError(f"preprocessor failed ({first_line})")
+
+    collected: list[tuple[int, str]] = []
+    cur_file = str(resolved_target)
+    cur_line = 1
+    keep = True
+    for line in proc.stdout.splitlines():
+        lm = _LINEMARKER_RE.match(line)
+        if lm:
+            cur_line = int(lm.group(1))
+            cur_file = lm.group(2)
+            keep = _is_repo_local_file(cur_file)
+            continue
+        if keep and line.strip():
+            if strip_framework_include and cur_file == "<stdin>":
+                report_ln = cur_line
+            else:
+                try:
+                    report_ln = cur_line if pathlib.Path(cur_file).resolve() == resolved_target else 1
+                except OSError:
+                    report_ln = 1
+            collected.append((report_ln, line))
+        cur_line += 1
+    return collected
+
+
+def _tokenize_preprocessed_lines(
+    preprocessed_lines: Sequence[tuple[int, str]],
+) -> list[tuple[int, str, str]]:
+    """Tokenize preprocessed source lines into ``[(line_num, kind, value)]``."""
+    tokens: list[tuple[int, str, str]] = []
+    for ln, line_txt in preprocessed_lines:
+        for m in _TOKENIZE_PREPROC_RE.finditer(line_txt):
+            tok = m.group(0)
+            if tok.startswith(('"', 'R"')):
+                tokens.append((ln, "str", _decode_c_string_literal(tok)))
+            elif tok.startswith("'"):
+                tokens.append((ln, "char", tok))
+            elif tok[0].isalpha() or tok[0] == "_":
+                tokens.append((ln, "id", tok))
+            else:
+                tokens.append((ln, "op", tok))
+    return tokens
+
+
+def _scan_inline_asm_tokens(
+    preprocessed_lines: Sequence[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """Return ``[(line_num, reason)]`` for any ``asm`` / ``__asm`` / ``__asm__`` token."""
+    hits: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for ln, kind, val in _tokenize_preprocessed_lines(preprocessed_lines):
+        if kind == "id" and val in _INLINE_ASM_IDENTS:
+            reason = f"Inline assembly or asm-label declaration ('{val}') is forbidden (MISRA C++:2023 [verify])"
+            key = (ln, reason)
+            if key not in seen:
+                seen.add(key)
+                hits.append(key)
+    return hits
+
+
+def _scan_framework_tamper_tokens(
+    preprocessed_lines: Sequence[tuple[int, str]],
+    raw_text: str,
+    *,
+    check_namespace_and_registry: bool,
+) -> list[tuple[int, str]]:
+    """Return ``[(line_num, reason)]`` for framework tamper on joined directives and preprocessed tokens."""
+    hits: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+
+    def _record(ln: int, reason: str) -> None:
+        key = (ln, reason)
+        if key not in seen:
+            seen.add(key)
+            hits.append(key)
+
+    no_comments = _strip_comments_preserve_strings_and_lines(raw_text)
+    for ln, joined in _join_backslash_lines_with_map(no_comments):
+        if _FRAMEWORK_TAMPER_MACRO_RE.search(joined):
+            _record(ln, "Defining or redefining test framework guard, macros, or framework symbols is forbidden")
+        if check_namespace_and_registry and _FRAMEWORK_HEADER_INCLUDE_RE.match(joined):
+            _record(ln, "Non-test worker code must not include test_framework.hpp")
+
+    tokens = _tokenize_preprocessed_lines(preprocessed_lines)
+    n = len(tokens)
+    for idx, (ln, kind, val) in enumerate(tokens):
+        if kind != "id":
+            continue
+        if val in _FRAMEWORK_TAMPER_EXACT_IDENTS:
+            _record(
+                ln,
+                f"Defining or referencing test framework symbol '{val}' is forbidden",
+            )
+            continue
+        if check_namespace_and_registry:
+            if val in _FRAMEWORK_NAMESPACE_EXACT_IDENTS:
+                _record(
+                    ln,
+                    f"Defining or referencing test framework namespace/symbol '{val}' is forbidden",
+                )
+                continue
+            if val == "namespace" and idx + 1 < n and tokens[idx + 1][1] == "id" and tokens[idx + 1][2] == "can_fixture_test":
+                _record(
+                    ln,
+                    "Defining or reopening namespace 'can_fixture_test' is forbidden",
+                )
+    return hits
 
 
 def _scan_process_termination_tokens(
@@ -3180,7 +3447,19 @@ def check_c_or_cpp_file(
         ):
             _add_lexical_finding(idx, "MISRA-C-20.4", "error", "Macro shall not redefine a C/C++ keyword")
 
-    # 2b. Preprocessed token-stream PROCESS-TERMINATION, TEST-FRAMEWORK-TAMPER, and SUPPRESSION-WITHOUT-DEVIATION
+    # 2b. Absolute #include rejection, preprocessed token-stream INLINE-ASM, PROCESS-TERMINATION,
+    # TEST-FRAMEWORK-TAMPER, and SUPPRESSION-WITHOUT-DEVIATION
+    abs_includes = _find_absolute_includes(path, raw_text)
+    has_abs_include = bool(abs_includes)
+    if has_abs_include and "ABSOLUTE-INCLUDE" not in disabled:
+        for inc_ln, inc_target in abs_includes:
+            _add_lexical_finding(
+                inc_ln,
+                "ABSOLUTE-INCLUDE",
+                "error",
+                f"Absolute or device path #include '{inc_target}' is forbidden",
+            )
+
     is_test_dir = _is_test_code_path(path, repository_root)
     pack_fixture_tests = pathlib.Path(_REPO_ROOT_STR) / "eval" / "fixture" / "tests"
     is_pack_owned_framework = path.name in ("test_framework.hpp", "test_main.cpp") and (
@@ -3192,32 +3471,6 @@ def check_c_or_cpp_file(
     )
     worker_changed = False if is_pack_owned_framework else _is_worker_changed_file(path, repository_root, cfg)
     enforce_proc_term = (not is_test_dir) or worker_changed
-    if enforce_proc_term and "PROCESS-TERMINATION" not in disabled:
-        if not _has_process_termination_deviation(path, repository_root, cfg.deviation_id):
-            preproc_lines = _preprocess_repo_lines(
-                path,
-                raw_text,
-                is_c=is_c,
-                std=cfg.std,
-                c_std=cfg.c_std,
-                repository_root=repository_root,
-            )
-            for hit_ln, hit_reason in _scan_process_termination_tokens(preproc_lines, raw_text):
-                finding = Finding(
-                    str(path),
-                    hit_ln,
-                    "PROCESS-TERMINATION",
-                    "error",
-                    f"{hit_reason}; process-terminating, exec/spawn, constructor/destructor, or proof-literal forbidden",
-                )
-                report.findings.append(finding)
-                if contexts is not None:
-                    contexts[id(finding)] = FingerprintContext(
-                        tokens=_extract_statement_tokens(raw_text, hit_ln),
-                        extra_roots=extra_roots,
-                    )
-
-    # TEST-FRAMEWORK-TAMPER: worker headers/code/tests defining framework guard or framework symbols
     is_pristine_framework_file = is_pack_owned_framework or (
         (not worker_changed)
         and path.name
@@ -3230,18 +3483,102 @@ def check_c_or_cpp_file(
             "test_dtc_debouncer.cpp",
         )
     )
-    if not is_pristine_framework_file and "TEST-FRAMEWORK-TAMPER" not in disabled:
-        for idx, raw_ln in enumerate(_strip_comments_preserve_strings_and_lines(raw_text).splitlines(), start=1):
-            tamper_hit = bool(_FRAMEWORK_TAMPER_MACRO_RE.search(raw_ln) or _FRAMEWORK_TAMPER_SYMBOLS_RE.search(raw_ln))
-            if not tamper_hit and (is_header or not is_test_dir):
-                tamper_hit = bool(_FRAMEWORK_REGISTRY_FN_RE.search(raw_ln) or _FRAMEWORK_NAMESPACE_RE.search(raw_ln))
-            if tamper_hit:
-                _add_lexical_finding(
-                    idx,
-                    "TEST-FRAMEWORK-TAMPER",
-                    "error",
-                    "Defining or redefining test framework guard, macros, or framework symbols is forbidden",
+
+    resource_limit_hit = False
+    preprocess_failed = False
+    preproc_lines: list[tuple[int, str]] | None = None
+    if not has_abs_include and (
+        "INLINE-ASM" not in disabled
+        or (enforce_proc_term and "PROCESS-TERMINATION" not in disabled)
+        or (not is_pristine_framework_file and "TEST-FRAMEWORK-TAMPER" not in disabled and not is_test_dir)
+    ):
+        try:
+            preproc_lines = _preprocess_repo_lines(
+                path,
+                raw_text,
+                is_c=is_c,
+                std=cfg.std,
+                c_std=cfg.c_std,
+                repository_root=repository_root,
+                timeout_s=cfg.subprocess_timeout_s,
+                max_as_bytes=cfg.max_as_bytes,
+                strip_framework_include=False,
+                allow_missing_tools=cfg.allow_missing_tools,
+            )
+        except LintResourceLimitError as exc:
+            resource_limit_hit = True
+            _add_lexical_finding(1, "LINT-RESOURCE-LIMIT", "error", str(exc))
+        except PreprocessorMissingError as exc:
+            _add_tool_missing_finding(str(exc))
+        except PreprocessFailedError as exc:
+            preprocess_failed = True
+            _add_lexical_finding(1, "PREPROCESS-ERROR", "error", str(exc))
+
+    if preproc_lines is not None and "INLINE-ASM" not in disabled:
+        for asm_ln, asm_reason in _scan_inline_asm_tokens(preproc_lines):
+            _add_lexical_finding(asm_ln, "INLINE-ASM", "error", asm_reason)
+
+    if (
+        preproc_lines is not None
+        and enforce_proc_term
+        and "PROCESS-TERMINATION" not in disabled
+        and not _has_process_termination_deviation(path, repository_root, cfg.deviation_id)
+    ):
+        for hit_ln, hit_reason in _scan_process_termination_tokens(preproc_lines, raw_text):
+            finding = Finding(
+                str(path),
+                hit_ln,
+                "PROCESS-TERMINATION",
+                "error",
+                f"{hit_reason}; process-terminating, exec/spawn, constructor/destructor, or proof-literal forbidden",
+            )
+            report.findings.append(finding)
+            if contexts is not None:
+                contexts[id(finding)] = FingerprintContext(
+                    tokens=_extract_statement_tokens(raw_text, hit_ln),
+                    extra_roots=extra_roots,
                 )
+
+    # TEST-FRAMEWORK-TAMPER: worker headers/code/tests defining framework guard or framework symbols
+    if (
+        not has_abs_include
+        and not resource_limit_hit
+        and not is_pristine_framework_file
+        and "TEST-FRAMEWORK-TAMPER" not in disabled
+    ):
+        tamper_lines = preproc_lines
+        if is_test_dir or tamper_lines is None:
+            try:
+                tamper_lines = _preprocess_repo_lines(
+                    path,
+                    raw_text,
+                    is_c=is_c,
+                    std=cfg.std,
+                    c_std=cfg.c_std,
+                    repository_root=repository_root,
+                    timeout_s=cfg.subprocess_timeout_s,
+                    max_as_bytes=cfg.max_as_bytes,
+                    strip_framework_include=is_test_dir,
+                    allow_missing_tools=cfg.allow_missing_tools,
+                )
+            except LintResourceLimitError as exc:
+                resource_limit_hit = True
+                _add_lexical_finding(1, "LINT-RESOURCE-LIMIT", "error", str(exc))
+                tamper_lines = None
+            except PreprocessorMissingError:
+                tamper_lines = None
+            except PreprocessFailedError as exc:
+                if not preprocess_failed:
+                    preprocess_failed = True
+                    _add_lexical_finding(1, "PREPROCESS-ERROR", "error", str(exc))
+                tamper_lines = None
+        if tamper_lines is not None:
+            for tamper_ln, tamper_reason in _scan_framework_tamper_tokens(
+                tamper_lines,
+                raw_text,
+                check_namespace_and_registry=(is_header or not is_test_dir),
+            ):
+                _add_lexical_finding(tamper_ln, "TEST-FRAMEWORK-TAMPER", "error", tamper_reason)
 
     # SUPPRESSION-WITHOUT-DEVIATION: inline suppressions added by the worker require verified Deviation: DEV-<n>
     if "SUPPRESSION-WITHOUT-DEVIATION" not in disabled:
@@ -3268,8 +3605,8 @@ def check_c_or_cpp_file(
                     "Inline suppression requires 'Deviation: DEV-<n>' on the same line matching DEVPACK_DEVIATIONS",
                 )
 
-    # Scan non-standard locally #included fragments (e.g. .inc/.inl) within repo for PROCESS-TERMINATION
-    if enforce_proc_term and "PROCESS-TERMINATION" not in disabled:
+    # Scan non-standard locally #included fragments (e.g. .inc/.inl) within repo for PROCESS-TERMINATION / INLINE-ASM
+    if (enforce_proc_term and "PROCESS-TERMINATION" not in disabled) or ("INLINE-ASM" not in disabled):
         for idx, raw_line in enumerate(raw_text.splitlines(), start=1):
             inc_match = _LOCAL_INCLUDE_RE.match(raw_line)
             if not inc_match:
@@ -3289,20 +3626,28 @@ def check_c_or_cpp_file(
                         for ln_i, ln_t in enumerate(_strip_comments_preserve_strings_and_lines(cand_raw).splitlines(), start=1)
                         if ln_t.strip()
                     ]
-                    frag_hits = _scan_process_termination_tokens(cand_lines, cand_raw)
-                    if frag_hits and not _has_process_termination_deviation(
-                        cand, repository_root, cfg.deviation_id
-                    ):
-                        inc_ln, frag_reason = frag_hits[0]
-                        finding = Finding(
-                            str(cand),
-                            inc_ln,
-                            "PROCESS-TERMINATION",
-                            "error",
-                            f"{frag_reason} in included fragment (from {path.name}:{idx})",
-                        )
-                        report.findings.append(finding)
-                        break
+                    if "INLINE-ASM" not in disabled:
+                        asm_frag = _scan_inline_asm_tokens(cand_lines)
+                        if asm_frag:
+                            asm_ln, asm_reason = asm_frag[0]
+                            report.findings.append(
+                                Finding(str(cand), asm_ln, "INLINE-ASM", "error", f"{asm_reason} in included fragment (from {path.name}:{idx})")
+                            )
+                    if enforce_proc_term and "PROCESS-TERMINATION" not in disabled:
+                        frag_hits = _scan_process_termination_tokens(cand_lines, cand_raw)
+                        if frag_hits and not _has_process_termination_deviation(
+                            cand, repository_root, cfg.deviation_id
+                        ):
+                            inc_ln, frag_reason = frag_hits[0]
+                            finding = Finding(
+                                str(cand),
+                                inc_ln,
+                                "PROCESS-TERMINATION",
+                                "error",
+                                f"{frag_reason} in included fragment (from {path.name}:{idx})",
+                            )
+                            report.findings.append(finding)
+                            break
                     break
 
     # 3. Compiler syntax & warning check + 4. Clang AST JSON check
@@ -3314,11 +3659,13 @@ def check_c_or_cpp_file(
         gcc_dir = detect_gcc_install_dir()
 
     ast_succeeded = False
-    if not compiler_bin:
+    if has_abs_include or resource_limit_hit:
+        compiler_bin = None
+    elif not compiler_bin:
         _add_tool_missing_finding(
             f"Required compiler/AST tool '{'clang' if is_c else 'clang++'}' is not installed or not on PATH"
         )
-    else:
+    if compiler_bin:
         if tool_env is not None and compile_commands is not None and tool_env.compile_commands_entries:
             cc_flags = (
                 _extract_flags_from_entries(tool_env.compile_commands_entries, compile_commands.parent, path)
@@ -3365,13 +3712,16 @@ def check_c_or_cpp_file(
 
         syntax_cmd = [compiler_bin, "-fsyntax-only", *base_flags, str(path)]
         try:
-            res = subprocess.run(
+            res = _run_limited_subprocess(
                 syntax_cmd,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
+                timeout_s=cfg.subprocess_timeout_s,
+                max_as_bytes=cfg.max_as_bytes,
+                stderr_mode=subprocess.STDOUT,
             )
+        except LintResourceLimitError as exc:
+            resource_limit_hit = True
+            _add_lexical_finding(1, "LINT-RESOURCE-LIMIT", "error", str(exc))
+            res = None
         except OSError as exc:
             _add_tool_missing_finding(f"compiler launch failed: {exc}")
             res = None
@@ -3425,17 +3775,23 @@ def check_c_or_cpp_file(
                     f"compiler exited {res.returncode} without a recognized diagnostic"
                 )
 
-        ast_cmd = [compiler_bin, "-Xclang", "-ast-dump=json", "-fsyntax-only", *base_flags, str(path)]
-        try:
-            ast_res = subprocess.run(
-                ast_cmd,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except OSError as exc:
-            _add_tool_missing_finding(f"AST compiler launch failed: {exc}")
+        if not resource_limit_hit:
+            ast_cmd = [compiler_bin, "-Xclang", "-ast-dump=json", "-fsyntax-only", *base_flags, str(path)]
+            try:
+                ast_res = _run_limited_subprocess(
+                    ast_cmd,
+                    timeout_s=cfg.subprocess_timeout_s,
+                    max_as_bytes=cfg.max_as_bytes,
+                    stderr_mode=subprocess.DEVNULL,
+                )
+            except LintResourceLimitError as exc:
+                resource_limit_hit = True
+                _add_lexical_finding(1, "LINT-RESOURCE-LIMIT", "error", str(exc))
+                ast_res = None
+            except OSError as exc:
+                _add_tool_missing_finding(f"AST compiler launch failed: {exc}")
+                ast_res = None
+        else:
             ast_res = None
 
         if ast_res is not None and ast_res.returncode < 0:
@@ -3485,7 +3841,7 @@ def check_c_or_cpp_file(
             except json.JSONDecodeError:
                 _add_tool_missing_finding("AST compiler produced invalid JSON AST output")
 
-    # 4b. Structural lexical checks & AST fallback (when AST did not succeed)
+    # 4b. Structural lexical checks & AST fallback (only when compiler absent / allow_missing_tools; never on resource limit)
     existing_rule_lines = {(f.rule, f.line) for f in report.findings}
     _run_structural_lexical_checks(
         stripped,
@@ -3493,13 +3849,13 @@ def check_c_or_cpp_file(
         is_c=is_c,
         heap_allowed=heap_allowed,
         config=cfg,
-        include_ast_fallback=not ast_succeeded,
+        include_ast_fallback=(not ast_succeeded and not resource_limit_hit and not has_abs_include),
         existing_rule_lines=existing_rule_lines,
         add_finding_cb=_add_lexical_finding,
     )
 
     # 5. Optional clang-tidy check (for C++ source files)
-    effective_skip_tidy = skip_clang_tidy or cfg.skip_clang_tidy
+    effective_skip_tidy = skip_clang_tidy or cfg.skip_clang_tidy or has_abs_include or resource_limit_hit
     clang_tidy = (
         (tool_env.clang_tidy_bin or None)
         if tool_env is not None
@@ -3530,15 +3886,14 @@ def check_c_or_cpp_file(
                 tidy_cmd.extend(["--", f"-std={cfg.std}", *exc_flags, *rtti_flags, *repo_flags])
 
             try:
-                tidy_res = subprocess.run(
+                tidy_res = _run_limited_subprocess(
                     tidy_cmd,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    check=False,
+                    timeout_s=cfg.subprocess_timeout_s,
+                    max_as_bytes=cfg.max_as_bytes,
+                    stderr_mode=subprocess.STDOUT,
                 )
-            except subprocess.TimeoutExpired:
-                report.execution_errors.append("clang-tidy timed out")
+            except LintResourceLimitError as exc:
+                _add_lexical_finding(1, "LINT-RESOURCE-LIMIT", "error", str(exc))
                 tidy_res = None
             except OSError as exc:
                 report.execution_errors.append(f"clang-tidy launch failed: {exc}")
@@ -4767,6 +5122,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Base git ref for detecting worker-added suppressions and changed test files",
     )
+    parser.add_argument(
+        "--subprocess-timeout-s",
+        type=int,
+        default=None,
+        help=f"Timeout in seconds for compiler/preprocessor subprocesses (default: {DEFAULT_SUBPROCESS_TIMEOUT_S})",
+    )
+    parser.add_argument(
+        "--max-memory-mb",
+        type=int,
+        default=None,
+        help="Address-space limit (RLIMIT_AS) in MiB for compiler/preprocessor subprocesses (default: 2048)",
+    )
     return parser
 
 
@@ -4831,6 +5198,20 @@ def _resolve_config_from_args(
     config.naming.validate()
     config.deviation_id = str(getattr(args, "deviation", "") or "").strip()
     config.base_ref = str(getattr(args, "base", "") or "").strip()
+    env_timeout = os.environ.get("DEVPACK_LINT_TIMEOUT_S", "").strip()
+    if env_timeout.isdigit() and int(env_timeout) >= 1:
+        config.subprocess_timeout_s = int(env_timeout)
+    if getattr(args, "subprocess_timeout_s", None) is not None:
+        if args.subprocess_timeout_s < 1:
+            raise ValueError(f"--subprocess-timeout-s must be >= 1, got {args.subprocess_timeout_s}")
+        config.subprocess_timeout_s = args.subprocess_timeout_s
+    env_as_bytes = os.environ.get("DEVPACK_LINT_MAX_AS_BYTES", "").strip()
+    if env_as_bytes.isdigit() and int(env_as_bytes) >= 1024 * 1024:
+        config.max_as_bytes = int(env_as_bytes)
+    if getattr(args, "max_memory_mb", None) is not None:
+        if args.max_memory_mb < 64:
+            raise ValueError(f"--max-memory-mb must be >= 64, got {args.max_memory_mb}")
+        config.max_as_bytes = args.max_memory_mb * 1024 * 1024
     return config
 
 

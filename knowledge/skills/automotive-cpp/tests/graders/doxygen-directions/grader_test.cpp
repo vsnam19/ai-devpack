@@ -25,7 +25,7 @@ namespace {
 
 inline void graderFail(const char* expr, const char* file, int line) noexcept
 {
-    std::fprintf(stderr, "GRADER_CHECK failed at %s:%d: %s\n", file, line, expr);
+    std::fprintf(stderr, "GRADER_CHECK failed at %s:%d: %s\n", file, line, expr);  // DEVPACK_FAILURE_PATH
     std::exit(1);
 }
 

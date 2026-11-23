@@ -124,6 +124,7 @@ else
 fi
 
 TEST_OUT_FILE="$BUILD_DIR/fixture_tests.out"
+TEST_START_TIME="$(python3 -c 'import time; print(time.time())')"
 set +e
 env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE "$TEST_BIN" >"$TEST_OUT_FILE" 2>&1
 test_rc=$?
@@ -142,4 +143,5 @@ python3 "$PROOF_PY" verify \
     --obj-dir "$COV_OBJ_DIR" \
     --stdout-file "$TEST_OUT_FILE" \
     --returncode "$test_rc" \
+    --start-time "$TEST_START_TIME" \
     --label "fixture_tests"

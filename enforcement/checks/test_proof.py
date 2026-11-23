@@ -31,13 +31,18 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Sequence
 
 DEFAULT_ASSERT_REGEX = r"(?<![A-Za-z0-9_])CHECK(?:_EQ|_TRUE|_FALSE|_NEAR)?\s*\("
+FAILURE_PATH_MARKER = "DEVPACK_FAILURE_PATH"
+_FAILURE_PATH_RE = re.compile(rf"//[^\n]*\b{FAILURE_PATH_MARKER}\b")
 _FAILURE_LINE_RE = re.compile(
     r"(?m)^(?:\s*FAIL:|.*:\s*CHECK(?:_EQ|_TRUE|_FALSE|_NEAR)?\([^)]*\)\s+failed|.*GRADER_CHECK\s+failed)"
 )
 _COMPLETION_LINE_RE = re.compile(r"\bprintSummaryAndExitCode\s*(?:<[^>]*>)?\s*\(|DEVPACK_TESTS_COMPLETED")
+_FRAMEWORK_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"[^"]*test_framework\.hpp"', re.MULTILINE)
+_MTIME_JIFFY_SLACK_S = 0.05
 
 
 @dataclass(frozen=True)
@@ -145,6 +150,16 @@ def extract_completion_lines(source_path: Path) -> list[int]:
     lines: list[int] = []
     for idx, line in enumerate(stripped.splitlines(), start=1):
         if _COMPLETION_LINE_RE.search(line):
+            lines.append(idx)
+    return lines
+
+
+def extract_failure_path_lines(source_path: Path) -> list[int]:
+    """Return 1-based line numbers annotated with ``DEVPACK_FAILURE_PATH`` in ``source_path``."""
+    raw_text = source_path.read_text(encoding="utf-8", errors="replace")
+    lines: list[int] = []
+    for idx, line in enumerate(raw_text.splitlines(), start=1):
+        if _FAILURE_PATH_RE.search(line):
             lines.append(idx)
     return lines
 
@@ -281,8 +296,9 @@ def verify_gcov_proof(
     assert_regex: str = DEFAULT_ASSERT_REGEX,
     require_nonempty_checks: bool = True,
     label: str = "test_binary",
+    min_mtime: float | None = None,
 ) -> ProofResult:
-    """Verify exit status 0, absence of failure lines, and gcov execution of all ``CHECK*`` lines."""
+    """Verify exit 0, no failure lines, fresh .gcda mtime, CHECK execution >=1, and failure-path count == 0."""
     resolved_gcov = find_gcov_bin(gcov_bin)
     if resolved_gcov is None:
         return ProofResult(
@@ -339,6 +355,21 @@ def verify_gcov_proof(
                 reason=f"FAIL: {label} abnormal termination before gcov .gcda data was written for {src.name}",
                 output=output_text,
             )
+        if min_mtime is not None:
+            try:
+                gcda_mtime = gcda.stat().st_mtime
+            except OSError as exc:
+                return ProofResult(
+                    exit_code=1,
+                    reason=f"FAIL: {label} unable to stat gcov .gcda data for {src.name}: {exc}",
+                    output=output_text,
+                )
+            if gcda_mtime < (min_mtime - _MTIME_JIFFY_SLACK_S):
+                return ProofResult(
+                    exit_code=1,
+                    reason=f"FAIL: {label} stale gcov .gcda data for {src.name} (written before test run started)",
+                    output=output_text,
+                )
         try:
             parsed = _run_gcov_json(resolved_gcov, gcno, obj_dir)
         except (OSError, RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
@@ -353,7 +384,11 @@ def verify_gcov_proof(
                 dest[ln] = max(dest.get(ln, 0), cnt)
 
     total_verified = 0
+    uses_pack_fw = False
     for src in test_sources:
+        src_text = src.read_text(encoding="utf-8", errors="replace")
+        if _FRAMEWORK_INCLUDE_RE.search(src_text):
+            uses_pack_fw = True
         line_counts = _lookup_line_counts(all_counts, src)
         if line_counts is None:
             return ProofResult(
@@ -378,6 +413,18 @@ def verify_gcov_proof(
                 )
             total_verified += 1
 
+        for fail_ln in extract_failure_path_lines(src):
+            fail_cnt = line_counts.get(fail_ln, 0)
+            if fail_cnt > 0:
+                return ProofResult(
+                    exit_code=1,
+                    reason=(
+                        f"FAIL: {label} failure-path line {src.name}:{fail_ln} executed "
+                        f"{fail_cnt} time(s)"
+                    ),
+                    output=output_text,
+                )
+
         for comp_ln in extract_completion_lines(src):
             if line_counts.get(comp_ln, 0) < 1:
                 return ProofResult(
@@ -386,6 +433,40 @@ def verify_gcov_proof(
                         f"FAIL: {label} completion line {src.name}:{comp_ln} was never executed "
                         "(early process termination)"
                     ),
+                    output=output_text,
+                )
+
+    fw_entries = [
+        (Path(fkey), lmap)
+        for fkey, lmap in all_counts.items()
+        if Path(fkey).name == "test_framework.hpp" and Path(fkey).is_file()
+    ]
+    if uses_pack_fw and not fw_entries and total_verified > 0:
+        return ProofResult(
+            exit_code=1,
+            reason=f"FAIL: {label} gcov output missing coverage entry for test_framework.hpp",
+            output=output_text,
+        )
+    for fw_path, fw_counts in fw_entries:
+        fw_fail_lines = extract_failure_path_lines(fw_path)
+        for fail_ln in fw_fail_lines:
+            fail_cnt = fw_counts.get(fail_ln, 0)
+            if fail_cnt > 0:
+                return ProofResult(
+                    exit_code=1,
+                    reason=(
+                        f"FAIL: {label} framework failure-path line {fw_path.name}:{fail_ln} executed "
+                        f"{fail_cnt} time(s)"
+                    ),
+                    output=output_text,
+                )
+        if total_verified > 0:
+            fw_fail_set = set(fw_fail_lines)
+            non_fail_exec = any(cnt >= 1 for ln, cnt in fw_counts.items() if ln not in fw_fail_set)
+            if not non_fail_exec:
+                return ProofResult(
+                    exit_code=1,
+                    reason=f"FAIL: {label} test_framework.hpp recorded 0 executed assertions in gcov",
                     output=output_text,
                 )
 
@@ -423,6 +504,7 @@ def run_and_verify_gcov(
     child_env = dict(os.environ)
     child_env.pop("DEVPACK_HARNESS_NONCE", None)
     child_env.pop("DEVPACK_HARNESS_NONCE_FILE", None)
+    start_time = time.time()
 
     try:
         proc = subprocess.run(
@@ -452,6 +534,7 @@ def run_and_verify_gcov(
         assert_regex=assert_regex,
         require_nonempty_checks=require_nonempty_checks,
         label=label,
+        min_mtime=start_time,
     )
 
 
@@ -478,6 +561,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         else:
             sp.add_argument("--stdout-file", type=Path, default=None, help="Captured output file")
             sp.add_argument("--returncode", type=int, default=0, help="Process return code")
+            sp.add_argument("--start-time", type=float, default=None, help="Epoch timestamp before run started")
     return parser
 
 
@@ -517,6 +601,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             assert_regex=args.assert_regex,
             require_nonempty_checks=not args.allow_zero_checks,
             label=args.label,
+            min_mtime=args.start_time,
         )
 
     if result.output:

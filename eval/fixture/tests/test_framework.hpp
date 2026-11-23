@@ -38,6 +38,26 @@ inline TestCounters& counters() noexcept {
 }
 
 /**
+ * @brief Record a single failed assertion on a dedicated failure-path line for gcov verification.
+ * @tparam Tag Dummy template parameter for header-only template definition.
+ * @param[in] checkName Macro name that triggered the failure.
+ * @param[in] expressionText Source string of the checked expression.
+ * @param[in] fileName Source file path of the check.
+ * @param[in] lineNumber 1-based source line number of the check.
+ */
+template <int Tag = 0>
+inline void recordCheckFailure(
+    const char* checkName,
+    const char* expressionText,
+    const char* fileName,
+    int lineNumber) {
+    TestCounters& state = counters<Tag>();
+    ++state.failedChecks;  // DEVPACK_FAILURE_PATH
+    std::cerr << "FAIL: " << fileName << ":" << lineNumber
+              << ": " << checkName << "(" << expressionText << ") failed\n";
+}
+
+/**
  * @brief Record a single boolean check result and print diagnostics on failure.
  * @tparam Tag Dummy template parameter for header-only template definition.
  * @param[in] condition Evaluated boolean condition.
@@ -54,9 +74,7 @@ inline void recordCheck(
     TestCounters& state = counters<Tag>();
     ++state.totalChecks;
     if (!condition) {
-        ++state.failedChecks;
-        std::cerr << "FAIL: " << fileName << ":" << lineNumber
-                  << ": CHECK(" << expressionText << ") failed\n";
+        recordCheckFailure<Tag>("CHECK", expressionText, fileName, lineNumber);  // DEVPACK_FAILURE_PATH
     }
 }
 
@@ -80,9 +98,7 @@ inline void recordCheckEq(
     TestCounters& state = counters<0>();
     ++state.totalChecks;
     if (!(actualValue == expectedValue)) {
-        ++state.failedChecks;
-        std::cerr << "FAIL: " << fileName << ":" << lineNumber
-                  << ": CHECK_EQ(" << expressionText << ") failed\n";
+        recordCheckFailure<0>("CHECK_EQ", expressionText, fileName, lineNumber);  // DEVPACK_FAILURE_PATH
     }
 }
 
@@ -101,7 +117,7 @@ inline int printSummaryAndExitCode() {
               << " failed=" << state.failedChecks << "\n"
               << std::flush;
     if (state.totalChecks == 0U || state.failedChecks > 0U) {
-        return 1;
+        return 1;  // DEVPACK_FAILURE_PATH
     }
     return 0;
 }

@@ -18,6 +18,12 @@ timeout_s = 600
 required = true
 
 [[check]]
+name = "test_lock"
+cmd = ["python3", "{pack_root}/enforcement/gate/project_checks.py", "--check", "test_lock"]
+timeout_s = 600
+required = true
+
+[[check]]
 name = "build"
 cmd = ["python3", "{pack_root}/enforcement/gate/project_checks.py", "--check", "build"]
 timeout_s = 1200
