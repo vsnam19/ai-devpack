@@ -82,7 +82,7 @@ from safe_git import (  # noqa: E402
     run_git,
     snapshot_git_metadata,
 )
-from workspace_scope import resolve_workspace_scope  # noqa: E402
+from workspace_scope import allowed_glob_warnings, resolve_workspace_scope  # noqa: E402
 
 ESCALATE_TO_HUMAN = "ESCALATE_TO_HUMAN"
 VERDICT_APPROVE = "APPROVE"
@@ -751,8 +751,10 @@ def run_task_workflow(
     impl_brief, impl_tpl_src = render_implement_brief(repo_root, context)
 
     if dry_run:
+        scope_warnings = allowed_glob_warnings(ws_scope, resolved_allow_globs)
         plan = {
             "mode": "dry-run",
+            "warnings": scope_warnings,
             "task_id": context["TASK_ID"],
             "task_title": context["TASK_TITLE"],
             "worktree": str(worktree),
@@ -780,6 +782,8 @@ def run_task_workflow(
         print(f"  template: {impl_tpl_src}")
         print(f"  worktree: {worktree}")
         print(f"  max_fix_rounds: {max_fix_rounds}")
+        for warning in scope_warnings:
+            print(f"WARNING: {warning}")
         for line in plan["steps"]:
             print(f"  {line}")
         return 0, plan

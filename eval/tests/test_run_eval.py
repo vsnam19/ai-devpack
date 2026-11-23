@@ -156,6 +156,43 @@ class RunEvalUnitTests(unittest.TestCase):
             self.assertEqual("unqualified", rec["status"])
             self.assertIn("insufficient_valid_runs", rec["unqualified_reason"])
 
+    def test_invalid_run_is_never_qualified_and_records_nothing(self) -> None:
+        """An INVALID_RUN refuses qualification even with three passes, and writes no record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            qual_file = base / "qualification.json"
+            summary = run_eval.TaskModelSummary(
+                task_id="01-mini-bugfix",
+                category="bugfix",
+                model="local",
+                k=4,
+                passes=3,
+                pass_at_1=0.75,
+                pass_hat_k=0.75,
+                pass_hat_k_unbiased=0.75,
+                pass_at_k_unbiased=1.0,
+                mean_cost_usd=None,
+                mean_turns=None,
+                mean_duration_s=0.0,
+                tier="smoke",
+                harness_errors=1,
+                valid_runs=3,
+            )
+            kwargs = {
+                "tier": "smoke",
+                "mode": "single",
+                "unit_labels": ["local"],
+                "engine_map": {"local": mock.Mock()},
+                "task_summaries": [summary],
+                "qualification_file": qual_file,
+                "eval_summary_path": base / "summary.md",
+                "repo_root": base,
+            }
+            qual_ok, messages = run_eval.evaluate_and_record_qualification(**kwargs, run_invalid=True)
+            self.assertFalse(qual_ok)
+            self.assertEqual(["INVALID_RUN: qualification not recorded"], messages)
+            self.assertFalse(qual_file.exists())
+
     def test_dry_run_validates_tasks_and_does_not_call_agent(self) -> None:
         """Verify --dry-run exits 0, lists task x model plan, and invokes no subprocesses."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -477,6 +514,32 @@ class HarnessErrorTests(unittest.TestCase):
         self.assertTrue(run["harness_error"])
         self.assertIn("non-zero", run["harness_error_reason"])
 
+    def test_invalid_run_refuses_qualification_even_with_allow_flag(self) -> None:
+        """--allow-harness-errors keeps exit 0 only for valid runs; an INVALID_RUN records nothing and exits 1."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+        cred = base / "creds.json"
+        cred.write_text(json.dumps({"accessToken": "TOKEN_ABC_123456"}), encoding="utf-8")
+        agent = _write_agent(base, "sys.exit(3)\n")
+        out = base / "out"
+        qual_file = base / "qualification.json"
+        rc = run_eval.main(
+            [
+                "--isolation", "local", "--allow-unsandboxed-local", "--models", "haiku", "--k", "2",
+                "--tasks", "01-mini-bugfix", "--credentials", str(cred),
+                "--work-root", str(base / "wr"), "--fixture-dir", str(fixture_dir),
+                "--tasks-dir", str(tasks_dir), "--agent-bin", str(agent), "--out", str(out),
+                "--tier", "smoke", "--record-qualification", "--qualification-file", str(qual_file),
+                "--allow-harness-errors",
+            ]
+        )
+        results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual("INVALID_RUN", results["run_status"])
+        self.assertEqual(1, rc)
+        self.assertFalse(qual_file.exists())
+
     def test_unparsable_json_is_harness_error(self) -> None:
         """Garbage stdout with exit 0 is a harness error."""
         rc, results, _, _ = self._run("print('not json at all')\n")
@@ -496,7 +559,9 @@ class HarnessErrorTests(unittest.TestCase):
         )
         # Per-trial dirs differ so n is always 1; use a shared marker via env-free path.
         body = body.replace("cwd.parent / 'count'", "pathlib.Path(__file__).parent / 'count'")
-        rc, results, _, _ = self._run(body, k=2)
+        # 1 harness error in 2 trials is above the default 10% cap, so the cap is raised here
+        # to test the exclusion itself; the cap behaviour is tested separately.
+        rc, results, _, _ = self._run(body, ["--max-harness-error-rate", "0.5"], k=2)
         self.assertEqual(1, rc)
         task = results["tasks"][0]
         self.assertEqual(1, task["harness_errors"])
@@ -661,8 +726,8 @@ class HarnessErrorTests(unittest.TestCase):
             self.assertIn("450/120", md)
             self.assertNotIn("0.1974", md)
 
-    def test_devpack_root_set_in_check_env_and_grader_misconfigured_is_harness_error(self) -> None:
-        """check.sh receives DEVPACK_ROOT and exit 2 / GRADER_MISCONFIGURED classifies as harness_error."""
+    def test_devpack_root_set_in_check_env_and_bare_exit_2_is_fail_not_harness_error(self) -> None:
+        """check.sh receives DEVPACK_ROOT; a bare exit 2 without a marker is a fail, not a harness error."""
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
@@ -694,14 +759,13 @@ class HarnessErrorTests(unittest.TestCase):
                     "--out", str(out),
                 ]
             )
-            self.assertEqual(1, rc)
+            self.assertEqual(0, rc)
             captured = json.loads(env_dump.read_text(encoding="utf-8"))
             self.assertEqual(str(REPO_ROOT), captured.get("DEVPACK_ROOT"))
             results = json.loads((out / "results.json").read_text(encoding="utf-8"))
             run_rec = results["tasks"][0]["runs"][0]
-            self.assertTrue(run_rec["harness_error"])
+            self.assertFalse(run_rec["harness_error"])
             self.assertFalse(run_rec["passed"])
-            self.assertIn("GRADER_MISCONFIGURED", run_rec["harness_error_reason"])
 
     def test_sandbox_local_refused_without_allow_flag(self) -> None:
         """run_eval refuses --isolation local without --allow-unsandboxed-local."""

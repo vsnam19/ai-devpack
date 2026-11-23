@@ -34,8 +34,8 @@ def _write_exec(path: Path, text: str) -> Path:
 class EvalBuildTimeoutTests(unittest.TestCase):
     """Verify build_and_test.sh TimeoutExpired before proposal acceptance is a harness error."""
 
-    def test_memory_step_build_timeout_becomes_harness_error_and_skips_proposals(self) -> None:
-        """TimeoutExpired on build_and_test.sh marks the trial harness_error with build_timeout."""
+    def test_memory_step_build_timeout_is_candidate_failure_and_skips_proposals(self) -> None:
+        """A build_and_test.sh timeout (exit 124) is a timeout failure, not a harness error."""
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             fixture_dir = base / "fixture"
@@ -137,13 +137,14 @@ class EvalBuildTimeoutTests(unittest.TestCase):
                     records[data["memory_arm"]] = data
 
             self.assertEqual({"with_memory", "without_memory"}, set(records.keys()))
-            self.assertEqual("harness_error", records["with_memory"]["outcome"])
+            self.assertEqual("timeout", records["with_memory"]["outcome"])
+            self.assertTrue(records["with_memory"]["timed_out"])
             self.assertEqual("pass", records["without_memory"]["outcome"])
 
             results_files = sorted((base / "out").rglob("results.json"))
             self.assertGreaterEqual(len(results_files), 1)
             results_text = "".join(p.read_text(encoding="utf-8") for p in results_files)
-            self.assertIn("build_timeout", results_text)
+            self.assertNotIn('"harness_error": true', results_text)
             # Step 2 never ran for with_memory (1 call) + 2 steps for without_memory = 3 calls total.
             self.assertEqual(3, len(call_log.read_text(encoding="utf-8").splitlines()))
             # Proposal from timed-out step was never accepted.
