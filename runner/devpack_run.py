@@ -47,6 +47,7 @@ for _p in (str(REPO_ROOT), str(RUNNER_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from workspace_scope import resolve_protected_test_globs  # noqa: E402
 import agent_exec  # noqa: E402
 from agent_exec import (  # noqa: E402
     AgentRequest,
@@ -673,7 +674,7 @@ def run_task_workflow(
     components: str | Sequence[str] | None = None,
     all_components: bool = False,
     allow_globs: Sequence[str] | None = None,
-    protected_globs: Sequence[str] = ("tests/**",),
+    protected_globs: Sequence[str] = (),
     deviation_id: str = "",
     gate_config: Path | None = None,
     trusted_git_dir: Path | None = None,
@@ -741,7 +742,7 @@ def run_task_workflow(
                 f"{dev_reason} (pass --deviation <ID> matching DEVPACK_DEVIATIONS)"
             )
     resolved_allow_globs = _parse_allowed_globs(context, allow_globs, ws_scope=ws_scope)
-    resolved_protected_globs = [str(g).strip() for g in protected_globs if str(g).strip()]
+    resolved_protected_globs = resolve_protected_test_globs(worktree, protected_globs)
 
     impl_engine = _coerce_role_engine(config, "implementer")
     rev_engine = _coerce_role_engine(config, "reviewer")
@@ -759,6 +760,8 @@ def run_task_workflow(
             "max_fix_rounds": max_fix_rounds,
             "components": active_component_names,
             "scan_mode": ws_scope.scan_mode,
+            "protected": list(resolved_protected_globs),
+            "scope": list(resolved_allow_globs),
             "roles": {
                 "implementer": impl_engine.name,
                 "reviewer": rev_engine.name,
@@ -766,6 +769,8 @@ def run_task_workflow(
             },
             "steps": [
                 f"1. implement: render brief and run role implementer ({impl_engine.name}) in worktree",
+                f"scope: scope_check.py against {resolved_allow_globs}",
+                f"test_lock: test_lock.py --protected {list(resolved_protected_globs)}",
                 f"2. gate: run {' '.join(gate_cmd)} (on failure -> fix round)",
                 f"3. review: run role reviewer ({rev_engine.name}) with git diff and parse final VERDICT line",
                 f"4. fix: on gate failure or VERDICT: REQUEST_CHANGES, run fixer ({fix_engine.name}) (up to {max_fix_rounds} rounds, then {ESCALATE_TO_HUMAN})",
@@ -1590,6 +1595,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Enable slash commands/skills in agent invocations (default: off, passes --disable-slash-commands)",
     )
     parser.add_argument(
+        "--protected", action="extend", nargs="+", default=[], metavar="GLOB",
+        help="Additional protected test globs (nested-test and project defaults always apply)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the step plan and template resolution without running commands",
@@ -1674,6 +1683,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=repo_root,
             max_fix_rounds_override=args.max_fix_rounds,
             dry_run=args.dry_run,
+            protected_globs=args.protected,
             run_dir=run_dir,
             isolation=args.isolation,
             allow_unsandboxed_local=args.allow_unsandboxed_local,

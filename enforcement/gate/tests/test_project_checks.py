@@ -23,7 +23,7 @@ class TestProjectChecks(unittest.TestCase):
             self.assertIn("{pack_root}/enforcement/gate/project_checks.py", entry["cmd"])
 
     def test_empty_changes_skip_and_component_commands_run(self) -> None:
-        """No C/C++ changes skip lint, while build and test execute configured commands."""
+        """Explicitly allowed empty C/C++ changes skip lint, while build and test execute configured commands."""
         root = Path(__file__).resolve().parents[3]
         helper = root / "enforcement/gate/project_checks.py"
         self.assertTrue(helper.is_file())
@@ -46,7 +46,7 @@ class TestProjectChecks(unittest.TestCase):
             )
             for args in (["init"], ["-c", "user.name=test", "-c", "user.email=test@local.invalid", "add", "."], ["-c", "user.name=test", "-c", "user.email=test@local.invalid", "commit", "-m", "init"]):
                 subprocess.run(["git", "-C", tmp, *args], check=True, capture_output=True)
-            result = subprocess.run(["python3", str(helper), "--check", "lint", "--repo", tmp], capture_output=True, text=True)
+            result = subprocess.run(["python3", str(helper), "--check", "lint", "--repo", tmp, "--allow-empty"], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("SKIP: no C/C++ changes", result.stdout)
             for check, expected in (("build", "123"), ("tests", "456")):

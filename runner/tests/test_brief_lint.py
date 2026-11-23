@@ -117,6 +117,7 @@ class BriefLintTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(0, rc2, buf2.getvalue())
+        self.assertEqual([], json.loads(buf2.getvalue()))
 
     def test_rule_brief_headings_positive_and_negative(self) -> None:
         """Missing required headings trigger BRIEF-HEADINGS error; template aliases pass."""
@@ -217,13 +218,13 @@ class BriefLintTests(unittest.TestCase):
             )
             findings = brief_lint.lint_brief_text(text, repo_root=repo)
             missing = [f for f in findings if f["rule"] == "BRIEF-PATH-MISSING"]
-            self.assertEqual(2, len(missing), findings)
+            self.assertEqual(1, len(missing), findings)
             self.assertTrue(all("src/ghost.cpp" in f["message"] for f in missing), findings)
             self.assertTrue(all(f["severity"] == "warning" for f in missing), findings)
             self.assertFalse(brief_lint.has_errors(findings), findings)
 
     def test_rule_brief_path_missing_fix_in_input_errors_even_with_files_allowed(self) -> None:
-        """A missing path that Input asks to fix is an error; its Files allowed mention is only a warning."""
+        """A missing path that Input asks to fix stays one error despite a Files allowed mention."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             _create_sample_repo(repo)
@@ -236,10 +237,10 @@ class BriefLintTests(unittest.TestCase):
             )
             findings = brief_lint.lint_brief_text(text, repo_root=repo)
             missing = [f for f in findings if f["rule"] == "BRIEF-PATH-MISSING"]
-            self.assertEqual(2, len(missing), findings)
+            self.assertEqual(1, len(missing), findings)
             self.assertTrue(all("src/driver.cpp" in f["message"] for f in missing))
             by_severity = {f["severity"]: f for f in missing}
-            self.assertEqual({"error", "warning"}, set(by_severity), findings)
+            self.assertEqual({"error"}, set(by_severity), findings)
             self.assertEqual(text.splitlines().index("- Fix `src/driver.cpp` as well.") + 1,
                              by_severity["error"]["line"])
             self.assertTrue(brief_lint.has_errors(findings))
@@ -317,7 +318,8 @@ class BriefLintTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             _create_sample_repo(repo)
-            text = _valid_brief_text().replace("`computeValue()`", "`nonExistentHelper()`")
+            text = _valid_brief_text().replace(
+                "## Input\n", "## Input\nInspect `nonExistentHelper()` and `otherMissingHelper()`.\n")
             text += "\nInspect class `GhostClass`.\n"
             brief = repo / "briefs" / "sym.md"
             brief.write_text(text, encoding="utf-8")
@@ -414,7 +416,8 @@ class BriefLintTests(unittest.TestCase):
             os.chmod(worker, stat.S_IRWXU)
 
             (wt / "briefs" / "bad.md").write_text("Update src/missing.cpp\n", encoding="utf-8")
-            warn_brief = _valid_brief_text().replace("`computeValue()`", "`futureHelper()`")
+            warn_brief = _valid_brief_text().replace(
+                "## Input\n", "## Input\nInspect `futureHelper()`.\n")
             (wt / "briefs" / "warn.md").write_text(warn_brief, encoding="utf-8")
 
             broker = devpack_broker.Broker(

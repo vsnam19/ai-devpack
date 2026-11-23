@@ -69,6 +69,7 @@ from enforcement.checks.scope_check import (  # noqa: E402
     is_gate_protected_path,
     normalize_rel_posix_path,
 )
+from runner.workspace_scope import resolve_protected_test_globs  # noqa: E402
 from runner import agent_exec  # noqa: E402
 from runner.agent_exec import (  # noqa: E402
     AgentRequest,
@@ -768,7 +769,7 @@ def dispatch_job(
     brief_path: Path,
     workdir: Path,
     allow_globs: Sequence[str] = (),
-    protected_globs: Sequence[str] = ("tests/**",),
+    protected_globs: Sequence[str] = (),
     base_ref: str = "",
     gate_cmd: str = "",
     no_gate: bool = False,
@@ -811,6 +812,7 @@ def dispatch_job(
         raise ValueError(f"Requested project config does not exist: {project_config_path}")
 
     project_cfg = load_project_config(workdir, project_config_path)
+    protected_globs = resolve_protected_test_globs(workdir, protected_globs, project_config_path)
     ws_scope = resolve_workspace_scope(
         workdir,
         project_config_path=project_config_path,
@@ -1066,6 +1068,8 @@ def _dispatch_job_with_trusted_cfg(
             "base_ref": effective_base,
             "allow": list(allow_globs),
             "protected": list(protected_globs),
+            "steps": ["agent", "scope: scope_check.py", "test_lock: test_lock.py --no-deviation",
+                      "preflight", "cppcheck", "gate"],
             "brief": str(brief_path),
             "profile_path": str(resolved_profile) if resolved_profile else "",
             "components": active_component_names,
@@ -1698,9 +1702,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--protected",
         action="extend",
         nargs="+",
-        default=["tests/**"],
+        default=[],
         metavar="GLOB",
-        help="Protected test glob(s) checked via test_lock.py (default: tests/**)",
+        help="Additional protected test globs (nested-test and project defaults always apply)",
     )
     parser.add_argument(
         "--base",

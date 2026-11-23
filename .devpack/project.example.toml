@@ -22,6 +22,10 @@ gate_config = "gate.toml"
 # Directory where v0.2 run logs (runs/<run-id>/) are written (must stay in .gitignore).
 runs_root = "runs"
 
+# Additional repository-relative test protections; nested tests are protected by default.
+protected_test_globs = ["checks/**"]
+# Gitignore /gate_receipt.json and /runs/ in the product repository.
+
 # Default engine names (must match [engines.<name>] entries in engines_config).
 [default_engines]
 implementer = "haiku"
@@ -50,7 +54,8 @@ fail_on = ["error", "warning"]
 
 # Optional Yocto / multi-component workspace scope (see policy/workspace_scope.md).
 # When [workspace] is omitted, the entire repository is treated as a single
-# implicit component (legacy behaviour). When [workspace] is set, every pack
+# implicit component in standalone tools (legacy behaviour). The project gate
+# requires [workspace] and active components. When [workspace] is set, every pack
 # check, brief linter, repomap, and worker edit is bounded to workspace.root
 # and never touches poky/, other meta-* layers, build/, tmp/, downloads/, or
 # sstate-cache/.
@@ -66,7 +71,11 @@ fail_on = ["error", "warning"]
 # # CMakeLists.txt, Makefile, meson.build, *.bb / *.bbappend identify components.
 # [[component]]
 # name = "ipc_bus"
-# path = "middleware/ipc_bus"            # relative to workspace.root
+# path = "middleware/ipc_bus"
+# Optional test patterns relative to this component; added to default protections.
+# test_globs = ["specs/**"]
+# Optional lint config relative to repository root; otherwise use component/preflight.toml.
+# preflight_config = "config/ipc_preflight.toml"
 # compile_commands = "build/ipc_bus/compile_commands.json"  # optional, repo-relative; used by cppcheck
 # include_dirs = ["middleware/ipc_bus/include"]             # optional, used when no compile_commands
 # build_cmd = "devtool build ipc-bus"    # optional
