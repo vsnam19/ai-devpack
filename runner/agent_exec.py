@@ -69,6 +69,7 @@ try:
         redact_structure,
         redact_value,
     )
+    from runner.safe_git import GitSecurityError, run_git  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: no cover
     import memory as devpack_memory  # type: ignore[no-redef]
     from redaction import (  # type: ignore[no-redef]
@@ -82,10 +83,12 @@ except ModuleNotFoundError:  # pragma: no cover
         redact_structure,
         redact_value,
     )
+    from safe_git import GitSecurityError, run_git  # type: ignore[no-redef]
 
 DEFAULT_CLAUDE_VERSION = "2.1.330"
 DOCKER_IMAGE_TAG = f"devpack-eval:{DEFAULT_CLAUDE_VERSION}"
 DOCKER_TASK_DIR = "/workspace/task"
+_GIT_COMMON_DIR_TIMEOUT_S = 30
 ALLOWED_TOOLS: tuple[str, ...] = ("Read", "Edit", "Write", "Bash", "Glob", "Grep")
 ORCHESTRATOR_TOOLS: tuple[str, ...] = (
     "Read", "Glob", "Grep", "Write(briefs/**)", "Edit(briefs/**)",
@@ -1514,8 +1517,25 @@ def _resolve_local_engine_env(
     }
 
 
+MOUNT_SOURCE_FORBIDDEN_CHARS: tuple[str, ...] = (":", ",", "\n", "\r")
+
+
+def _validate_mount_source(path: Path | str) -> str:
+    """Return ``path`` as a docker ``-v`` source string, refusing ``:``, ``,`` and newlines.
+
+    Docker parses ``-v`` values on ``:``; a separator inside a host path would let the
+    path be re-interpreted as a different source or destination.
+    """
+    text = str(path)
+    if any(ch in text for ch in MOUNT_SOURCE_FORBIDDEN_CHARS):
+        raise HarnessError(
+            f"Refusing docker mount source containing ':', ',' or a newline: {text!r}"
+        )
+    return text
+
+
 def _parse_worktree_gitdir(dot_git_file: Path, workdir: Path) -> Path | None:
-    """Resolve the ``gitdir:`` target from a worktree ``.git`` pointer file."""
+    """Resolve the ``gitdir:`` target from a worktree ``.git`` pointer file (realpath)."""
     text = dot_git_file.read_text(encoding="utf-8", errors="replace")
     raw_gitdir = ""
     for line in text.splitlines():
@@ -1526,31 +1546,73 @@ def _parse_worktree_gitdir(dot_git_file: Path, workdir: Path) -> Path | None:
     if not raw_gitdir:
         raise HarnessError(f"Malformed .git pointer file: {dot_git_file}")
     gd_path = Path(raw_gitdir)
-    return (workdir / gd_path).resolve() if not gd_path.is_absolute() else gd_path.resolve()
+    return Path(os.path.realpath(workdir / gd_path if not gd_path.is_absolute() else gd_path))
+
+
+def _trusted_git_common_dir(workdir: Path) -> Path:
+    """Ask git (hardened, host side) for the common git dir of the checkout at ``workdir``."""
+    try:
+        proc = run_git(
+            ["rev-parse", "--git-common-dir"],
+            repo_root=workdir,
+            timeout=_GIT_COMMON_DIR_TIMEOUT_S,
+        )
+    except (GitSecurityError, OSError, subprocess.SubprocessError) as exc:
+        raise HarnessError(f"Cannot verify worktree git metadata in {workdir}: {exc}") from exc
+    out = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not out:
+        raise HarnessError(f"git rev-parse --git-common-dir failed for workdir: {workdir}")
+    return Path(os.path.realpath(workdir / out))
+
+
+def _resolve_worktree_mount_dirs(dot_git_file: Path, resolved_workdir: Path) -> tuple[Path, Path]:
+    """Return ``(gitdir, common_dir)`` for a worktree pointer, or refuse with ``HarnessError``.
+
+    Accepted only when ``gitdir`` is a directory directly under ``<common_dir>/worktrees/``,
+    contains ``commondir`` and ``HEAD``, and its ``commondir`` file resolves to ``common_dir``.
+    ``common_dir`` comes from git run on the host, not from the pointer file alone.
+    """
+    gitdir = _parse_worktree_gitdir(dot_git_file, resolved_workdir)
+    if gitdir is None or not gitdir.is_dir():
+        raise HarnessError(f"Worktree gitdir is not a directory: {gitdir}")
+    common_dir = _trusted_git_common_dir(resolved_workdir)
+    if gitdir.parent != common_dir / "worktrees":
+        raise HarnessError(
+            f"Refusing worktree gitdir outside '{common_dir / 'worktrees'}': {gitdir}"
+        )
+    commondir_file = gitdir / "commondir"
+    if not commondir_file.is_file() or not (gitdir / "HEAD").is_file():
+        raise HarnessError(f"Worktree gitdir lacks commondir or HEAD: {gitdir}")
+    declared = commondir_file.read_text(encoding="utf-8", errors="replace").strip()
+    if not declared or Path(os.path.realpath(gitdir / declared)) != common_dir:
+        raise HarnessError(f"Worktree commondir does not match git common dir: {gitdir}")
+    return gitdir, common_dir
 
 
 def _docker_git_ro_mounts(resolved_workdir: Path) -> list[str]:
-    """Return read-only ``-v`` mount flags for ``.git`` (and worktree gitdir) in Docker mode."""
-    git_entry = resolved_workdir / ".git"
-    if not git_entry.exists() and not git_entry.is_symlink():
-        return []
-    if git_entry.is_symlink() and not git_entry.exists():
-        raise HarnessError(f"Broken .git symlink in workdir: {git_entry}")
+    """Return read-only ``-v`` mount flags for ``.git`` in Docker mode (T24 policy).
 
-    resolved_git = git_entry.resolve() if git_entry.is_symlink() else git_entry
-    mounts = ["-v", f"{resolved_git}:{DOCKER_TASK_DIR}/.git:ro"]
-    if resolved_git.is_file():
-        gitdir_path = _parse_worktree_gitdir(resolved_git, resolved_workdir)
-        if gitdir_path is not None:
-            resolved_wd = resolved_workdir.resolve()
-            if gitdir_path == resolved_wd:
-                raise HarnessError(f"Invalid worktree gitdir pointing to workdir: {gitdir_path}")
-            if gitdir_path.exists():
-                if gitdir_path.is_relative_to(resolved_wd):
-                    rel_gd = gitdir_path.relative_to(resolved_wd).as_posix()
-                    mounts.extend(["-v", f"{gitdir_path}:{DOCKER_TASK_DIR}/{rel_gd}:ro"])
-                else:
-                    mounts.extend(["-v", f"{gitdir_path}:{gitdir_path}:ro"])
+    * ``.git`` symlink: refused (``HarnessError``), never followed.
+    * ``.git`` real directory: mounted read-only at the task ``.git`` path.
+    * ``.git`` pointer file: the worktree gitdir and the common dir are mounted read-only
+      at their own host paths, after ``_resolve_worktree_mount_dirs`` accepts them.
+    """
+    git_entry = resolved_workdir / ".git"
+    if git_entry.is_symlink():
+        raise HarnessError(f"Refusing symlinked .git in workdir: {git_entry}")
+    if not git_entry.exists():
+        return []
+    if git_entry.is_dir():
+        src = _validate_mount_source(git_entry)
+        return ["-v", f"{src}:{DOCKER_TASK_DIR}/.git:ro"]
+    if not git_entry.is_file():
+        raise HarnessError(f"Unsupported .git entry type in workdir: {git_entry}")
+
+    gitdir, common_dir = _resolve_worktree_mount_dirs(git_entry, resolved_workdir)
+    mounts = ["-v", f"{_validate_mount_source(git_entry)}:{DOCKER_TASK_DIR}/.git:ro"]
+    for src in (gitdir, common_dir):
+        safe_src = _validate_mount_source(src)
+        mounts.extend(["-v", f"{safe_src}:{safe_src}:ro"])
     return mounts
 
 
@@ -1719,9 +1781,9 @@ def build_invocation(
         DOCKER_TASK_DIR,
         *docker_env_flags,
         "-v",
-        f"{resolved_workdir}:{DOCKER_TASK_DIR}:rw",
+        f"{_validate_mount_source(resolved_workdir)}:{DOCKER_TASK_DIR}:rw",
         "-v",
-        f"{resolved_cfg}:/workspace/cfg:ro",
+        f"{_validate_mount_source(resolved_cfg)}:/workspace/cfg:ro",
         *_docker_git_ro_mounts(resolved_workdir),
         image_tag,
         *_build_claude_tail(agent_bin_in_container),

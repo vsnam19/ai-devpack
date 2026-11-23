@@ -11,6 +11,13 @@ deviation (`deviations.md`), never a default (LSN-014).
    `broker-worker`, and `eval`). Agent roles do not commit inside the container; host-side
    steps record commits, provenance, and checks after verifying git metadata. No host home
    directory, no host sockets (container runtime socket, ssh agent), no other repositories.
+   Host paths bind-mounted into the container are never chosen by repository content: a `.git`
+   symlink is refused; a real `.git` directory is mounted read-only; a worktree `.git` pointer file
+   is followed only when git (run host-side through `runner/safe_git.py`) reports a common dir and the
+   pointed gitdir is a direct child of `<common_dir>/worktrees/` with `commondir` and `HEAD` present and
+   consistent. Only that gitdir and the common dir are mounted, read-only. Any mount source containing
+   `:`, `,` or a newline is refused, so a pointer file cannot redirect a mount to a host directory such as
+   an `.ssh` directory.
 2. **Least-privilege credentials.** A dedicated, short-lived token per task: read the one
    repository, push to a task branch only, no merge right, no access to CI secrets, no
    production or vehicle access. Credentials are mounted read-only and never written to
