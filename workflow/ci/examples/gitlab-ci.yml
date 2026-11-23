@@ -1,55 +1,45 @@
-# Example only: GitLab CI wiring for ai-devpack. Adapt image, tags and variables.
-# The pack is CI-neutral; every job just calls local scripts. Exit code != 0 fails the job.
-stages:
-  - preflight
-  - implement
-  - gate
-  - review
-  - human
+# Example: CI-only vendored pack. Pin its version and provision clang/cppcheck/build tools.
+# Optional agent jobs require an external trusted runner installation (topology A).
+# Every non-zero command exit fails the job. Review/fix is part of devpack_run's real loop.
+stages: [preflight, implement_review, gate, human]
 
 variables:
-  DEVPACK_DIR: "."                       # path of the pack inside the project
-  GATE_CONFIG: "enforcement/gate/gate.example.toml"
+  DEVPACK_DIR: "devpack"
+  GATE_CONFIG: ".devpack/gate.toml"
+  ENGINES_CONFIG: ".devpack/engines.toml"
+  DEVPACK_BASE: "origin/main" # fetch this ref and choose the project's merge base
 
 preflight:
   stage: preflight
-  image: python:3.11
+  image: devpack-checks:latest # Python 3.11+, git, clang, cppcheck, project build tools
   script:
-    - python3 $DEVPACK_DIR/enforcement/checks/secret_pii_check.py --help >/dev/null
-    - python3 $DEVPACK_DIR/enforcement/lint/preflight_lint.py --help >/dev/null
+    - python3 $DEVPACK_DIR/enforcement/gate/project_checks.py --check lint --base "$DEVPACK_BASE" --all-components
 
-implement:
-  stage: implement
-  image: devpack-agent-sandbox:latest      # container built per policy/sandbox.md
-  rules:
-    - if: '$DEVPACK_TASK'
-  script:
-    - python3 $DEVPACK_DIR/runner/devpack_run.py --help >/dev/null
-    - python3 $DEVPACK_DIR/runner/devpack_run.py --task "$DEVPACK_TASK"
-  artifacts:
-    paths: [evidence/]
-    when: always
-
-gate:
-  stage: gate
-  image: python:3.11
-  script:
-    - python3 $DEVPACK_DIR/enforcement/gate/gate.py --config $GATE_CONFIG
-  artifacts:
-    paths: [gate_receipt.json]
-    when: always
-
-review:
-  stage: review
+implement_review:
+  stage: implement_review
   image: devpack-agent-sandbox:latest
   rules:
     - if: '$DEVPACK_TASK'
   script:
-    - python3 $DEVPACK_DIR/runner/devpack_run.py --task "$DEVPACK_TASK" --review-only
+    # Set DEVPACK_DIR to the external trusted installation for this optional agent topology.
+    # The actual command includes implement -> gate -> read-only review -> bounded fix.
+    - python3 $DEVPACK_DIR/runner/devpack_run.py --config "$ENGINES_CONFIG" --task-file "$DEVPACK_TASK" --gate-config "$GATE_CONFIG" --all-components
+  artifacts:
+    paths: [runs/]
+    when: always
+
+gate:
+  stage: gate
+  image: devpack-checks:latest
+  script:
+    - python3 $DEVPACK_DIR/enforcement/gate/gate.py --config "$GATE_CONFIG" --all-components
+  artifacts:
+    paths: [gate_receipt.json]
+    when: always
 
 human_approval:
   stage: human
-  when: manual                             # a human approves; only then a merge job may run
+  when: manual
   allow_failure: false
   script:
     - echo "Independent human reviewer approves in the merge request"

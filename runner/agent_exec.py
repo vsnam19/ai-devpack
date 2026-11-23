@@ -96,9 +96,9 @@ ROLE_TOOLS = {"reviewer": ("Read", "Glob", "Grep"), "orchestrator": ORCHESTRATOR
 DISALLOWED_TOOLS: tuple[str, ...] = ("WebFetch", "WebSearch")
 DEFAULT_GATE_CMD: tuple[str, ...] = (
     "python3",
-    "enforcement/gate/gate.py",
+    str(Path(__file__).resolve().parents[1] / "enforcement/gate/gate.py"),
     "--config",
-    "enforcement/gate/gate.example.toml",
+    ".devpack/project.toml:gate_config",
 )
 VALID_ENGINE_CLASSES = ("cloud", "local")
 VALID_RUN_KINDS = ("task", "eval", "dispatch", "skilltest")
@@ -715,7 +715,8 @@ def load_project_config(
     """Load ``.devpack/project.toml`` from ``workdir`` (missing file defaults to ``internal``)."""
     defaults: dict[str, Any] = {
         "data_class": "internal",
-        "engines_config": "runner/engines.example.toml",
+        "engines_config": str(Path(__file__).resolve().parent / "engines.example.toml"),
+        "gate_config": "",
         "runs_root": "runs",
         "default_engines": {},
         "allow_unsandboxed_local": False,
@@ -755,7 +756,15 @@ def load_project_config(
             f"(must be one of {', '.join(DATA_CLASS_ORDER)})"
         )
     defaults["data_class"] = data_class
-    defaults["engines_config"] = str(raw.get("engines_config", defaults["engines_config"])).strip()
+    for key in ("engines_config", "gate_config"):
+        value = str(raw.get(key, defaults[key])).strip()
+        if value:
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                project_candidate = cfg_path.resolve().parent / candidate
+                pack_candidate = Path(__file__).resolve().parents[1] / candidate
+                candidate = project_candidate if project_candidate.exists() or not pack_candidate.exists() else pack_candidate
+            defaults[key] = str(candidate.resolve())
     defaults["runs_root"] = str(raw.get("runs_root", defaults["runs_root"])).strip()
     raw_defaults = raw.get("default_engines", {})
     if isinstance(raw_defaults, dict):
@@ -781,6 +790,67 @@ def load_project_config(
         raise ValueError(f"[scan] must be a table in {cfg_path}")
     defaults["config_found"] = True
     return defaults
+
+
+def build_gate_argv(
+    gate_config: Path | str,
+    repo: Path | str,
+    *,
+    receipt: Path | str | None = None,
+    all_components: bool = True,
+    components: Sequence[str] | None = None,
+    project_config_path: Path | str | None = None,
+    pack_root: Path | str | None = None,
+) -> list[str]:
+    """Build the ``enforcement/gate/gate.py`` argv shared by dispatch and the project gate.
+
+    Scope precedence matches the lint and cppcheck invocations: ``all_components`` wins, otherwise
+    a non-empty ``components`` list is forwarded as one ``--components`` value. ``project_config_path``
+    is forwarded so gate.py resolves the same project settings as the caller.
+    """
+    root = Path(pack_root) if pack_root is not None else Path(__file__).resolve().parents[1]
+    argv = [
+        "python3", str(root / "enforcement" / "gate" / "gate.py"),
+        "--config", str(gate_config), "--repo", str(repo),
+    ]
+    if receipt is not None:
+        argv.extend(["--receipt", str(receipt)])
+    if all_components:
+        argv.append("--all-components")
+    elif components:
+        argv.extend(["--components", ",".join(components)])
+    if project_config_path is not None and str(project_config_path):
+        argv.extend(["--project-config", str(project_config_path)])
+    return argv
+
+
+def resolve_project_gate_command(
+    workdir: Path,
+    gate_config: Path | str | None = None,
+    project_config_path: Path | str | None = None,
+    *,
+    receipt: Path | str | None = None,
+    all_components: bool = True,
+    components: Sequence[str] | None = None,
+) -> list[str]:
+    """Build a pack-absolute gate command from the project's explicit gate configuration."""
+    project = load_project_config(workdir, project_config_path)
+    config = Path(gate_config).resolve() if gate_config else None
+    if config is None:
+        raw = str(project.get("gate_config", "")).strip()
+        if not raw:
+            raise ValueError("Project gate_config is unset; set gate_config in .devpack/project.toml or pass --gate-config")
+        config = Path(raw)
+    if not config.is_file():
+        raise ValueError(f"Project gate_config not found: {config}")
+    return build_gate_argv(
+        config,
+        workdir.resolve(),
+        receipt=receipt,
+        all_components=all_components,
+        components=components,
+        project_config_path=project_config_path,
+    )
 
 
 def check_data_class_allowed(engine: EngineConfig, data_class: str) -> tuple[bool, str]:
@@ -2581,6 +2651,30 @@ def run_agent(request: AgentRequest) -> AgentResult:
             shutil.rmtree(created_temp_iso, ignore_errors=True)
 
 
+def install_project_skills(workdir: Path) -> list[str]:
+    """Copy bundled skills into a project's local skill directory before its task baseline."""
+    root = workdir.resolve()
+    if not root.is_dir():
+        raise ValueError(f"Project directory not found: {workdir}")
+    skills_root = root / ".claude" / "skills"
+    if not skills_root.resolve().is_relative_to(root):
+        raise ValueError("Skills installation path escapes the project")
+    source = Path(__file__).resolve().parents[1] / "knowledge" / "skills"
+    installed: list[str] = []
+    for skill in sorted(source.iterdir()):
+        if not (skill / "SKILL.md").is_file():
+            continue
+        destination = skills_root / skill.name
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_dir():
+                raise ValueError(f"Unsafe existing skill path: {destination}")
+            # Existing installations are project-owned; do not overwrite edits.
+            continue
+        shutil.copytree(skill, destination, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        installed.append(skill.name)
+    return installed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser for ``runner/agent_exec.py``."""
     parser = argparse.ArgumentParser(
@@ -2590,6 +2684,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "and stream-json transcript parser."
         ),
     )
+    parser.add_argument("--install-skills", default="", metavar="PROJECT", help="Copy bundled skills into PROJECT/.claude/skills before committing the task baseline")
     parser.add_argument(
         "--check-config",
         default="",
@@ -2609,6 +2704,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for ``runner/agent_exec.py``."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.install_skills:
+        try:
+            installed = install_project_skills(Path(args.install_skills))
+        except (ValueError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print("Installed skills: " + ", ".join(installed))
+        return 0
 
     if args.check_config:
         try:

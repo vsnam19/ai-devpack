@@ -162,6 +162,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="GLOB",
         help="Allowed POSIX path glob pattern(s) (e.g. 'src/**', 'tests/*.cpp').",
     )
+    parser.add_argument("--components", default=None, help="Comma-separated active component names.")
+    parser.add_argument("--all-components", action="store_true", help="Check scope against every workspace component.")
     parser.add_argument(
         "--project-config",
         default="",
@@ -193,7 +195,10 @@ def main(argv: list[str] | None = None) -> int:
 
     proj_cfg = pathlib.Path(args.project_config) if args.project_config else None
     try:
-        ws_scope = resolve_workspace_scope(repo_root, project_config_path=proj_cfg)
+        ws_scope = resolve_workspace_scope(
+            repo_root, project_config_path=proj_cfg, components=args.components,
+            all_components=args.all_components,
+        )
     except ValueError as exc:
         print(f"SCOPE_ERROR: {exc}", file=sys.stderr)
         return 1
@@ -218,31 +223,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SCOPE_ERROR: {err}", file=sys.stderr)
         return 1
 
-    gate_touched = [
-        path for path in changed_files if is_gate_protected_path(path, args.gate_config_file)
-    ]
-    if gate_touched:
-        for path in gate_touched:
-            print(
+    violations: list[str] = []
+    for path in changed_files:
+        if is_gate_protected_path(path, args.gate_config_file):
+            violations.append(
                 f"SCOPE_VIOLATION: {path} is gate-touched "
                 "(gate/lint/cppcheck configuration cannot be modified by workers)"
             )
-        return 1
-
-    if ws_scope.configured:
-        outside_ws = [path for path in changed_files if ws_scope.outside_workspace(path)]
-        if outside_ws:
-            for path in outside_ws:
-                print(
+        if ws_scope.configured:
+            if ws_scope.outside_workspace(path):
+                violations.append(
                     f"SCOPE_VIOLATION: {path} is outside workspace root "
                     f"({ws_scope.workspace_root_rel})"
                 )
-            return 1
-
-    violations = [path for path in changed_files if not matches_any_glob(path, compiled_globs)]
+            elif ws_scope.is_excluded(path):
+                violations.append(f"SCOPE_VIOLATION: {path} is excluded by workspace configuration")
+            elif not ws_scope.is_in_active_components(path):
+                violations.append(f"SCOPE_VIOLATION: {path} is outside active components")
+        if not matches_any_glob(path, compiled_globs):
+            violations.append(
+                f"SCOPE_VIOLATION: {path} is outside allowed globs ({', '.join(allow_patterns)})"
+            )
     if violations:
-        for path in violations:
-            print(f"SCOPE_VIOLATION: {path} is outside allowed globs ({', '.join(allow_patterns)})")
+        for violation in violations:
+            print(violation)
         return 1
 
     print(f"SCOPE_OK: {len(changed_files)} changed file(s) within allowed scope")

@@ -578,6 +578,16 @@ class WorkspaceScope:
                 return ws_cand
         return None
 
+    def unchecked_components(self) -> list[str]:
+        """Return names omitted by the active component selection."""
+        active = {comp.name for comp in self.active_components}
+        return [comp.name for comp in self.all_components if comp.name not in active]
+
+    def selection_warning(self) -> str:
+        """Describe partial scan coverage, or return an empty string for a full scan."""
+        unchecked = self.unchecked_components()
+        return (f"WARNING: {len(unchecked)} configured components not checked: " + ", ".join(unchecked)) if unchecked else ""
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable summary of the resolved workspace scope."""
         return {
@@ -586,6 +596,7 @@ class WorkspaceScope:
             "scan_mode": self.scan_mode,
             "components": [comp.name for comp in self.active_components],
             "all_components": [comp.name for comp in self.all_components],
+            "unchecked_components": self.unchecked_components(),
             "globs": self.path_globs(),
             "exclude": list(self.exclude),
         }
@@ -595,52 +606,52 @@ def discover_components(
     repo_root: Path,
     workspace_root: Path,
     workspace_root_rel: str,
+    discovery_depth: int = 4,
+    exclude: Sequence[str] = (),
+    explicit: Sequence[ComponentSpec] = (),
 ) -> tuple[ComponentSpec, ...]:
-    """Discover direct subdirectories of ``workspace_root`` that look like buildable components."""
+    """Discover nested components, pruning excludes and stopping at component roots."""
     if not workspace_root.is_dir():
         return ()
-    repo_res = repo_root.resolve()
-    ws_res = workspace_root.resolve()
     found: list[ComponentSpec] = []
-    for child in sorted(workspace_root.iterdir(), key=lambda p: p.name):
-        if child.name.startswith("."):
-            continue
-        if child.is_symlink():
-            child_res = child.resolve()
-            if not child_res.is_relative_to(ws_res) or not child_res.is_relative_to(repo_res):
-                raise WorkspaceConfigError(
-                    f"Discovered component path '{child.name}' resolves outside workspace/repository root: {child_res}"
-                )
-        if not child.is_dir():
-            continue
-        child_res = validate_path_contained(
-            child,
-            repo_res,
-            workspace_root=ws_res,
-            label=f"component directory '{child.name}'",
-        )
-        has_marker = False
-        try:
-            for item in child.iterdir():
-                if not item.is_file():
-                    continue
-                if item.name in DISCOVERY_MARKERS or item.suffix in DISCOVERY_SUFFIXES:
-                    has_marker = True
-                    break
-        except OSError:
-            continue
-        if has_marker:
-            comp_rel = child.name
-            repo_rel = _join_rel(workspace_root_rel, comp_rel)
-            found.append(
-                ComponentSpec(
-                    name=child.name,
-                    path=comp_rel,
-                    repo_rel_path=repo_rel,
-                    abs_path=child_res,
-                    discovered=True,
-                )
+    known_paths = {comp.abs_path.resolve() for comp in explicit}
+    used_names = {comp.name for comp in explicit}
+    excluded = tuple(_glob_to_regex(pat) for pat in exclude)
+
+    def visit(parent: Path, depth: int, ancestors: frozenset[Path]) -> None:
+        """Visit bounded child directories without following cycles or external links."""
+        if depth > discovery_depth:
+            return
+        for child in sorted(parent.iterdir(), key=lambda p: p.name):
+            if child.name.startswith('.') or not child.is_dir():
+                continue
+            resolved = validate_path_contained(
+                child, repo_root, workspace_root=workspace_root,
+                label=f"component directory '{child.name}'",
             )
+            relative = child.relative_to(workspace_root).as_posix()
+            repo_rel = _join_rel(workspace_root_rel, relative)
+            if any(rx.match(repo_rel) for rx in excluded):
+                continue
+            if resolved in ancestors or resolved in known_paths:
+                continue
+            marker = any(
+                item.is_file() and (item.name in DISCOVERY_MARKERS or item.suffix in DISCOVERY_SUFFIXES)
+                for item in child.iterdir()
+            )
+            if marker:
+                name = child.name
+                if name in used_names:
+                    raise WorkspaceConfigError(f"Duplicate discovered component name '{name}'; configure unique names explicitly")
+                used_names.add(name)
+                found.append(ComponentSpec(
+                    name=name, path=relative, repo_rel_path=repo_rel,
+                    abs_path=resolved, discovered=True,
+                ))
+            else:
+                visit(child, depth + 1, ancestors | {resolved})
+
+    visit(workspace_root, 1, frozenset({workspace_root.resolve()}))
     return tuple(found)
 
 
@@ -649,8 +660,11 @@ def _select_project_config_path(
     project_config_path: Path | str | None,
 ) -> Path | None:
     """Locate the project TOML file to inspect for ``[workspace]`` settings."""
-    if project_config_path is not None and str(project_config_path):
-        cand = Path(project_config_path)
+    selected = project_config_path or os.environ.get("DEVPACK_PROJECT_CONFIG")
+    if selected is not None and str(selected).lower() == "none":
+        return None
+    if selected is not None and str(selected):
+        cand = Path(selected)
         if not cand.is_file():
             raise WorkspaceConfigError(f"Requested project config does not exist: {cand}")
         return cand
@@ -797,8 +811,14 @@ def load_workspace_config(
                     discovered=False,
                 )
             )
-    else:
-        components = list(discover_components(root, ws_abs, ws_rel))
+    discover = ws_tbl.get("discover", True)
+    depth = ws_tbl.get("discovery_depth", 4)
+    if not isinstance(discover, bool):
+        raise WorkspaceConfigError("[workspace].discover must be a boolean")
+    if isinstance(depth, bool) or not isinstance(depth, int) or depth < 1:
+        raise WorkspaceConfigError("[workspace].discovery_depth must be a positive integer")
+    if discover:
+        components.extend(discover_components(root, ws_abs, ws_rel, depth, exclude, components))
 
     scan_tbl = raw_toml.get("scan", {})
     if scan_tbl is None:

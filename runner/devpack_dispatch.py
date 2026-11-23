@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 from datetime import datetime, timezone
 import json
@@ -127,6 +127,8 @@ class TrustedGateConfig:
     gate_toml_path: Path | None = None
     suppressions_rel_path: str | None = None
     suppressions_sha256: str | None = None
+    project_gate_path: Path | None = None
+    project_gate_bytes: bytes | None = None
 
 
 def _git_show_regular_blob(workdir: Path, ref: str, rel_path: str) -> bytes | None:
@@ -594,32 +596,40 @@ def _resolve_gate_command(
     run_dir: Path,
     pack_root: Path = PACK_ROOT,
     trusted_gate_toml: Path | None = None,
+    *,
+    all_components: bool = False,
+    components: Sequence[str] | None = None,
+    project_config_path: Path | None = None,
 ) -> tuple[list[str] | None, int]:
-    """Determine the deterministic gate command and timeout for ``workdir``."""
+    """Determine the deterministic gate command and timeout for ``workdir``.
+
+    Scope (``all_components`` / ``components``) and ``project_config_path`` are forwarded to
+    gate.py on both the trusted-config and the project-gate paths via the shared builder.
+    Raises ``ValueError`` when no gate can be resolved (for example, ``gate_config`` is unset).
+    """
     timeout_s = engines_cfg.gate_timeout_s if engines_cfg is not None else 300
     if explicit_gate_cmd.strip():
         return shlex.split(explicit_gate_cmd), timeout_s
 
     if trusted_gate_toml is not None and trusted_gate_toml.is_file():
-        return [
-            "python3",
-            str(pack_root / "enforcement" / "gate" / "gate.py"),
-            "--config",
-            str(trusted_gate_toml),
-            "--repo",
-            str(workdir),
-            "--receipt",
-            str(run_dir / "steps" / "02-gate-receipt.json"),
-        ], timeout_s
+        return agent_exec.build_gate_argv(
+            trusted_gate_toml,
+            workdir,
+            receipt=run_dir / "steps" / "02-gate-receipt.json",
+            all_components=all_components,
+            components=components,
+            project_config_path=project_config_path,
+            pack_root=pack_root,
+        ), timeout_s
 
-    if engines_cfg is not None:
-        cfg_cmd = list(engines_cfg.gate_cmd)
-        if cfg_cmd != list(agent_exec.DEFAULT_GATE_CMD):
-            return cfg_cmd, timeout_s
-        if (workdir / "enforcement" / "gate" / "gate.example.toml").is_file():
-            return cfg_cmd, timeout_s
-
-    return None, timeout_s
+    if engines_cfg is not None and list(engines_cfg.gate_cmd) != list(agent_exec.DEFAULT_GATE_CMD):
+        return list(engines_cfg.gate_cmd), timeout_s
+    return agent_exec.resolve_project_gate_command(
+        workdir,
+        project_config_path=project_config_path,
+        all_components=all_components,
+        components=components,
+    ), timeout_s
 
 
 def _render_run_dir_quietly(
@@ -805,12 +815,12 @@ def dispatch_job(
     if ws_scope.configured and allow_globs:
         ws_scope = ws_scope.with_allow_globs(allow_globs)
     active_component_names = [c.name for c in ws_scope.active_components]
+    if ws_scope.selection_warning():
+        print(ws_scope.selection_warning(), file=sys.stderr)
 
     effective_engines_path = engines_config_path
     if effective_engines_path is None:
-        rel_eng = project_cfg.get("engines_config", "runner/engines.example.toml")
-        candidate = workdir / rel_eng
-        effective_engines_path = candidate if candidate.is_file() else (pack_root / rel_eng)
+        effective_engines_path = Path(project_cfg["engines_config"])
 
     engines_cfg: EnginesConfig | None = None
     if effective_engines_path.is_file():
@@ -884,6 +894,22 @@ def dispatch_job(
             pack_root=pack_root,
             pre_run_project_bytes=pre_run_project_bytes,
         )
+        if (not no_gate and not gate_cmd.strip()
+                and (engines_cfg is None or list(engines_cfg.gate_cmd) == list(agent_exec.DEFAULT_GATE_CMD))
+                and str(project_cfg.get("gate_config", "")).strip()):
+            project_gate_cmd = agent_exec.resolve_project_gate_command(workdir, project_config_path=project_config_path)
+            original_gate = Path(project_gate_cmd[project_gate_cmd.index("--config") + 1])
+            if original_gate.is_symlink():
+                raise ValueError("Project gate_config must be a regular file, not a symlink")
+            original_bytes = original_gate.read_bytes()
+            snapshot_gate = Path(gate_cfg_tmp) / "project-gate.toml"
+            snapshot_gate.write_bytes(original_bytes)
+            gate_refs = trusted_cfg.protected_rel_paths
+            if original_gate.is_relative_to(workdir):
+                gate_refs = (*gate_refs, original_gate.relative_to(workdir).as_posix())
+            trusted_cfg = replace(trusted_cfg, gate_toml_path=snapshot_gate,
+                                  protected_rel_paths=gate_refs,
+                                  project_gate_path=original_gate, project_gate_bytes=original_bytes)
         return _dispatch_job_with_trusted_cfg(
             trusted_cfg=trusted_cfg,
             engine=engine,
@@ -918,6 +944,7 @@ def dispatch_job(
             gate_cmd=gate_cmd,
             no_gate=no_gate,
             project_config_path=project_config_path,
+            all_components=all_components,
             isolation=isolation,
             allow_unsandboxed_local=allow_unsandboxed_local,
             credentials_path=credentials_path,
@@ -968,6 +995,7 @@ def _dispatch_job_with_trusted_cfg(
     gate_cmd: str,
     no_gate: bool,
     project_config_path: Path | None,
+    all_components: bool,
     isolation: str,
     allow_unsandboxed_local: bool,
     credentials_path: Path | None,
@@ -1035,6 +1063,7 @@ def _dispatch_job_with_trusted_cfg(
             "profile_path": str(resolved_profile) if resolved_profile else "",
             "components": active_component_names,
             "scan_mode": ws_scope.scan_mode,
+            "unchecked_components": ws_scope.unchecked_components(),
         }
         if qual_deviation_logged:
             plan["deviation_id"] = cleaned_deviation
@@ -1054,6 +1083,7 @@ def _dispatch_job_with_trusted_cfg(
         isolation=isolation,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
+        unchecked_components=ws_scope.unchecked_components(),
     )
 
     if not data_ok:
@@ -1144,6 +1174,52 @@ def _dispatch_job_with_trusted_cfg(
             qualification_warning=qual_reason,
             engine_config_hash=engine_cfg_hash,
         )
+
+    # Resolve and validate the gate before any agent starts: a missing gate configuration is a
+    # clean refusal here, not an exception raised after the agent has already run.
+    resolved_gate_cmd: list[str] | None = None
+    gate_timeout_s = 300
+    if not no_gate:
+        gate_scope_names = (
+            [c.name for c in ws_scope.active_components]
+            if ws_scope.configured and ws_scope.scan_mode == "selected"
+            else None
+        )
+        try:
+            resolved_gate_cmd, gate_timeout_s = _resolve_gate_command(
+                gate_cmd,
+                engines_cfg,
+                workdir,
+                run_dir,
+                pack_root=pack_root,
+                trusted_gate_toml=trusted_cfg.gate_toml_path,
+                all_components=all_components or ws_scope.scan_mode == "all",
+                components=gate_scope_names,
+                project_config_path=project_config_path,
+            )
+        except ValueError as exc:
+            refusal = f"Refused before agent launch: {exc}"
+            sys.stderr.write(refusal + "\n")
+            update_run_json(
+                run_dir,
+                outcome="refused",
+                gate="skipped",
+                refusal_reason=refusal,
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+            payload = {
+                "run_dir": str(run_dir),
+                "status": "refused",
+                "gate": "skipped",
+                "scope": "ok",
+                "changed_files": [],
+                "final_text_tail": "",
+                "cost_usd": None if engine.is_local else 0.0,
+                "error": refusal,
+            }
+            _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
+            _emit_json_line(payload)
+            return 1, payload
 
     req = AgentRequest(
         engine=engine,
@@ -1276,6 +1352,14 @@ def _dispatch_job_with_trusted_cfg(
             if is_gate_protected_path(name, trusted_cfg.protected_rel_paths)
         }
     )
+    if trusted_cfg.project_gate_path is not None and (
+        trusted_cfg.project_gate_path.is_symlink()
+        or not trusted_cfg.project_gate_path.is_file()
+        or trusted_cfg.project_gate_path.read_bytes() != trusted_cfg.project_gate_bytes
+    ):
+        original = trusted_cfg.project_gate_path
+        gate_label = original.relative_to(workdir).as_posix() if original.is_relative_to(workdir) else original.name
+        gate_touched = sorted(set(gate_touched) | {gate_label})
     out_of_scope_changes: list[str] = []
     scoped_changed_files: list[str] = list(changed_files)
     if ws_scope.configured:
@@ -1327,6 +1411,11 @@ def _dispatch_job_with_trusted_cfg(
                 "--allow",
                 *allow_globs,
             ]
+            if ws_scope.configured:
+                if ws_scope.scan_mode == "all":
+                    scope_cmd.append("--all-components")
+                else:
+                    scope_cmd.extend(["--components", ",".join(c.name for c in ws_scope.active_components)])
             for extra_gate in trusted_cfg.protected_rel_paths:
                 scope_cmd.extend(["--gate-config-file", extra_gate])
             if project_config_path is not None:
@@ -1431,15 +1520,7 @@ def _dispatch_job_with_trusted_cfg(
             if not static_clean:
                 gate_ok = False
 
-            # 3. Configured gate command (if any)
-            resolved_gate_cmd, gate_timeout_s = _resolve_gate_command(
-                gate_cmd,
-                engines_cfg,
-                workdir,
-                run_dir,
-                pack_root=pack_root,
-                trusted_gate_toml=trusted_cfg.gate_toml_path,
-            )
+            # 3. Configured gate command (resolved and validated before the agent launched)
             if resolved_gate_cmd is not None:
                 g_rc, g_out, g_err = _run_subprocess(resolved_gate_cmd, workdir, timeout_s=gate_timeout_s)
                 g_combined = (g_out + "\n" + g_err).strip()
@@ -1512,6 +1593,7 @@ def _dispatch_job_with_trusted_cfg(
         memory_proposals=mem_proposal_summary,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
+        unchecked_components=ws_scope.unchecked_components(),
         gate_config_source=trusted_cfg.source,
         gate_config_sha256=trusted_cfg.sha256,
         **suppressions_meta,
@@ -1542,6 +1624,7 @@ def _dispatch_job_with_trusted_cfg(
         "memory_tokens": int(agent_res.memory_tokens),
         "components": active_component_names,
         "scan_mode": ws_scope.scan_mode,
+        "unchecked_components": ws_scope.unchecked_components(),
         "gate_config_source": trusted_cfg.source,
         "gate_config_sha256": trusted_cfg.sha256,
         **suppressions_meta,

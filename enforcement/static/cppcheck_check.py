@@ -1045,6 +1045,7 @@ def run_cppcheck_check(
     all_components: bool = False,
     project_config_path: Path | None = None,
     trusted_suppressions_dir: Path | None = None,
+    allow_empty: bool = False,
 ) -> CppcheckRunResult:
     """Run cppcheck on ``targets`` or git-changed files since ``base_ref``.
 
@@ -1076,8 +1077,23 @@ def run_cppcheck_check(
         config.extra_args = validate_extra_args(config.extra_args)
     config.fail_on = validate_fail_on(config.fail_on)
 
-    if not targets and not base_ref.strip() and not ws_scope.configured:
+    if not targets and not base_ref.strip() and not ws_scope.configured and not allow_empty:
         raise ValueError("provide one or more target paths or --base <ref>")
+
+    warning = ws_scope.selection_warning()
+    if warning:
+        print(warning, file=sys.stderr)
+    invalid = []
+    for raw in targets:
+        target = Path(raw)
+        if not target.is_absolute():
+            cwd_target = (Path.cwd() / target).resolve()
+            target = cwd_target if cwd_target.exists() else effective_root / target
+        if target.is_file() and (ws_scope.is_excluded(target) or
+                                (ws_scope.configured and not ws_scope.is_in_active_components(target))):
+            invalid.append(raw)
+    if invalid:
+        return CppcheckRunResult(exit_code=1, error_message="OUT_OF_SCOPE: " + ", ".join(invalid))
 
     target_files: list[Path]
     has_explicit_file_target = False
@@ -1103,6 +1119,12 @@ def run_cppcheck_check(
     else:
         target_files = collect_cpp_targets(targets, effective_root)
 
+    if not target_files:
+        no_changes = bool(base_ref.strip()) and not changed_files
+        if allow_empty or no_changes:
+            return CppcheckRunResult(exit_code=0, error_message="SKIP: no C/C++ changes", fail_on=config.fail_on)
+        return CppcheckRunResult(exit_code=1, error_message="NO_FILES_CHECKED: no matching in-scope C/C++ files found", fail_on=config.fail_on)
+
     resolved_bin = resolve_cppcheck_binary(cppcheck_bin)
     if resolved_bin is None:
         return CppcheckRunResult(
@@ -1118,15 +1140,6 @@ def run_cppcheck_check(
     baseline_counts: Counter[tuple[str, str, str, str]] = Counter()
     if baseline_path is not None and not baseline_update:
         baseline_counts = load_baseline(baseline_path)
-
-    if not target_files:
-        if baseline_update and baseline_path is not None:
-            save_baseline(baseline_path, [])
-        return CppcheckRunResult(
-            exit_code=0,
-            files_checked=0,
-            fail_on=config.fail_on,
-        )
 
     cfg_base_dir = resolved_cfg_path.parent if resolved_cfg_path is not None else effective_root
 
@@ -1326,7 +1339,7 @@ def format_result_json(result: CppcheckRunResult) -> str:
 
 def format_result_text(result: CppcheckRunResult) -> str:
     """Format a ``CppcheckRunResult`` into human-readable summary lines."""
-    if result.tool_missing:
+    if result.error_message:
         return result.error_message
     fail_set = {s.lower() for s in result.fail_on}
     lines: list[str] = []
@@ -1363,6 +1376,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="cppcheck_check.py",
         description="Run cppcheck static analysis on C/C++ targets or changed files vs --base.",
     )
+    parser.add_argument("--allow-empty", action="store_true", help="Allow an intentionally empty scan")
     parser.add_argument(
         "targets",
         nargs="*",
@@ -1491,7 +1505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.timeout_s < 1:
         print("error: --timeout-s must be >= 1", file=sys.stderr)
         return 2
-    if args.project_config is not None and not args.project_config.is_file():
+    if args.project_config is not None and str(args.project_config) != "none" and not args.project_config.is_file():
         print(f"error: project config not found: {args.project_config}", file=sys.stderr)
         return 2
 
@@ -1526,6 +1540,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             all_components=bool(args.all_components),
             project_config_path=args.project_config,
             trusted_suppressions_dir=args.trusted_suppressions_dir,
+            allow_empty=args.allow_empty,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

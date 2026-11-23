@@ -1,0 +1,4 @@
+[workspace]
+root = "src"
+discovery_depth = 4
+exclude = ["**/generated/**"]

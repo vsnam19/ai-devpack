@@ -18,7 +18,7 @@ internally.
 | Path | Content |
 |---|---|
 | `policy/` | operating model, ASIL boundaries (company policy, needs safety approval), sandbox, data governance, provenance, failure handling, `policy/failure_attribution.md`, `policy/static_analysis.md`, `policy/workspace_scope.md`, tool confidence, deviations, `policy/logging.md`, `policy/local_models.md`, `policy/memory.md` |
-| `knowledge/` | `lessons.md` (LSN-001..LSN-019), `context_template/AGENTS.md`, `skills/` (`automotive-cpp`, `review-taxonomy`, `skill-authoring`, `requirements-analysis`; deprecated: `misra-cpp-2023`, `doxygen-naming`), `engine_profiles/` |
+| `knowledge/` | `lessons.md` (versioned lesson IDs), `context_template/AGENTS.md`, `skills/` (`automotive-cpp`, `review-taxonomy`, `skill-authoring`, `requirements-analysis`; deprecated: `misra-cpp-2023`, `doxygen-naming`), `engine_profiles/` |
 | `workflow/templates/` | brief (implement, fix, review), task plan and ADR templates |
 | `workflow/ci/` | `pipeline.md` and examples (`examples/gitlab-ci.yml`, `examples/Jenkinsfile`) |
 | `runner/` | `agent_exec.py` (single executor + v2 engine loader), `workspace_scope.py` (Yocto component scope), `brief_lint.py` (pre-dispatch brief linter), `devpack_run.py`, `devpack_dispatch.py`, `devpack_broker.py`, `devpack_logs.py`, `memory.py`, `devpack_memory.py`, `engines.example.toml`, `quality_checklist.md` |
@@ -115,7 +115,7 @@ qualified engine fails re-qualification.
   ```bash
   python3 runner/devpack_memory.py list
   python3 runner/devpack_memory.py approve <id>
-  python3 runner/devpack_memory.py query --brief briefs/task.md
+  python3 runner/devpack_memory.py query --task-file briefs/task.md
   ```
 - **Learning loop (`learning/README.md`, `knowledge/engine_profiles/`):**
   Mine recurring failures from logs, draft a bounded candidate profile (`<= 40` lines),
@@ -128,19 +128,61 @@ qualified engine fails re-qualification.
 
 ## Install into a project
 
-1. **Day 0:** fill in `policy/data_governance.md` section 4 (data owner sign-off) and get
-   `policy/asil_boundaries.md` approved by the safety manager.
-2. Copy or vendor the pack at a pinned version (for example as a `devpack/` directory or
-   a git subtree). Do not edit pack files in the project; open a change against the pack.
-3. Copy `knowledge/context_template/AGENTS.md` to the project root and replace every
-   `{{PLACEHOLDER}}`.
-4. Copy `enforcement/gate/gate.example.toml` to the project's gate config and list the
-   project's build, test and lint commands.
-5. Install `enforcement/hooks/pre-commit` as the git pre-commit hook.
-6. Set up the sandbox container (`policy/sandbox.md`) and agent credentials; for local
-   endpoints, configure environment variable names in `runner/engines.example.toml`
-   (`policy/local_models.md`) and project data class in `.devpack/project.toml`.
-7. Wire CI using `workflow/ci/pipeline.md` and the examples.
+1. **Day 0:** complete the data-owner sign-off in `policy/data_governance.md` and
+   obtain safety approval for `policy/asil_boundaries.md`.
+2. Choose one installation topology and pin the pack version:
+   - **A: external pack (recommended; required for the broker).** Install the trusted
+     pack outside the product repository, for example `/opt/devpack`. Keep engines,
+     credentials, and run logs outside worker scope. Follow `orchestrator/README.md`
+     for broker setup. Never vendor executable pack code into a broker workspace.
+   - **B: vendored `devpack/` (CI-only).** Vendor the pinned pack under `devpack/`.
+     CI executes this trusted copy; workers must never edit it. Use topology A for
+     interactive runner/broker jobs. The CI examples assume this layout.
+3. Create the project's `.devpack/` directory. Copy `.devpack/project.example.toml`
+   to `.devpack/project.toml`, `enforcement/gate/gate.project.example.toml` to
+   `.devpack/gate.toml`, and `runner/engines.example.toml` to `.devpack/engines.toml`.
+   In project TOML set `gate_config = "gate.toml"`, `engines_config = "engines.toml"`,
+   and the repository data class. These config paths resolve relative to the project
+   config file; pack-relative defaults resolve against the installed pack. Do not
+   edit the pack's engine example or reuse its self-test `gate.example.toml` for a product.
+4. Configure `[workspace]` and component build/test commands as described in
+   `policy/workspace_scope.md`. Discovery is recursive (default depth 4) and merges
+   explicit component metadata. Set `[scan] default = "all"` for team adoption;
+   use selected components for local fast loops. CI always passes `--all-components`.
+   Adapt coding conventions before the first run using the section below.
+5. Copy `knowledge/context_template/AGENTS.md` to the project root and replace its
+   project-level placeholders. Task role and task ID come from each brief. Before
+   creating the task baseline, install skills with
+   `python3 /opt/devpack/runner/agent_exec.py --install-skills /path/to/project`
+   (substitute your pack path); `--skills` enables installed skills in runner jobs.
+   Treat `.claude/skills/` as bootstrap context, outside worker edits. Install the hook using `enforcement/hooks/install.sh --repo /path/to/project`.
+6. Set up container isolation and credentials using `policy/sandbox.md`. For local
+   endpoints, edit the project's copy of the engines config to name environment
+   variables and complete qualification in `policy/local_models.md`.
+7. Wire CI using `workflow/ci/pipeline.md` and its examples. The project gate template
+   lints and analyzes changed C/C++ files, then runs active components' build/test
+   commands. Set its base ref to the CI merge base. Missing commands and unexpectedly
+   empty scans fail closed. Only legitimately empty changed-file sets may use
+   `--allow-empty`; they print `SKIP: no C/C++ changes`.
+
+### Adapting the coding rules
+
+The linter automatically loads **the product repository root's `preflight.toml`**;
+`--config` chooses an explicit file. Its strict defaults require camelCase parameters,
+meaningful names (`NAMING-MEANINGFUL` rejects placeholders such as `tmp` and `buf`),
+and Doxygen `@file` / `@brief` blocks in **tests as well as production files**.
+Document each parameter direction using `@param[in]`, `@param[out]`, or
+`@param[in,out]`. Add these comments to tests during adoption; test files are not
+implicitly exempt. Agree project conventions with the team before recording a baseline.
+
+For an existing snake_case project, copy
+`enforcement/lint/preflight.snake_case.example.toml` to the product root as
+`preflight.toml`. This ready variant changes naming regexes while retaining meaningful
+names, Doxygen checks, and compiler/static-analysis checks. Adjust `[naming]` regexes,
+`disallowed_names`, and `allowed_loop_indices` to the project's approved conventions.
+`[doxygen] require_file_doxygen` and `require_param_direction` control documentation
+requirements; exceptions need the project's documented deviation policy. See
+`enforcement/lint/README.md` for all options and portable baseline workflows.
 
 ## Quickstart
 
@@ -156,7 +198,7 @@ python3 enforcement/gate/gate.py --config enforcement/gate/gate.example.toml --r
 
 # run one task through the local runner (implement -> scope/test_lock -> gate -> review -> fix, max 2 rounds)
 python3 runner/devpack_run.py --config runner/engines.example.toml --task-id task-001 \
-  --title "Short title" --goal "One-paragraph goal" --allowed-files "src/*.cpp" --dry-run
+  --title "Short title" --goal "One-paragraph goal" --allowed-files "src/*.cpp" --gate-config .devpack/gate.toml --dry-run
 
 # governed paths enforced automatically after every implementer/fixer step in both
 # devpack_run.py and devpack_dispatch.py:

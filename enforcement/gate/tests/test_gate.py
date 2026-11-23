@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[3])
 if _REPO_ROOT not in sys.path:
@@ -455,6 +456,77 @@ required = false
         )
         self.assertEqual(code, 1)
         self.assertEqual(out.strip().splitlines()[-1], "GATE_FAIL config")
+
+
+    def test_failed_output_tail_is_redacted_and_recorded(self) -> None:
+        """Failed commands expose their last sixty redacted lines in output and receipt."""
+        command = "import sys; [print('line-'+str(i)) for i in range(65)]; print('password=example-secret', file=sys.stderr); sys.exit(1)"
+        self.config_path.write_text('[[check]]\nname="detail"\ncmd=' + json.dumps([sys.executable, "-c", command]) + '\n', encoding="utf-8")
+        code, out = self._run_gate(["--config", str(self.config_path), "--repo", str(self.repo_dir), "--receipt", str(self.receipt_path)])
+        receipt = json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(code, 1)
+        self.assertIn("line-64", out)
+        self.assertNotIn("line-0\n", out)
+        self.assertNotIn("example-secret", out)
+        self.assertEqual(len(receipt["checks"][0]["output_tail"].splitlines()), 60)
+        self.assertNotIn("example-secret", receipt["checks"][0]["output_tail"])
+
+    def test_configured_workspace_empty_fails_unless_allowed(self) -> None:
+        """An undiscovered workspace cannot silently pass a project gate."""
+        (self.repo_dir / ".devpack").mkdir()
+        (self.repo_dir / "src").mkdir()
+        (self.repo_dir / ".devpack/project.toml").write_text('[workspace]\nroot="src"\n', encoding="utf-8")
+        self.config_path.write_text('[[check]]\nname="pass"\ncmd=["python3","-c","pass"]\n', encoding="utf-8")
+        argv = ["--config", str(self.config_path), "--repo", str(self.repo_dir), "--receipt", str(self.receipt_path)]
+        code, out = self._run_gate(argv)
+        self.assertEqual(code, 1)
+        self.assertIn("NO_FILES_CHECKED", out)
+        code, out = self._run_gate([*argv, "--allow-empty"])
+        self.assertEqual(code, 0)
+        self.assertIn("SKIP: no C/C++ changes", out)
+
+    def test_selected_warning_records_unchecked_components(self) -> None:
+        """Selected gates identify every configured component they omitted."""
+        (self.repo_dir / ".devpack").mkdir()
+        for name in ("alpha", "beta"):
+            folder = self.repo_dir / "src" / name
+            folder.mkdir(parents=True)
+            (folder / "main.cpp").write_text("int value;\n", encoding="utf-8")
+        (self.repo_dir / ".devpack/project.toml").write_text('[workspace]\nroot="src"\n[[component]]\nname="alpha"\npath="alpha"\n[[component]]\nname="beta"\npath="beta"\n[scan]\nselected=["alpha"]\n', encoding="utf-8")
+        self.config_path.write_text('[[check]]\nname="pass"\ncmd=["python3","-c","pass"]\n', encoding="utf-8")
+        code, out = self._run_gate(["--config", str(self.config_path), "--repo", str(self.repo_dir), "--receipt", str(self.receipt_path)])
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING: 1 configured components not checked: beta", out)
+        self.assertEqual(json.loads(self.receipt_path.read_text())["unchecked_components"], ["beta"])
+
+
+    def test_relative_config_uses_repository_and_pack_commands_use_pack_root(self) -> None:
+        """A project config is resolved from --repo and pack script paths are cwd independent."""
+        (self.repo_dir / "project-gate.toml").write_text('[[check]]\nname="pack-help"\ncmd=["python3","{pack_root}/enforcement/gate/project_checks.py","--help"]\n', encoding="utf-8")
+        code, out = self._run_gate(["--config", "project-gate.toml", "--repo", str(self.repo_dir), "--receipt", str(self.receipt_path)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS pack-help", out)
+
+
+    def test_timeout_keeps_redacted_partial_output(self) -> None:
+        """Timeout diagnostics retain output emitted before termination."""
+        check = {"name": "timeout", "cmd": [sys.executable, "-c", "import time; print('before-timeout', flush=True); time.sleep(2)"], "timeout_s": 0.1, "required": True}
+        result = gate.run_single_check(check, self.repo_dir)
+        self.assertEqual(result["exit_code"], 124)
+        self.assertIn("before-timeout", result.get("output_tail", ""))
+
+
+    def test_pack_skill_selftests_ignore_parent_project_configuration(self) -> None:
+        """Pack skill suites receive an explicit scope override without affecting other checks."""
+        pack = self.tmp_path / "pack"
+        config = pack / "enforcement/gate/gate.example.toml"
+        config.parent.mkdir(parents=True)
+        command = "import os,sys; sys.exit(0 if os.environ.get('DEVPACK_PROJECT_CONFIG') == 'none' else 1)"
+        config.write_text('[[check]]\nname="skill-unit-tests"\ncmd=' + json.dumps([sys.executable, "-c", command]) + '\n', encoding="utf-8")
+        with mock.patch.object(gate, "_REPO_ROOT_STR", str(pack)):
+            code, out = self._run_gate(["--config", str(config), "--repo", str(self.repo_dir), "--receipt", str(self.receipt_path)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS skill-unit-tests", out)
 
 
 if __name__ == "__main__":

@@ -606,6 +606,11 @@ def _enforce_step_scope_and_test_lock(
                 "--allow",
                 *allow_globs,
             ]
+            if ws_scope.configured:
+                if ws_scope.scan_mode == "all":
+                    scope_cmd.append("--all-components")
+                else:
+                    scope_cmd.extend(["--components", ",".join(c.name for c in ws_scope.active_components)])
             for extra_gate in trusted_cfg.protected_rel_paths:
                 scope_cmd.extend(["--gate-config-file", extra_gate])
             s_rc, s_out, s_err, _ = execute_command(scope_cmd, cwd=worktree, timeout_s=timeout_s)
@@ -670,6 +675,7 @@ def run_task_workflow(
     allow_globs: Sequence[str] | None = None,
     protected_globs: Sequence[str] = ("tests/**",),
     deviation_id: str = "",
+    gate_config: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -701,6 +707,19 @@ def run_task_workflow(
             else [str(x) for x in gate_cmd_raw]
         )
         gate_timeout_s = int(config.get("gate_timeout_s", 300))
+
+    project_gate_path: Path | None = None
+    project_gate_bytes: bytes | None = None
+    if gate_config is not None or gate_cmd == list(agent_exec.DEFAULT_GATE_CMD):
+        gate_cmd = agent_exec.resolve_project_gate_command(worktree, gate_config)
+        project_gate_path = Path(gate_cmd[gate_cmd.index("--config") + 1])
+        if project_gate_path.is_symlink():
+            raise ValueError("Project gate_config must be a regular file, not a symlink")
+        project_gate_bytes = project_gate_path.read_bytes()
+
+    unchecked_components = ws_scope.unchecked_components()
+    if ws_scope.selection_warning():
+        print(ws_scope.selection_warning())
 
     max_fix_rounds = (
         max_fix_rounds_override
@@ -776,6 +795,7 @@ def run_task_workflow(
             engines=role_engine_map,
             components=active_component_names,
             scan_mode=ws_scope.scan_mode,
+            unchecked_components=unchecked_components,
             outcome="running",
         )
     else:
@@ -783,6 +803,7 @@ def run_task_workflow(
             active_run_dir,
             components=active_component_names,
             scan_mode=ws_scope.scan_mode,
+            unchecked_components=unchecked_components,
         )
 
     iso_ok, iso_msg = check_local_isolation_allowed(
@@ -874,6 +895,19 @@ def run_task_workflow(
         """Verify git integrity, scope_check, and test_lock immediately after an agent step."""
         nonlocal scope_status, test_lock_status, step_gate_touched
         nonlocal final_status, escalation_reason, enforcement_failed
+        if project_gate_path is not None and (
+            project_gate_path.is_symlink()
+            or not project_gate_path.is_file()
+            or project_gate_path.read_bytes() != project_gate_bytes
+        ):
+            label = (project_gate_path.relative_to(worktree).as_posix()
+                     if project_gate_path.is_relative_to(worktree) else project_gate_path.name)
+            scope_status = "violation"
+            step_gate_touched = sorted(set(step_gate_touched) | {label})
+            final_status = "fail"
+            escalation_reason = f"SCOPE_VIOLATION: {label} is gate-touched (project gate configuration changed)"
+            enforcement_failed = True
+            return False
         if git_tampered:
             scope_status = "violation"
             final_status = "git_metadata_tampered"
@@ -1387,6 +1421,7 @@ def run_task_workflow(
         outcome="fail" if (git_tampered or enforcement_failed) else final_status,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
+        unchecked_components=unchecked_components,
         lint_findings_first_attempt=lint_findings_first_attempt,
         lint_clean_final=bool(last_lint_clean),
         static_findings_first_attempt=static_findings_first_attempt,
@@ -1404,6 +1439,7 @@ def run_task_workflow(
         "scope_violation": "git_metadata_tampered" if git_tampered else ("scope_violation" if scope_status == "violation" else ""),
         "test_lock": test_lock_status,
         "git_metadata_tampered": git_tampered,
+        "gate_touched": step_gate_touched,
         "components": active_component_names,
         "scan_mode": ws_scope.scan_mode,
         "fix_rounds_used": fix_rounds_used,
@@ -1455,7 +1491,6 @@ def run_task_workflow(
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser for ``runner/devpack_run.py``."""
     repo_root = Path(__file__).resolve().parent.parent
-    default_config = repo_root / "runner" / "engines.example.toml"
 
     parser = argparse.ArgumentParser(
         prog="devpack_run.py",
@@ -1466,9 +1501,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default=str(default_config),
+        default="",
         help="Path to engines TOML configuration (default: runner/engines.example.toml)",
     )
+    parser.add_argument("--gate-config", default="", help="Project gate TOML override (otherwise project gate_config is required).")
     parser.add_argument(
         "--task-file",
         default="",
@@ -1574,7 +1610,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    config_path = Path(args.config).resolve()
     worktree = Path(args.worktree).resolve()
     repo_root = Path(args.repo_root).resolve()
     task_file = Path(args.task_file).resolve() if args.task_file else None
@@ -1585,6 +1620,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
+        project_config = agent_exec.load_project_config(worktree)
+        config_path = Path(args.config).resolve() if args.config else Path(project_config["engines_config"])
         config = load_engine_config(config_path)
         context = load_task_data(
             task_file=task_file,
@@ -1644,6 +1681,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             components=args.components,
             all_components=bool(args.all_components),
             deviation_id=args.deviation,
+            gate_config=Path(args.gate_config).resolve() if args.gate_config else None,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
