@@ -166,6 +166,21 @@ class TestScopeCheck(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("SCOPE_OK", out)
 
+    def test_gate_and_lint_config_edits_fail_as_gate_touched_regardless_of_allow(self) -> None:
+        """Edits to preflight.toml, .devpack/**, .clang-tidy, or gate config fail as gate-touched even with --allow **."""
+        for rel in ("preflight.toml", ".devpack/project.toml", ".clang-tidy", "gate.toml"):
+            with self.subTest(rel=rel):
+                target = self.repo_dir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("# modified\n", encoding="utf-8")
+                code, out, _ = self._run_scope(
+                    ["--repo", str(self.repo_dir), "--base", "HEAD", "--allow", "**"]
+                )
+                self.assertEqual(1, code)
+                self.assertIn("gate-touched", out)
+                self.assertIn(rel, out)
+                target.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

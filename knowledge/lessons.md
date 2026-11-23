@@ -136,3 +136,10 @@ discipline and needs a mechanism later. Mechanism paths are relative to the pack
 - **Rule:** Evaluation callers and task graders must invoke `test_lock.py` with `--no-deviation` so an agent under test cannot self-exempt protected test files.
 - **Enforced by:** `enforcement/checks/test_lock.py` (`--no-deviation`), `eval/run_eval.py`, `eval/tasks/v2_check.sh`, `eval/tasks/18-review-fault-recovery/check.sh`, `eval/orchestrator_goals/01-link-fault-recovery/check.sh`
 - **Status:** enforced
+
+## LSN-020 Gate configuration is trusted input; snapshot it from base, never read it from the agent's tree
+- **ID:** LSN-020
+- **Incident:** `runner/devpack_dispatch.py` passed `workdir/preflight.toml` from the agent-writable working tree to `preflight_lint.py` and `cppcheck_check.py`, allowing a worker to weaken `fail_on`/rules or inject `extra_args` (such as `--addon=` or `--rule-file=`) into host-side gate execution.
+- **Rule:** Gate config is trusted input; snapshot it from the base commit (`git show <base>:preflight.toml` into a temporary file outside `workdir`) or from pack/broker-owned project config, never read it from the agent's working tree, validate analyzer options against a strict allowlist, and fail any worker edit to gate/lint config files as a gate-touched scope violation.
+- **Enforced by:** `runner/devpack_dispatch.py`, `runner/devpack_run.py`, `runner/devpack_broker.py`, `enforcement/static/cppcheck_check.py`, `enforcement/lint/preflight_lint.py`, `enforcement/checks/scope_check.py`
+- **Status:** enforced

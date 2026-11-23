@@ -660,6 +660,85 @@ class WorkspaceScopeTests(unittest.TestCase):
                 payload3["out_of_scope_changes"],
             )
 
+    def test_symlinked_component_and_workspace_escapes_raise_error(self) -> None:
+        """Auto-discovered components, explicit components, workspace root, and repomap files escaping via symlinks raise errors."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            outside = base / "outside_comp"
+            outside.mkdir()
+            (outside / "CMakeLists.txt").write_text("project(evil)\n", encoding="utf-8")
+            (outside / "evil.cpp").write_text("int evil() { return 0; }\n", encoding="utf-8")
+
+            # 1. Auto-discovered symlinked component escaping workspace root -> error (not repomap relative_to crash)
+            repo1 = base / "repo1"
+            (repo1 / ".devpack").mkdir(parents=True)
+            (repo1 / "ws").mkdir()
+            (repo1 / ".devpack" / "project.toml").write_text('[workspace]\nroot = "ws"\n', encoding="utf-8")
+            (repo1 / "ws" / "escaped_comp").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(ValueError):
+                workspace_scope.load_workspace_config(repo1)
+            with self.assertRaises(ValueError):
+                repomap.generate_repomap(repo1)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(2, repomap.main(["--repo", str(repo1)]))
+
+            # 2. Symlinked file inside valid component escaping workspace root -> repomap error
+            repo2 = base / "repo2"
+            (repo2 / ".devpack").mkdir(parents=True)
+            (repo2 / "ws" / "legit").mkdir(parents=True)
+            (repo2 / ".devpack" / "project.toml").write_text('[workspace]\nroot = "ws"\n', encoding="utf-8")
+            (repo2 / "ws" / "legit" / "CMakeLists.txt").write_text("project(legit)\n", encoding="utf-8")
+            (repo2 / "ws" / "legit" / "link.cpp").symlink_to(outside / "evil.cpp")
+
+            with self.assertRaises(ValueError):
+                repomap.generate_repomap(repo2)
+
+            # 3. Symlinked workspace root escaping repo_root -> error
+            repo3 = base / "repo3"
+            (repo3 / ".devpack").mkdir(parents=True)
+            (repo3 / ".devpack" / "project.toml").write_text('[workspace]\nroot = "ws_link"\n', encoding="utf-8")
+            (repo3 / "ws_link").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                workspace_scope.load_workspace_config(repo3)
+
+            # 4. WorkspaceScope.to_repo_relative / outside_workspace rejects symlink escaping repo
+            scope_legit = workspace_scope.resolve_workspace_scope(YOCTO_FIXTURE, components="ipc_bus", env={})
+            self.assertIsNone(scope_legit.to_repo_relative(outside / "evil.cpp"))
+            self.assertTrue(scope_legit.outside_workspace(outside / "evil.cpp"))
+
+    def test_explicit_missing_or_unparsable_project_config_fails_closed_never_legacy(self) -> None:
+        """Missing or unparsable explicit --project-config exits 2 / raises error; never falls back to legacy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            (repo / "src").mkdir(parents=True)
+            (repo / "src" / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+
+            missing_cfg = base / "does_not_exist.toml"
+            bad_cfg = base / "malformed.toml"
+            bad_cfg.write_text("[workspace\nroot = 'broken'\n", encoding="utf-8")
+
+            for bad_path in (missing_cfg, bad_cfg):
+                with self.assertRaises(ValueError):
+                    workspace_scope.load_workspace_config(repo, project_config_path=bad_path)
+                with self.assertRaises(ValueError):
+                    workspace_scope.resolve_workspace_scope(repo, project_config_path=bad_path)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rc_ws = workspace_scope.main(["resolve", "--repo", str(repo), "--project-config", str(bad_path)])
+                    rc_rm = repomap.main(["--repo", str(repo), "--project-config", str(bad_path)])
+                    rc_cc = cppcheck_check.main(["--repo-root", str(repo), "--project-config", str(bad_path), "src/main.cpp"])
+                    rc_pl = preflight_lint.main(["--repo-root", str(repo), "--project-config", str(bad_path), "src/main.cpp"])
+                self.assertEqual(2, rc_ws, bad_path)
+                self.assertEqual(2, rc_rm, bad_path)
+                self.assertEqual(2, rc_cc, bad_path)
+                self.assertEqual(2, rc_pl, bad_path)
+
+            # Without explicit config and with no .devpack/project.toml, legacy fallback still works
+            legacy_scope = workspace_scope.resolve_workspace_scope(repo, env={})
+            self.assertFalse(legacy_scope.configured)
+            self.assertEqual("legacy", legacy_scope.scan_mode)
+
 
 if __name__ == "__main__":
     unittest.main()

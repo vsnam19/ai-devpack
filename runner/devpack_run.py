@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from datetime import datetime, timezone
 import json
 import os
@@ -36,6 +37,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Mapping, Sequence
 
@@ -60,8 +62,13 @@ from agent_exec import (  # noqa: E402
     run_agent,
     update_run_json,
 )
-from devpack_dispatch import run_cppcheck_on_changed, run_preflight_lint_on_changed  # noqa: E402
-from enforcement.checks.scope_check import get_changed_files  # noqa: E402
+from devpack_dispatch import (  # noqa: E402
+    _control_snapshot,
+    resolve_trusted_gate_config,
+    run_cppcheck_on_changed,
+    run_preflight_lint_on_changed,
+)
+from enforcement.checks.scope_check import get_changed_files, is_gate_protected_path  # noqa: E402
 from memory import memory_root_for, process_memory_proposals  # noqa: E402
 from workspace_scope import resolve_workspace_scope  # noqa: E402
 
@@ -617,6 +624,11 @@ def run_task_workflow(
     base_ref = _resolve_git_base_ref(worktree)
     lint_pack_root = repo_root if (repo_root / "enforcement" / "lint" / "preflight_lint.py").is_file() else REPO_ROOT
     static_pack_root = repo_root if (repo_root / "enforcement" / "static" / "cppcheck_check.py").is_file() else REPO_ROOT
+    pre_run_proj_bytes: bytes | None = None
+    default_proj_path = worktree / ".devpack" / "project.toml"
+    if default_proj_path.is_file() and not default_proj_path.is_symlink():
+        pre_run_proj_bytes = default_proj_path.read_bytes()
+    control_before = _control_snapshot(worktree)
 
     step_index = 0
     step_logs: list[str] = []
@@ -763,42 +775,97 @@ def run_task_workflow(
         static_ok = True
         if base_ref is not None:
             changed_files, _ = get_changed_files(worktree, base_ref)
-            if ws_scope.configured and changed_files:
-                outside_ws = [p for p in changed_files if ws_scope.outside_workspace(p)]
-                if outside_ws:
+            with tempfile.TemporaryDirectory(prefix="devpack-run-gate-cfg-") as gate_cfg_tmp:
+                trusted_cfg = resolve_trusted_gate_config(
+                    worktree,
+                    Path(gate_cfg_tmp),
+                    base_ref=base_ref,
+                    pack_root=lint_pack_root,
+                    pre_run_project_bytes=pre_run_proj_bytes,
+                )
+                update_run_json(
+                    active_run_dir,
+                    gate_config_source=trusted_cfg.source,
+                    gate_config_sha256=trusted_cfg.sha256,
+                )
+                control_after = _control_snapshot(worktree)
+                control_changes = sorted(
+                    name
+                    for name in control_before.keys() | control_after.keys()
+                    if control_before.get(name) != control_after.get(name)
+                )
+                gate_touched = sorted(
+                    {
+                        p
+                        for p in (changed_files or [])
+                        if not (p == ".devpack" or p.startswith(".devpack/"))
+                        and is_gate_protected_path(p, trusted_cfg.protected_rel_paths)
+                    }
+                    | {
+                        p
+                        for p in control_changes
+                        if is_gate_protected_path(p, trusted_cfg.protected_rel_paths)
+                    }
+                )
+                if gate_touched:
                     gate_passed = False
-                    ws_msg = "\n".join(
-                        f"SCOPE_VIOLATION: {p} is outside workspace root ({ws_scope.workspace_root_rel})"
-                        for p in outside_ws
+                    gt_msg = "\n".join(
+                        f"SCOPE_VIOLATION: {p} is gate-touched "
+                        "(gate/lint/cppcheck configuration cannot be modified by workers)"
+                        for p in gate_touched
                     )
                     combined_gate_output = (
                         (combined_gate_output + "\n\n" if combined_gate_output else "")
-                        + "[workspace_scope]\n"
-                        + ws_msg
+                        + "[gate_touched]\n"
+                        + gt_msg
                     )
-            lint_ok, lint_findings, lint_out = run_preflight_lint_on_changed(
-                worktree, changed_files or [], pack_root=lint_pack_root, scope=ws_scope
-            )
-            if lint_out:
-                combined_gate_output = (
-                    (combined_gate_output + "\n\n" if combined_gate_output else "")
-                    + "[preflight_lint]\n"
-                    + lint_out
+                    update_run_json(active_run_dir, gate_touched=gate_touched)
+                if ws_scope.configured and changed_files:
+                    outside_ws = [p for p in changed_files if ws_scope.outside_workspace(p)]
+                    if outside_ws:
+                        gate_passed = False
+                        ws_msg = "\n".join(
+                            f"SCOPE_VIOLATION: {p} is outside workspace root ({ws_scope.workspace_root_rel})"
+                            for p in outside_ws
+                        )
+                        combined_gate_output = (
+                            (combined_gate_output + "\n\n" if combined_gate_output else "")
+                            + "[workspace_scope]\n"
+                            + ws_msg
+                        )
+                lint_ok, lint_findings, lint_out = run_preflight_lint_on_changed(
+                    worktree,
+                    changed_files or [],
+                    pack_root=lint_pack_root,
+                    scope=ws_scope,
+                    config_path=trusted_cfg.config_path,
+                    base_ref=base_ref,
                 )
-            if not lint_ok:
-                gate_passed = False
+                if lint_out:
+                    combined_gate_output = (
+                        (combined_gate_output + "\n\n" if combined_gate_output else "")
+                        + "[preflight_lint]\n"
+                        + lint_out
+                    )
+                if not lint_ok:
+                    gate_passed = False
 
-            static_ok, static_findings, static_out = run_cppcheck_on_changed(
-                worktree, changed_files or [], pack_root=static_pack_root, scope=ws_scope
-            )
-            if static_out:
-                combined_gate_output = (
-                    (combined_gate_output + "\n\n" if combined_gate_output else "")
-                    + "[cppcheck]\n"
-                    + static_out
+                static_ok, static_findings, static_out = run_cppcheck_on_changed(
+                    worktree,
+                    changed_files or [],
+                    pack_root=static_pack_root,
+                    scope=ws_scope,
+                    config_path=trusted_cfg.config_path,
+                    base_ref=base_ref,
                 )
-            if not static_ok:
-                gate_passed = False
+                if static_out:
+                    combined_gate_output = (
+                        (combined_gate_output + "\n\n" if combined_gate_output else "")
+                        + "[cppcheck]\n"
+                        + static_out
+                    )
+                if not static_ok:
+                    gate_passed = False
 
         if lint_findings_first_attempt is None:
             lint_findings_first_attempt = lint_findings

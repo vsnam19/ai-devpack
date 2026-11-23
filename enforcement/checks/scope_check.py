@@ -22,6 +22,32 @@ if _REPO_ROOT not in sys.path:
 
 from runner.workspace_scope import resolve_workspace_scope  # noqa: E402
 
+GATE_PROTECTED_FILENAMES: frozenset[str] = frozenset({"preflight.toml", ".clang-tidy", "gate.toml"})
+
+
+def _normalize_rel_path(rel_posix_path: str) -> str:
+    """Normalize a repository-relative POSIX path for matching."""
+    norm = rel_posix_path.strip().replace("\\", "/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    return norm.lstrip("/")
+
+
+def is_gate_protected_path(
+    rel_posix_path: str,
+    extra_gate_paths: tuple[str, ...] | list[str] | set[str] = (),
+) -> bool:
+    """Return True when ``rel_posix_path`` is a gate, lint, cppcheck, or control config path."""
+    norm = _normalize_rel_path(rel_posix_path)
+    if not norm:
+        return False
+    if norm == ".devpack" or norm.startswith(".devpack/"):
+        return True
+    if pathlib.PurePosixPath(norm).name in GATE_PROTECTED_FILENAMES:
+        return True
+    normalized_extras = {_normalize_rel_path(item) for item in extra_gate_paths if str(item).strip()}
+    return norm in normalized_extras
+
 
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Compile a POSIX path glob pattern (supporting ``*``, ``?``, and ``**``) to a regex."""
@@ -133,6 +159,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional path to project.toml for workspace-root boundary checks.",
     )
+    parser.add_argument(
+        "--gate-config-file",
+        action="append",
+        default=[],
+        help="Additional repository-relative gate/lint config path protected from worker edits.",
+    )
     return parser
 
 
@@ -175,6 +207,17 @@ def main(argv: list[str] | None = None) -> int:
     changed_files, err = get_changed_files(repo_root, args.base)
     if changed_files is None:
         print(f"SCOPE_ERROR: {err}", file=sys.stderr)
+        return 1
+
+    gate_touched = [
+        path for path in changed_files if is_gate_protected_path(path, args.gate_config_file)
+    ]
+    if gate_touched:
+        for path in gate_touched:
+            print(
+                f"SCOPE_VIOLATION: {path} is gate-touched "
+                "(gate/lint/cppcheck configuration cannot be modified by workers)"
+            )
         return 1
 
     if ws_scope.configured:

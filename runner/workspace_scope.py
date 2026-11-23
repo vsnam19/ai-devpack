@@ -46,6 +46,33 @@ DISCOVERY_SUFFIXES: frozenset[str] = frozenset({".bb", ".bbappend"})
 VALID_SCAN_DEFAULTS: frozenset[str] = frozenset({"selected", "all"})
 
 
+class WorkspaceConfigError(ValueError):
+    """Raised when workspace/project configuration is missing, malformed, or escapes containment."""
+
+
+def validate_path_contained(
+    path: Path,
+    repo_root: Path,
+    *,
+    workspace_root: Path | None = None,
+    label: str = "path",
+) -> Path:
+    """Resolve ``path`` and require it to stay inside ``repo_root`` (and ``workspace_root`` if given)."""
+    repo_res = repo_root.resolve()
+    resolved = path.resolve()
+    if not resolved.is_relative_to(repo_res):
+        raise WorkspaceConfigError(
+            f"{label} '{path}' resolves outside repository root {repo_res}: {resolved}"
+        )
+    if workspace_root is not None:
+        ws_res = workspace_root.resolve()
+        if not resolved.is_relative_to(ws_res):
+            raise WorkspaceConfigError(
+                f"{label} '{path}' resolves outside workspace root {ws_res}: {resolved}"
+            )
+    return resolved
+
+
 def _strip_toml_comment(line: str) -> str:
     """Strip an unquoted ``#`` comment from a TOML line."""
     in_quote: str | None = None
@@ -358,26 +385,25 @@ class WorkspaceScope:
     def to_repo_relative(self, path: str | Path) -> str | None:
         """Convert ``path`` (relative to repo_root, or absolute) into a repo-relative POSIX string.
 
-        Returns ``None`` if ``path`` resolves outside ``self.repo_root``.
+        Returns ``None`` if ``path`` resolves outside ``self.repo_root`` (including via symlinks).
         """
         raw = str(path).strip().replace("\\", "/")
         if not raw:
             return None
+        repo_resolved = self.repo_root.resolve()
         candidate = Path(raw)
         if candidate.is_absolute():
-            repo_resolved = self.repo_root.resolve()
             cand_resolved = candidate.resolve()
             try:
                 rel = cand_resolved.relative_to(repo_resolved).as_posix()
                 return "." if rel == "." else rel
             except ValueError:
-                try:
-                    rel_raw = candidate.relative_to(self.repo_root).as_posix()
-                    return "." if rel_raw == "." else rel_raw
-                except ValueError:
-                    return None
+                return None
         norm = PurePosixPath(os.path.normpath(raw)).as_posix()
         if norm == ".." or norm.startswith("../"):
+            return None
+        cand_resolved = (repo_resolved / norm).resolve()
+        if not cand_resolved.is_relative_to(repo_resolved):
             return None
         return "." if norm == "." else norm
 
@@ -573,10 +599,26 @@ def discover_components(
     """Discover direct subdirectories of ``workspace_root`` that look like buildable components."""
     if not workspace_root.is_dir():
         return ()
+    repo_res = repo_root.resolve()
+    ws_res = workspace_root.resolve()
     found: list[ComponentSpec] = []
     for child in sorted(workspace_root.iterdir(), key=lambda p: p.name):
-        if not child.is_dir() or child.name.startswith("."):
+        if child.name.startswith("."):
             continue
+        if child.is_symlink():
+            child_res = child.resolve()
+            if not child_res.is_relative_to(ws_res) or not child_res.is_relative_to(repo_res):
+                raise WorkspaceConfigError(
+                    f"Discovered component path '{child.name}' resolves outside workspace/repository root: {child_res}"
+                )
+        if not child.is_dir():
+            continue
+        child_res = validate_path_contained(
+            child,
+            repo_res,
+            workspace_root=ws_res,
+            label=f"component directory '{child.name}'",
+        )
         has_marker = False
         try:
             for item in child.iterdir():
@@ -595,7 +637,7 @@ def discover_components(
                     name=child.name,
                     path=comp_rel,
                     repo_rel_path=repo_rel,
-                    abs_path=child.resolve(),
+                    abs_path=child_res,
                     discovered=True,
                 )
             )
@@ -609,9 +651,9 @@ def _select_project_config_path(
     """Locate the project TOML file to inspect for ``[workspace]`` settings."""
     if project_config_path is not None and str(project_config_path):
         cand = Path(project_config_path)
-        if cand.is_file():
-            return cand
-        return None
+        if not cand.is_file():
+            raise WorkspaceConfigError(f"Requested project config does not exist: {cand}")
+        return cand
     default_cfg = repo_root / ".devpack" / "project.toml"
     return default_cfg if default_cfg.is_file() else None
 
@@ -629,9 +671,9 @@ def load_workspace_config(
         try:
             raw_toml = parse_toml_with_arrays(cfg_path.read_text(encoding="utf-8"))
         except OSError as exc:
-            raise ValueError(f"Failed to read project config {cfg_path}: {exc}") from exc
+            raise WorkspaceConfigError(f"Failed to read project config {cfg_path}: {exc}") from exc
         except Exception as exc:
-            raise ValueError(f"Failed to parse TOML in {cfg_path}: {exc}") from exc
+            raise WorkspaceConfigError(f"Failed to parse TOML in {cfg_path}: {exc}") from exc
 
     if "workspace" not in raw_toml:
         implicit = ComponentSpec(
@@ -655,47 +697,56 @@ def load_workspace_config(
 
     ws_tbl = raw_toml.get("workspace")
     if not isinstance(ws_tbl, Mapping):
-        raise ValueError("[workspace] in project config must be a table")
+        raise WorkspaceConfigError("[workspace] in project config must be a table")
     raw_root = ws_tbl.get("root")
     if not isinstance(raw_root, str) or not raw_root.strip():
-        raise ValueError("[workspace].root must be a non-empty relative path string")
-    ws_rel = _normalize_rel_posix(raw_root, field_name="[workspace].root", allow_dot=True)
+        raise WorkspaceConfigError("[workspace].root must be a non-empty relative path string")
+    try:
+        ws_rel = _normalize_rel_posix(raw_root, field_name="[workspace].root", allow_dot=True)
+    except ValueError as exc:
+        raise WorkspaceConfigError(str(exc)) from exc
     ws_abs = (root / ws_rel).resolve() if ws_rel != "." else root
     if not ws_abs.is_relative_to(root):
-        raise ValueError(f"[workspace].root escapes repository root: {raw_root!r}")
+        raise WorkspaceConfigError(f"[workspace].root escapes repository root: {raw_root!r}")
 
-    exclude = _coerce_str_list(ws_tbl.get("exclude"), "[workspace].exclude")
+    try:
+        exclude = _coerce_str_list(ws_tbl.get("exclude"), "[workspace].exclude")
+    except ValueError as exc:
+        raise WorkspaceConfigError(str(exc)) from exc
 
     raw_components = raw_toml.get("component")
     components: list[ComponentSpec] = []
     if raw_components is not None:
         if not isinstance(raw_components, list):
-            raise ValueError("[[component]] entries must form an array of tables")
+            raise WorkspaceConfigError("[[component]] entries must form an array of tables")
         seen_names: set[str] = set()
         for idx, entry in enumerate(raw_components, start=1):
             if not isinstance(entry, Mapping):
-                raise ValueError(f"[[component]] #{idx} must be a TOML table")
+                raise WorkspaceConfigError(f"[[component]] #{idx} must be a TOML table")
             name_raw = entry.get("name")
             if not isinstance(name_raw, str) or not name_raw.strip():
-                raise ValueError(f"[[component]] #{idx} is missing a non-empty 'name'")
+                raise WorkspaceConfigError(f"[[component]] #{idx} is missing a non-empty 'name'")
             name = name_raw.strip()
             if name.lower() == "all":
-                raise ValueError("[[component]].name must not be 'all'")
+                raise WorkspaceConfigError("[[component]].name must not be 'all'")
             if name in seen_names:
-                raise ValueError(f"Duplicate [[component]].name '{name}'")
+                raise WorkspaceConfigError(f"Duplicate [[component]].name '{name}'")
             seen_names.add(name)
 
             path_raw = entry.get("path")
             if not isinstance(path_raw, str) or not path_raw.strip():
-                raise ValueError(f"[[component]] '{name}' is missing a non-empty 'path'")
-            comp_rel = _normalize_rel_posix(
-                path_raw,
-                field_name=f"[[component]] '{name}'.path",
-                allow_dot=True,
-            )
+                raise WorkspaceConfigError(f"[[component]] '{name}' is missing a non-empty 'path'")
+            try:
+                comp_rel = _normalize_rel_posix(
+                    path_raw,
+                    field_name=f"[[component]] '{name}'.path",
+                    allow_dot=True,
+                )
+            except ValueError as exc:
+                raise WorkspaceConfigError(str(exc)) from exc
             comp_abs = (ws_abs / comp_rel).resolve() if comp_rel != "." else ws_abs
-            if not comp_abs.is_relative_to(ws_abs):
-                raise ValueError(
+            if not comp_abs.is_relative_to(ws_abs) or not comp_abs.is_relative_to(root):
+                raise WorkspaceConfigError(
                     f"[[component]] '{name}'.path escapes workspace.root: {path_raw!r}"
                 )
             repo_rel = _join_rel(ws_rel, comp_rel)
@@ -704,21 +755,33 @@ def load_workspace_config(
             if cc_raw is None:
                 cc_raw = ""
             if not isinstance(cc_raw, str):
-                raise ValueError(f"[[component]] '{name}'.compile_commands must be a string")
-            compile_commands = (
-                _normalize_rel_posix(
-                    cc_raw,
-                    field_name=f"[[component]] '{name}'.compile_commands",
-                    allow_dot=False,
+                raise WorkspaceConfigError(f"[[component]] '{name}'.compile_commands must be a string")
+            try:
+                compile_commands = (
+                    _normalize_rel_posix(
+                        cc_raw,
+                        field_name=f"[[component]] '{name}'.compile_commands",
+                        allow_dot=False,
+                    )
+                    if cc_raw.strip()
+                    else ""
                 )
-                if cc_raw.strip()
-                else ""
-            )
+            except ValueError as exc:
+                raise WorkspaceConfigError(str(exc)) from exc
+            if compile_commands:
+                validate_path_contained(
+                    root / compile_commands,
+                    root,
+                    label=f"[[component]] '{name}'.compile_commands",
+                )
 
-            include_dirs = _coerce_str_list(
-                entry.get("include_dirs"),
-                f"[[component]] '{name}'.include_dirs",
-            )
+            try:
+                include_dirs = _coerce_str_list(
+                    entry.get("include_dirs"),
+                    f"[[component]] '{name}'.include_dirs",
+                )
+            except ValueError as exc:
+                raise WorkspaceConfigError(str(exc)) from exc
             build_cmd = str(entry.get("build_cmd", "") or "").strip()
             test_cmd = str(entry.get("test_cmd", "") or "").strip()
             components.append(
@@ -741,8 +804,11 @@ def load_workspace_config(
     if scan_tbl is None:
         scan_tbl = {}
     if not isinstance(scan_tbl, Mapping):
-        raise ValueError("[scan] in project config must be a table")
-    scan_selected = _coerce_str_list(scan_tbl.get("selected"), "[scan].selected")
+        raise WorkspaceConfigError("[scan] in project config must be a table")
+    try:
+        scan_selected = _coerce_str_list(scan_tbl.get("selected"), "[scan].selected")
+    except ValueError as exc:
+        raise WorkspaceConfigError(str(exc)) from exc
     if "default" in scan_tbl:
         scan_default = str(scan_tbl["default"]).strip().lower()
     elif scan_selected:
@@ -750,7 +816,7 @@ def load_workspace_config(
     else:
         scan_default = "all"
     if scan_default not in VALID_SCAN_DEFAULTS:
-        raise ValueError(
+        raise WorkspaceConfigError(
             f"[scan].default must be one of {', '.join(sorted(VALID_SCAN_DEFAULTS))}, got {scan_default!r}"
         )
 
@@ -985,6 +1051,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         for kept in scope.filter(raw_paths):
             print(kept)
         return 0
+    except WorkspaceConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

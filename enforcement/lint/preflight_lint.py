@@ -353,7 +353,22 @@ def load_plugins(plugin_paths: Sequence[str], base_dir: pathlib.Path) -> list[Li
     return loaded
 
 
-def load_config_file(config_path: pathlib.Path) -> LintConfig:
+VALID_CPP_STDS: frozenset[str] = frozenset({"c++11", "c++14", "c++17", "c++20", "c++23"})
+VALID_C_STDS: frozenset[str] = frozenset({"c89", "c90", "c99", "c11", "c17", "c23"})
+
+
+def _require_bool(val: Any, field_name: str) -> bool:
+    """Validate that a TOML boolean setting is genuinely a bool."""
+    if not isinstance(val, bool):
+        raise ValueError(f"{field_name} must be a boolean, got {val!r}")
+    return val
+
+
+def load_config_file(
+    config_path: pathlib.Path,
+    *,
+    allow_config_plugins: bool = False,
+) -> LintConfig:
     """Load and validate a preflight.toml configuration file."""
     if not config_path.is_file():
         raise ValueError(f"configuration file does not exist: {config_path}")
@@ -385,18 +400,40 @@ def load_config_file(config_path: pathlib.Path) -> LintConfig:
         return raw_toml.get(key, default)
 
     config = LintConfig()
-    config.std = str(_get_gen("std", config.std))
-    config.c_std = str(_get_gen("c_std", config.c_std))
+    std_val = _get_gen("std", config.std)
+    if not isinstance(std_val, str) or std_val.strip() not in VALID_CPP_STDS:
+        raise ValueError(
+            f"std must be one of {', '.join(sorted(VALID_CPP_STDS))}, got {std_val!r}"
+        )
+    config.std = std_val.strip()
+
+    c_std_val = _get_gen("c_std", config.c_std)
+    if not isinstance(c_std_val, str) or c_std_val.strip() not in VALID_C_STDS:
+        raise ValueError(
+            f"c_std must be one of {', '.join(sorted(VALID_C_STDS))}, got {c_std_val!r}"
+        )
+    config.c_std = c_std_val.strip()
+
     max_params_val = _get_gen("max_params", config.max_params)
     if isinstance(max_params_val, bool) or not isinstance(max_params_val, int) or max_params_val < 1:
         raise ValueError(f"max_params must be a positive integer, got {max_params_val!r}")
     config.max_params = max_params_val
-    config.allow_missing_tools = bool(_get_gen("allow_missing_tools", config.allow_missing_tools))
-    config.skip_clang_tidy = bool(_get_gen("skip_clang_tidy", config.skip_clang_tidy))
-    config.no_exceptions = bool(_get_gen("no_exceptions", config.no_exceptions))
-    config.no_rtti = bool(_get_gen("no_rtti", config.no_rtti))
-    config.no_impl_in_header = bool(_get_gen("no_impl_in_header", config.no_impl_in_header))
-    config.allow_new_in_init = bool(_get_gen("allow_new_in_init", config.allow_new_in_init))
+    config.allow_missing_tools = _require_bool(
+        _get_gen("allow_missing_tools", config.allow_missing_tools), "allow_missing_tools"
+    )
+    config.skip_clang_tidy = _require_bool(
+        _get_gen("skip_clang_tidy", config.skip_clang_tidy), "skip_clang_tidy"
+    )
+    config.no_exceptions = _require_bool(
+        _get_gen("no_exceptions", config.no_exceptions), "no_exceptions"
+    )
+    config.no_rtti = _require_bool(_get_gen("no_rtti", config.no_rtti), "no_rtti")
+    config.no_impl_in_header = _require_bool(
+        _get_gen("no_impl_in_header", config.no_impl_in_header), "no_impl_in_header"
+    )
+    config.allow_new_in_init = _require_bool(
+        _get_gen("allow_new_in_init", config.allow_new_in_init), "allow_new_in_init"
+    )
 
     allowed_heap = _get_gen("allowed_heap_paths", list(config.allowed_heap_paths))
     if not isinstance(allowed_heap, list) or any(not isinstance(x, str) for x in allowed_heap):
@@ -424,16 +461,18 @@ def load_config_file(config_path: pathlib.Path) -> LintConfig:
         raise ValueError("exempt_param_prefixes must be a list of strings")
     config.exempt_param_prefixes = tuple(exempt_prefixes_val)
 
-    config.require_file_doxygen = bool(
-        doxygen.get("require_file_doxygen", _get_gen("require_file_doxygen", config.require_file_doxygen))
+    config.require_file_doxygen = _require_bool(
+        doxygen.get("require_file_doxygen", _get_gen("require_file_doxygen", config.require_file_doxygen)),
+        "doxygen.require_file_doxygen",
     )
-    config.require_param_direction = bool(
-        doxygen.get("require_param_direction", _get_gen("require_param_direction", config.require_param_direction))
+    config.require_param_direction = _require_bool(
+        doxygen.get("require_param_direction", _get_gen("require_param_direction", config.require_param_direction)),
+        "doxygen.require_param_direction",
     )
 
     naming = NamingConfig()
     if "check_meaningful" in naming_tbl:
-        naming.check_meaningful = bool(naming_tbl["check_meaningful"])
+        naming.check_meaningful = _require_bool(naming_tbl["check_meaningful"], "naming.check_meaningful")
     if "disallowed_names" in naming_tbl:
         raw_disallowed = naming_tbl["disallowed_names"]
         if not isinstance(raw_disallowed, list) or any(not isinstance(x, str) for x in raw_disallowed):
@@ -466,6 +505,10 @@ def load_config_file(config_path: pathlib.Path) -> LintConfig:
     plugin_list = plugins_tbl.get("paths", _get_gen("plugins", []))
     if not isinstance(plugin_list, list) or any(not isinstance(x, str) for x in plugin_list):
         raise ValueError("plugins.paths must be a list of strings")
+    if plugin_list and not allow_config_plugins:
+        raise ValueError(
+            "plugins.paths in config file is disallowed unless --allow-config-plugins is passed"
+        )
     config.plugin_paths = tuple(plugin_list)
 
     return config
@@ -4018,6 +4061,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to a Python plugin file implementing the preflight hook interface (repeatable)",
     )
+    parser.add_argument(
+        "--allow-config-plugins",
+        action="store_true",
+        help="Allow loading Python plugin modules declared in [plugins].paths in preflight.toml",
+    )
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
     parser.add_argument(
         "--baseline",
@@ -4098,10 +4146,13 @@ def _resolve_config_from_args(
     repository_root: pathlib.Path,
 ) -> LintConfig:
     """Build a LintConfig from --config / repository preflight.toml and apply CLI overrides."""
+    allow_cfg_plugins = bool(getattr(args, "allow_config_plugins", False))
     if args.config is not None:
-        config = load_config_file(args.config)
+        config = load_config_file(args.config, allow_config_plugins=allow_cfg_plugins)
     elif (repository_root / "preflight.toml").is_file():
-        config = load_config_file(repository_root / "preflight.toml")
+        config = load_config_file(
+            repository_root / "preflight.toml", allow_config_plugins=allow_cfg_plugins
+        )
     else:
         config = LintConfig()
 

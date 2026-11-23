@@ -603,6 +603,145 @@ class DevpackDispatchTests(unittest.TestCase):
             self.assertGreater(run_meta["static_findings_first_attempt"], 0)
             self.assertFalse(run_meta["static_clean_final"])
 
+    def test_worker_edit_to_preflight_toml_is_ignored_and_flagged_gate_touched(self) -> None:
+        """Worker editing preflight.toml to weaken fail_on still fails gate on known finding, flags gate-touched, and records config source+hash."""
+        import hashlib
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_repo(wt)
+            orig_toml = (
+                '[general]\nstd = "c++17"\n\n'
+                '[cppcheck]\nenable = ["warning", "style", "performance", "portability"]\n'
+                'fail_on = ["error", "warning"]\n'
+            )
+            (wt / "preflight.toml").write_text(orig_toml, encoding="utf-8")
+            subprocess.run(["git", "add", "preflight.toml"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "set cppcheck fail_on"], cwd=wt, check=True)
+            expected_sha = hashlib.sha256(orig_toml.encode("utf-8")).hexdigest()
+
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nWeaken config and introduce defect.\n", encoding="utf-8")
+
+            bad_cpp = (
+                "/**\n * @file mod.cpp\n * @brief Sample module.\n */\n"
+                "/**\n * @brief Bad function.\n * @param[in] flag Input flag.\n * @return Value.\n */\n"
+                "int oneValue(int flag) {\n"
+                "    int *missingPtr = nullptr;\n"
+                "    if (flag > 0) {\n"
+                "        return *missingPtr;\n"
+                "    }\n"
+                "    return (int)flag;\n"
+                "}\n"
+            )
+            evil_toml = (
+                '[general]\nstd = "c++17"\ndisabled_rules = ["MISRA-8.2.2"]\n\n'
+                '[cppcheck]\nfail_on = []\nextra_args = ["--addon=x.py"]\n'
+            )
+            # Even with --allow "**", modifying preflight.toml must be a gate-touched scope violation
+            fake_agent = _write_fake_agent(
+                base / "fake_claude.py",
+                f"pathlib.Path('preflight.toml').write_text({evil_toml!r}, encoding='utf-8')\n"
+                f"pathlib.Path('src/mod.cpp').write_text({bad_cpp!r}, encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'is_error': False, 'total_cost_usd': 0.01, 'num_turns': 1, 'result': 'done'}))\n",
+            )
+            rc, stdout, _ = self._run_dispatch(
+                [
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--allow", "**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(base / "runs"),
+                    "--agent-bin", str(fake_agent),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(1, rc)
+            data = json.loads(stdout.strip())
+            self.assertEqual("violation", data["scope"])
+            self.assertEqual("fail", data["gate"])
+            self.assertIn("preflight.toml", data["gate_touched"])
+            self.assertIn("gate-touched", data["scope_detail"])
+            self.assertGreater(data["lint_findings"], 0)
+            self.assertEqual("base:preflight.toml", data["gate_config_source"])
+            self.assertEqual(expected_sha, data["gate_config_sha256"])
+
+            rdir = Path(data["run_dir"])
+            gate_txt = (rdir / "steps" / "02-gate.txt").read_text(encoding="utf-8")
+            self.assertIn("MISRA-8.2.2", gate_txt)
+            self.assertIn("gate-touched", gate_txt)
+            if shutil.which("cppcheck") is not None:
+                self.assertGreater(data["static_findings"], 0)
+                self.assertIn("nullPointer", gate_txt)
+
+            run_meta = json.loads((rdir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("base:preflight.toml", run_meta["gate_config_source"])
+            self.assertEqual(expected_sha, run_meta["gate_config_sha256"])
+            self.assertIn("preflight.toml", run_meta["gate_touched"])
+
+    def test_repo_without_preflight_uses_trusted_project_or_pack_config_and_blocks_worker_created_toml(self) -> None:
+        """When repo has no preflight.toml, gate uses project/pack config and ignores worker-created preflight.toml."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            (wt / "src").mkdir(parents=True)
+            (wt / "tests").mkdir(parents=True)
+            (wt / "src" / "mod.cpp").write_text(
+                "/**\n * @file mod.cpp\n * @brief Sample module.\n */\n"
+                "/**\n * @brief Return one.\n * @return Constant 1.\n */\n"
+                "int oneValue() { return 1; }\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
+            subprocess.run(["git", "config", "user.name", "Tester"], cwd=wt, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init without preflight"], cwd=wt, check=True)
+
+            ext_proj = base / "trusted_project.toml"
+            ext_proj.write_text(
+                'data_class = "internal"\nallow_unsandboxed_local = true\n'
+                '[general]\nstd = "c++17"\n'
+                '[cppcheck]\nfail_on = ["error", "warning"]\n',
+                encoding="utf-8",
+            )
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nTry creating preflight.toml.\n", encoding="utf-8")
+
+            fake_agent = _write_fake_agent(
+                base / "fake_claude.py",
+                "pathlib.Path('preflight.toml').write_text('[general]\\ndisabled_rules = [\"MISRA-8.2.2\"]\\n', encoding='utf-8')\n"
+                "pathlib.Path('src/mod.cpp').write_text('int oneValue() { return (int)2.0; }\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type': 'result', 'is_error': False, 'result': 'done'}))\n",
+            )
+            rc, stdout, _ = self._run_dispatch(
+                [
+                    "--engine", "haiku",
+                    "--brief", str(brief),
+                    "--workdir", str(wt),
+                    "--project-config", str(ext_proj),
+                    "--allow", "**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(base / "runs"),
+                    "--agent-bin", str(fake_agent),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ]
+            )
+            self.assertEqual(1, rc)
+            data = json.loads(stdout.strip())
+            self.assertEqual("project_config", data["gate_config_source"])
+            self.assertEqual("violation", data["scope"])
+            self.assertIn("preflight.toml", data["gate_touched"])
+            self.assertGreater(data["lint_findings"], 0)
+            run_meta = json.loads((Path(data["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("project_config", run_meta["gate_config_source"])
+            self.assertEqual(64, len(run_meta["gate_config_sha256"]))
+
 
 if __name__ == "__main__":
     unittest.main()

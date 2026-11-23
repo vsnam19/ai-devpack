@@ -5,6 +5,31 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Security
+- **Trusted gate configuration (`runner/devpack_dispatch.py`, `runner/devpack_run.py`, `runner/devpack_broker.py`, `enforcement/checks/scope_check.py`)**:
+  preflight lint and `cppcheck` configuration is now snapshotted from the base commit
+  (`git show <base>:preflight.toml` into a temporary file outside `workdir`) or from
+  broker/pack-owned project configuration, never from the post-run working tree; records
+  `gate_config_source` and `gate_config_sha256` in `run.json`. Any worker modification to
+  `preflight.toml`, `.devpack/**`, `.clang-tidy`, `gate.toml`, or configured
+  `suppressions_file`/plugin paths is rejected as a `gate-touched` scope violation
+  regardless of `--allow` globs (see LSN-020 in `knowledge/lessons.md`).
+- **Analyzer config allowlisting (`enforcement/static/cppcheck_check.py`, `enforcement/lint/preflight_lint.py`)**:
+  `cppcheck_check.py` now validates `[cppcheck].extra_args` / `--extra-arg` against a
+  strict allowlist (`--inline-suppr`, `--check-level=normal|exhaustive`,
+  `--suppress=<id>[:path]`, `--std=c++NN`, `-D<NAME>[=value]`, `-U<NAME>`,
+  `--platform=<name>`, `--max-ctu-depth=<n>`) and requires `[cppcheck].fail_on` to be
+  non-empty with only known severities, exiting `2` before execution on violations.
+  `preflight_lint.py` rejects `[plugins].paths` in config files unless
+  `--allow-config-plugins` is explicitly passed and validates `std`/`c_std` and boolean
+  settings.
+- **Workspace containment & fail-closed config resolution (`runner/workspace_scope.py`, `runner/repomap.py`, `enforcement/static/cppcheck_check.py`)**:
+  rejects symlinks escaping the repository or workspace root across component discovery,
+  workspace root/component paths, `repomap`, and `compile_commands.json` entries; fails
+  with exit `2` when an explicitly requested `--project-config` is missing or unparsable
+  (no silent legacy fallback); and restricts `compile_commands.json` filtering to the
+  requested directory targets in `cppcheck_check.py`.
+
 ### Added
 - **Automotive C++17 skill (`knowledge/skills/automotive-cpp/`)**: consolidated,
   source-grounded coding and review skill merging MISRA C++:2023 themes, ISO 26262-6
