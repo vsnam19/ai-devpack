@@ -261,6 +261,7 @@ class TrialResult:
     ablation_cause: str | None = None
     ablation_arms: dict[str, Any] = field(default_factory=dict)
     arm: str = "base"
+    pipeline_mode: str = "autonomous"
 
 
 @dataclass
@@ -1998,6 +1999,7 @@ def run_runner_trial(
             home_placeholder="$HOME",
             profile_overrides=profile_overrides,
             skills_enabled=skills_enabled,
+            mode="autonomous",
         )
 
         task_prompt_in_work = work_dir / "TASK_PROMPT.md"
@@ -2066,6 +2068,7 @@ def run_runner_trial(
             brief_variant=brief_variant,
             skills_enabled=skills_enabled,
             arm=arm,
+            pipeline_mode="autonomous",
             grader_isolation=isolation,
             grader_unsandboxed_opt_in=(isolation == "local" and allow_unsandboxed_local),
             finished=datetime.now(timezone.utc).isoformat(),
@@ -2278,7 +2281,7 @@ def run_orchestrator_trial(
         # The broker installs only a credential-free client under this path.
         (work_dir / ".devpack").mkdir(exist_ok=True)
         (work_dir / ".devpack/project.toml").write_text(
-            'data_class = "internal"\n', encoding="utf-8",
+            'data_class = "internal"\n\n[pipeline]\nmode = "autonomous"\n', encoding="utf-8",
         )
         orch_src = REPO_ROOT / "orchestrator"
         if (orch_src / "CLAUDE.md").is_file():
@@ -2449,6 +2452,7 @@ def run_orchestrator_trial(
             context="none",
             brief_variant="standard",
             skills_enabled=False,
+            pipeline_mode="autonomous",
             grader_isolation=isolation,
             grader_unsandboxed_opt_in=(isolation == "local" and allow_unsandboxed_local),
             finished=datetime.now(timezone.utc).isoformat(),
@@ -4671,6 +4675,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "run_id": run_id,
         "date": date_str,
         "mode": mode,
+        "pipeline_mode": "autonomous",
         "tier": args.tier,
         "isolation": args.isolation,
         "brief_variant": args.brief_variant,

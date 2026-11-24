@@ -85,6 +85,7 @@ class DispatchTrustedGitDirTests(unittest.TestCase):
                     runs_root=base / "runs",
                     isolation="local",
                     allow_unsandboxed_local=True,
+                    mode="autonomous",
                     **extra,
                 )
         return recorded
@@ -148,6 +149,7 @@ class RunTaskWorkflowTrustedGitDirTests(unittest.TestCase):
                     isolation="local",
                     allow_unsandboxed_local=True,
                     trusted_git_dir=trusted,
+                    mode="autonomous",
                 )
         self.assertEqual(0, rc, summary)
         roles = {req.role for req in recorded}

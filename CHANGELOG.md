@@ -5,6 +5,13 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Added
+- **Pipeline operating modes (`policy/operating_modes.md`, `runner/checkpoints.py`, `runner/devpack_approve.py`, `runner/devpack_run.py`, `runner/devpack_dispatch.py`, `runner/devpack_broker.py`, `runner/devpack_submit.py`, `runner/memory.py`, `runner/devpack_memory.py`, `runner/agent_exec.py`, `eval/run_eval.py`, `tests/test_pipeline_modes.py`)**:
+  - Added `[pipeline]` (`mode = "hitl" | "autonomous"`, default `"hitl"`, `state_dir = ".devpack/state"`) and `[pipeline.checkpoints]` tightening-only overrides to `.devpack/project.toml` parsing and validation; CLI `--mode` and `DEVPACK_MODE` may only tighten (`autonomous` -> `hitl`), never loosen.
+  - Implemented `runner/checkpoints.py` with blocking (`plan`, `brief`, `deviation`, `selinux-manifest`) vs terminal (`pre-merge`, `escalation`, `memory-decision`) checkpoints, hard-stop enforcement, green gate/brief-lint receipt verification for auto-approval, trusted `state_dir` containment outside agent worktrees, provenance logging (`provenance.jsonl` and `refs/notes/ai-provenance`), and exit code `20` (`AWAITING_APPROVAL`) on blocking stops.
+  - Added human/CI-only `runner/devpack_approve.py` (`list`, `show`, `approve`, `reject --note`) with hashed OS user IDs and sandbox/broker refusal, plus `devpack_run.py --resume <approval-id>` and unified `memory-decision` checkpoint synchronization with `runner/memory.py` / `runner/devpack_memory.py`.
+  - Updated documentation (`README.md`, `orchestrator/README.md`, `workflow/ci/pipeline.md`, `.devpack/project.example.toml`) and configured `eval/run_eval.py` and existing unattended tests to select `autonomous` mode explicitly.
+
 ## [0.2.3] - 2026-11-24
 
 ### Security

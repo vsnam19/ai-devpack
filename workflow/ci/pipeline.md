@@ -17,6 +17,19 @@ CI-neutral. Each stage is a local script call that any CI can run. Example wirin
 Evidence (`enforcement/evidence/collect.py`) is bundled after stages 3-5 and kept with the
 change. Provenance notes are written by the runner/CI (`policy/provenance.md`).
 
+## Pipeline modes in CI
+
+See `policy/operating_modes.md` for checkpoint definitions:
+
+- **PR / feature pipelines:** typically run in `autonomous` mode (`[pipeline] mode = "autonomous"`
+  in `.devpack/project.toml`), auto-approving `brief` when `runner/brief_lint.py` is error-free
+  while still stopping at hard-stops (`escalation`, `memory-decision`, safety/security
+  `deviation`, release `selinux-manifest`, and `pre-merge` into protected branches) and never
+  merging autonomously.
+- **Release pipelines:** run in `hitl` mode (or tighten via `--mode hitl` / `DEVPACK_MODE=hitl`),
+  requiring explicit human approval via `runner/devpack_approve.py` before dispatching or
+  releasing.
+
 ## Rules
 
 1. The gate in CI is the only truth for "checks pass". An agent saying "tests pass" is not evidence.

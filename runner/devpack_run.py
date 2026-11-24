@@ -20,9 +20,10 @@
 # steps/NN-gate.txt) as well as run_summary.json.
 #
 # Exit codes:
-#   0 - Task passed gate and received VERDICT: APPROVE (or --dry-run completed)
-#   1 - Task stopped with ESCALATE_TO_HUMAN or execution failure
-#   2 - Invalid command-line arguments or configuration error
+#   0  - Task passed gate and received VERDICT: APPROVE (or --dry-run completed)
+#   1  - Task stopped with ESCALATE_TO_HUMAN, rejected checkpoint, or execution failure
+#   2  - Invalid command-line arguments or configuration error
+#   20 - AWAITING_APPROVAL (paused at a blocking HITL or hard-stop checkpoint)
 """Local task runner driving implement -> gate -> review -> fix via agent_exec."""
 
 from __future__ import annotations
@@ -49,6 +50,8 @@ for _p in (str(REPO_ROOT), str(RUNNER_DIR)):
 
 from workspace_scope import resolve_protected_test_globs  # noqa: E402
 import agent_exec  # noqa: E402
+from brief_lint import has_errors as brief_has_errors, lint_brief_text  # noqa: E402
+import checkpoints  # noqa: E402
 from agent_exec import (  # noqa: E402
     AgentRequest,
     EngineConfig,
@@ -108,6 +111,9 @@ Requirement IDs: {{REQ_IDS}}
 - {{ALLOWED_GLOB_1}}
 
 Out of scope: {{OUT_OF_SCOPE}}
+
+## Gate
+- `{{GREEN_CMD}}` -> {{GREEN_EXPECTED}}
 
 ## STOP conditions
 Stop if the brief contradicts the repository, requires files outside the allowed scope,
@@ -678,6 +684,11 @@ def run_task_workflow(
     deviation_id: str = "",
     gate_config: Path | None = None,
     trusted_git_dir: Path | None = None,
+    mode: str | None = None,
+    state_dir: Path | str | None = None,
+    brief_author: str = "human",
+    brief_approved: bool = False,
+    engines_config_path: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -744,6 +755,18 @@ def run_task_workflow(
     resolved_allow_globs = _parse_allowed_globs(context, allow_globs, ws_scope=ws_scope)
     resolved_protected_globs = resolve_protected_test_globs(worktree, protected_globs)
 
+    pre_run_proj_bytes: bytes | None = None
+    default_proj_path = worktree / ".devpack" / "project.toml"
+    if default_proj_path.is_file() and not default_proj_path.is_symlink():
+        pre_run_proj_bytes = default_proj_path.read_bytes()
+
+    pipeline_cfg = checkpoints.load_pipeline_config(
+        worktree,
+        trusted_project_bytes=pre_run_proj_bytes,
+        override_mode=mode,
+        override_state_dir=state_dir,
+    )
+
     impl_engine = _coerce_role_engine(config, "implementer")
     rev_engine = _coerce_role_engine(config, "reviewer")
     fix_engine = _coerce_role_engine(config, "fixer", fallback_role="implementer")
@@ -754,6 +777,7 @@ def run_task_workflow(
         scope_warnings = allowed_glob_warnings(ws_scope, resolved_allow_globs)
         plan = {
             "mode": "dry-run",
+            "pipeline_mode": pipeline_cfg.mode,
             "warnings": scope_warnings,
             "task_id": context["TASK_ID"],
             "task_title": context["TASK_TITLE"],
@@ -790,6 +814,16 @@ def run_task_workflow(
 
     log_dir.mkdir(parents=True, exist_ok=True)
     active_run_dir = run_dir if run_dir is not None else log_dir
+    if state_dir is None and not pipeline_cfg.state_dir_explicit:
+        ext_root = run_dir.parent if run_dir is not None else log_dir
+        ext_state = checkpoints.external_state_dir_for_runs_root(worktree, ext_root)
+        if ext_state is not None:
+            pipeline_cfg = checkpoints.PipelineConfig(
+                mode=pipeline_cfg.mode,
+                state_dir=str(ext_state),
+                state_dir_explicit=False,
+                checkpoints=pipeline_cfg.checkpoints,
+            )
     (active_run_dir / "steps").mkdir(parents=True, exist_ok=True)
     role_engine_map = {
         "implementer": impl_engine.name,
@@ -863,12 +897,133 @@ def run_task_workflow(
     )
     lint_pack_root = repo_root if (repo_root / "enforcement" / "lint" / "preflight_lint.py").is_file() else REPO_ROOT
     static_pack_root = repo_root if (repo_root / "enforcement" / "static" / "cppcheck_check.py").is_file() else REPO_ROOT
-    pre_run_proj_bytes: bytes | None = None
-    default_proj_path = worktree / ".devpack" / "project.toml"
-    if default_proj_path.is_file() and not default_proj_path.is_symlink():
-        pre_run_proj_bytes = default_proj_path.read_bytes()
-    control_before = _control_snapshot(worktree)
 
+    checkpoint_records: list[dict[str, Any]] = []
+    if not brief_approved:
+        lint_engine_name = impl_engine.name if engines_config_path is not None else (
+            impl_engine.name if impl_engine.name in ("haiku", "sonnet", "local") else ""
+        )
+        brief_findings = lint_brief_text(
+            impl_brief,
+            repo_root=worktree,
+            engine=lint_engine_name,
+            engines_config=engines_config_path,
+            author=brief_author,
+        )
+        lint_receipt_path = active_run_dir / "steps" / "00-brief-lint.json"
+        lint_receipt_path.write_text(
+            json.dumps(
+                {
+                    "brief_lint": brief_findings,
+                    "error_count": sum(1 for item in brief_findings if item.get("severity") == "error"),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        brief_decision = checkpoints.request(
+            "brief",
+            context["TASK_ID"],
+            [lint_receipt_path],
+            f"Brief checkpoint for task '{context['TASK_ID']}' ({context['TASK_TITLE']}).",
+            pipeline_config=pipeline_cfg,
+            project_root=worktree,
+            requested_by="devpack_run",
+            gate_passed=not brief_has_errors(brief_findings),
+            repo_root=worktree,
+            run_dir=active_run_dir,
+        )
+        checkpoint_records.append(
+            {
+                "checkpoint": "brief",
+                "approval_id": brief_decision.approval_id,
+                "status": brief_decision.status,
+                "decided_by": brief_decision.decided_by,
+            }
+        )
+        if not brief_decision.approved:
+            resume_payload: dict[str, Any] = {
+                "approval_id": brief_decision.approval_id,
+                "checkpoint_id": "brief",
+                "task_id": context["TASK_ID"],
+                "context": dict(context),
+                "worktree": str(worktree),
+                "log_dir": str(log_dir),
+                "run_dir": str(active_run_dir),
+                "repo_root": str(repo_root),
+                "max_fix_rounds_override": max_fix_rounds_override,
+                "protected_globs": list(protected_globs),
+                "allow_globs": list(allow_globs) if allow_globs is not None else None,
+                "components": list(components) if isinstance(components, (list, tuple)) else components,
+                "all_components": bool(all_components),
+                "deviation_id": deviation_id,
+                "gate_config": str(gate_config) if gate_config is not None else "",
+                "isolation": isolation,
+                "allow_unsandboxed_local": bool(allow_unsandboxed_local),
+                "credentials_path": str(credentials_path) if credentials_path is not None else "",
+                "agent_bin": agent_bin,
+                "skills_enabled": bool(skills_enabled),
+                "brief_author": brief_author,
+                "pipeline_mode": pipeline_cfg.mode,
+                "engines_config_path": str(engines_config_path) if engines_config_path is not None else "",
+                "roles": {
+                    role_k: {
+                        "name": eng_v.name,
+                        "model": eng_v.model,
+                        "class": eng_v.engine_class,
+                        "timeout_s": eng_v.timeout_s,
+                        "cmd": list(eng_v.cmd) if eng_v.cmd is not None else None,
+                    }
+                    for role_k, eng_v in (
+                        ("implementer", impl_engine),
+                        ("reviewer", rev_engine),
+                        ("fixer", fix_engine),
+                    )
+                },
+                "gate_cmd": list(gate_cmd),
+                "gate_timeout_s": gate_timeout_s,
+                "max_fix_rounds": default_max_rounds,
+            }
+            checkpoints.save_resume_state(pipeline_cfg.state_dir, brief_decision.approval_id, resume_payload)
+            update_run_json(
+                active_run_dir,
+                outcome="awaiting_approval",
+                pipeline_mode=pipeline_cfg.mode,
+                approval_id=brief_decision.approval_id,
+                checkpoint_id="brief",
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+            paused_summary: dict[str, Any] = {
+                "task_id": context["TASK_ID"],
+                "task_title": context["TASK_TITLE"],
+                "status": checkpoints.AWAITING_APPROVAL,
+                "approval_id": brief_decision.approval_id,
+                "checkpoint_id": "brief",
+                "pipeline_mode": pipeline_cfg.mode,
+                "state_dir": pipeline_cfg.state_dir,
+                "checkpoints": checkpoint_records,
+                "verdict": "",
+                "fix_rounds_used": 0,
+                "max_fix_rounds": max_fix_rounds,
+                "cost_usd": 0.0,
+                "run_dir": str(active_run_dir),
+                "step_logs": [],
+            }
+            (log_dir / "run_summary.json").write_text(
+                json.dumps(paused_summary, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            if active_run_dir != log_dir:
+                (active_run_dir / "run_summary.json").write_text(
+                    json.dumps(paused_summary, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            print(f"{checkpoints.AWAITING_APPROVAL} [brief]: {brief_decision.approval_id}")
+            print(f"Approve: python3 runner/devpack_approve.py --state-dir {pipeline_cfg.state_dir} approve {brief_decision.approval_id}")
+            return checkpoints.AWAITING_APPROVAL_EXIT_CODE, paused_summary
+
+    control_before = _control_snapshot(worktree)
     step_index = 0
     step_logs: list[str] = []
     total_cost_usd = 0.0
@@ -1280,6 +1435,8 @@ def run_task_workflow(
                     task_id=context.get("TASK_ID", ""),
                     stop_report_text=stop_report_text if idx_p == len(pending_proposal_texts) - 1 else "",
                     extra_secrets=extra_secrets,
+                    state_dir=pipeline_cfg.state_dir,
+                    mode=pipeline_cfg.mode,
                 )
                 accepted_proposals.extend(e.id for e in prop_res.accepted)
                 pending_proposals.extend(e.id for e in prop_res.pending)
@@ -1336,6 +1493,8 @@ def run_task_workflow(
                     source=f"run:{active_run_dir.name}",
                     task_id=context.get("TASK_ID", ""),
                     extra_secrets=extra_secrets,
+                    state_dir=pipeline_cfg.state_dir,
+                    mode=pipeline_cfg.mode,
                 )
                 accepted_proposals.extend(e.id for e in rev_prop.accepted)
                 pending_proposals.extend(e.id for e in rev_prop.pending)
@@ -1412,6 +1571,58 @@ def run_task_workflow(
             },
         )
         step_logs.append(esc_log.name)
+        esc_decision = checkpoints.request(
+            "escalation",
+            context["TASK_ID"],
+            [esc_log],
+            escalation_reason or "Escalation to human after fix rounds exhausted.",
+            pipeline_config=pipeline_cfg,
+            project_root=worktree,
+            requested_by="devpack_run",
+            gate_passed=False,
+            metadata={"fix_rounds_used": fix_rounds_used, "max_fix_rounds": max_fix_rounds},
+            repo_root=worktree,
+            run_dir=active_run_dir,
+        )
+        checkpoint_records.append(
+            {
+                "checkpoint": "escalation",
+                "approval_id": esc_decision.approval_id,
+                "status": esc_decision.status,
+                "decided_by": esc_decision.decided_by,
+            }
+        )
+
+    if final_status == "APPROVED":
+        protected_branch, branch_name = checkpoints.is_protected_branch(worktree)
+        pm_evidence: list[Path] = []
+        gate_files = sorted((active_run_dir / "steps").glob("*-gate.txt"))
+        if gate_files:
+            pm_evidence.append(gate_files[-1])
+        review_logs = [log_dir / name for name in step_logs if "review" in name]
+        if review_logs:
+            pm_evidence.append(review_logs[-1])
+        pm_decision = checkpoints.request(
+            "pre-merge",
+            context["TASK_ID"],
+            pm_evidence,
+            f"Ready for merge approval: task '{context['TASK_ID']}' ({context['TASK_TITLE']}).",
+            pipeline_config=pipeline_cfg,
+            project_root=worktree,
+            requested_by="devpack_run",
+            gate_passed=True,
+            metadata={"protected_branch": protected_branch, "branch": branch_name},
+            repo_root=worktree,
+            run_dir=active_run_dir,
+        )
+        checkpoint_records.append(
+            {
+                "checkpoint": "pre-merge",
+                "approval_id": pm_decision.approval_id,
+                "status": pm_decision.status,
+                "decided_by": pm_decision.decided_by,
+            }
+        )
 
     run_json_extra: dict[str, Any] = {
         "scope": scope_status,
@@ -1430,6 +1641,8 @@ def run_task_workflow(
         task=context["TASK_ID"],
         engines=role_engine_map,
         outcome="fail" if (git_tampered or enforcement_failed) else final_status,
+        pipeline_mode=pipeline_cfg.mode,
+        checkpoints=checkpoint_records,
         components=active_component_names,
         scan_mode=ws_scope.scan_mode,
         unchecked_components=unchecked_components,
@@ -1480,6 +1693,9 @@ def run_task_workflow(
             "pending": pending_proposals,
             "rejected": rejected_proposals,
         },
+        "pipeline_mode": pipeline_cfg.mode,
+        "state_dir": pipeline_cfg.state_dir,
+        "checkpoints": checkpoint_records,
     }
     (log_dir / "run_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n",
@@ -1617,7 +1833,162 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run workspace-scoped checks across all configured/discovered components",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("hitl", "autonomous"),
+        default=None,
+        help="Override pipeline mode (may only tighten autonomous -> hitl)",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default="",
+        help="Explicit checkpoint state directory (must be outside agent worktree)",
+    )
+    parser.add_argument(
+        "--resume",
+        default="",
+        help="Resume a paused run from a checkpoint approval ID",
+    )
+    parser.add_argument(
+        "--brief-author",
+        choices=("human", "orchestrator"),
+        default="human",
+        help="Author mode passed to brief_lint (default: human)",
+    )
     return parser
+
+
+def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
+    """Resume or fail a paused workflow from ``--resume <approval-id>``."""
+    try:
+        pipeline_cfg = checkpoints.load_pipeline_config(
+            worktree,
+            cli_mode=args.mode,
+            override_state_dir=args.state_dir or None,
+        )
+        rec, _rec_path = checkpoints.show_approval(pipeline_cfg.state_dir, args.resume)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1 if isinstance(exc, FileNotFoundError) else 2
+
+    status = str(rec.get("status", "")).upper()
+    checkpoint_id = str(rec.get("checkpoint", ""))
+    if status == checkpoints.PENDING:
+        print(f"{checkpoints.AWAITING_APPROVAL} [{checkpoint_id}]: {args.resume} is still pending")
+        return checkpoints.AWAITING_APPROVAL_EXIT_CODE
+
+    saved: dict[str, Any] = {}
+    try:
+        saved = checkpoints.load_resume_state(pipeline_cfg.state_dir, args.resume)
+    except (OSError, ValueError):
+        saved = {}
+
+    if status == checkpoints.REJECTED:
+        note = str(rec.get("note", "")).strip()
+        msg = f"REJECTED [{checkpoint_id}] {args.resume}: {note}" if note else f"REJECTED [{checkpoint_id}] {args.resume}"
+        print(msg)
+        run_dir_raw = str(saved.get("run_dir") or rec.get("run_dir") or "").strip()
+        log_dir_raw = str(saved.get("log_dir") or run_dir_raw).strip()
+        if run_dir_raw and Path(run_dir_raw).is_dir():
+            update_run_json(
+                Path(run_dir_raw),
+                outcome="rejected",
+                approval_id=args.resume,
+                approval_status=checkpoints.REJECTED,
+                approval_note=note,
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+        if log_dir_raw and Path(log_dir_raw).is_dir():
+            rej_summary = {
+                "task_id": saved.get("task_id", rec.get("subject", "")),
+                "status": checkpoints.REJECTED,
+                "approval_id": args.resume,
+                "checkpoint_id": checkpoint_id,
+                "approval_note": note,
+                "decided_by": rec.get("decided_by", ""),
+                "decided_at": rec.get("decided_at", ""),
+            }
+            (Path(log_dir_raw) / "run_summary.json").write_text(
+                json.dumps(rej_summary, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        return 1
+
+    if status != checkpoints.APPROVED:
+        print(f"error: unexpected approval status '{status}' for {args.resume}", file=sys.stderr)
+        return 1
+
+    if not saved:
+        print(f"error: resume state missing for approval '{args.resume}'", file=sys.stderr)
+        return 1
+
+    resumed_worktree = Path(saved.get("worktree") or worktree).resolve()
+    resumed_repo_root = Path(args.repo_root).resolve() if args.repo_root else Path(saved.get("repo_root", ".")).resolve()
+    resumed_log_dir = Path(args.log_dir).resolve() if args.log_dir else Path(saved["log_dir"]).resolve()
+    resumed_run_dir = Path(saved["run_dir"]).resolve() if saved.get("run_dir") else resumed_log_dir
+
+    cfg_path_str = str(args.config).strip() or str(saved.get("engines_config_path", "")).strip()
+    if cfg_path_str and Path(cfg_path_str).is_file():
+        resumed_cfg: EnginesConfig | dict[str, Any] = load_engine_config(Path(cfg_path_str).resolve())
+        resumed_cfg_path: Path | None = Path(cfg_path_str).resolve()
+    elif isinstance(saved.get("roles"), dict):
+        resumed_cfg = {
+            "roles": dict(saved["roles"]),
+            "gate_cmd": list(saved.get("gate_cmd", list(agent_exec.DEFAULT_GATE_CMD))),
+            "gate_timeout_s": int(saved.get("gate_timeout_s", 300)),
+            "limits": {"max_fix_rounds": int(saved.get("max_fix_rounds", 2))},
+        }
+        resumed_cfg_path = None
+    else:
+        proj_cfg = agent_exec.load_project_config(resumed_worktree)
+        resumed_cfg_path = Path(proj_cfg["engines_config"])
+        resumed_cfg = load_engine_config(resumed_cfg_path)
+
+    credentials_path = (
+        Path(args.credentials).resolve()
+        if args.credentials
+        else (Path(saved["credentials_path"]).resolve() if saved.get("credentials_path") else None)
+    )
+    gate_cfg = (
+        Path(args.gate_config).resolve()
+        if args.gate_config
+        else (Path(saved["gate_config"]).resolve() if saved.get("gate_config") else None)
+    )
+    resumed_isolation = args.isolation if args.isolation != "docker" else str(saved.get("isolation", "docker"))
+    resumed_allow_local = bool(args.allow_unsandboxed_local or saved.get("allow_unsandboxed_local", False))
+    resumed_agent_bin = args.agent_bin if args.agent_bin != "claude" else str(saved.get("agent_bin", "claude"))
+
+    try:
+        rc, _summary = run_task_workflow(
+            config=resumed_cfg,
+            context=dict(saved["context"]),
+            worktree=resumed_worktree,
+            log_dir=resumed_log_dir,
+            repo_root=resumed_repo_root,
+            max_fix_rounds_override=args.max_fix_rounds if args.max_fix_rounds is not None else saved.get("max_fix_rounds_override"),
+            dry_run=False,
+            protected_globs=args.protected or saved.get("protected_globs", ()),
+            run_dir=resumed_run_dir,
+            isolation=resumed_isolation,
+            allow_unsandboxed_local=resumed_allow_local,
+            credentials_path=credentials_path,
+            agent_bin=resumed_agent_bin,
+            skills_enabled=bool(args.skills or saved.get("skills_enabled", False)),
+            components=args.components if args.components is not None else saved.get("components"),
+            all_components=bool(args.all_components or saved.get("all_components", False)),
+            allow_globs=saved.get("allow_globs"),
+            deviation_id=args.deviation or str(saved.get("deviation_id", "")),
+            gate_config=gate_cfg,
+            mode=pipeline_cfg.mode,
+            state_dir=pipeline_cfg.state_dir if pipeline_cfg.state_dir_explicit else None,
+            brief_author=str(saved.get("brief_author", args.brief_author)),
+            brief_approved=(checkpoint_id == "brief"),
+            engines_config_path=resumed_cfg_path,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return rc
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1634,8 +2005,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: worktree directory not found: {worktree}", file=sys.stderr)
         return 2
 
+    if args.resume:
+        return _resume_from_approval(args, worktree)
+
     try:
         project_config = agent_exec.load_project_config(worktree)
+        pipeline_cfg = checkpoints.load_pipeline_config(
+            worktree,
+            cli_mode=args.mode,
+            override_state_dir=args.state_dir or None,
+        )
         config_path = Path(args.config).resolve() if args.config else Path(project_config["engines_config"])
         config = load_engine_config(config_path)
         context = load_task_data(
@@ -1698,6 +2077,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             all_components=bool(args.all_components),
             deviation_id=args.deviation,
             gate_config=Path(args.gate_config).resolve() if args.gate_config else None,
+            mode=pipeline_cfg.mode,
+            state_dir=pipeline_cfg.state_dir if pipeline_cfg.state_dir_explicit else None,
+            brief_author=args.brief_author,
+            engines_config_path=config_path,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

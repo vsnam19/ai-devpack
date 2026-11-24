@@ -42,6 +42,10 @@ Requests contain an engine, a relative brief path, and nonempty allow globs. The
 
 Stop the broker with Ctrl-C after the session. Eval starts and stops one broker per orchestrator trial automatically. Eval uses `true` as its fixed per-job gate command in addition to dispatch's test-lock and lint checks; the final goal checker runs separately against the product tree.
 
+## Pipeline modes and checkpoints
+
+The broker snapshots `[pipeline]` (`mode = "hitl" | "autonomous"`, default `hitl`) from the host `.devpack/project.toml` at startup (`policy/operating_modes.md`). Before launching a worker, the broker enforces the blocking `brief` checkpoint against `<state_dir>` (default `<workdir>/.devpack/state/`, outside the worker sandbox): in `autonomous` mode, `brief` auto-approves when `runner/brief_lint.py` passes with zero error-severity findings; in `hitl` mode, it records a pending approval and exits `20` (`AWAITING_APPROVAL`). `runner/devpack_approve.py` is a human/CI-only command; the broker refuses any queue request that attempts to invoke or forward `devpack_approve`.
+
 ## Worker isolation and scope
 
 Workers default to Docker. They receive a separate product copy without `.devpack/`, orchestrator settings, or host Git metadata. Their generated Git baseline is mounted read-only. Ignored `.devpack` writes are independently fingerprinted and always fail worker scope checks. Only regular product files from jobs with valid scope are copied back. Requests, refusals, and responses are logged under the host run root, alongside worker transcripts.

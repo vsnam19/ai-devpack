@@ -22,6 +22,17 @@ gate_config = "gate.toml"
 # Directory where v0.2 run logs (runs/<run-id>/) are written (must stay in .gitignore).
 runs_root = "runs"
 
+# Pipeline operating mode and checkpoint approvals (see policy/operating_modes.md).
+# Default when [pipeline] is omitted: mode = "hitl", state_dir = ".devpack/state".
+# [pipeline]
+# mode = "hitl"                 # "hitl" | "autonomous"
+# state_dir = ".devpack/state"  # must remain outside agent-writable worktrees
+#
+# [pipeline.checkpoints]
+# Optional tightening-only overrides ("auto" | "human"). Hard-stops cannot be set to "auto".
+# plan = "human"
+# brief = "human"
+
 # Additional repository-relative test protections; nested tests are protected by default.
 protected_test_globs = ["checks/**"]
 # Gitignore /gate_receipt.json and /runs/ in the product repository.

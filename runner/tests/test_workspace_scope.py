@@ -33,6 +33,10 @@ YOCTO_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "yocto_ws"
 def _init_git_from_fixture(dst: Path) -> None:
     """Copy tests/fixtures/yocto_ws into ``dst`` and initialize it as a git repo."""
     shutil.copytree(YOCTO_FIXTURE, dst)
+    proj_toml = dst / ".devpack" / "project.toml"
+    proj_text = proj_toml.read_text(encoding="utf-8")
+    if "[pipeline]" not in proj_text:
+        proj_toml.write_text(proj_text.rstrip() + '\n\n[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
     for cmd in (
         ["git", "init", "-q"],
         ["git", "config", "user.email", "tester@example.invalid"],

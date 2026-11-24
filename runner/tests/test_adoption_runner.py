@@ -113,6 +113,7 @@ class AdoptionRunnerTests(unittest.TestCase):
                 rc, summary = devpack_run.run_task_workflow(
                     config, context, root, root / 'logs', root, gate_config=gate,
                     isolation='local', allow_unsandboxed_local=True,
+                    mode='autonomous',
                 )
             self.assertEqual(1, rc)
             self.assertEqual('violation', summary['scope'])

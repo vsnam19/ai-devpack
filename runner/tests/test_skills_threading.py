@@ -61,6 +61,7 @@ def _run_recorded_workflow(base: Path, **extra) -> list[agent_exec.AgentRequest]
             base,
             isolation="local",
             allow_unsandboxed_local=True,
+            mode="autonomous",
             **extra,
         )
     if rc != 0:

@@ -37,7 +37,9 @@ from runner.agent_exec import (
     update_run_json,
 )
 from runner.brief_lint import has_errors as brief_has_errors, lint_brief_text
+from runner import checkpoints
 from runner.devpack_dispatch import dispatch_job, _render_run_dir_quietly
+from runner.memory import _ensure_memory_decision_checkpoint, find_memory_entry
 from runner.safe_git import run_git
 from runner.workspace_scope import load_workspace_config, parse_toml_with_arrays
 
@@ -177,7 +179,8 @@ class Broker:
 
     def __init__(self, workdir, runs_root, *, credentials_path=None, engines_path=None,
                  isolation='docker', allow_unsandboxed_local=False, agent_bin='claude',
-                 gate_cmd='', docker_bin='docker', image_tag=None, allowed_engines=None):
+                 gate_cmd='', docker_bin='docker', image_tag=None, allowed_engines=None,
+                 mode=None):
         """Snapshot trusted settings and install only the standalone client in the project."""
         self.workdir = Path(workdir).resolve()
         self.runs_root = Path(runs_root).resolve()
@@ -207,6 +210,14 @@ class Broker:
                 if isinstance(sec_val, dict):
                     self.project[section] = dict(sec_val)
         self.workspace_config = load_workspace_config(self.workdir)
+        self.pipeline_config = checkpoints.load_pipeline_config(self.workdir)
+        if mode is not None:
+            validated = checkpoints.validate_pipeline_dict({'mode': mode})
+            self.pipeline_config = checkpoints.PipelineConfig(
+                mode=validated['mode'],
+                state_dir=self.pipeline_config.state_dir,
+                checkpoints=self.pipeline_config.checkpoints,
+            )
         self.isolation = isolation
         self.allow_local = allow_unsandboxed_local
         self.agent_bin = agent_bin
@@ -251,9 +262,19 @@ class Broker:
             self._lock_file.close()
 
     def _validate(self, request):
-        """Refuse launch overrides, unknown engines, unknown components, forbidden data classes, and path escapes."""
-        if not isinstance(request, dict) or set(request) - {'engine', 'brief', 'allow', 'gate_cmd', 'components', 'all_components'}:
+        """Refuse launch overrides, devpack_approve forwarding, unknown engines, unknown components, forbidden data classes, and path escapes."""
+        if not isinstance(request, dict):
             raise ValueError('unsupported request fields')
+        for key in request:
+            if 'devpack_approve' in str(key).lower():
+                raise ValueError('devpack_approve is a human/CI command and cannot be invoked via broker')
+        for val in request.values():
+            if isinstance(val, str) and 'devpack_approve' in val.lower():
+                raise ValueError('devpack_approve is a human/CI command and cannot be forwarded via broker')
+        if set(request) - {'engine', 'brief', 'allow', 'gate_cmd', 'components', 'all_components', 'mode'}:
+            raise ValueError('unsupported request fields')
+        if 'mode' in request and request['mode'] is not None:
+            checkpoints.resolve_pipeline_mode(self.pipeline_config.mode, cli_mode=str(request['mode']))
         if self.client_path.is_symlink() or hashlib.sha256(self.client_path.read_bytes()).hexdigest() != self.client_hash:
             raise ValueError('client integrity mismatch')
         engine = request.get('engine')
@@ -321,6 +342,55 @@ class Broker:
             with tempfile.TemporaryDirectory(prefix='devpack-broker-') as temporary:
                 sandbox = Path(temporary)
                 work = sandbox / 'work'
+                req_mode = checkpoints.resolve_pipeline_mode(
+                    self.pipeline_config.mode,
+                    cli_mode=str(request.get('mode') or '') or None,
+                )
+                lint_receipt = run / '00-brief-lint.json'
+                lint_receipt.write_text(
+                    json.dumps({'brief_lint': brief_findings, 'error_count': 0}, indent=2) + '\n',
+                    encoding='utf-8',
+                )
+                req_pipeline_cfg = checkpoints.PipelineConfig(
+                    mode=req_mode,
+                    state_dir=self.pipeline_config.state_dir,
+                    state_dir_explicit=self.pipeline_config.state_dir_explicit,
+                    checkpoints=dict(self.pipeline_config.checkpoints),
+                )
+                brief_decision = checkpoints.request(
+                    'brief',
+                    str(request['brief']),
+                    [lint_receipt],
+                    f"Broker brief checkpoint for '{request['brief']}' on '{request['engine']}'",
+                    pipeline_config=req_pipeline_cfg,
+                    project_root=self.workdir,
+                    agent_worktree=work,
+                    requested_by='broker',
+                    gate_passed=True,
+                    repo_root=self.workdir,
+                    run_dir=run,
+                )
+                if not brief_decision.approved:
+                    code = checkpoints.AWAITING_APPROVAL_EXIT_CODE
+                    payload.update(
+                        status=checkpoints.AWAITING_APPROVAL,
+                        approval_id=brief_decision.approval_id,
+                        checkpoint='brief',
+                        pipeline_mode=req_mode,
+                    )
+                    payload = json.loads(redact_sensitive_text(json.dumps(payload)))
+                    write_json(run / (request_id + '.response.json'), payload)
+                    update_run_json(
+                        run,
+                        outcome='awaiting_approval',
+                        approval_id=brief_decision.approval_id,
+                        checkpoint='brief',
+                        pipeline_mode=req_mode,
+                        response=payload,
+                        brief_lint=brief_findings,
+                    )
+                    _render_run_dir_quietly(run)
+                    return code, payload
                 # Never expose the queue, installed client, orchestrator configuration, or host Git metadata.
                 shutil.copytree(self.workdir, work, symlinks=True,
                                 ignore=shutil.ignore_patterns('.devpack', '.git', '.claude', 'CLAUDE.md', 'briefs', 'runs', '__pycache__'))
@@ -362,6 +432,12 @@ class Broker:
                         all_components=all_components,
                         task_id=Path(request['brief']).stem,
                         trusted_git_dir=(work / '.git').resolve(),
+                        mode=req_mode,
+                        state_dir=self.pipeline_config.state_dir,
+                        brief_approved=True,
+                        agent_worktree=work,
+                        project_root=self.workdir,
+                        record_memory_checkpoints=False,
                     )
                 if payload.get('gate') == 'ok' and payload.get('scope') == 'ok' and sandbox_memory.is_dir():
                     changed_mem = [
@@ -372,6 +448,17 @@ class Broker:
                         host_memory.mkdir(parents=True, exist_ok=True)
                         for mem_file in changed_mem:
                             copy_back(sandbox_memory, host_memory, mem_file.relative_to(sandbox_memory))
+                    for pending_mem_id in payload.get('memory_proposals', {}).get('pending', []):
+                        try:
+                            mem_entry = find_memory_entry(host_memory, str(pending_mem_id))
+                            _ensure_memory_decision_checkpoint(
+                                host_memory,
+                                mem_entry,
+                                state_dir=self.pipeline_config.state_dir,
+                                mode=req_mode,
+                            )
+                        except Exception:
+                            pass
                 if payload['scope'] == 'ok':
                     for name in payload['changed_files']:
                         relative = relative_path(name)

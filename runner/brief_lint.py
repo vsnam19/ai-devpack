@@ -251,7 +251,12 @@ def resolve_engine_brief_budget(
     data = _load_toml_dict(cfg_path)
     engines = data.get("engines", {})
     roles = data.get("roles", {})
-    if engine and engine not in engines and engine not in roles:
+    role_models = {
+        str(spec.get("model", "")).strip()
+        for spec in roles.values()
+        if isinstance(spec, Mapping) and str(spec.get("model", "")).strip()
+    } if isinstance(roles, Mapping) else set()
+    if engine and engine not in engines and engine not in roles and engine not in role_models:
         raise ValueError(f"Unknown engine '{engine}' in engines config: {cfg_path}")
     ctx_tokens = DEFAULT_CONTEXT_TOKENS.get(engine, 200000)
     brief_max = 0

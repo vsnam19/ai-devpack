@@ -92,7 +92,8 @@ from runner.agent_exec import (  # noqa: E402
     save_qualification_data,
     update_run_json,
 )
-from runner.brief_lint import lint_brief_text  # noqa: E402
+from runner.brief_lint import has_errors as brief_has_errors, lint_brief_text  # noqa: E402
+from runner import checkpoints  # noqa: E402
 from runner.devpack_logs import load_run_dir, write_rendered_outputs  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
 from runner.redaction import Redactor, collect_credential_secrets  # noqa: E402
@@ -800,6 +801,12 @@ def dispatch_job(
     all_components: bool = False,
     task_id: str = "",
     trusted_git_dir: Path | None = None,
+    mode: str | None = None,
+    state_dir: Path | str | None = None,
+    brief_approved: bool = False,
+    agent_worktree: Path | str | None = None,
+    project_root: Path | str | None = None,
+    record_memory_checkpoints: bool = True,
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
@@ -892,6 +899,25 @@ def dispatch_job(
     if project_config_path is None and default_proj.is_file() and not default_proj.is_symlink():
         pre_run_project_bytes = default_proj.read_bytes()
 
+    eff_project_root = Path(project_root).resolve() if project_root is not None else workdir
+    pipeline_cfg = checkpoints.load_pipeline_config(
+        eff_project_root,
+        project_config_path=project_config_path,
+        trusted_project_bytes=pre_run_project_bytes if project_config_path is None else None,
+        override_mode=mode,
+        override_state_dir=state_dir,
+        agent_worktree=agent_worktree,
+    )
+    if state_dir is None and not pipeline_cfg.state_dir_explicit and project_root is None:
+        ext_state = checkpoints.external_state_dir_for_runs_root(workdir, effective_runs_root)
+        if ext_state is not None:
+            pipeline_cfg = checkpoints.PipelineConfig(
+                mode=pipeline_cfg.mode,
+                state_dir=str(ext_state),
+                state_dir_explicit=False,
+                checkpoints=pipeline_cfg.checkpoints,
+            )
+
     with tempfile.TemporaryDirectory(prefix="devpack-gate-cfg-") as gate_cfg_tmp:
         trusted_cfg = resolve_trusted_gate_config(
             workdir,
@@ -965,6 +991,11 @@ def dispatch_job(
             memory_enabled=memory_enabled,
             memory_top_k=memory_top_k,
             memory_budget_tokens=memory_budget_tokens,
+            pipeline_cfg=pipeline_cfg,
+            brief_approved=brief_approved,
+            eff_project_root=eff_project_root,
+            agent_worktree=agent_worktree,
+            record_memory_checkpoints=record_memory_checkpoints,
         )
 
 
@@ -1017,6 +1048,11 @@ def _dispatch_job_with_trusted_cfg(
     memory_enabled: bool | None,
     memory_top_k: int | None,
     memory_budget_tokens: int | None,
+    pipeline_cfg: checkpoints.PipelineConfig,
+    brief_approved: bool = False,
+    eff_project_root: Path | None = None,
+    agent_worktree: Path | str | None = None,
+    record_memory_checkpoints: bool = True,
 ) -> tuple[int, dict[str, Any]]:
     """Run one dispatched worker job using the pre-snapshotted ``trusted_cfg``."""
     if dry_run:
@@ -1058,6 +1094,7 @@ def _dispatch_job_with_trusted_cfg(
             }
         plan = {
             "mode": "dry-run",
+            "pipeline_mode": pipeline_cfg.mode,
             "engine": engine.name,
             "engine_class": engine.engine_class,
             "engine_config_hash": engine_cfg_hash,
@@ -1231,6 +1268,67 @@ def _dispatch_job_with_trusted_cfg(
             _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
             _emit_json_line(payload)
             return 1, payload
+
+    brief_approval_id = ""
+    if not brief_approved:
+        steps_dir = run_dir / "steps"
+        steps_dir.mkdir(parents=True, exist_ok=True)
+        lint_receipt_path = steps_dir / "00-brief-lint.json"
+        lint_receipt_path.write_text(
+            json.dumps(
+                {
+                    "brief_lint": effective_brief_lint,
+                    "error_count": sum(
+                        1 for item in effective_brief_lint if item.get("severity") == "error"
+                    ),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        proj_root = eff_project_root if eff_project_root is not None else workdir
+        brief_decision = checkpoints.request(
+            "brief",
+            task_id or brief_path.stem,
+            [lint_receipt_path],
+            f"Brief checkpoint before dispatch of '{brief_path.name}' on '{engine.name}'.",
+            pipeline_config=pipeline_cfg,
+            project_root=proj_root,
+            agent_worktree=agent_worktree,
+            requested_by=f"dispatch:{role}",
+            gate_passed=not brief_has_errors(effective_brief_lint),
+            repo_root=proj_root,
+            run_dir=run_dir,
+        )
+        brief_approval_id = brief_decision.approval_id
+        if not brief_decision.approved:
+            update_run_json(
+                run_dir,
+                task=brief_path.stem,
+                outcome="awaiting_approval",
+                gate="skipped",
+                approval_id=brief_decision.approval_id,
+                checkpoint="brief",
+                pipeline_mode=pipeline_cfg.mode,
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+            payload = {
+                "run_dir": str(run_dir),
+                "status": checkpoints.AWAITING_APPROVAL,
+                "approval_id": brief_decision.approval_id,
+                "checkpoint": "brief",
+                "pipeline_mode": pipeline_cfg.mode,
+                "state_dir": pipeline_cfg.state_dir,
+                "gate": "skipped",
+                "scope": "ok",
+                "changed_files": [],
+                "final_text_tail": "",
+                "cost_usd": None if engine.is_local else 0.0,
+            }
+            _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
+            _emit_json_line(payload)
+            return checkpoints.AWAITING_APPROVAL_EXIT_CODE, payload
 
     req = AgentRequest(
         engine=engine,
@@ -1573,6 +1671,9 @@ def _dispatch_job_with_trusted_cfg(
             source=f"run:{run_dir.name}",
             task_id=task_id,
             stop_report_text=stop_report_text,
+            state_dir=pipeline_cfg.state_dir,
+            record_checkpoints=record_memory_checkpoints,
+            mode=pipeline_cfg.mode,
         )
         mem_proposal_summary = prop_res.to_dict()
 
@@ -1590,6 +1691,8 @@ def _dispatch_job_with_trusted_cfg(
         run_dir,
         task=brief_path.stem,
         outcome=outcome,
+        pipeline_mode=pipeline_cfg.mode,
+        approval_id=brief_approval_id,
         gate=gate_status,
         scope=scope_status,
         test_lock=test_lock_status,
@@ -1812,6 +1915,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run workspace-scoped checks across all configured/discovered components",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("hitl", "autonomous"),
+        default=None,
+        help="Override pipeline mode (may only tighten autonomous -> hitl)",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default="",
+        help="Explicit checkpoint state directory (must be outside agent worktree)",
+    )
     return parser
 
 
@@ -1852,6 +1966,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     qual_file = Path(args.qualification_file).resolve() if args.qualification_file else None
 
     try:
+        cli_pipeline_cfg = checkpoints.load_pipeline_config(
+            workdir,
+            project_config_path=project_cfg_path,
+            cli_mode=args.mode,
+            override_state_dir=args.state_dir or None,
+        )
         rc, _payload = dispatch_job(
             engine_name=args.engine,
             brief_path=brief_path,
@@ -1879,6 +1999,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             memory_enabled=False if args.no_memory else None,
             components=args.components,
             all_components=bool(args.all_components),
+            mode=cli_pipeline_cfg.mode,
+            state_dir=cli_pipeline_cfg.state_dir if cli_pipeline_cfg.state_dir_explicit else None,
         )
         return rc
     except (ValueError, GitSecurityError) as exc:

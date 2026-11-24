@@ -380,7 +380,7 @@ def _minimal_toml_loads(text: str) -> dict[str, Any]:
         if "=" not in raw:
             continue
         key, val_str = raw.split("=", 1)
-        key = key.strip()
+        key = key.strip().strip('"').strip("'")
         val_str = val_str.strip()
         if val_str.startswith("[") and not val_str.endswith("]"):
             buf = [val_str]
@@ -725,6 +725,7 @@ def load_project_config(
         "workspace": {},
         "components": [],
         "scan": {},
+        "pipeline": {"mode": "hitl", "state_dir": ".devpack/state", "checkpoints": {}},
         "config_found": False,
     }
     if project_config_path is not None and str(project_config_path):
@@ -788,6 +789,12 @@ def load_project_config(
         defaults["scan"] = dict(raw_scan)
     elif "scan" in raw:
         raise ValueError(f"[scan] must be a table in {cfg_path}")
+    if "pipeline" in raw:
+        try:
+            from runner.checkpoints import validate_pipeline_dict  # noqa: E402
+        except ModuleNotFoundError:  # pragma: no cover
+            from checkpoints import validate_pipeline_dict  # type: ignore[no-redef] # noqa: E402
+        defaults["pipeline"] = validate_pipeline_dict(raw["pipeline"], source=str(cfg_path))
     defaults["config_found"] = True
     return defaults
 
@@ -1773,6 +1780,7 @@ def build_invocation(
             "TMPDIR": str(resolved_tmp),
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
+            "DEVPACK_AGENT_SANDBOX": "1",
         }
         if engine.is_local:
             env.update(local_engine_vars)
@@ -1785,6 +1793,8 @@ def build_invocation(
         "HOME=/workspace/home",
         "-e",
         "CLAUDE_CONFIG_DIR=/workspace/cfg",
+        "-e",
+        "DEVPACK_AGENT_SANDBOX=1",
     ]
     if engine.is_local:
         for var_name in (

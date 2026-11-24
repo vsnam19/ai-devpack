@@ -875,25 +875,118 @@ def add_memory_entry(
     )
 
 
+def _resolve_checkpoint_context(
+    memory_root: Path | str,
+    state_dir: Path | str | None = None,
+) -> tuple[Path | None, Path | None]:
+    """Return ``(resolved_state_dir, project_root)`` when ``memory_root`` lives under ``.devpack/memory``."""
+    mem_path = Path(memory_root).resolve()
+    project_root: Path | None = None
+    if mem_path.name == "memory" and mem_path.parent.name == ".devpack":
+        project_root = mem_path.parent.parent
+    if state_dir is not None and str(state_dir).strip():
+        return Path(state_dir).resolve(), project_root
+    if project_root is not None:
+        try:
+            from runner.checkpoints import load_pipeline_config  # noqa: E402
+        except ModuleNotFoundError:  # pragma: no cover
+            from checkpoints import load_pipeline_config  # type: ignore[no-redef] # noqa: E402
+        try:
+            cfg = load_pipeline_config(project_root)
+            return Path(cfg.state_dir), project_root
+        except ValueError:
+            return mem_path.parent / "state", project_root
+    return None, None
+
+
+def _ensure_memory_decision_checkpoint(
+    memory_root: Path | str,
+    entry: MemoryEntry,
+    *,
+    state_dir: Path | str | None = None,
+    mode: str | None = None,
+) -> None:
+    """Create a pending ``memory-decision`` checkpoint record if one does not already exist."""
+    resolved_state, project_root = _resolve_checkpoint_context(memory_root, state_dir=state_dir)
+    if resolved_state is None:
+        return
+    try:
+        from runner import checkpoints  # noqa: E402
+    except ModuleNotFoundError:  # pragma: no cover
+        import checkpoints  # type: ignore[no-redef] # noqa: E402
+    if checkpoints.find_pending_for_subject(resolved_state, "memory-decision", entry.id) is not None:
+        return
+    evidence = [entry.path] if entry.path is not None else []
+    summary = f"Memory {entry.entry_type} proposal '{entry.id}' ({entry.scope}) awaiting human approval."
+    checkpoints.request(
+        "memory-decision",
+        entry.id,
+        evidence,
+        summary,
+        mode=mode,
+        state_dir=resolved_state,
+        project_root=project_root,
+        requested_by=entry.source or "memory",
+        metadata={
+            "memory_id": entry.id,
+            "entry_type": entry.entry_type,
+            "scope": entry.scope,
+            "memory_root": str(Path(memory_root).resolve()),
+        },
+        repo_root=project_root if project_root and (project_root / ".git").exists() else None,
+    )
+
+
 def approve_memory_entry(
     memory_root: Path | str,
     entry_id: str,
     *,
     extra_secrets: Sequence[str] = (),
     patterns_file: Path | str | None = None,
+    _sync_checkpoint: bool = True,
+    state_dir: Path | str | None = None,
 ) -> MemoryEntry:
     """Approve a ``pending`` memory entry, transitioning it to ``active``."""
     entry = find_memory_entry(memory_root, entry_id)
     if entry.status in ("superseded", "expired"):
         raise MemoryValidationError(f"Cannot approve {entry.status} memory entry '{entry.id}'")
     entry.status = "active"
-    return write_memory_entry(
+    written = write_memory_entry(
         memory_root,
         entry,
         overwrite=True,
         extra_secrets=extra_secrets,
         patterns_file=patterns_file,
     )
+    if _sync_checkpoint:
+        resolved_state, project_root = _resolve_checkpoint_context(memory_root, state_dir=state_dir)
+        if resolved_state is not None:
+            try:
+                from runner import checkpoints  # noqa: E402
+            except ModuleNotFoundError:  # pragma: no cover
+                import checkpoints  # type: ignore[no-redef] # noqa: E402
+            pending_hit = checkpoints.find_pending_for_subject(
+                resolved_state, "memory-decision", written.id
+            )
+            repo_arg = project_root if project_root and (project_root / ".git").exists() else None
+            if pending_hit is None:
+                _ensure_memory_decision_checkpoint(
+                    memory_root, written, state_dir=resolved_state
+                )
+                pending_hit = checkpoints.find_pending_for_subject(
+                    resolved_state, "memory-decision", written.id
+                )
+            if pending_hit is not None:
+                rec, _ = pending_hit
+                checkpoints.decide_approval(
+                    resolved_state,
+                    str(rec["id"]),
+                    decision_status=checkpoints.APPROVED,
+                    note="Approved via devpack_memory",
+                    repo_root=repo_arg,
+                    sync_memory=False,
+                )
+    return written
 
 
 def supersede_memory_entry(
@@ -1417,6 +1510,9 @@ def process_memory_proposals(
     stop_report_text: str = "",
     extra_secrets: Sequence[str] = (),
     patterns_file: Path | str | None = None,
+    state_dir: Path | str | None = None,
+    record_checkpoints: bool = True,
+    mode: str | None = None,
 ) -> ProposalProcessResult:
     """Parse proposals from ``final_text`` and ``stop_report_text`` and store them safely.
 
@@ -1477,6 +1573,10 @@ def process_memory_proposals(
                 result.accepted.append(entry)
             else:
                 result.pending.append(entry)
+                if record_checkpoints:
+                    _ensure_memory_decision_checkpoint(
+                        root, entry, state_dir=state_dir, mode=mode
+                    )
         except MemoryValidationError as exc:
             result.rejected.append(
                 {

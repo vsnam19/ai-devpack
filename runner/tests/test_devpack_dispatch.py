@@ -41,6 +41,11 @@ def _init_git_repo(workdir: Path) -> None:
         "#include <cassert>\nvoid testOne() { assert(1 == 1); }\n",
         encoding="utf-8",
     )
+    (workdir / ".devpack").mkdir(exist_ok=True)
+    (workdir / ".devpack" / "project.toml").write_text(
+        '[pipeline]\nmode = "autonomous"\n',
+        encoding="utf-8",
+    )
     subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
     subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=workdir, check=True)
     subprocess.run(["git", "config", "user.name", "Tester"], cwd=workdir, check=True)
@@ -263,9 +268,9 @@ class DevpackDispatchTests(unittest.TestCase):
             base = Path(tmp)
             wt = base / "wt"
             _init_git_repo(wt)
-            (wt / ".devpack").mkdir()
+            (wt / ".devpack").mkdir(exist_ok=True)
             (wt / ".devpack" / "project.toml").write_text(
-                'data_class = "confidential"\n',
+                'data_class = "confidential"\n[pipeline]\nmode = "autonomous"\n',
                 encoding="utf-8",
             )
             brief = base / "brief.md"
@@ -726,6 +731,7 @@ class DevpackDispatchTests(unittest.TestCase):
             ext_proj = base / "trusted_project.toml"
             ext_proj.write_text(
                 'data_class = "internal"\nallow_unsandboxed_local = true\n'
+                '[pipeline]\nmode = "autonomous"\n'
                 '[general]\nstd = "c++17"\n'
                 '[cppcheck]\nfail_on = ["error", "warning"]\n',
                 encoding="utf-8",
@@ -853,9 +859,10 @@ class DevpackDispatchTests(unittest.TestCase):
         """Create a clean repo whose only config is ``.devpack/project.toml``, plus the committed ``committed`` files."""
         _init_git_repo(wt)
         (wt / "preflight.toml").unlink()
-        (wt / ".devpack").mkdir()
+        (wt / ".devpack").mkdir(exist_ok=True)
         (wt / ".devpack" / "project.toml").write_text(
-            '[cppcheck]\nsuppressions_file = "cfg/suppr.txt"\n', encoding="utf-8"
+            '[pipeline]\nmode = "autonomous"\n\n[cppcheck]\nsuppressions_file = "cfg/suppr.txt"\n',
+            encoding="utf-8",
         )
         for rel, text in committed.items():
             (wt / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -940,7 +947,8 @@ class DevpackDispatchTests(unittest.TestCase):
             (wt / "preflight.toml").unlink()
         trusted_list = "unusedFunction:src/legacy.cpp\n"
         (wt / cfg_rel).parent.mkdir(parents=True, exist_ok=True)
-        (wt / cfg_rel).write_text(f'[cppcheck]\nsuppressions_file = "{suppr_rel}"\n', encoding="utf-8")
+        extra_pipeline = '[pipeline]\nmode = "autonomous"\n' if cfg_rel == ".devpack/project.toml" else ""
+        (wt / cfg_rel).write_text(f'{extra_pipeline}[cppcheck]\nsuppressions_file = "{suppr_rel}"\n', encoding="utf-8")
         (wt / suppr_rel).parent.mkdir(parents=True, exist_ok=True)
         (wt / suppr_rel).write_text(trusted_list, encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
@@ -1077,9 +1085,9 @@ class DevpackDispatchTests(unittest.TestCase):
             base = Path(tmp)
             wt = base / "wt"
             _init_git_repo(wt)
-            (wt / ".devpack").mkdir()
+            (wt / ".devpack").mkdir(exist_ok=True)
             (wt / ".devpack" / "project.toml").write_text(
-                'data_class = "internal"\nallow_unsandboxed_local = true\n',
+                'data_class = "internal"\nallow_unsandboxed_local = true\n[pipeline]\nmode = "autonomous"\n',
                 encoding="utf-8",
             )
             subprocess.run(["git", "add", "-A"], cwd=wt, check=True)

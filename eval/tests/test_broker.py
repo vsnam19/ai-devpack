@@ -48,6 +48,7 @@ class BrokerTests(unittest.TestCase):
         self.broker = self.broker_module.Broker(
             self.work, self.root / 'runs', credentials_path=self.credentials,
             isolation='local', allow_unsandboxed_local=True, agent_bin=str(self.worker), gate_cmd='true',
+            mode='autonomous',
         )
         self.addCleanup(self.broker.close)
 
@@ -329,6 +330,8 @@ class BrokerTests(unittest.TestCase):
             (work / '.devpack/project.toml').write_text(
                 'data_class = "internal"\n'
                 'allow_unsandboxed_local = true\n\n'
+                '[pipeline]\n'
+                'mode = "autonomous"\n\n'
                 '[workspace]\n'
                 'root = "meta-org/src"\n'
                 'exclude = ["**/third_party/**"]\n\n'

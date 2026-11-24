@@ -17,11 +17,11 @@ internally.
 
 | Path | Content |
 |---|---|
-| `policy/` | operating model, ASIL boundaries (company policy, needs safety approval), sandbox, data governance, provenance, failure handling, `policy/failure_attribution.md`, `policy/static_analysis.md`, `policy/workspace_scope.md`, tool confidence, deviations, `policy/logging.md`, `policy/local_models.md`, `policy/memory.md` |
+| `policy/` | operating model, `policy/operating_modes.md` (`hitl` / `autonomous`), ASIL boundaries (company policy, needs safety approval), sandbox, data governance, provenance, failure handling, `policy/failure_attribution.md`, `policy/static_analysis.md`, `policy/workspace_scope.md`, tool confidence, deviations, `policy/logging.md`, `policy/local_models.md`, `policy/memory.md` |
 | `knowledge/` | `lessons.md` (versioned lesson IDs), `context_template/AGENTS.md`, `skills/` (`automotive-cpp`, `review-taxonomy`, `skill-authoring`, `requirements-analysis`; deprecated: `misra-cpp-2023`, `doxygen-naming`), `engine_profiles/` |
 | `workflow/templates/` | brief (implement, fix, review), task plan and ADR templates |
 | `workflow/ci/` | `pipeline.md` and examples (`examples/gitlab-ci.yml`, `examples/Jenkinsfile`) |
-| `runner/` | `agent_exec.py` (single executor + v2 engine loader), `workspace_scope.py` (Yocto component scope), `brief_lint.py` (pre-dispatch brief linter), `repomap.py` (code index), `devpack_submit.py` (submission checks), `redaction.py` (shared secret rules), `safe_git.py` (hardened git access), `devpack_run.py`, `devpack_dispatch.py`, `devpack_broker.py`, `devpack_logs.py`, `memory.py`, `devpack_memory.py`, `engines.example.toml`, `quality_checklist.md` |
+| `runner/` | `agent_exec.py` (single executor + v2 engine loader), `checkpoints.py` (pipeline modes and approvals), `devpack_approve.py` (human/CI checkpoint CLI), `workspace_scope.py` (Yocto component scope), `brief_lint.py` (pre-dispatch brief linter), `repomap.py` (code index), `devpack_submit.py` (submission checks), `redaction.py` (shared secret rules), `safe_git.py` (hardened git access), `devpack_run.py`, `devpack_dispatch.py`, `devpack_broker.py`, `devpack_logs.py`, `memory.py`, `devpack_memory.py`, `engines.example.toml`, `quality_checklist.md` |
 | `orchestrator/` | drop-in Sonnet orchestrator config (`orchestrator/CLAUDE.md`, `orchestrator/README.md`, `orchestrator/briefs/`) |
 | `skilltest/` | `skilltest.py` (`lint`, `run`, `report`) for deterministic skill linting and A/B experiments |
 | `learning/` | `harvest.py`, `propose.py`, `validate.py` for mining run logs and validating bounded engine profiles |
@@ -55,6 +55,34 @@ Three deployment topologies are supported through `runner/engines.example.toml` 
    Runs entirely against an on-premises Anthropic-compatible endpoint (`class = "local"`
    in `runner/engines.example.toml`) for `confidential` repositories. Requires prior
    qualification against `policy/local_models.md`.
+
+## Pipeline modes
+
+Pipelines run in either **`hitl`** (human-in-the-loop, default when `[pipeline]` is absent)
+or **`autonomous`** mode (`policy/operating_modes.md`), configured in `.devpack/project.toml`:
+
+- **Blocking checkpoints (`plan`, `brief`, `deviation`, `selinux-manifest`):** pause with exit
+  code `20` (`AWAITING_APPROVAL`) when human approval is required (in `hitl`, at hard-stops, or
+  when gate/lint evidence is red) and write `<state_dir>/approvals/pending/<uuid>.json`. In
+  `autonomous` mode, `brief` auto-approves when `runner/brief_lint.py` reports no error-severity
+  findings.
+- **Terminal checkpoints (`pre-merge`, `escalation`, `memory-decision`):** record pending or
+  decided approval entries when a run finishes without altering the run's existing exit code (`0`
+  when ready for merge approval; `1` on `ESCALATE_TO_HUMAN`).
+- **Tightening only:** CLI `--mode` and `DEVPACK_MODE` may tighten `autonomous` to `hitl`, never
+  loosen `hitl` to `autonomous`; `[pipeline.checkpoints]` cannot set hard-stops to `auto`.
+- **Human/CI approvals:** `runner/devpack_approve.py` is restricted to human operators and CI
+  (refused inside agent sandboxes and by `runner/devpack_broker.py`), with `--status pending`
+  available on `list` and `--note <text>` required on `reject` (optional on `approve`). Decisions
+  append to provenance (`policy/provenance.md`):
+
+```bash
+python3 runner/devpack_approve.py list
+python3 runner/devpack_approve.py show <approval-id>
+python3 runner/devpack_approve.py approve <approval-id>
+python3 runner/devpack_approve.py reject <approval-id>
+python3 runner/devpack_run.py --resume <approval-id>
+```
 
 ## Reading agent logs
 
