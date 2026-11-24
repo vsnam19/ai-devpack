@@ -48,3 +48,7 @@ Inspect nonempty aggregate file_contexts and applied image labels. If supplied, 
 build even if image tooling accepts them. Pre-link approved modules where possible;
 verify loaded modules and domains after update/reboot. Profile content and a successful
 source build are not evidence of the final linked permissions or runtime confinement.
+
+Use `python3 scripts/gen_policy.py --manifest approved.json --profile platform.toml --out module`.
+The implemented category-to-interface keys and explicit argument bindings are listed
+in [tooling](tooling.md). Unknown kinds produce TODOs, QUESTIONS.md and exit 3.

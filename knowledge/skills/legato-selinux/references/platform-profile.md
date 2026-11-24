@@ -3,8 +3,8 @@
 The adopting project supplies `[selinux] platform_profile = "profiles/platform.toml"`
 in its project config. The path is workspace-root-relative, including when the project
 config is elsewhere. Absolute paths outside the workspace, parent escapes and escaping
-symlinks are rejected. The profile itself is TOML (Python 3.10+). It is data, never an
-executable hook. Keep proprietary profiles outside the pack. The
+symlinks are rejected. The profile itself is TOML (Python 3.10+). It is data during extraction. The generator alone may explicitly run its optional
+`skeleton_generator` command; treat profiles as reviewed executable build inputs. Keep proprietary profiles outside the pack. The
 [example](example-platform-profile.toml) uses fictional conventions only.
 
 | Key | Type and meaning |
@@ -71,3 +71,11 @@ must be lists of strings; `platform_root`, `sdk_policy_include`, `linked_policy`
 string-list fields, and nested tables follow the contract above, including an
 `interfaces` table whose values are strings. Missing profile fields still become
 questions; supplied fields of the wrong type exit 2 before output is created.
+
+## Offline generation and gate extensions
+
+The part-1 keys and manifest schema remain unchanged. Optional `contexts`, `bindings`,
+`baseline`, `enforcing_evidence`, `platform_root`, `adef` and `build.makefile` fields supply explicit
+project evidence for the new tools; see [tooling contract](tooling.md). Missing operation
+mappings or required context/type arguments produce incomplete generation, never guesses.
+`interfaces.app_transition` provides source syntax corresponding to `transition_check`.

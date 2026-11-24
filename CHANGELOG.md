@@ -6,6 +6,7 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 ## [Unreleased]
 
 ### Added
+- `legato-selinux` part 2: approval-only policy generator, fail-closed source/linked-policy gate, evidence-preserving AVC triage, configurable simulation macros and bound API FD-reception inventory, with offline regression tests.
 - `legato-selinux` part 1: approval-first SELinux/sandbox workflow, manifest schema and references, portable draft extractor, and synthetic offline tests. Platform conventions are supplied by a validated project-owned TOML profile; the pack contains only a fictional example.
 
 ## [0.2.3] - 2026-11-24

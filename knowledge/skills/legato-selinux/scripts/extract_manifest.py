@@ -117,6 +117,8 @@ class Extractor:
         if path is None or path in self.seen:
             return
         self.seen.add(path)
+        if path.suffix == '.adef':
+            self.app_definition = path
         try:
             text = path.read_text()
         except (OSError, UnicodeError):
@@ -174,7 +176,54 @@ class Extractor:
                 self.add('limits', path, line, name=key if sep else 'run', value=value if sep else statement)
             elif leaf == 'configTree':
                 self.add('config_tree', path, line, path=statement, access=['unknown'])
+        self.received_files(path, text)
         self.unknown('Verify build-expanded definitions, includes, shared libraries and per-process component ownership: ' + self.relative(path))
+
+    def received_files(self, path, text):
+        """Inventory OUT file parameters on required, bound API aliases; never infer labels."""
+        for context, statement, _ in sections(text):
+            if not context or context[-1] != 'api' or 'requires' not in context:
+                continue
+            match = re.search(r'(?:(\w+)\s*=\s*)?([\w./-]+\.api)\b', statement)
+            if not match:
+                continue
+            alias = match[1] or Path(match[2]).stem
+            bindings = []
+            for definition in [self.app_definition] if hasattr(self, 'app_definition') else []:
+                safe = self.safe(definition)
+                if safe:
+                    try:
+                        definition_text = safe.read_text()
+                    except (OSError, UnicodeError):
+                        self.unknown('Missing/unreadable definition: ' + self.relative(safe))
+                        continue
+                    for ctx, stmt, _ in sections(definition_text):
+                        if ctx and ctx[-1] == 'bindings' and '->' in stmt:
+                            client, peer = stmt.split('->', 1)
+                            if client.strip().endswith('.' + alias):
+                                bindings.append((client.strip().split('.')[0], peer.strip()))
+            if not bindings:
+                self.unknown('Resolve binding for required API: ' + alias)
+                continue
+            api = self.resolve(match[2], path.parent)
+            if not api:
+                continue
+            try:
+                content = api.read_text()
+            except (OSError, UnicodeError):
+                self.unknown('Missing/unreadable API: ' + self.relative(api))
+                continue
+            content = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/',
+                             lambda m: '\n' * m[0].count('\n'), content)
+            for signature in re.finditer(r'\bFUNCTION\s+(\w+)\s*\((.*?)\)\s*;', content, re.S):
+                for parameter in signature[2].split(','):
+                    if re.search(r'\bfile\s+\w+\s+(?:OUT|INOUT)\b', parameter):
+                        for receiver, peer in bindings:
+                            self.add('fd_passing', api, content[:signature.start()].count('\n') + 1,
+                                     object=signature[1] + ': ' + parameter.strip(),
+                                     **{'class': 'unknown', 'to': [receiver], 'from': [peer]},
+                                     processes=[receiver])
+                        self.unknown('Resolve received FD creator domain and underlying object class: ' + signature[1])
 
     def source(self, path):
         path = self.safe(path)
@@ -194,7 +243,8 @@ class Extractor:
             directive = re.match(r'\s*#\s*(if\w*|elif|else|endif)\b(.*)', content)
             if directive:
                 op, condition = directive.groups()
-                marked = bool(re.search(r'\b\w*(?:SIMULATION|TEST|MOCK)\w*\b', condition, re.I))
+                marked = any(re.search(r'\b' + re.escape(macro) + r'\b', condition)
+                             for macro in self.config.get('sim_macros', [])) or bool(re.search(r'\b\w*(?:SIMULATION|TEST|MOCK)\w*\b', condition, re.I))
                 if op in ('if', 'ifdef', 'ifndef'):
                     conditional.append((marked, marked and op != 'ifndef' and '!' not in condition))
                 elif op == 'endif' and conditional:
@@ -265,7 +315,9 @@ def main():
             config = document.get('selinux', {})
         platform_profile.check_types(config, 'selinux',
             strings=('platform_root', 'sdk_policy_include', 'linked_policy',
-                     'platform_profile', 'manifest_name'), lists=('app_globs', 'exclude'))
+                     'platform_profile', 'manifest_name'), lists=('app_globs', 'exclude', 'sim_macros'))
+        if any(not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', macro) for macro in config.get('sim_macros', [])):
+            raise ValueError('sim_macros must contain macro identifiers')
         for key in ('platform_root', 'sdk_policy_include', 'linked_policy'):
             if config.get(key):
                 contained(config[key])

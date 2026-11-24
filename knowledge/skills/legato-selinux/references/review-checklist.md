@@ -1,7 +1,8 @@
 # Review and gate checklist
 
 Record pass/fail/unknown and evidence for each applicable check. Unknown blocks the
-dependent gate. This part supplies a workflow, not an implemented policy gate.
+dependent gate. Use `python3 scripts/sel_gate.py` for the implemented supplementary checks;
+see [tooling](tooling.md). Live-target and BSP integration checks remain human obligations.
 
 1. Platform: active LSM, enforcing state, policy mcs/mls, kernel policy version,
    per-domain permissive capability, matching SDK include and linked-policy artifact.

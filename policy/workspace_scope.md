@@ -176,3 +176,13 @@ Naming, interfaces, build conventions, inherited grants and loader checks come o
 from that profile. Missing or invalid fields become unknowns in QUESTIONS.md and
 block dependent steps. Keep proprietary profiles outside the pack in ignored project
 research or configuration storage; the shipped example is fictional.
+
+
+## SELinux extractor configuration
+
+The skill reads `[selinux]` independently of component selection. Optional
+`sim_macros = ["PROJECT_REPLAY"]` adds exact C preprocessor identifiers for project
+simulation branches to the built-in SIMULATION/TEST/MOCK recognition. Such evidence
+is `candidate_denied` and draft; it never authorizes a production grant or confirms a
+denial. `#else` production evidence remains in ordinary draft resource categories.
+See [Legato SELinux](../knowledge/skills/legato-selinux/SKILL.md) for the full config.
