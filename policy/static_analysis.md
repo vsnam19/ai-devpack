@@ -109,7 +109,8 @@ references a denied primitive (`__gcov_*`, `_exit`, `_Exit`, `exit`, `quick_exit
   objects may reference **only** undefined symbols matching the minimal pure-computation allowlist in
   `enforcement/checks/symbol_allowlist_eval.txt` (`memcpy`, `memset`, `memmove`, `memcmp`, `strlen`,
   `round`, `__stack_chk_fail`, and `can_fixture::*`; worker-authored test TUs additionally permit
-  the `std::cerr` primitives emitted by `test_framework.hpp`). `operator new`/`delete`, file I/O,
+  the exact stdio names `fprintf`, `fputs`, `fflush`, `stderr`, `stdout` used by `test_framework.hpp`,
+  and no other `std::` stream symbols). `operator new`/`delete`, file I/O,
   `std::cout`/`std::basic_streambuf`/`rdbuf`, `/proc`, `getenv`, `mmap`, `dl_iterate_phdr`, and
   any other external import fail closed with `SYMBOL-NOT-ALLOWED`.
 - **`production` import profile (default for `project_checks.py --check tests`):** keeps the

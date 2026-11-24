@@ -5,6 +5,8 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-24
+
 ### Security
 - **F6a_fix3 framework uses cstdio (no static init); test-object import allowlist narrowed; preflight fallback tuple (`eval/fixture/tests/test_framework.hpp`, `enforcement/checks/symbol_check.py`, `enforcement/lint/preflight_lint.py`, `eval/tasks/*/check.sh`, `tests/test_security_f6a_fix3.py`)**:
   - `test_framework.hpp` no longer includes `<iostream>`. Diagnostics and the summary banner use `std::fprintf` / `std::fflush` on `stderr` / `stdout`, with the same text. A test TU that includes the framework no longer emits `std::ios_base::Init` or `__cxa_atexit`, which GCC 12's libstdc++ forced into every test object. The framework hash in each `eval/tasks/*/check.sh` `BASELINE_HASHES` is updated.
