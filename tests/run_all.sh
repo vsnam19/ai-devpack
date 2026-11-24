@@ -35,13 +35,17 @@ cd "$ROOT"
 status=0
 
 # run_logged LOG CMD...: run CMD with its stdout and stderr shown live and copied to LOG.
-# Sets RC to the exit code of CMD. set -e is suspended so a failing CMD does not abort the script.
+# Sets RC to the exit code of CMD and LOG_RC to the exit code of tee (the log capture).
+# set -e is suspended so a failing CMD does not abort the script.
 run_logged() {
   local log="$1"
   shift
   set +e
   "$@" 2>&1 | tee "$log"
-  RC=${PIPESTATUS[0]}
+  # Copy PIPESTATUS first: any later command, including this assignment, resets it.
+  local pipe_status=("${PIPESTATUS[@]}")
+  RC=${pipe_status[0]}
+  LOG_RC=${pipe_status[1]}
   set -e
 }
 
@@ -50,7 +54,17 @@ report_failure() {
   local name="$1" rc="$2" log="$3"
   echo "FAIL $name (exit code $rc)" >&2
   echo "--- last 20 lines of output for: $name ---" >&2
-  tail -n 20 "$log" >&2
+  tail -n 20 "$log" >&2 || true
+  echo "--- end of output for: $name ---" >&2
+}
+
+# report_log_failure NAME LOG_RC LOG: the step's output could not be fully copied to its log,
+# so the log cannot be trusted (for example the "Ran 0 tests" check). The step is a failure.
+report_log_failure() {
+  local name="$1" rc="$2" log="$3"
+  echo "FAIL $name: log capture failed (tee exit code $rc)" >&2
+  echo "--- last 20 lines of captured output for: $name ---" >&2
+  tail -n 20 "$log" >&2 || true
   echo "--- end of output for: $name ---" >&2
 }
 
@@ -67,7 +81,10 @@ for dir in tests enforcement eval runner skilltest learning; do
       scope_env=(DEVPACK_PROJECT_CONFIG=none)
     fi
     run_logged "$log" env "${scope_env[@]}" python3 -m unittest discover "${discover_args[@]}"
-    if [[ $RC -ne 0 ]]; then
+    if [[ $LOG_RC -ne 0 ]]; then
+      report_log_failure "unittest: $dir" "$LOG_RC" "$log"
+      status=1
+    elif [[ $RC -ne 0 ]]; then
       report_failure "unittest: $dir" "$RC" "$log"
       status=1
     elif [[ -n "$(find "$dir" -name 'test_*.py' -not -path '*/.git/*' -print -quit)" ]] \
@@ -89,7 +106,10 @@ for skill_tests in knowledge/skills/*/tests; do
     echo "== unittest: $skill_tests"
     log="$(mktemp)"
     run_logged "$log" env DEVPACK_PROJECT_CONFIG=none python3 -m unittest discover -s "$skill_tests" -p 'test_*.py'
-    if [[ $RC -ne 0 ]]; then
+    if [[ $LOG_RC -ne 0 ]]; then
+      report_log_failure "unittest: $skill_tests" "$LOG_RC" "$log"
+      status=1
+    elif [[ $RC -ne 0 ]]; then
       report_failure "unittest: $skill_tests" "$RC" "$log"
       status=1
     fi
@@ -104,7 +124,10 @@ if command -v shellcheck >/dev/null 2>&1; then
   if [[ ${#scripts[@]} -gt 0 ]]; then
     log="$(mktemp)"
     run_logged "$log" shellcheck "${scripts[@]}"
-    if [[ $RC -ne 0 ]]; then
+    if [[ $LOG_RC -ne 0 ]]; then
+      report_log_failure "shellcheck" "$LOG_RC" "$log"
+      status=1
+    elif [[ $RC -ne 0 ]]; then
       report_failure "shellcheck" "$RC" "$log"
       status=1
     fi
