@@ -20,6 +20,19 @@ ipc → ipc_client/ipc_server; fd_passing → fd_passing; network → network;
 capabilities → capability; exec → helper_exec; proc_sys → proc_global;
 config_tree → config_tree. An absent mapping or unresolved argument yields TODO,
 QUESTIONS.md and exit 3. No lexical pathname becomes an inferred SELinux type.
+File access uses this closed table; every operation in an item must be supported.
+
+| Access | Mapping |
+| --- | --- |
+| read | file_read |
+| write, create, unlink, append, rw | file_rw |
+| execute | unsupported; TODO and question, exit 3 |
+| unknown, empty, any other value | unsupported; TODO and question, exit 3 |
+
+A supported combination containing a write operation uses file_rw. The profile owner
+must review the interface expansion against the approved operations.
+The manifest must contain at least one process; invalid manifests return exit 2.
+
 Different library/proc/network suboperations must be reconciled into reviewed profile
 mappings before generation; the extractor is not a build-language evaluator.
 

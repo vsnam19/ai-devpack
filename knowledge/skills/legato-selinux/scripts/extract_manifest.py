@@ -192,7 +192,12 @@ class Extractor:
             for definition in [self.app_definition] if hasattr(self, 'app_definition') else []:
                 safe = self.safe(definition)
                 if safe:
-                    for ctx, stmt, _ in sections(safe.read_text()):
+                    try:
+                        definition_text = safe.read_text()
+                    except (OSError, UnicodeError):
+                        self.unknown('Missing/unreadable definition: ' + self.relative(safe))
+                        continue
+                    for ctx, stmt, _ in sections(definition_text):
                         if ctx and ctx[-1] == 'bindings' and '->' in stmt:
                             client, peer = stmt.split('->', 1)
                             if client.strip().endswith('.' + alias):
@@ -203,7 +208,11 @@ class Extractor:
             api = self.resolve(match[2], path.parent)
             if not api:
                 continue
-            content = api.read_text()
+            try:
+                content = api.read_text()
+            except (OSError, UnicodeError):
+                self.unknown('Missing/unreadable API: ' + self.relative(api))
+                continue
             content = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/',
                              lambda m: '\n' * m[0].count('\n'), content)
             for signature in re.finditer(r'\bFUNCTION\s+(\w+)\s*\((.*?)\)\s*;', content, re.S):

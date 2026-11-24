@@ -7,7 +7,7 @@ import re
 
 def validate(value, schema, root):
     supported = {'$schema', 'title', '$defs', '$ref', 'type', 'required', 'properties',
-                 'additionalProperties', 'items', 'enum', 'minLength', 'pattern'}
+                 'additionalProperties', 'items', 'enum', 'minLength', 'minItems', 'pattern'}
     if set(schema) - supported:
         raise ValueError('Unsupported schema keyword')
     if '$ref' in schema:
@@ -38,6 +38,8 @@ def validate(value, schema, root):
             raise ValueError('Unknown keys')
         for key in value.keys() & properties.keys():
             validate(value[key], properties[key], root)
+    if isinstance(value, list) and len(value) < schema.get('minItems', 0):
+        raise ValueError('Array too short')
     if isinstance(value, list) and 'items' in schema:
         for entry in value:
             validate(entry, schema['items'], root)

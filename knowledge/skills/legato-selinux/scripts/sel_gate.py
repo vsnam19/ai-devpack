@@ -23,8 +23,21 @@ def rules(text):
                       if line.strip().startswith(('allow ', 'allowxperm '))))
 
 
+def has_transition(text, expected):
+    def tokens(statement):
+        return re.findall(r'[A-Za-z0-9_]+', re.sub(r'\btype_transition\b', 'typetransition', statement))
+    wanted = tokens(expected)
+    # Compare complete statements, preserving identifier boundaries.
+    code = '\n'.join(line.split('#', 1)[0] for line in text.splitlines())
+    statements = re.findall(r'(?m)^\s*(?:type_transition|typetransition)\b[^;]*;', code)
+    return any(tokens(statement) == wanted for statement in statements)
+
+
 def check(args):
-    manifest, profile = load(args.manifest, args.profile, approved=True)
+    try:
+        manifest, profile = load(args.manifest, args.profile, approved=True)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        return dict(status='FAIL', errors=[str(error)]), 2
     ctx = values(manifest, profile)
     module = Path(args.module)
     names = {k: render(v, ctx) for k, v in profile['module_files'].items()}
@@ -60,8 +73,7 @@ def check(args):
     for identifier in items.keys() - seen:
         errors.append('UNCOVERED ' + identifier)
     expected = render(profile['transition_check'], ctx)
-    canonical = lambda text: re.sub(r'[^A-Za-z0-9_]+', ' ', text.replace('type_transition', 'typetransition')).strip()
-    if canonical(expected) not in canonical(source_text):
+    if not has_transition(source_text, expected):
         errors.append('MISSING_TRANSITION ' + expected)
     for key, name in names.items():
         if not (module / name).is_file():
@@ -92,7 +104,7 @@ def check(args):
                 if not denied.get('processes') or any(x not in owners for x in denied['processes']):
                     errors.append('UNRESOLVED_DENIAL_OWNER ' + denied['id'])
             transitions = run(['sesearch', '-T', '-s', profile['admin_source_domain'], args.linked_policy])
-            if canonical(expected) not in canonical(transitions):
+            if not has_transition(transitions, expected):
                 errors.append('MISSING_LINKED_TRANSITION')
             for process in manifest['processes']:
                 domain = values(manifest, profile, process['executable'])['domain']

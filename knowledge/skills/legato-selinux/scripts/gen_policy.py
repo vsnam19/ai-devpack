@@ -60,7 +60,10 @@ def generate(manifest, profile, output):
                 te.append(traced("gen_require(`", item))
                 te.extend(traced('    type ' + typ + ';', item) for typ in sorted(external_types))
                 te.append(traced("')", item))
-            for kind in mapping(category, item):
+            kinds = mapping(category, item)
+            if not kinds:
+                questions.append(item['id'] + ': unknown or unsupported file access mapping')
+            for kind in kinds:
                 try:
                     template = profile['interfaces'].get(kind)
                     if not template:

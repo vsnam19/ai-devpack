@@ -25,6 +25,8 @@ def load(manifest_path, profile_path, approved=False):
     spec.loader.exec_module(validator)
     schema = json.loads((base / 'references/manifest.schema.json').read_text())
     validator.validate(manifest, schema, schema)
+    if not manifest['processes']:
+        raise ValueError('At least one process is required')
     ids = [item['id'] for _, item in records(manifest)]
     if any(not re.fullmatch(r'[A-Za-z0-9_-]+', identifier) for identifier in ids):
         raise ValueError('Unsafe manifest ID')
@@ -126,7 +128,10 @@ def mapping(category, item):
     if category == 'processes':
         return ['entrypoint', 'admin_registration']
     if category == 'files':
-        return ['file_rw' if set(item.get('access', [])) & {'write', 'create', 'unlink', 'rw', 'w'} else 'file_read']
+        access = set(item.get('access', []))
+        if not access or not access <= {'read', 'write', 'create', 'unlink', 'append', 'rw'}:
+            return []
+        return ['file_read' if access == {'read'} else 'file_rw']
     return [dict(data_dirs='private_data', ipc='ipc_' + item.get('role', 'unknown'),
                  devices='device_ioctl', unix_sockets='unix_socket', capabilities='capability',
                  exec='helper_exec', proc_sys='proc_global').get(category, category)]

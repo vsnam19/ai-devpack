@@ -13,9 +13,13 @@ AVC to that exact operation. The offline tool records these four classifications
 
 If evidence cannot distinguish these, mark unknown and ask in QUESTIONS.md; do not
 invent a grant-producing category. A policy correction must stay inside approved access.
-The parser matches exact domain, path (or explicit type binding), class when known and
+The parser matches exact domain, path (or explicit type binding), a known class and
 permissions. Generic target labels take precedence; denied matches precede approved
-matches. Relative audit `name` alone does not establish an absolute path. Unmatched
+matches. Only an absolute audit `path` identifies a file; `name` never substitutes
+for it. A missing absolute path is written as `path: unknown` with a question.
+The files/denied, data_dirs, devices and unix_sockets categories default to file,
+dir, chr_file and sock_file respectively. Other categories require an explicit
+item or binding class; otherwise they are skipped with a reason in `skipped_items`. Unmatched
 records remain draft proposals, with the complete AVC preserved in `expression`. Track resolved disposition per AVC.
 
 Per-domain permissive diagnostics require an authorized target session with prior-state

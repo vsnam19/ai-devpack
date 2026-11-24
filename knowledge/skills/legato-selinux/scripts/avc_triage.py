@@ -22,17 +22,23 @@ def parse(line):
     return fields
 
 
+def object_class(item, profile, category):
+    return profile.get('bindings', {}).get(item['id'], {}).get('class', item.get('class',
+        dict(files='file', data_dirs='dir', devices='chr_file', unix_sockets='sock_file',
+             denied='file').get(category)))
+
+
 def match(item, avc, manifest, profile, category=None):
     domains = [values(manifest, profile, x)['domain'] for x in item.get('processes', []) if x != 'unknown']
     if avc['domain'] not in domains:
         return False
-    path = avc.get('path', avc.get('name'))
+    path = avc.get('path', '')
+    path = path if Path(path).is_absolute() else None
     binding = profile.get('bindings', {}).get(item['id'], {})
     object_match = (path and path == item.get('path')) or (binding.get('type') == avc['target_type'])
     permissions = binding.get('permissions', item.get('access', []))
-    klass = binding.get('class', item.get('class', dict(files='file', data_dirs='dir',
-                devices='chr_file', unix_sockets='sock_file').get(category)))
-    return bool(object_match and (not klass or klass == avc['tclass']) and
+    klass = object_class(item, profile, category)
+    return bool(object_match and (klass == avc['tclass']) and
                 set(avc['permissions']) <= set(permissions))
 
 
@@ -48,7 +54,7 @@ def triage(args):
             continue
         if avc['target_type'] in ('default_t', 'unlabeled_t', 'device_t', 'file_t'):
             category = 'label-problem'
-        elif any(item['status'] == 'approved' and match(item, avc, manifest, profile)
+        elif any(item['status'] == 'approved' and match(item, avc, manifest, profile, 'denied')
                  for item in manifest['denied']):
             category = 'likely-code-bug'
         elif any(match(item, avc, manifest, profile, key) for key, item in approved):
@@ -57,7 +63,11 @@ def triage(args):
             category = 'missing-in-manifest'
             item = dict(id=f'AVC-{number:04}', why='', evidence=[str(Path(args.log)) + ':' + str(number)],
                         status='draft', processes=[known.get(avc['domain'], 'unknown')],
-                        path=avc.get('path', avc.get('name', 'unknown')), access=avc['permissions'], expression=line)
+                        path=avc.get('path') if Path(avc.get('path', '')).is_absolute() else 'unknown',
+                        access=avc['permissions'], expression=line)
+            if item['path'] == 'unknown':
+                patch.setdefault('unknowns', []).append(
+                    item['id'] + ': What absolute path identifies the denied object?')
             patch.setdefault('files', []).append(item)
         domains.setdefault(avc['domain'], []).append({**avc, 'classification': category, 'evidence': line})
     # Exclusive creation prevents accidental replacement of any evidence or policy input.
@@ -65,7 +75,9 @@ def triage(args):
     report_path = Path(args.report_out or str(args.log) + '.triage.json')
     if patch_path.resolve() == report_path.resolve() or patch_path.exists() or report_path.exists():
         raise ValueError('Output files must be distinct new files')
-    report = dict(domains=domains, patch_file=str(patch_path.resolve()))
+    skipped = [dict(id=item['id'], reason='No known object class; provide an explicit class')
+               for key, item in approved if not object_class(item, profile, key)]
+    report = dict(domains=domains, patch_file=str(patch_path.resolve()), skipped_items=skipped)
     with patch_path.open('x') as stream:
         json.dump(patch, stream, indent=2)
     with report_path.open('x') as stream:
