@@ -17,7 +17,7 @@ void checkCond(bool cond, const char* msg) {
     ++g_checks;
     if (!cond) {
         std::cerr << "FAIL: " << msg << "\n";
-        ++g_failures;
+        ++g_failures;  // DEVPACK_FAILURE_PATH
     }
 }
 
@@ -65,7 +65,7 @@ int main() {
               << " failed=" << g_failures << "\n"
               << std::flush;
     if (g_checks == 0 || g_failures != 0) {
-        return 1;
+        return 1;  // DEVPACK_FAILURE_PATH
     }
     return 0;
 }

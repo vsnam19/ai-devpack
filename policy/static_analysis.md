@@ -60,6 +60,17 @@ fail_on = ["error", "warning"]
 - Missing `cppcheck` on `PATH` fails closed with exit code `3` (`TOOL_MISSING`), never
   silently passing. In `eval/tasks/v2_check.sh`, `TOOL_MISSING` maps to
   `GRADER_MISCONFIGURED` (exit `2`).
+- Every preprocessor, syntax, AST, `clang-tidy`, and `cppcheck` subprocess on worker
+  sources runs under a timeout and an address-space limit (`resource.setrlimit`
+  `RLIMIT_AS`, default `2 GiB`, configurable). Timeout or memory exhaustion fails closed on
+  the worker with `LINT-RESOURCE-LIMIT` (exit `1`, never falling back silently to a
+  weaker lexical pass and never reporting a harness error).
+- Any `#include` naming an absolute path or `/dev/*` device path is rejected before
+  compiler or `cppcheck` invocation as `ABSOLUTE-INCLUDE` (exit `1`).
+- `INLINE-ASM` (`enforcement/lint/preflight_lint.py`) rejects any `asm`, `__asm`, or
+  `__asm__` token in the preprocessed token stream as an error (MISRA C++:2023 [verify]).
+  `TEST-FRAMEWORK-TAMPER` is also evaluated over backslash-joined directives and the
+  preprocessed token stream so multi-line namespaces and spliced symbol overrides fail.
 
 ## Suppressions and deviations
 
@@ -81,22 +92,54 @@ Inline suppression format:
 Project-wide suppressions may be placed in the file configured by
 `[cppcheck].suppressions_file`, with each line documented by its `DEV-<nnn>` reference.
 
-## Test execution proof (`--check tests`)
+## Test execution proof (`--check tests`) and symbol allowlist
+
+Before executing any test binary in `eval/tasks/v2_check.sh`, `eval/fixture/build_and_test.sh`,
+`eval/lib/check_memory_step.sh`, `eval/orchestrator_goals/`, or
+`enforcement/gate/project_checks.py --check tests`, `enforcement/checks/symbol_check.py` runs
+`nm -C --defined-only` and `nm -u` on objects compiled from worker-changed sources (and all
+component translation units whenever any header in the component changes). It rejects any object
+that defines a symbol in the test-framework namespace, collides with a framework-defined symbol, or
+references a denied primitive (`__gcov_*`, `_exit`, `_Exit`, `exit`, `quick_exit`, `abort`, `fork`,
+`vfork`, `exec*`, `posix_spawn*`, `kill`, `raise`, `signal`, `sigaction`, `dlopen`, `dlsym`,
+`syscall`, `ptrace`, `setjmp`/`longjmp`, `std::set_terminate`, `atexit`, `at_quick_exit`, `freopen`,
+`dup2`):
+
+- **`eval` import profile (`--import-profile eval`, default for all evaluation graders):** worker
+  objects may reference **only** undefined symbols matching the minimal pure-computation allowlist in
+  `enforcement/checks/symbol_allowlist_eval.txt` (`memcpy`, `memset`, `memmove`, `memcmp`, `strlen`,
+  `round`, `__stack_chk_fail`, and `can_fixture::*`; worker-authored test TUs additionally permit
+  the `std::cerr` primitives emitted by `test_framework.hpp`). `operator new`/`delete`, file I/O,
+  `std::cout`/`std::basic_streambuf`/`rdbuf`, `/proc`, `getenv`, `mmap`, `dl_iterate_phdr`, and
+  any other external import fail closed with `SYMBOL-NOT-ALLOWED`.
+- **`production` import profile (default for `project_checks.py --check tests`):** keeps the
+  denylist above so normal application/SDK dependencies continue to build, and optionally enforces
+  a per-project or per-component allowlist configured in `.devpack/project.toml` via
+  `symbol_allowlist = ["^memcpy$", ...]` or `symbol_allowlist_file = "path/to/allowlist.txt"`
+  under `[workspace]`, `[symbols]`, or `[[component]]`.
 
 `enforcement/gate/project_checks.py --check tests` refuses to trust plain exit code `0` as
 test proof:
 
-- For projects using the pack test framework (`test_framework.hpp` / `CHECK*`), the gate
-  requires out-of-process `gcov` line-coverage proof (`enforcement/checks/test_proof.py`)
-  confirming every `CHECK*` assertion line in pristine test sources executed at least once
-  with zero failure lines and exit `0`.
-- For non-pack / third-party test runners (e.g. GoogleTest, Catch2, CTest), the gate
-  requires a JUnit XML (`--junitxml` / `Test.xml`) or CTest XML report produced by the run
-  showing executed test count `> 0` and zero failures/errors/crashes. Note: JUnit/CTest XML
-  or exit-code-only evidence for non-pack runners is **weaker** than pack out-of-process
-  `gcov` assertion proof (a test binary running inside the same process could still exit
-  cleanly after generating XML in custom harnesses unless paired with CI-enforced test-binary
-  isolation).
+- For projects using the pack test framework (`test_framework.hpp` / `CHECK*`), `printSummaryAndExitCode`
+  tracks `passedChecks` independently on the success path (`DEVPACK_SUCCESS_PATH`) and returns
+  failure unless `passedChecks == totalChecks`, `failedChecks == 0`, and `totalChecks > 0`. The
+  gate requires out-of-process `gcov` proof (`enforcement/checks/test_proof.py`) confirming every
+  `CHECK*` assertion line in pristine test sources executed at least once, every dedicated
+  failure-path line (`DEVPACK_FAILURE_PATH`) executed `0` times, the `DEVPACK_SUCCESS_PATH` gcov
+  execution count equals the framework `CHECK` execution count and `DEVPACK_TESTS_COMPLETED` tally,
+  `.gcda` files were written after the run started (any missing `.gcda` fails with exit `1`, not
+  harness error), zero failure lines appeared in output, and the test exited `0`.
+- For non-pack / third-party test runners (e.g. GoogleTest, Catch2, CTest), each component
+  must declare `test_xml` (relative to its `build_dir` or `compile_commands` directory;
+  duplicate `test_xml` paths across components are a configuration error). The gate deletes
+  the declared file before running `test_cmd`, then requires it to exist afterward, be newer
+  than the run start, and contain `>= 1` `<testcase>`/`<Test>` and `0` failures/errors.
+  Note: XML proof for non-pack runners is **weaker** than pack out-of-process `gcov`
+  assertion proof.
+- The project gate template (`enforcement/gate/gate.project.example.toml`) also runs
+  `enforcement/gate/project_checks.py --check test_lock` (`enforcement/checks/test_lock.py`)
+  across every component to enforce `policy/asil_boundaries.md`.
 
 ## Baselines for legacy code
 

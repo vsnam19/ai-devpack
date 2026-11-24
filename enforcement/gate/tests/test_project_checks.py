@@ -11,14 +11,17 @@ import unittest
 class TestProjectChecks(unittest.TestCase):
     """Run project gate checks in temporary repositories with real component commands."""
 
-    def test_template_uses_pack_paths_and_four_project_checks(self) -> None:
-        """The project template cannot accidentally invoke pack self-tests."""
+    def test_template_uses_pack_paths_and_five_project_checks(self) -> None:
+        """The project template cannot accidentally invoke pack self-tests and includes test_lock."""
         import tomllib
         root = Path(__file__).resolve().parents[3]
         template = root / "enforcement/gate/gate.project.example.toml"
         self.assertTrue(template.is_file())
         checks = tomllib.loads(template.read_text())["check"]
-        self.assertEqual([entry["name"] for entry in checks], ["preflight", "cppcheck", "build", "tests"])
+        self.assertEqual(
+            [entry["name"] for entry in checks],
+            ["preflight", "cppcheck", "test_lock", "build", "tests"],
+        )
         for entry in checks:
             self.assertIn("{pack_root}/enforcement/gate/project_checks.py", entry["cmd"])
 
@@ -41,6 +44,7 @@ class TestProjectChecks(unittest.TestCase):
             test_cmd = f"python3 -c {json.dumps(test_script)}"
             (repo / ".devpack/project.toml").write_text(
                 '[workspace]\nroot="src"\n[[component]]\nname="part"\npath="part"\n'
+                'build_dir="."\ntest_xml="junit.xml"\n'
                 'build_cmd="python3 -c \'print(123)\'"\n'
                 f"test_cmd={json.dumps(test_cmd)}\n"
             )
@@ -55,7 +59,7 @@ class TestProjectChecks(unittest.TestCase):
                 self.assertIn(expected, result.stdout)
 
     def test_tests_check_rejects_exit0_without_proof_and_empty_or_failing_xml(self) -> None:
-        """Plain exit 0 without XML/gcov, tests='0' XML, or failures='1' XML must fail --check tests."""
+        """Plain exit 0 without XML/gcov, tests='0' XML, 0 testcases, or failures='1' XML must fail --check tests."""
         root = Path(__file__).resolve().parents[3]
         helper = root / "enforcement/gate/project_checks.py"
         with tempfile.TemporaryDirectory() as tmp:
@@ -65,10 +69,14 @@ class TestProjectChecks(unittest.TestCase):
             (repo / "src/part/main.cpp").write_text("int value;\n")
             for idx, (cmd_script, expected_err) in enumerate(
                 [
-                    ("print('exit zero only')", "without JUnit/CTest XML"),
+                    ("print('exit zero only')", "without creating declared test_xml"),
                     (
                         "import pathlib; pathlib.Path('junit.xml').write_text('<testsuite tests=\"0\" failures=\"0\" errors=\"0\"/>\\n')",
                         "executed=0",
+                    ),
+                    (
+                        "import pathlib; pathlib.Path('junit.xml').write_text('<testsuite tests=\"1\" failures=\"0\" errors=\"0\"/>\\n')",
+                        "testcases=0",
                     ),
                     (
                         "import pathlib; pathlib.Path('junit.xml').write_text('<testsuite tests=\"2\" failures=\"1\" errors=\"0\"/>\\n')",
@@ -79,6 +87,7 @@ class TestProjectChecks(unittest.TestCase):
                 with self.subTest(case=idx):
                     (repo / ".devpack/project.toml").write_text(
                         '[workspace]\nroot="src"\n[[component]]\nname="part"\npath="part"\n'
+                        'build_dir="."\ntest_xml="junit.xml"\n'
                         f'build_cmd="true"\ntest_cmd={json.dumps("python3 -c " + json.dumps(cmd_script))}\n'
                     )
                     for args in (
@@ -108,6 +117,7 @@ class TestProjectChecks(unittest.TestCase):
             )
             (repo / ".devpack/project.toml").write_text(
                 '[workspace]\nroot="src"\n[[component]]\nname="part"\npath="part"\n'
+                'build_dir="."\ntest_xml="Test.xml"\n'
                 f'build_cmd="true"\ntest_cmd={json.dumps("python3 -c " + json.dumps(ctest_script))}\n'
             )
             for args in (
@@ -139,3 +149,34 @@ class TestProjectChecks(unittest.TestCase):
             res = subprocess.run(["python3", str(helper), "--check", "tests", "--repo", tmp], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
             self.assertIn("verified via gcov", res.stdout)
+
+    def test_duplicate_or_missing_test_xml_config_fails(self) -> None:
+        """Duplicate test_xml across two components is a config error (exit 2); missing test_xml fails."""
+        root = Path(__file__).resolve().parents[3]
+        helper = root / "enforcement/gate/project_checks.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".devpack").mkdir()
+            (repo / "src/c1").mkdir(parents=True)
+            (repo / "src/c2").mkdir(parents=True)
+            (repo / "src/c1/a.cpp").write_text("int a = 1;\n")
+            (repo / "src/c2/b.cpp").write_text("int b = 2;\n")
+            (repo / ".devpack/project.toml").write_text(
+                '[workspace]\nroot="src"\n'
+                '[[component]]\nname="c1"\npath="c1"\nbuild_dir="."\ntest_xml="shared.xml"\nbuild_cmd="true"\ntest_cmd="true"\n'
+                '[[component]]\nname="c2"\npath="c2"\nbuild_dir="."\ntest_xml="shared.xml"\nbuild_cmd="true"\ntest_cmd="true"\n'
+            )
+            for args in (["init"], ["-c", "user.name=t", "-c", "user.email=t@e.invalid", "add", "."], ["-c", "user.name=t", "-c", "user.email=t@e.invalid", "commit", "-m", "init"]):
+                subprocess.run(["git", "-C", tmp, *args], check=True, capture_output=True)
+            dup = subprocess.run(["python3", str(helper), "--check", "tests", "--repo", tmp, "--all-components"], capture_output=True, text=True)
+            self.assertEqual(dup.returncode, 2, dup.stdout + dup.stderr)
+            self.assertIn("Duplicate test_xml", dup.stderr)
+
+            # Missing test_xml fails with exit 1
+            (repo / ".devpack/project.toml").write_text(
+                '[workspace]\nroot="src"\n'
+                '[[component]]\nname="c1"\npath="c1"\nbuild_cmd="true"\ntest_cmd="true"\n'
+            )
+            miss = subprocess.run(["python3", str(helper), "--check", "tests", "--repo", tmp, "--components", "c1"], capture_output=True, text=True)
+            self.assertEqual(miss.returncode, 1, miss.stdout + miss.stderr)
+            self.assertIn("test_xml", miss.stderr)

@@ -12,7 +12,7 @@
 
 #include <cmath>
 #include <cstddef>
-#include <iostream>
+#include <cstdio>
 
 namespace can_fixture_test {
 
@@ -22,6 +22,8 @@ namespace can_fixture_test {
 struct TestCounters {
     /** @brief Total number of assertions evaluated. */
     std::size_t totalChecks;
+    /** @brief Number of assertions that passed. */
+    std::size_t passedChecks;
     /** @brief Number of assertions that failed. */
     std::size_t failedChecks;
 };
@@ -33,8 +35,27 @@ struct TestCounters {
  */
 template <int Tag = 0>
 inline TestCounters& counters() noexcept {
-    static TestCounters instance{0U, 0U};
+    static TestCounters instance{0U, 0U, 0U};
     return instance;
+}
+
+/**
+ * @brief Record a single failed assertion on a dedicated failure-path line for gcov verification.
+ * @tparam Tag Dummy template parameter for header-only template definition.
+ * @param[in] checkName Macro name that triggered the failure.
+ * @param[in] expressionText Source string of the checked expression.
+ * @param[in] fileName Source file path of the check.
+ * @param[in] lineNumber 1-based source line number of the check.
+ */
+template <int Tag = 0>
+inline void recordCheckFailure(
+    const char* checkName,
+    const char* expressionText,
+    const char* fileName,
+    int lineNumber) {
+    TestCounters& state = counters<Tag>();
+    ++state.failedChecks;  // DEVPACK_FAILURE_PATH
+    std::fprintf(stderr, "FAIL: %s:%d: %s(%s) failed\n", fileName, lineNumber, checkName, expressionText);
 }
 
 /**
@@ -52,11 +73,11 @@ inline void recordCheck(
     const char* fileName,
     int lineNumber) {
     TestCounters& state = counters<Tag>();
-    ++state.totalChecks;
+    ++state.totalChecks;  // DEVPACK_CHECK_TOTAL
     if (!condition) {
-        ++state.failedChecks;
-        std::cerr << "FAIL: " << fileName << ":" << lineNumber
-                  << ": CHECK(" << expressionText << ") failed\n";
+        recordCheckFailure<Tag>("CHECK", expressionText, fileName, lineNumber);  // DEVPACK_FAILURE_PATH
+    } else {
+        ++state.passedChecks;  // DEVPACK_SUCCESS_PATH
     }
 }
 
@@ -78,11 +99,11 @@ inline void recordCheckEq(
     const char* fileName,
     int lineNumber) {
     TestCounters& state = counters<0>();
-    ++state.totalChecks;
+    ++state.totalChecks;  // DEVPACK_CHECK_TOTAL
     if (!(actualValue == expectedValue)) {
-        ++state.failedChecks;
-        std::cerr << "FAIL: " << fileName << ":" << lineNumber
-                  << ": CHECK_EQ(" << expressionText << ") failed\n";
+        recordCheckFailure<0>("CHECK_EQ", expressionText, fileName, lineNumber);  // DEVPACK_FAILURE_PATH
+    } else {
+        ++state.passedChecks;  // DEVPACK_SUCCESS_PATH
     }
 }
 
@@ -94,14 +115,14 @@ inline void recordCheckEq(
 template <int Tag = 0>
 inline int printSummaryAndExitCode() {
     const TestCounters& state = counters<Tag>();
-    const std::size_t passedChecks = state.totalChecks - state.failedChecks;
-    std::cout << "TEST SUMMARY: " << passedChecks << "/" << state.totalChecks
-              << " checks passed (" << state.failedChecks << " failed)\n"
-              << "DEVPACK_TESTS_COMPLETED checks=" << state.totalChecks
-              << " failed=" << state.failedChecks << "\n"
-              << std::flush;
-    if (state.totalChecks == 0U || state.failedChecks > 0U) {
-        return 1;
+    std::fprintf(stdout,
+                 "TEST SUMMARY: %zu/%zu checks passed (%zu failed)\n"
+                 "DEVPACK_TESTS_COMPLETED checks=%zu failed=%zu\n",
+                 state.passedChecks, state.totalChecks, state.failedChecks,
+                 state.totalChecks, state.failedChecks);
+    std::fflush(stdout);
+    if (state.totalChecks == 0U || state.failedChecks > 0U || state.passedChecks != state.totalChecks) {
+        return 1;  // DEVPACK_FAILURE_PATH
     }
     return 0;
 }

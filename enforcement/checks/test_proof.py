@@ -31,13 +31,23 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Sequence
 
 DEFAULT_ASSERT_REGEX = r"(?<![A-Za-z0-9_])CHECK(?:_EQ|_TRUE|_FALSE|_NEAR)?\s*\("
+FAILURE_PATH_MARKER = "DEVPACK_FAILURE_PATH"
+SUCCESS_PATH_MARKER = "DEVPACK_SUCCESS_PATH"
+CHECK_TOTAL_MARKER = "DEVPACK_CHECK_TOTAL"
+_FAILURE_PATH_RE = re.compile(rf"//[^\n]*\b{FAILURE_PATH_MARKER}\b")
+_SUCCESS_PATH_RE = re.compile(rf"//[^\n]*\b{SUCCESS_PATH_MARKER}\b")
+_CHECK_TOTAL_RE = re.compile(rf"(?://[^\n]*\b{CHECK_TOTAL_MARKER}\b|\+\+\s*state\.totalChecks\b)")
 _FAILURE_LINE_RE = re.compile(
     r"(?m)^(?:\s*FAIL:|.*:\s*CHECK(?:_EQ|_TRUE|_FALSE|_NEAR)?\([^)]*\)\s+failed|.*GRADER_CHECK\s+failed)"
 )
 _COMPLETION_LINE_RE = re.compile(r"\bprintSummaryAndExitCode\s*(?:<[^>]*>)?\s*\(|DEVPACK_TESTS_COMPLETED")
+_COMPLETED_TALLY_RE = re.compile(r"DEVPACK_TESTS_COMPLETED\s+checks=(\d+)\s+failed=(\d+)")
+_FRAMEWORK_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"[^"]*test_framework\.hpp"', re.MULTILINE)
+_MTIME_JIFFY_SLACK_S = 0.05
 
 
 @dataclass(frozen=True)
@@ -149,6 +159,36 @@ def extract_completion_lines(source_path: Path) -> list[int]:
     return lines
 
 
+def extract_failure_path_lines(source_path: Path) -> list[int]:
+    """Return 1-based line numbers annotated with ``DEVPACK_FAILURE_PATH`` in ``source_path``."""
+    raw_text = source_path.read_text(encoding="utf-8", errors="replace")
+    lines: list[int] = []
+    for idx, line in enumerate(raw_text.splitlines(), start=1):
+        if _FAILURE_PATH_RE.search(line):
+            lines.append(idx)
+    return lines
+
+
+def extract_success_path_lines(source_path: Path) -> list[int]:
+    """Return 1-based line numbers annotated with ``DEVPACK_SUCCESS_PATH`` in ``source_path``."""
+    raw_text = source_path.read_text(encoding="utf-8", errors="replace")
+    lines: list[int] = []
+    for idx, line in enumerate(raw_text.splitlines(), start=1):
+        if _SUCCESS_PATH_RE.search(line):
+            lines.append(idx)
+    return lines
+
+
+def extract_check_total_lines(source_path: Path) -> list[int]:
+    """Return 1-based line numbers tracking total executed checks in ``source_path``."""
+    raw_text = source_path.read_text(encoding="utf-8", errors="replace")
+    lines: list[int] = []
+    for idx, line in enumerate(raw_text.splitlines(), start=1):
+        if _CHECK_TOTAL_RE.search(line):
+            lines.append(idx)
+    return lines
+
+
 def _find_gcda_and_gcno_for_source(obj_dir: Path, src_path: Path) -> tuple[Path | None, Path | None]:
     """Locate ``.gcno`` and ``.gcda`` files in ``obj_dir`` corresponding to ``src_path``."""
     stem = src_path.stem
@@ -194,7 +234,8 @@ def _parse_gcov_json_payload(payload_text: str) -> dict[str, dict[int, int]]:
                 ln = line_rec.get("line_number")
                 cnt = line_rec.get("count")
                 if isinstance(ln, int) and isinstance(cnt, int):
-                    line_map[ln] = max(line_map.get(ln, 0), cnt)
+                    # Sum across template instantiations/functions sharing a line in one .gcno
+                    line_map[ln] = line_map.get(ln, 0) + cnt
     return counts_by_file
 
 
@@ -236,7 +277,7 @@ def _run_gcov_json(gcov_bin: str, gcno_path: Path, obj_dir: Path) -> dict[str, d
         for fkey, lmap in _parse_gcov_json_payload(text).items():
             dest = merged.setdefault(fkey, {})
             for ln, cnt in lmap.items():
-                dest[ln] = max(dest.get(ln, 0), cnt)
+                dest[ln] = dest.get(ln, 0) + cnt
     return merged
 
 
@@ -281,8 +322,9 @@ def verify_gcov_proof(
     assert_regex: str = DEFAULT_ASSERT_REGEX,
     require_nonempty_checks: bool = True,
     label: str = "test_binary",
+    min_mtime: float | None = None,
 ) -> ProofResult:
-    """Verify exit status 0, absence of failure lines, and gcov execution of all ``CHECK*`` lines."""
+    """Verify exit 0, no failure lines, fresh .gcda mtime, CHECK execution >=1, and failure-path count == 0."""
     resolved_gcov = find_gcov_bin(gcov_bin)
     if resolved_gcov is None:
         return ProofResult(
@@ -304,13 +346,6 @@ def verify_gcov_proof(
             output=output_text,
         )
 
-    if _FAILURE_LINE_RE.search(output_text):
-        return ProofResult(
-            exit_code=1,
-            reason=f"FAIL: {label} printed test failure lines despite exit 0",
-            output=output_text,
-        )
-
     if not test_sources:
         return ProofResult(
             exit_code=1,
@@ -319,6 +354,7 @@ def verify_gcov_proof(
         )
 
     all_counts: dict[str, dict[int, int]] = {}
+    seen_gcnos: set[Path] = set()
     for src in test_sources:
         if not src.is_file():
             return ProofResult(
@@ -339,6 +375,25 @@ def verify_gcov_proof(
                 reason=f"FAIL: {label} abnormal termination before gcov .gcda data was written for {src.name}",
                 output=output_text,
             )
+        if min_mtime is not None:
+            try:
+                gcda_mtime = gcda.stat().st_mtime
+            except OSError as exc:
+                return ProofResult(
+                    exit_code=1,
+                    reason=f"FAIL: {label} unable to stat gcov .gcda data for {src.name}: {exc}",
+                    output=output_text,
+                )
+            if gcda_mtime < (min_mtime - _MTIME_JIFFY_SLACK_S):
+                return ProofResult(
+                    exit_code=1,
+                    reason=f"FAIL: {label} stale gcov .gcda data for {src.name} (written before test run started)",
+                    output=output_text,
+                )
+        resolved_gcno = gcno.resolve()
+        if resolved_gcno in seen_gcnos:
+            continue
+        seen_gcnos.add(resolved_gcno)
         try:
             parsed = _run_gcov_json(resolved_gcov, gcno, obj_dir)
         except (OSError, RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
@@ -350,10 +405,14 @@ def verify_gcov_proof(
         for fkey, lmap in parsed.items():
             dest = all_counts.setdefault(fkey, {})
             for ln, cnt in lmap.items():
-                dest[ln] = max(dest.get(ln, 0), cnt)
+                dest[ln] = dest.get(ln, 0) + cnt
 
     total_verified = 0
+    uses_pack_fw = False
     for src in test_sources:
+        src_text = src.read_text(encoding="utf-8", errors="replace")
+        if _FRAMEWORK_INCLUDE_RE.search(src_text):
+            uses_pack_fw = True
         line_counts = _lookup_line_counts(all_counts, src)
         if line_counts is None:
             return ProofResult(
@@ -378,6 +437,18 @@ def verify_gcov_proof(
                 )
             total_verified += 1
 
+        for fail_ln in extract_failure_path_lines(src):
+            fail_cnt = line_counts.get(fail_ln, 0)
+            if fail_cnt > 0:
+                return ProofResult(
+                    exit_code=1,
+                    reason=(
+                        f"FAIL: {label} failure-path line {src.name}:{fail_ln} executed "
+                        f"{fail_cnt} time(s)"
+                    ),
+                    output=output_text,
+                )
+
         for comp_ln in extract_completion_lines(src):
             if line_counts.get(comp_ln, 0) < 1:
                 return ProofResult(
@@ -389,10 +460,95 @@ def verify_gcov_proof(
                     output=output_text,
                 )
 
+    fw_entries = [
+        (Path(fkey), lmap)
+        for fkey, lmap in all_counts.items()
+        if Path(fkey).name == "test_framework.hpp" and Path(fkey).is_file()
+    ]
+    if uses_pack_fw and not fw_entries and total_verified > 0:
+        return ProofResult(
+            exit_code=1,
+            reason=f"FAIL: {label} gcov output missing coverage entry for test_framework.hpp",
+            output=output_text,
+        )
+    for fw_path, fw_counts in fw_entries:
+        fw_fail_lines = extract_failure_path_lines(fw_path)
+        for fail_ln in fw_fail_lines:
+            fail_cnt = fw_counts.get(fail_ln, 0)
+            if fail_cnt > 0:
+                return ProofResult(
+                    exit_code=1,
+                    reason=(
+                        f"FAIL: {label} framework failure-path line {fw_path.name}:{fail_ln} executed "
+                        f"{fail_cnt} time(s)"
+                    ),
+                    output=output_text,
+                )
+        if total_verified > 0:
+            fw_fail_set = set(fw_fail_lines)
+            non_fail_exec = any(cnt >= 1 for ln, cnt in fw_counts.items() if ln not in fw_fail_set)
+            if not non_fail_exec:
+                return ProofResult(
+                    exit_code=1,
+                    reason=f"FAIL: {label} test_framework.hpp recorded 0 executed assertions in gcov",
+                    output=output_text,
+                )
+            fw_success_lines = extract_success_path_lines(fw_path)
+            if fw_success_lines:
+                fw_success_count = sum(fw_counts.get(ln, 0) for ln in fw_success_lines)
+                fw_total_lines = extract_check_total_lines(fw_path)
+                fw_total_count = sum(fw_counts.get(ln, 0) for ln in fw_total_lines)
+                if fw_success_count == 0:
+                    return ProofResult(
+                        exit_code=1,
+                        reason=f"FAIL: {label} {fw_path.name} DEVPACK_SUCCESS_PATH recorded 0 passed checks in gcov",
+                        output=output_text,
+                    )
+                if fw_total_lines and fw_success_count != fw_total_count:
+                    return ProofResult(
+                        exit_code=1,
+                        reason=(
+                            f"FAIL: {label} {fw_path.name} success-path count ({fw_success_count}) "
+                            f"!= CHECK execution count ({fw_total_count}) in gcov"
+                        ),
+                        output=output_text,
+                    )
+                if fw_success_count < total_verified:
+                    return ProofResult(
+                        exit_code=1,
+                        reason=(
+                            f"FAIL: {label} {fw_path.name} success-path count ({fw_success_count}) "
+                            f"< executed CHECK lines ({total_verified})"
+                        ),
+                        output=output_text,
+                    )
+                tally_match = _COMPLETED_TALLY_RE.search(output_text)
+                if tally_match:
+                    reported_checks = int(tally_match.group(1))
+                    reported_failed = int(tally_match.group(2))
+                    if reported_failed != 0 or fw_success_count != reported_checks:
+                        return ProofResult(
+                            exit_code=1,
+                            reason=(
+                                f"FAIL: {label} {fw_path.name} success-path gcov count ({fw_success_count}) "
+                                f"!= DEVPACK_TESTS_COMPLETED checks={reported_checks} failed={reported_failed}"
+                            ),
+                            output=output_text,
+                        )
+
     if require_nonempty_checks and total_verified == 0:
         return ProofResult(
             exit_code=1,
             reason=f"FAIL: {label} found 0 CHECK* lines across pristine test sources",
+            output=output_text,
+        )
+
+    # Output scan runs last so the gcov proof (the authoritative evidence) names the reason when both apply.
+    # Verdict is unchanged: any output with failure lines still fails, even when every gcov check passes.
+    if _FAILURE_LINE_RE.search(output_text):
+        return ProofResult(
+            exit_code=1,
+            reason=f"FAIL: {label} printed test failure lines despite exit 0",
             output=output_text,
         )
 
@@ -423,6 +579,7 @@ def run_and_verify_gcov(
     child_env = dict(os.environ)
     child_env.pop("DEVPACK_HARNESS_NONCE", None)
     child_env.pop("DEVPACK_HARNESS_NONCE_FILE", None)
+    start_time = time.time()
 
     try:
         proc = subprocess.run(
@@ -452,6 +609,7 @@ def run_and_verify_gcov(
         assert_regex=assert_regex,
         require_nonempty_checks=require_nonempty_checks,
         label=label,
+        min_mtime=start_time,
     )
 
 
@@ -478,6 +636,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         else:
             sp.add_argument("--stdout-file", type=Path, default=None, help="Captured output file")
             sp.add_argument("--returncode", type=int, default=0, help="Process return code")
+            sp.add_argument("--start-time", type=float, default=None, help="Epoch timestamp before run started")
     return parser
 
 
@@ -517,6 +676,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             assert_regex=args.assert_regex,
             require_nonempty_checks=not args.allow_zero_checks,
             label=args.label,
+            min_mtime=args.start_time,
         )
 
     if result.output:

@@ -229,6 +229,110 @@ run_verified_test_binary() {
     return 0
 }
 
+# Compile worker-changed C/C++ sources (or src/*.cpp when headers/src exist) and run symbol_check.py.
+# Usage: run_worker_symbol_check WORKDIR [BASE_REF]
+run_worker_symbol_check() {
+    local workdir="$1"
+    local base_ref="${2:-${DEVPACK_BASELINE_SHA:-}}"
+    local pack_root="${DEVPACK_ROOT:-$_SAFE_GIT_DEFAULT_ROOT}"
+    local sym_py="$pack_root/enforcement/checks/symbol_check.py"
+    local pack_fw="$pack_root/eval/fixture/tests/test_framework.hpp"
+
+    if [[ ! -f "$sym_py" ]]; then
+        grader_misconfigured_at pack_file "missing symbol_check.py under DEVPACK_ROOT=$pack_root"
+    fi
+
+    local changed_list=""
+    if [[ -n "$base_ref" ]] && safe_git -C "$workdir" cat-file -e "${base_ref}^{commit}" 2>/dev/null; then
+        changed_list="$(list_changed_files "$workdir" "$base_ref" 2>/dev/null || true)"
+    fi
+
+    local worker_srcs=()
+    local worker_test_srcs=()
+    local check_all_src=0
+    if [[ -z "$changed_list" ]]; then
+        check_all_src=1
+    else
+        local rel_f
+        while IFS= read -r rel_f; do
+            [[ -z "$rel_f" ]] && continue
+            case "$rel_f" in
+                include/*.h|include/*.hh|include/*.hpp|include/*.hxx|src/*.h|src/*.hh|src/*.hpp|src/*.hxx)
+                    check_all_src=1
+                    ;;
+                src/*.c|src/*.cc|src/*.cpp|src/*.cxx)
+                    if [[ -f "$workdir/$rel_f" ]]; then
+                        worker_srcs+=("$workdir/$rel_f")
+                    fi
+                    ;;
+                tests/*.c|tests/*.cc|tests/*.cpp|tests/*.cxx)
+                    if [[ -f "$workdir/$rel_f" ]]; then
+                        case "$(basename "$rel_f")" in
+                            test_main.cpp|test_can_codec.cpp|test_ring_buffer.cpp|test_link_state_machine.cpp|test_dtc_debouncer.cpp)
+                                ;;
+                            *)
+                                worker_test_srcs+=("$workdir/$rel_f")
+                                ;;
+                        esac
+                    fi
+                    ;;
+                *.c|*.cc|*.cpp|*.cxx)
+                    if [[ -f "$workdir/$rel_f" ]]; then
+                        worker_srcs+=("$workdir/$rel_f")
+                    fi
+                    ;;
+            esac
+        done <<< "$changed_list"
+    fi
+
+    if [[ "$check_all_src" -eq 1 && -d "$workdir/src" ]]; then
+        worker_srcs=()
+        local sf
+        while IFS= read -r sf; do
+            worker_srcs+=("$sf")
+        done < <(find "$workdir/src" -maxdepth 1 -type f \( -name '*.cpp' -o -name '*.cc' -o -name '*.c' -o -name '*.cxx' \) | sort)
+    fi
+
+    if [[ "${#worker_srcs[@]}" -eq 0 && "${#worker_test_srcs[@]}" -eq 0 ]]; then
+        return 0
+    fi
+
+    local sym_args=(--label "worker_symbol_check" --import-profile eval)
+    if [[ -d "$workdir/include" ]]; then
+        sym_args+=(-I "$workdir/include")
+    fi
+    if [[ -d "$workdir/tests" ]]; then
+        sym_args+=(-I "$workdir/tests")
+    fi
+    if [[ -f "$pack_fw" ]]; then
+        sym_args+=(--force-include-framework "$pack_fw")
+    fi
+    if [[ -f "$workdir/tests/test_main.cpp" ]]; then
+        sym_args+=(--framework-src "$workdir/tests/test_main.cpp")
+    elif [[ -f "$pack_root/eval/fixture/tests/test_main.cpp" ]]; then
+        sym_args+=(--framework-src "$pack_root/eval/fixture/tests/test_main.cpp")
+    fi
+    local s
+    for s in "${worker_srcs[@]}"; do
+        sym_args+=(--worker-src "$s")
+    done
+    for s in "${worker_test_srcs[@]}"; do
+        sym_args+=(--worker-test-src "$s")
+    done
+
+    local rc=0
+    python3 "$sym_py" "${sym_args[@]}" >&2 || rc=$?
+    if [[ "$rc" -eq 3 ]]; then
+        grader_misconfigured "nm or compiler TOOL_MISSING in symbol_check"
+    elif [[ "$rc" -eq 2 ]]; then
+        grader_misconfigured "symbol_check internal error"
+    elif [[ "$rc" -ne 0 ]]; then
+        echo "FAIL: symbol_check rejected worker object symbols" >&2
+        return 1
+    fi
+    return 0
+}
+
 # Build and run C++ test sources with --coverage on TEST TUs only and pack test_framework.hpp force-included,
 # then verify out-of-process gcov coverage of every CHECK* line in the pristine test sources.
 # Usage: run_gcov_hidden_tests LABEL WORKDIR HIDDEN_DIR [ASSERT_REGEX]
@@ -239,10 +343,11 @@ run_gcov_hidden_tests() {
     local assert_regex="${4:-}"
     local pack_root="${DEVPACK_ROOT:-$_SAFE_GIT_DEFAULT_ROOT}"
     local proof_py="$pack_root/enforcement/checks/test_proof.py"
+    local sym_py="$pack_root/enforcement/checks/symbol_check.py"
     local pack_fw="$pack_root/eval/fixture/tests/test_framework.hpp"
 
-    if [[ ! -f "$proof_py" || ! -f "$pack_fw" ]]; then
-        grader_misconfigured_at pack_file "missing test_proof.py or test_framework.hpp under DEVPACK_ROOT=$pack_root"
+    if [[ ! -f "$proof_py" || ! -f "$pack_fw" || ! -f "$sym_py" ]]; then
+        grader_misconfigured_at pack_file "missing test_proof.py, symbol_check.py, or test_framework.hpp under DEVPACK_ROOT=$pack_root"
     fi
 
     local tmp_grade_dir
@@ -299,6 +404,30 @@ run_gcov_hidden_tests() {
         return 1
     fi
 
+    if [[ "${#src_objs[@]}" -gt 0 ]]; then
+        local sym_args=(--label "$label" --import-profile eval)
+        local fw_o
+        for fw_o in "${test_objs[@]}"; do
+            sym_args+=(--framework-obj "$fw_o")
+        done
+        local w_o
+        for w_o in "${src_objs[@]}"; do
+            sym_args+=(--worker-obj "$w_o")
+        done
+        local sym_rc=0
+        python3 "$sym_py" "${sym_args[@]}" >&2 || sym_rc=$?
+        if [[ "$sym_rc" -eq 3 ]]; then
+            rm -rf "$tmp_grade_dir"
+            grader_misconfigured "nm TOOL_MISSING"
+        elif [[ "$sym_rc" -eq 2 ]]; then
+            rm -rf "$tmp_grade_dir"
+            grader_misconfigured "symbol_check internal error"
+        elif [[ "$sym_rc" -ne 0 ]]; then
+            rm -rf "$tmp_grade_dir"
+            return 1
+        fi
+    fi
+
     if ! "$cxx_bin" --coverage "${src_objs[@]}" "${test_objs[@]}" -o "$tmp_grade_dir/hidden_test"; then
         rm -rf "$tmp_grade_dir"
         echo "FAIL: $label failed to link hidden_test" >&2
@@ -345,7 +474,11 @@ run_gcov_visible_tests() {
     local cov_dir="$tmp_vis_dir/cov"
     mkdir -p "$cov_dir"
 
+    run_worker_symbol_check "$workdir" "${DEVPACK_BASELINE_SHA:-}"
+
     local out_file="$tmp_vis_dir/visible.out"
+    local test_start_time
+    test_start_time="$(python3 -c 'import time; print(time.time())')"
     local test_rc=0
     env -u DEVPACK_HARNESS_NONCE -u DEVPACK_HARNESS_NONCE_FILE -u DEVPACK_HARNESS_MARKER_NONCE -u DEVPACK_HARNESS_MARKER_DIR \
         DEVPACK_ROOT="$pack_root" DEVPACK_GCOV_OBJ_DIR="$cov_dir" \
@@ -358,7 +491,7 @@ run_gcov_visible_tests() {
         return 1
     fi
 
-    local proof_args=(verify --obj-dir "$cov_dir" --stdout-file "$out_file" --returncode "$test_rc" --label "$label")
+    local proof_args=(verify --obj-dir "$cov_dir" --stdout-file "$out_file" --returncode "$test_rc" --start-time "$test_start_time" --label "$label")
     local f
     for f in "$fixture_tests_dir"/*.cpp; do
         [[ -f "$f" ]] && proof_args+=(--test-src "$f")

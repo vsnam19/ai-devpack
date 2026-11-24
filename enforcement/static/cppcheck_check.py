@@ -26,7 +26,9 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -63,6 +65,7 @@ DEFAULT_ENABLE = ("warning", "style", "performance", "portability")
 DEFAULT_FAIL_ON = ("error", "warning")
 DEFAULT_INCLUDE_DIRS = ("include",)
 DEFAULT_EXTRA_ARGS: tuple[str, ...] = ()
+DEFAULT_MAX_AS_BYTES = 2 * 1024 * 1024 * 1024
 BASELINE_SCHEMA_VERSION = 1
 KNOWN_FAIL_ON_SEVERITIES: frozenset[str] = frozenset(
     {"error", "warning", "style", "performance", "portability", "information"}
@@ -277,6 +280,8 @@ class CppcheckConfig:
     suppressions_file: str = ""
     extra_args: tuple[str, ...] = DEFAULT_EXTRA_ARGS
     fail_on: tuple[str, ...] = DEFAULT_FAIL_ON
+    max_as_bytes: int = DEFAULT_MAX_AS_BYTES
+    timeout_s: int | None = None
 
 
 @dataclass(frozen=True)
@@ -400,6 +405,16 @@ def load_cppcheck_config(
         if "fail_on" in cppcheck_tbl:
             raw_fail = _coerce_str_list(cppcheck_tbl["fail_on"], "fail_on", allow_csv=True)
             cfg.fail_on = validate_fail_on(raw_fail)
+        if "max_memory_mb" in cppcheck_tbl:
+            mem_mb = cppcheck_tbl["max_memory_mb"]
+            if isinstance(mem_mb, bool) or not isinstance(mem_mb, int) or mem_mb < 64:
+                raise ValueError(f"[cppcheck].max_memory_mb must be an integer >= 64, got {mem_mb!r}")
+            cfg.max_as_bytes = mem_mb * 1024 * 1024
+        if "timeout_s" in cppcheck_tbl:
+            ts = cppcheck_tbl["timeout_s"]
+            if isinstance(ts, bool) or not isinstance(ts, int) or ts < 1:
+                raise ValueError(f"[cppcheck].timeout_s must be a positive integer, got {ts!r}")
+            cfg.timeout_s = ts
 
     cfg.extra_args = validate_extra_args(cfg.extra_args)
     cfg.fail_on = validate_fail_on(cfg.fail_on)
@@ -1021,12 +1036,89 @@ def _find_unapproved_inline_suppressions(
     return findings
 
 
+_ABS_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*(?:"([^"]+)"|<([^>]+)>)')
+_CPPCHECK_OOM_RE = re.compile(
+    r"virtual memory exhausted|cannot allocate memory|out of memory|"
+    r"terminate called after throwing an instance of 'std::bad_alloc'|allocation failed",
+    re.IGNORECASE,
+)
+
+
+def _make_rlimit_preexec(max_as_bytes: int | None):
+    """Return a preexec_fn clamping ``RLIMIT_AS`` to ``max_as_bytes``."""
+    if max_as_bytes is None or max_as_bytes <= 0:
+        return None
+
+    def _apply() -> None:
+        try:
+            _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            if hard == resource.RLIM_INFINITY or hard > max_as_bytes:
+                resource.setrlimit(resource.RLIMIT_AS, (max_as_bytes, max_as_bytes))
+            else:
+                target = min(max_as_bytes, hard)
+                resource.setrlimit(resource.RLIMIT_AS, (target, hard))
+        except (ValueError, OSError):
+            pass
+
+    return _apply
+
+
+def _find_absolute_includes_in_files(
+    target_files: Sequence[Path],
+    repo_root: Path,
+) -> list[CppcheckFinding]:
+    """Reject absolute or ``/dev/*`` ``#include`` directives before launching cppcheck."""
+    findings: list[CppcheckFinding] = []
+    comment_rx = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
+    for fp in target_files:
+        try:
+            raw = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        stripped = comment_rx.sub(lambda m: "\n" * m.group(0).count("\n"), raw)
+        rel_file = normalize_repo_path(str(fp), repo_root)
+        for idx, line in enumerate(stripped.splitlines(), start=1):
+            m = _ABS_INCLUDE_RE.match(line)
+            if not m:
+                continue
+            inc = (m.group(1) or m.group(2) or "").strip()
+            if not inc:
+                continue
+            is_abs = (
+                inc.startswith(("/", "\\"))
+                or bool(re.match(r"^[A-Za-z]:[/\\]", inc))
+                or inc.startswith("/dev/")
+                or "/dev/" in inc
+            )
+            if not is_abs:
+                try:
+                    resolved = (fp.parent / inc).resolve()
+                    if str(resolved) == "/dev" or str(resolved).startswith("/dev/"):
+                        is_abs = True
+                except OSError:
+                    pass
+            if is_abs:
+                findings.append(
+                    CppcheckFinding(
+                        file=rel_file,
+                        line=idx,
+                        id="ABSOLUTE-INCLUDE",
+                        severity="error",
+                        message=f"Absolute or device path #include '{inc}' is forbidden",
+                    )
+                )
+    return findings
+
+
 def _invoke_cppcheck_cmd(
     cmd: list[str],
     effective_root: Path,
     timeout_s: int,
+    *,
+    max_as_bytes: int = DEFAULT_MAX_AS_BYTES,
+    target_hint: str = ".",
 ) -> tuple[list[CppcheckFinding], str, str]:
-    """Execute a cppcheck command and return ``(findings, raw_xml, raw_stdout)``."""
+    """Execute a cppcheck command with timeout and ``RLIMIT_AS`` and return ``(findings, raw_xml, raw_stdout)``."""
     try:
         proc = subprocess.run(
             cmd,
@@ -1035,15 +1127,47 @@ def _invoke_cppcheck_cmd(
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            preexec_fn=_make_rlimit_preexec(max_as_bytes),
             check=False,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"cppcheck timed out after {timeout_s}s") from exc
+    except subprocess.TimeoutExpired:
+        return (
+            [
+                CppcheckFinding(
+                    file=target_hint,
+                    line=1,
+                    id="LINT-RESOURCE-LIMIT",
+                    severity="error",
+                    message=f"LINT-RESOURCE-LIMIT: cppcheck timed out after {timeout_s}s",
+                )
+            ],
+            "",
+            "",
+        )
     except OSError as exc:
         raise RuntimeError(f"failed to execute cppcheck: {exc}") from exc
 
     raw_xml = proc.stderr or ""
     raw_stdout = proc.stdout or ""
+    limit_sigs = {signal.SIGKILL, signal.SIGSEGV, signal.SIGABRT}
+    if hasattr(signal, "SIGXCPU"):
+        limit_sigs.add(signal.SIGXCPU)
+    if (proc.returncode < 0 and (-proc.returncode) in limit_sigs) or _CPPCHECK_OOM_RE.search(
+        raw_xml + "\n" + raw_stdout
+    ):
+        return (
+            [
+                CppcheckFinding(
+                    file=target_hint,
+                    line=1,
+                    id="LINT-RESOURCE-LIMIT",
+                    severity="error",
+                    message=f"LINT-RESOURCE-LIMIT: cppcheck exceeded memory/resource limit (rc={proc.returncode})",
+                )
+            ],
+            raw_xml,
+            raw_stdout,
+        )
     if "<results" not in raw_xml and proc.returncode != 0:
         detail = (raw_xml or raw_stdout).strip() or f"cppcheck exited with {proc.returncode}"
         raise RuntimeError(f"cppcheck execution failed: {detail}")
@@ -1072,6 +1196,7 @@ def run_cppcheck_check(
     project_config_path: Path | None = None,
     trusted_suppressions_dir: Path | None = None,
     allow_empty: bool = False,
+    max_as_bytes: int | None = None,
 ) -> CppcheckRunResult:
     """Run cppcheck on ``targets`` or git-changed files since ``base_ref``.
 
@@ -1150,6 +1275,27 @@ def run_cppcheck_check(
         if allow_empty or no_changes:
             return CppcheckRunResult(exit_code=0, error_message="SKIP: no C/C++ changes", fail_on=config.fail_on)
         return CppcheckRunResult(exit_code=1, error_message="NO_FILES_CHECKED: no matching in-scope C/C++ files found", fail_on=config.fail_on)
+
+    abs_inc_findings = _find_absolute_includes_in_files(target_files, effective_root)
+    if abs_inc_findings:
+        return CppcheckRunResult(
+            exit_code=1,
+            files_checked=len(target_files),
+            findings=abs_inc_findings,
+            blocking_findings=abs_inc_findings,
+            fail_on=config.fail_on,
+        )
+
+    effective_timeout_s = config.timeout_s if config.timeout_s is not None else timeout_s
+    env_timeout = os.environ.get("DEVPACK_CPPCHECK_TIMEOUT_S", "").strip()
+    if env_timeout.isdigit() and int(env_timeout) >= 1 and timeout_s == 300:
+        effective_timeout_s = int(env_timeout)
+    effective_max_as = config.max_as_bytes
+    env_as = os.environ.get("DEVPACK_LINT_MAX_AS_BYTES", "").strip()
+    if env_as.isdigit() and int(env_as) >= 1024 * 1024:
+        effective_max_as = int(env_as)
+    if max_as_bytes is not None:
+        effective_max_as = max_as_bytes
 
     resolved_bin = resolve_cppcheck_binary(cppcheck_bin)
     if resolved_bin is None:
@@ -1243,7 +1389,11 @@ def run_cppcheck_check(
                         cmd = _build_base_cmd()
                         cmd.append(f"--project={temp_cc}")
                         comp_findings, r_xml, r_out = _invoke_cppcheck_cmd(
-                            cmd, effective_root, timeout_s
+                            cmd,
+                            effective_root,
+                            effective_timeout_s,
+                            max_as_bytes=effective_max_as,
+                            target_hint=_rel_str(comp_files[0]),
                         )
                     raw_xml_parts.append(r_xml)
                     raw_stdout_parts.append(r_out)
@@ -1275,12 +1425,16 @@ def run_cppcheck_check(
                     )
                     cmd.extend(_rel_str(fp) for fp in unmatched_files)
                     comp_findings, r_xml, r_out = _invoke_cppcheck_cmd(
-                        cmd, effective_root, timeout_s
+                        cmd,
+                        effective_root,
+                        effective_timeout_s,
+                        max_as_bytes=effective_max_as,
+                        target_hint=_rel_str(unmatched_files[0]),
                     )
                     raw_xml_parts.append(r_xml)
                     raw_stdout_parts.append(r_out)
                     for f in comp_findings:
-                        if (
+                        if f.id == "LINT-RESOURCE-LIMIT" or (
                             not ws_scope.outside_workspace(f.file)
                             and not ws_scope.is_excluded(f.file)
                             and ws_scope.component_for_path(f.file) == comp
@@ -1293,7 +1447,11 @@ def run_cppcheck_check(
                 )
                 cmd.extend(_rel_str(fp) for fp in comp_files)
                 comp_findings, r_xml, r_out = _invoke_cppcheck_cmd(
-                    cmd, effective_root, timeout_s
+                    cmd,
+                    effective_root,
+                    effective_timeout_s,
+                    max_as_bytes=effective_max_as,
+                    target_hint=_rel_str(comp_files[0]),
                 )
                 raw_xml_parts.append(r_xml)
                 raw_stdout_parts.append(r_out)
@@ -1308,7 +1466,13 @@ def run_cppcheck_check(
             if inc_path.is_dir() or raw_inc in extra_include_dirs:
                 cmd.extend(["-I", inc_path.relative_to(effective_root).as_posix()])
         cmd.extend(_rel_str(fp) for fp in target_files)
-        parsed, raw_xml, raw_stdout = _invoke_cppcheck_cmd(cmd, effective_root, timeout_s)
+        parsed, raw_xml, raw_stdout = _invoke_cppcheck_cmd(
+            cmd,
+            effective_root,
+            effective_timeout_s,
+            max_as_bytes=effective_max_as,
+            target_hint=_rel_str(target_files[0]),
+        )
 
     if "--inline-suppr" in config.extra_args:
         parsed.extend(_find_unapproved_inline_suppressions(target_files, effective_root))
@@ -1503,6 +1667,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Timeout in seconds for cppcheck subprocess (default: 300)",
     )
     parser.add_argument(
+        "--max-memory-mb",
+        type=int,
+        default=None,
+        help="Address-space limit (RLIMIT_AS) in MiB for cppcheck subprocess (default: 2048)",
+    )
+    parser.add_argument(
         "--components",
         default=None,
         help="Comma-separated workspace component names to analyze (overrides [scan] defaults)",
@@ -1531,6 +1701,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.timeout_s < 1:
         print("error: --timeout-s must be >= 1", file=sys.stderr)
+        return 2
+    if args.max_memory_mb is not None and args.max_memory_mb < 64:
+        print("error: --max-memory-mb must be >= 64", file=sys.stderr)
         return 2
     if args.project_config is not None and str(args.project_config) != "none" and not args.project_config.is_file():
         print(f"error: project config not found: {args.project_config}", file=sys.stderr)
@@ -1568,6 +1741,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             project_config_path=args.project_config,
             trusted_suppressions_dir=args.trusted_suppressions_dir,
             allow_empty=args.allow_empty,
+            max_as_bytes=(args.max_memory_mb * 1024 * 1024) if args.max_memory_mb is not None else None,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

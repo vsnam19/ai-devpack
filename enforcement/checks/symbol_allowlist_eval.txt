@@ -1,0 +1,19 @@
+# Minimal undefined-symbol allowlist for `--import-profile eval` (one regex per line).
+# Derived by compiling and running `nm -u -C` and `nm -u` across -O0/-O2/-O3 on all
+# reference solutions in eval/fixture, eval/tasks/*, eval/memory_tasks/*, and
+# eval/orchestrator_goals/*.
+# Eval worker code builds with -fno-exceptions -fno-rtti (so operator new/delete and
+# std::__throw_* are NOT allowed; file I/O, std::cout/streambuf/rdbuf, /proc, getenv,
+# mmap, dl_iterate_phdr, etc. are NOT allowed).
+
+# Pure computation libc / libm / compiler runtime symbols
+^memcpy$
+^memset$
+^memmove$
+^memcmp$
+^strlen$
+^round$
+^__stack_chk_fail$
+
+# Fixture API cross-translation-unit symbols under evaluation
+^can_fixture::.*

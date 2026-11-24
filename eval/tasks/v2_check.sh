@@ -213,6 +213,7 @@ if [[ "${#lint_targets[@]}" -gt 0 ]]; then
         echo "$cppcheck_out" >&2
         exit 1
     fi
+    run_worker_symbol_check "$WORKDIR" "$BASE_REF"
 fi
 
 # 4. Run functional tests (visible + hidden) with out-of-process gcov coverage proof
