@@ -141,3 +141,38 @@ CI must pass `--all-components`. An empty changed-C/C++ set may explicitly use
 
 Pack self-tests select their own configuration through `DEVPACK_PROJECT_CONFIG=none`
 or `--project-config none`, so a vendored pack never inherits the parent product scope.
+
+## Optional Legato SELinux skill configuration
+
+The `legato-selinux` skill reads the following optional project section independently
+of component scope resolution. The workspace loader does not interpret these keys.
+Do not hardcode a company tree layout; reconcile selected components and exclusions
+before inventory. See [the skill](../knowledge/skills/legato-selinux/SKILL.md).
+
+```toml
+[selinux]
+platform_profile = "profiles/platform.toml"
+platform_root = ""
+app_globs = ["**/apps/*.adef"]
+manifest_name = "access-manifest.yaml"
+module_dir = "{app_dir}/../selinux"
+sdk_policy_include = ""
+linked_policy = ""
+exclude = []
+```
+
+Paths and globs are relative to the workspace root, including `platform_root`, SDK and
+linked policy. Empty paths mean unknown and block dependent policy/build validation.
+`app_globs` discovers definitions for `--app-name`; multiple matches require an explicit
+.adef. `exclude` removes matching workspace-relative references. `manifest_name` is a
+plain output filename. `module_dir` is a policy-authoring template: replace `{app_dir}`
+with the workspace-relative app directory, normalize, and reject workspace escapes.
+The extractor does not create modules. It accepts JSON config with the same `selinux`
+object when TOML support is unavailable, and writes draft YAML using JSON flow syntax.
+
+`platform_profile` selects a project-owned TOML file relative to the workspace root.
+See the [profile contract](../knowledge/skills/legato-selinux/references/platform-profile.md).
+Naming, interfaces, build conventions, inherited grants and loader checks come only
+from that profile. Missing or invalid fields become unknowns in QUESTIONS.md and
+block dependent steps. Keep proprietary profiles outside the pack in ignored project
+research or configuration storage; the shipped example is fictional.

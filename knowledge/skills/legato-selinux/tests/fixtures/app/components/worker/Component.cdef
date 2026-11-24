@@ -1,0 +1,4 @@
+sources: { worker.c }
+requires: { api: { service.api } }
+provides: { api: { published.api } }
+capabilities: { net_bind_service }

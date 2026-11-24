@@ -1,0 +1,30 @@
+# Fictional conventions for offline examples only; never a production default.
+prefix = "acme_"
+domain_pattern = "{prefix}{executable}_t"
+exec_type_pattern = "{prefix}{executable}_exec_t"
+data_type_pattern = "{prefix}{executable}_data_t"
+admin_source_domain = "acme_admin_t"
+transition_check = "typetransition {admin_source_domain} {prefix}{app}_exec_t process {prefix}{app}_t"
+module_bundle_path = "read-only/{app}.pp"
+base_inherited_grants = ["acme app baseline: logging IPC and creator-owned pipe access; verify linked expansion"]
+banned = ["unconfined_domain", "permissive", "wildcard allows", "generic writable labels"]
+
+[module_files]
+te = "{app}.te"
+fc = "{app}.fc"
+if = "{app}.if"
+makefile = "Makefile"
+component = "Component.cdef"
+
+[build]
+include_variables = ["SHAREDIR", "HEADERDIR", "TMPDIR", "OECORE_TARGET_SYSROOT", "TYPE", "MLS"]
+
+[interfaces]
+entrypoint = "init_{prefix}app_domain({domain}, {exec_type})"
+admin_registration = "{prefix}admin_manage({type})"
+file_read = "{prefix}read_data({domain}, {type})"
+file_rw = "{prefix}rw_data({domain}, {type})"
+private_data = "{prefix}manage_data({domain}, {data_type})"
+ipc_client = "{prefix}ipc_bind({client}, {server})"
+config_tree = "{prefix}use_config_tree({domain})"
+network = "{prefix}create_sockets({domain})"

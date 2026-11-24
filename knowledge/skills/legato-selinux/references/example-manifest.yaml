@@ -1,0 +1,127 @@
+{
+  "files": [
+    {
+      "id": "FILE-001",
+      "why": "Synthetic demonstration; requires human review",
+      "evidence": [
+        "apps/sample.adef:1"
+      ],
+      "status": "draft",
+      "processes": [
+        "worker"
+      ],
+      "path": "/etc/sample.conf",
+      "access": [
+        "read"
+      ]
+    }
+  ],
+  "data_dirs": [],
+  "devices": [
+    {
+      "id": "DEVICE-001",
+      "why": "Synthetic demonstration; requires human review",
+      "evidence": [
+        "apps/sample.adef:1"
+      ],
+      "status": "draft",
+      "processes": [
+        "worker"
+      ],
+      "path": "/dev/sample",
+      "access": [
+        "read",
+        "ioctl"
+      ],
+      "ioctls": [
+        "SAMPLE_QUERY"
+      ]
+    }
+  ],
+  "unix_sockets": [],
+  "ipc": [],
+  "fd_passing": [
+    {
+      "id": "FD-001",
+      "why": "Synthetic demonstration; requires human review",
+      "evidence": [
+        "apps/sample.adef:1"
+      ],
+      "status": "draft",
+      "processes": [
+        "worker"
+      ],
+      "object": "received stream",
+      "class": "unix_stream_socket",
+      "to": [
+        "worker"
+      ],
+      "from": [
+        "peer"
+      ]
+    }
+  ],
+  "network": [],
+  "capabilities": [],
+  "exec": [],
+  "proc_sys": [],
+  "config_tree": [],
+  "env_allowed": [],
+  "limits": [],
+  "inherited_grants": [
+    {
+      "id": "BASE-001",
+      "why": "Synthetic demonstration; requires human review",
+      "evidence": [
+        "apps/sample.adef:1"
+      ],
+      "status": "draft",
+      "processes": [
+        "worker"
+      ],
+      "deviation_id": "DEV-001",
+      "grant": "acme app baseline: logging IPC and creator-owned pipe access; verify linked expansion",
+      "source": "profiles/platform.toml:1"
+    }
+  ],
+  "denied": [],
+  "processes": [
+    {
+      "id": "PROCESS-001",
+      "why": "Synthetic demonstration; requires human review",
+      "evidence": [
+        "apps/sample.adef:1"
+      ],
+      "status": "draft",
+      "processes": [
+        "worker"
+      ],
+      "executable": "worker",
+      "declaration": "worker = ( worker )"
+    }
+  ],
+  "app": "sample",
+  "version": "1",
+  "approval": {
+    "by": "",
+    "date": "",
+    "version": ""
+  },
+  "unknowns": [
+    "SDK and target labels unknown"
+  ],
+  "identity": {
+    "id": "IDENTITY-001",
+    "why": "Synthetic demonstration; requires human review",
+    "evidence": [
+      "apps/sample.adef:1"
+    ],
+    "status": "draft",
+    "processes": [
+      "worker"
+    ],
+    "runs_as": "sample-user",
+    "sandboxed": true,
+    "groups": []
+  }
+}
