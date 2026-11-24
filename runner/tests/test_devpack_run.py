@@ -188,6 +188,8 @@ class DevpackRunUnitTests(unittest.TestCase):
             config_path = base / "engines.toml"
             _write_test_toml(config_path, script_path, max_fix_rounds=2)
             log_dir = base / "logs"
+            (base / ".devpack").mkdir(exist_ok=True)
+            (base / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
 
             rc = devpack_run.main(
                 [
@@ -243,6 +245,8 @@ class DevpackRunUnitTests(unittest.TestCase):
             config_path = base / "engines.toml"
             _write_test_toml(config_path, script_path, max_fix_rounds=2)
             log_dir = base / "logs"
+            (base / ".devpack").mkdir(exist_ok=True)
+            (base / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
 
             rc = devpack_run.main(
                 [
@@ -328,6 +332,8 @@ class DevpackRunUnitTests(unittest.TestCase):
             )
 
             runs_root = base / "runs"
+            (base / ".devpack").mkdir(exist_ok=True)
+            (base / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             rc = devpack_run.main(
                 [
                     "--config",
@@ -392,6 +398,8 @@ class DevpackRunUnitTests(unittest.TestCase):
                 "int addOne(int value) { return value + 1; }\n",
                 encoding="utf-8",
             )
+            (wt / ".devpack").mkdir(exist_ok=True)
+            (wt / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
             subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
             subprocess.run(["git", "config", "user.name", "T"], cwd=wt, check=True)
@@ -444,6 +452,8 @@ class DevpackRunUnitTests(unittest.TestCase):
             )
 
             runs_root = base / "runs"
+            (base / ".devpack").mkdir(exist_ok=True)
+            (base / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             rc = devpack_run.main(
                 [
                     "--config", str(config_path),
@@ -507,6 +517,8 @@ class DevpackRunUnitTests(unittest.TestCase):
                 "int addOne(int value) { return value + 1; }\n",
                 encoding="utf-8",
             )
+            (wt / ".devpack").mkdir(exist_ok=True)
+            (wt / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
             subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
             subprocess.run(["git", "config", "user.name", "T"], cwd=wt, check=True)
@@ -565,6 +577,8 @@ class DevpackRunUnitTests(unittest.TestCase):
             )
 
             runs_root = base / "runs"
+            (base / ".devpack").mkdir(exist_ok=True)
+            (base / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             rc = devpack_run.main(
                 [
                     "--config", str(config_path),
@@ -614,6 +628,8 @@ class DevpackRunUnitTests(unittest.TestCase):
                 "int addOne(int value) { return value + 1; }\n",
                 encoding="utf-8",
             )
+            (wt / ".devpack").mkdir(exist_ok=True)
+            (wt / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
             subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
             subprocess.run(["git", "config", "user.name", "T"], cwd=wt, check=True)
@@ -680,6 +696,8 @@ class DevpackRunUnitTests(unittest.TestCase):
             )
 
             runs_root = base / "runs"
+            (base / ".devpack").mkdir(exist_ok=True)
+            (base / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             rc = devpack_run.main(
                 [
                     "--config", str(config_path),
@@ -714,6 +732,8 @@ class DevpackRunUnitTests(unittest.TestCase):
             wt.mkdir()
             (wt / "src").mkdir()
             (wt / "src" / "a.cpp").write_text("int a() { return 1; }\n", encoding="utf-8")
+            (wt / ".devpack").mkdir(exist_ok=True)
+            (wt / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
             subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=wt, check=True)
             subprocess.run(["git", "config", "user.name", "T"], cwd=wt, check=True)
@@ -747,6 +767,8 @@ class DevpackRunUnitTests(unittest.TestCase):
             )
 
             runs_root = base / "runs"
+            (base / ".devpack").mkdir(exist_ok=True)
+            (base / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             rc = devpack_run.main(
                 [
                     "--config", str(config_path),

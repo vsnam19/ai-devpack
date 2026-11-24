@@ -137,7 +137,7 @@ class SecurityF1RegressionsTests(unittest.TestCase):
             (wt / "tests").mkdir(parents=True)
             (wt / "briefs").mkdir(parents=True)
             (wt / ".devpack").mkdir(parents=True)
-            (wt / ".devpack" / "project.toml").write_text('data_class = "internal"\n', encoding="utf-8")
+            (wt / ".devpack" / "project.toml").write_text('data_class = "internal"\n[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             (wt / ".gitignore").write_text(".devpack/\nbriefs/\nruns/\n", encoding="utf-8")
             (wt / "src" / "mod.cpp").write_text("int f() { return 1; }\n", encoding="utf-8")
             (wt / "tests" / "test_mod.cpp").write_text(
@@ -305,6 +305,8 @@ class SecurityF1RegressionsTests(unittest.TestCase):
             (wt / "src" / "a.cpp").write_text("int a() { return 1; }\n", encoding="utf-8")
             (wt / "tests" / "test_a.cpp").write_text("void t() { CHECK_EQ(1, 1); }\n", encoding="utf-8")
             (wt / "README.md").write_text("docs\n", encoding="utf-8")
+            (wt / ".devpack").mkdir(exist_ok=True)
+            (wt / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             _init_git_repo(wt)
 
             calls_file = base / "calls.json"

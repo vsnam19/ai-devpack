@@ -22,6 +22,21 @@ gate_config = "gate.toml"
 # Directory where v0.2 run logs (runs/<run-id>/) are written (must stay in .gitignore).
 runs_root = "runs"
 
+# Pipeline operating mode and checkpoint approvals (see policy/operating_modes.md).
+# Default when [pipeline] is omitted: mode = "hitl",
+# state_dir = "$XDG_STATE_HOME/devpack/<project-hash>" (always outside the worktree),
+# target_branch = "main".
+# [pipeline]
+# mode = "hitl"                 # "hitl" | "autonomous"
+# state_dir = "/var/lib/devpack/state/my-project"  # must remain outside worktree and writable mounts
+# target_branch = "main"        # merge target branch checked by pre-merge (fail-closed if unknown)
+# protected_branches = ["main", "master", "release/*", "hotfix/*"]
+#
+# [pipeline.checkpoints]
+# Optional tightening-only overrides ("auto" | "human"). Hard-stops cannot be set to "auto".
+# plan = "human"
+# brief = "human"
+
 # Additional repository-relative test protections; nested tests are protected by default.
 protected_test_globs = ["checks/**"]
 # Gitignore /gate_receipt.json and /runs/ in the product repository.

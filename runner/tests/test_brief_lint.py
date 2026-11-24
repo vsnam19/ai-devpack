@@ -419,6 +419,8 @@ class BriefLintTests(unittest.TestCase):
             warn_brief = _valid_brief_text().replace(
                 "## Input\n", "## Input\nInspect `futureHelper()`.\n")
             (wt / "briefs" / "warn.md").write_text(warn_brief, encoding="utf-8")
+            (wt / ".devpack").mkdir(exist_ok=True)
+            (wt / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
 
             broker = devpack_broker.Broker(
                 wt,
@@ -482,6 +484,7 @@ class BriefLintTests(unittest.TestCase):
                     isolation="local",
                     allow_unsandboxed_local=True,
                     agent_bin=str(worker),
+                    mode="autonomous",
                 )
             self.assertEqual(0, rc, payload)
             run_json = json.loads((Path(payload["run_dir"]) / "run.json").read_text(encoding="utf-8"))

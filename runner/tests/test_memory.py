@@ -595,12 +595,15 @@ class MemoryRunnerIntegrationTests(unittest.TestCase):
                     credentials_path=cred,
                     agent_bin=str(fake_claude),
                     no_checklist=True,
+                    mode="autonomous",
                 )
             self.assertEqual(1, rc_fail)
             self.assertEqual([], memory.load_memory_entries(memory.memory_root_for(wt)))
 
             # Reset worktree and test via Broker with passing gate
             subprocess.run(["git", "checkout", "--", "src/mod.cpp"], cwd=wt, check=True)
+            (wt / ".devpack").mkdir(exist_ok=True)
+            (wt / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             broker = devpack_broker.Broker(
                 wt,
                 base / "broker_runs",

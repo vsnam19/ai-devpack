@@ -380,7 +380,7 @@ def _minimal_toml_loads(text: str) -> dict[str, Any]:
         if "=" not in raw:
             continue
         key, val_str = raw.split("=", 1)
-        key = key.strip()
+        key = key.strip().strip('"').strip("'")
         val_str = val_str.strip()
         if val_str.startswith("[") and not val_str.endswith("]"):
             buf = [val_str]
@@ -725,6 +725,14 @@ def load_project_config(
         "workspace": {},
         "components": [],
         "scan": {},
+        "pipeline": {
+            "mode": "hitl",
+            "state_dir": "",
+            "state_dir_explicit": False,
+            "target_branch": "main",
+            "protected_branches": ["main", "master", "release/*", "hotfix/*"],
+            "checkpoints": {},
+        },
         "config_found": False,
     }
     if project_config_path is not None and str(project_config_path):
@@ -788,6 +796,12 @@ def load_project_config(
         defaults["scan"] = dict(raw_scan)
     elif "scan" in raw:
         raise ValueError(f"[scan] must be a table in {cfg_path}")
+    if "pipeline" in raw:
+        try:
+            from runner.checkpoints import validate_pipeline_dict  # noqa: E402
+        except ModuleNotFoundError:  # pragma: no cover
+            from checkpoints import validate_pipeline_dict  # type: ignore[no-redef] # noqa: E402
+        defaults["pipeline"] = validate_pipeline_dict(raw["pipeline"], source=str(cfg_path))
     defaults["config_found"] = True
     return defaults
 
@@ -1157,6 +1171,7 @@ class AgentRequest:
     code_map: str = ""
     operator_config_path: Path | None = None
     trusted_git_dir: Path | None = None
+    state_dir: Path | None = None
 
     def __init__(
         self,
@@ -1196,6 +1211,7 @@ class AgentRequest:
         code_map: str = "",
         operator_config_path: Path | str | None = None,
         trusted_git_dir: Path | str | None = None,
+        state_dir: Path | str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize AgentRequest with support for SPEC parameter aliases (timeout, engine_config, prompt_text)."""
@@ -1265,6 +1281,11 @@ class AgentRequest:
         self.operator_config_path = (
             Path(operator_config_path)
             if operator_config_path is not None and str(operator_config_path)
+            else None
+        )
+        self.state_dir = (
+            Path(state_dir)
+            if state_dir is not None and str(state_dir).strip()
             else None
         )
 
@@ -1662,6 +1683,7 @@ def build_invocation(
     output_format: str = "stream-json",
     prompt_file: Path | None = None,
     git_decision: GitMountDecision | None = None,
+    state_dir: Path | str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Construct ``(argv, env)`` for launching an agent in ``local`` or ``docker`` isolation.
 
@@ -1694,6 +1716,8 @@ def build_invocation(
             tmp_dir = req.tmp_dir
         if env_overrides is None:
             env_overrides = req.env_overrides
+        if state_dir is None:
+            state_dir = req.state_dir
     else:
         engine = request_or_engine
         resolved_workdir = Path(workdir) if workdir is not None else Path.cwd()
@@ -1718,6 +1742,19 @@ def build_invocation(
     source_env: dict[str, str] = dict(os.environ)
     if env_overrides:
         source_env.update(env_overrides)
+
+    eff_state_dir_raw = str(state_dir).strip() if state_dir is not None and str(state_dir).strip() else str(source_env.get("DEVPACK_STATE_DIR", "")).strip()
+    resolved_state_dir: Path | None = None
+    if eff_state_dir_raw:
+        cand_state = Path(eff_state_dir_raw)
+        if not cand_state.is_absolute():
+            cand_state = Path(resolved_workdir).resolve() / cand_state
+        resolved_state_dir = cand_state.resolve()
+        wd_res = Path(resolved_workdir).resolve()
+        if resolved_state_dir == wd_res or resolved_state_dir.is_relative_to(wd_res):
+            raise ValueError(
+                f"Refusing agent launch: approval state_dir '{resolved_state_dir}' must live outside worktree '{wd_res}'"
+            )
 
     local_engine_vars: dict[str, str] = {}
     if engine.is_local:
@@ -1773,6 +1810,7 @@ def build_invocation(
             "TMPDIR": str(resolved_tmp),
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
+            "DEVPACK_AGENT_SANDBOX": "1",
         }
         if engine.is_local:
             env.update(local_engine_vars)
@@ -1785,6 +1823,8 @@ def build_invocation(
         "HOME=/workspace/home",
         "-e",
         "CLAUDE_CONFIG_DIR=/workspace/cfg",
+        "-e",
+        "DEVPACK_AGENT_SANDBOX=1",
     ]
     if engine.is_local:
         for var_name in (
@@ -1815,6 +1855,20 @@ def build_invocation(
         image_tag,
         *_build_claude_tail(agent_bin_in_container),
     ]
+    if resolved_state_dir is not None:
+        for idx, tok in enumerate(argv):
+            if tok == "-v" and idx + 1 < len(argv):
+                spec = argv[idx + 1]
+                host_part = spec.split(":", 1)[0]
+                mount_src = Path(host_part).resolve()
+                if (
+                    resolved_state_dir == mount_src
+                    or resolved_state_dir.is_relative_to(mount_src)
+                    or mount_src.is_relative_to(resolved_state_dir)
+                ):
+                    raise ValueError(
+                        f"Refusing docker launch: approval state_dir '{resolved_state_dir}' overlaps container mount '{mount_src}'"
+                    )
     env = {
         "PATH": source_env.get("PATH", "/usr/bin:/bin"),
         "HOME": str(resolved_home),

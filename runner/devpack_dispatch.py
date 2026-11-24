@@ -92,7 +92,8 @@ from runner.agent_exec import (  # noqa: E402
     save_qualification_data,
     update_run_json,
 )
-from runner.brief_lint import lint_brief_text  # noqa: E402
+from runner.brief_lint import has_errors as brief_has_errors, lint_brief_text  # noqa: E402
+from runner import checkpoints  # noqa: E402
 from runner.devpack_logs import load_run_dir, write_rendered_outputs  # noqa: E402
 from runner.memory import memory_root_for, process_memory_proposals  # noqa: E402
 from runner.redaction import Redactor, collect_credential_secrets  # noqa: E402
@@ -800,6 +801,14 @@ def dispatch_job(
     all_components: bool = False,
     task_id: str = "",
     trusted_git_dir: Path | None = None,
+    mode: str | None = None,
+    state_dir: Path | str | None = None,
+    brief_approved: bool = False,
+    agent_worktree: Path | str | None = None,
+    project_root: Path | str | None = None,
+    record_memory_checkpoints: bool = True,
+    resume_approval_id: str = "",
+    resume_checkpoint_id: str = "",
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
@@ -892,6 +901,21 @@ def dispatch_job(
     if project_config_path is None and default_proj.is_file() and not default_proj.is_symlink():
         pre_run_project_bytes = default_proj.read_bytes()
 
+    eff_project_root = Path(project_root).resolve() if project_root is not None else workdir
+    eff_agent_worktree = Path(agent_worktree).resolve() if agent_worktree is not None else workdir
+    writable_roots: tuple[Path, ...] = (
+        (workdir, eff_agent_worktree) if eff_agent_worktree != workdir else (workdir,)
+    )
+    pipeline_cfg = checkpoints.load_pipeline_config(
+        eff_project_root,
+        project_config_path=project_config_path,
+        trusted_project_bytes=pre_run_project_bytes if project_config_path is None else None,
+        override_mode=mode,
+        override_state_dir=state_dir,
+        agent_worktree=eff_agent_worktree,
+        writable_mounts=writable_roots,
+    )
+
     with tempfile.TemporaryDirectory(prefix="devpack-gate-cfg-") as gate_cfg_tmp:
         trusted_cfg = resolve_trusted_gate_config(
             workdir,
@@ -965,6 +989,55 @@ def dispatch_job(
             memory_enabled=memory_enabled,
             memory_top_k=memory_top_k,
             memory_budget_tokens=memory_budget_tokens,
+            pipeline_cfg=pipeline_cfg,
+            brief_approved=brief_approved,
+            eff_project_root=eff_project_root,
+            agent_worktree=agent_worktree,
+            record_memory_checkpoints=record_memory_checkpoints,
+            resume_approval_id=resume_approval_id,
+            resume_checkpoint_id=resume_checkpoint_id,
+            resume_spec={
+                "kind": "dispatch",
+                "checkpoint_id": "brief",
+                "brief_path": str(brief_path.resolve()),
+                "engine_name": engine.name,
+                "workdir": str(workdir.resolve()),
+                "project_root": str(eff_project_root.resolve()),
+                "agent_worktree": str(eff_agent_worktree),
+                "allow_globs": list(allow_globs),
+                "protected_globs": list(protected_globs),
+                "base_ref": effective_base,
+                "gate_cmd": gate_cmd,
+                "no_gate": bool(no_gate),
+                "runs_root": str(effective_runs_root),
+                "engines_config_path": str(effective_engines_path.resolve()) if effective_engines_path else "",
+                "project_config_path": str(project_config_path.resolve()) if project_config_path else "",
+                "isolation": isolation,
+                "allow_unsandboxed_local": bool(allow_unsandboxed_local),
+                "credentials_path": str(credentials_path.resolve()) if credentials_path else "",
+                "agent_bin": agent_bin,
+                "docker_bin": docker_bin,
+                "image_tag": image_tag,
+                "role": role,
+                "no_checklist": bool(no_checklist),
+                "profile_path": str(resolved_profile.resolve()) if resolved_profile else "",
+                "qualification_file": str(qual_path.resolve()),
+                "allow_unqualified": bool(allow_unqualified),
+                "deviation_id": deviation_id,
+                "require_qualification": bool(require_qualification),
+                "memory_enabled": memory_enabled,
+                "memory_root": str(memory_root.resolve()) if memory_root else "",
+                "memory_top_k": memory_top_k,
+                "memory_budget_tokens": memory_budget_tokens,
+                "brief_lint_findings": list(effective_brief_lint),
+                "components": list(components) if isinstance(components, (list, tuple)) else components,
+                "all_components": bool(all_components),
+                "task_id": task_id or brief_path.stem,
+                "trusted_git_dir": str(trusted_git_dir.resolve()) if trusted_git_dir else "",
+                "pipeline_mode": pipeline_cfg.mode,
+                "state_dir": pipeline_cfg.state_dir,
+                "record_memory_checkpoints": bool(record_memory_checkpoints),
+            },
         )
 
 
@@ -1017,6 +1090,14 @@ def _dispatch_job_with_trusted_cfg(
     memory_enabled: bool | None,
     memory_top_k: int | None,
     memory_budget_tokens: int | None,
+    pipeline_cfg: checkpoints.PipelineConfig,
+    brief_approved: bool = False,
+    eff_project_root: Path | None = None,
+    agent_worktree: Path | str | None = None,
+    record_memory_checkpoints: bool = True,
+    resume_approval_id: str = "",
+    resume_checkpoint_id: str = "",
+    resume_spec: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run one dispatched worker job using the pre-snapshotted ``trusted_cfg``."""
     if dry_run:
@@ -1058,6 +1139,7 @@ def _dispatch_job_with_trusted_cfg(
             }
         plan = {
             "mode": "dry-run",
+            "pipeline_mode": pipeline_cfg.mode,
             "engine": engine.name,
             "engine_class": engine.engine_class,
             "engine_config_hash": engine_cfg_hash,
@@ -1232,6 +1314,83 @@ def _dispatch_job_with_trusted_cfg(
             _emit_json_line(payload)
             return 1, payload
 
+    brief_approval_id = ""
+    if not brief_approved:
+        steps_dir = run_dir / "steps"
+        steps_dir.mkdir(parents=True, exist_ok=True)
+        lint_receipt_path = steps_dir / "00-brief-lint.json"
+        lint_receipt_path.write_text(
+            json.dumps(
+                {
+                    "brief_lint": effective_brief_lint,
+                    "error_count": sum(
+                        1 for item in effective_brief_lint if item.get("severity") == "error"
+                    ),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        proj_root = eff_project_root if eff_project_root is not None else workdir
+        eff_agent_wt = Path(agent_worktree).resolve() if agent_worktree is not None else workdir
+        brief_sha256 = hashlib.sha256(brief_path.read_bytes()).hexdigest()
+        brief_decision = checkpoints.request(
+            "brief",
+            task_id or brief_path.stem,
+            [lint_receipt_path],
+            f"Brief checkpoint before dispatch of '{brief_path.name}' on '{engine.name}'.",
+            pipeline_config=pipeline_cfg,
+            project_root=proj_root,
+            agent_worktree=eff_agent_wt,
+            writable_mounts=(workdir, eff_agent_wt) if eff_agent_wt != workdir else (workdir,),
+            requested_by=f"dispatch:{role}",
+            gate_passed=not brief_has_errors(effective_brief_lint),
+            repo_root=proj_root,
+            run_dir=run_dir,
+        )
+        brief_approval_id = brief_decision.approval_id
+        if not brief_decision.approved:
+            resume_payload: dict[str, Any] = dict(resume_spec or {})
+            resume_payload.update(
+                {
+                    "kind": "dispatch",
+                    "approval_id": brief_decision.approval_id,
+                    "checkpoint_id": "brief",
+                    "brief_sha256": brief_sha256,
+                    "run_dir": str(run_dir),
+                }
+            )
+            checkpoints.save_resume_state(pipeline_cfg.state_dir, brief_decision.approval_id, resume_payload)
+            update_run_json(
+                run_dir,
+                task=brief_path.stem,
+                outcome="awaiting_approval",
+                gate="skipped",
+                approval_id=brief_decision.approval_id,
+                checkpoint="brief",
+                brief_sha256=brief_sha256,
+                pipeline_mode=pipeline_cfg.mode,
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+            payload = {
+                "run_dir": str(run_dir),
+                "status": checkpoints.AWAITING_APPROVAL,
+                "approval_id": brief_decision.approval_id,
+                "checkpoint": "brief",
+                "brief_sha256": brief_sha256,
+                "pipeline_mode": pipeline_cfg.mode,
+                "state_dir": pipeline_cfg.state_dir,
+                "gate": "skipped",
+                "scope": "ok",
+                "changed_files": [],
+                "final_text_tail": "",
+                "cost_usd": None if engine.is_local else 0.0,
+            }
+            _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
+            _emit_json_line(payload)
+            return checkpoints.AWAITING_APPROVAL_EXIT_CODE, payload
+
     req = AgentRequest(
         engine=engine,
         prompt=prompt_text,
@@ -1256,6 +1415,7 @@ def _dispatch_job_with_trusted_cfg(
         memory_task_text=brief_raw,
         memory_task_id=task_id,
         trusted_git_dir=trusted_git_dir,
+        state_dir=Path(pipeline_cfg.state_dir),
     )
     control_before = _control_snapshot(workdir)
     git_snap = snapshot_git_metadata(workdir)
@@ -1264,6 +1424,36 @@ def _dispatch_job_with_trusted_cfg(
         git_config_sha256=git_snap.config_sha256,
         git_hooks_listing=git_snap.hooks_entries_for_log(),
     )
+    if resume_approval_id:
+        try:
+            checkpoints.consume_resume_approval(
+                pipeline_cfg.state_dir,
+                resume_approval_id,
+                expected_checkpoint=resume_checkpoint_id or None,
+            )
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            err_msg = f"error: {exc}"
+            sys.stderr.write(err_msg + "\n")
+            update_run_json(
+                run_dir,
+                outcome="refused",
+                gate="skipped",
+                refusal_reason=str(exc),
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+            payload = {
+                "run_dir": str(run_dir),
+                "status": "refused",
+                "gate": "skipped",
+                "scope": "ok",
+                "changed_files": [],
+                "final_text_tail": "",
+                "cost_usd": None if engine.is_local else 0.0,
+                "error": str(exc),
+            }
+            _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
+            _emit_json_line(payload)
+            return 1, payload
     agent_res = run_agent(req)
 
     git_ok, git_tamper_reason = check_git_metadata_unchanged(git_snap)
@@ -1573,6 +1763,9 @@ def _dispatch_job_with_trusted_cfg(
             source=f"run:{run_dir.name}",
             task_id=task_id,
             stop_report_text=stop_report_text,
+            state_dir=pipeline_cfg.state_dir,
+            record_checkpoints=record_memory_checkpoints,
+            mode=pipeline_cfg.mode,
         )
         mem_proposal_summary = prop_res.to_dict()
 
@@ -1590,6 +1783,8 @@ def _dispatch_job_with_trusted_cfg(
         run_dir,
         task=brief_path.stem,
         outcome=outcome,
+        pipeline_mode=pipeline_cfg.mode,
+        approval_id=brief_approval_id,
         gate=gate_status,
         scope=scope_status,
         test_lock=test_lock_status,
@@ -1677,17 +1872,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--submit", action="store_true", help="Submit through the host broker")
     parser.add_argument(
         "--engine",
-        required=True,
+        required=False,
+        default="",
         help="Engine name from engines.toml (e.g. haiku, sonnet, local)",
     )
     parser.add_argument(
         "--brief",
-        required=True,
+        required=False,
+        default="",
         help="Path to the worker brief markdown file",
     )
     parser.add_argument(
         "--workdir",
-        required=True,
+        required=False,
+        default="",
         help="Path to the target git worktree",
     )
     parser.add_argument(
@@ -1812,7 +2010,225 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run workspace-scoped checks across all configured/discovered components",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("hitl", "autonomous"),
+        default=None,
+        help="Override pipeline mode (may only tighten autonomous -> hitl)",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default="",
+        help="Explicit checkpoint state directory (must be outside agent worktree)",
+    )
+    parser.add_argument(
+        "--resume",
+        default="",
+        help="Resume a paused dispatch job from an approved checkpoint ID",
+    )
     return parser
+
+
+def _resume_dispatch_from_approval(
+    args: argparse.Namespace,
+    workdir: Path,
+    project_cfg_path: Path | None,
+) -> int:
+    """Resume or fail a paused ``devpack_dispatch`` job from ``--resume <approval-id>``."""
+    try:
+        pipeline_cfg = checkpoints.load_pipeline_config(
+            workdir,
+            project_config_path=project_cfg_path,
+            cli_mode=args.mode,
+            override_state_dir=args.state_dir or None,
+            agent_worktree=workdir,
+            writable_mounts=(workdir,),
+        )
+        rec, _rec_path = checkpoints.show_approval(pipeline_cfg.state_dir, args.resume)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1 if isinstance(exc, FileNotFoundError) else 2
+
+    status = str(rec.get("status", "")).upper()
+    checkpoint_id = str(rec.get("checkpoint", ""))
+    if status == checkpoints.PENDING:
+        payload = {
+            "run_dir": str(rec.get("run_dir", "")),
+            "status": checkpoints.AWAITING_APPROVAL,
+            "approval_id": args.resume,
+            "checkpoint": checkpoint_id,
+            "pipeline_mode": pipeline_cfg.mode,
+            "state_dir": pipeline_cfg.state_dir,
+        }
+        _emit_json_line(payload)
+        return checkpoints.AWAITING_APPROVAL_EXIT_CODE
+
+    saved: dict[str, Any] = {}
+    try:
+        saved = checkpoints.load_resume_state(pipeline_cfg.state_dir, args.resume)
+    except (OSError, ValueError):
+        saved = {}
+
+    if status == checkpoints.REJECTED:
+        note = str(rec.get("note", "")).strip()
+        run_dir_raw = str(saved.get("run_dir") or rec.get("run_dir") or "").strip()
+        if run_dir_raw and Path(run_dir_raw).is_dir():
+            update_run_json(
+                Path(run_dir_raw),
+                outcome="rejected",
+                approval_id=args.resume,
+                approval_status=checkpoints.REJECTED,
+                approval_note=note,
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+        payload = {
+            "run_dir": run_dir_raw,
+            "status": checkpoints.REJECTED,
+            "approval_id": args.resume,
+            "checkpoint": checkpoint_id,
+            "note": note,
+        }
+        _emit_json_line(payload)
+        return 1
+
+    if status != checkpoints.APPROVED:
+        print(f"error: unexpected approval status '{status}' for {args.resume}", file=sys.stderr)
+        return 1
+
+    if not saved:
+        print(f"error: resume state missing for approval '{args.resume}'", file=sys.stderr)
+        return 1
+
+    saved_kind = str(saved.get("kind", "")).strip()
+    if saved_kind == "broker":
+        print(
+            f"error: approval '{args.resume}' belongs to a broker job; resume via --submit --resume {args.resume} or devpack_broker.py --resume {args.resume}",
+            file=sys.stderr,
+        )
+        return 1
+    if saved_kind not in ("", "dispatch"):
+        print(
+            f"error: approval '{args.resume}' belongs to a '{saved_kind}' job and cannot be resumed with devpack_dispatch.py",
+            file=sys.stderr,
+        )
+        return 1
+
+    saved_workdir = Path(saved["workdir"]).resolve()
+    if args.workdir and saved_workdir != workdir:
+        print(
+            f"error: resume workdir '{workdir}' does not match paused job workdir '{saved_workdir}'",
+            file=sys.stderr,
+        )
+        return 1
+
+    resumed_proj_cfg = project_cfg_path or (
+        Path(saved["project_config_path"]).resolve() if saved.get("project_config_path") else None
+    )
+    saved_project_root = Path(saved["project_root"]).resolve() if saved.get("project_root") else saved_workdir
+    saved_agent_worktree = Path(saved["agent_worktree"]).resolve() if saved.get("agent_worktree") else saved_workdir
+    saved_writable_mounts: tuple[Path, ...] = (
+        (saved_workdir, saved_agent_worktree) if saved_agent_worktree != saved_workdir else (saved_workdir,)
+    )
+
+    saved_brief = Path(saved["brief_path"]).resolve()
+    try:
+        checkpoints.verify_brief_hash(saved_brief, str(saved.get("brief_sha256", "")))
+        if bool(rec.get("consumed", False)) or bool(saved.get("consumed", False)):
+            raise ValueError(f"Approval '{args.resume}' has already been consumed")
+        current_project_cfg = checkpoints.load_pipeline_config(
+            saved_project_root,
+            project_config_path=resumed_proj_cfg,
+            cli_mode=args.mode,
+            override_state_dir=pipeline_cfg.state_dir,
+            agent_worktree=saved_agent_worktree,
+            writable_mounts=saved_writable_mounts,
+        )
+        saved_mode = str(saved.get("pipeline_mode") or "").strip()
+        if saved_mode:
+            saved_resolved = checkpoints.resolve_pipeline_mode(saved_mode, cli_mode=args.mode)
+            resumed_mode = (
+                saved_resolved
+                if checkpoints.MODE_STRICTNESS[saved_resolved] >= checkpoints.MODE_STRICTNESS[current_project_cfg.mode]
+                else current_project_cfg.mode
+            )
+        else:
+            resumed_mode = current_project_cfg.mode
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    resumed_runs_root = Path(args.runs_root).resolve() if args.runs_root else (
+        Path(saved["runs_root"]).resolve() if saved.get("runs_root") else None
+    )
+    resumed_engines = Path(args.engines).resolve() if args.engines else (
+        Path(saved["engines_config_path"]).resolve() if saved.get("engines_config_path") else None
+    )
+    resumed_creds = Path(args.credentials).resolve() if args.credentials else (
+        Path(saved["credentials_path"]).resolve() if saved.get("credentials_path") else None
+    )
+    resumed_profile = Path(args.profile).resolve() if args.profile else (
+        Path(saved["profile_path"]).resolve() if saved.get("profile_path") else None
+    )
+    resumed_qual = Path(args.qualification_file).resolve() if args.qualification_file else (
+        Path(saved["qualification_file"]).resolve() if saved.get("qualification_file") else None
+    )
+    resumed_mem_root = Path(saved["memory_root"]).resolve() if saved.get("memory_root") else None
+    resumed_trusted_git = Path(saved["trusted_git_dir"]).resolve() if saved.get("trusted_git_dir") else None
+    resumed_isolation = args.isolation if args.isolation != "docker" else str(saved.get("isolation", "docker"))
+    resumed_allow_local = bool(args.allow_unsandboxed_local or saved.get("allow_unsandboxed_local", False))
+    resumed_agent_bin = args.agent_bin if args.agent_bin != "claude" else str(saved.get("agent_bin", "claude"))
+    resumed_docker_bin = str(saved.get("docker_bin") or "docker")
+    resumed_image_tag = str(saved.get("image_tag") or agent_exec.DOCKER_IMAGE_TAG)
+
+    try:
+        rc, _payload = dispatch_job(
+            engine_name=str(saved["engine_name"]),
+            brief_path=saved_brief,
+            workdir=saved_workdir,
+            allow_globs=list(saved.get("allow_globs", ())),
+            protected_globs=list(saved.get("protected_globs", ())),
+            base_ref=str(saved.get("base_ref", "")),
+            gate_cmd=str(saved.get("gate_cmd", "")),
+            no_gate=bool(saved.get("no_gate", False)),
+            runs_root=resumed_runs_root,
+            engines_config_path=resumed_engines,
+            project_config_path=resumed_proj_cfg,
+            isolation=resumed_isolation,
+            allow_unsandboxed_local=resumed_allow_local,
+            credentials_path=resumed_creds,
+            agent_bin=resumed_agent_bin,
+            docker_bin=resumed_docker_bin,
+            image_tag=resumed_image_tag,
+            role=str(saved.get("role", "worker")),
+            no_checklist=bool(saved.get("no_checklist", False)),
+            profile_path=resumed_profile,
+            qualification_file=resumed_qual,
+            allow_unqualified=bool(saved.get("allow_unqualified", False)),
+            deviation_id=str(saved.get("deviation_id", "")),
+            require_qualification=bool(saved.get("require_qualification", False)),
+            dry_run=False,
+            memory_enabled=saved.get("memory_enabled"),
+            memory_root=resumed_mem_root,
+            memory_top_k=saved.get("memory_top_k"),
+            memory_budget_tokens=saved.get("memory_budget_tokens"),
+            brief_lint_findings=saved.get("brief_lint_findings"),
+            components=saved.get("components"),
+            all_components=bool(saved.get("all_components", False)),
+            task_id=str(saved.get("task_id", "")),
+            trusted_git_dir=resumed_trusted_git,
+            mode=resumed_mode,
+            state_dir=pipeline_cfg.state_dir,
+            brief_approved=True,
+            agent_worktree=saved.get("agent_worktree"),
+            project_root=saved.get("project_root"),
+            record_memory_checkpoints=bool(saved.get("record_memory_checkpoints", True)),
+            resume_approval_id=args.resume,
+            resume_checkpoint_id=checkpoint_id,
+        )
+    except (ValueError, FileNotFoundError, OSError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return rc
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1823,6 +2239,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         return submit_main(effective_argv)
     parser = build_arg_parser()
     args = parser.parse_args(effective_argv)
+
+    if args.resume:
+        workdir = Path(args.workdir or ".").resolve()
+        if not workdir.is_dir():
+            print(f"error: workdir not found: {workdir}", file=sys.stderr)
+            return 2
+        project_cfg_path = Path(args.project_config).resolve() if args.project_config else None
+        if project_cfg_path is not None and not project_cfg_path.is_file():
+            print(f"error: project config not found: {project_cfg_path}", file=sys.stderr)
+            return 2
+        try:
+            return _resume_dispatch_from_approval(args, workdir, project_cfg_path)
+        except (ValueError, GitSecurityError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1 if isinstance(exc, GitSecurityError) else 2
+
+    missing = [name for name, val in (("--engine", args.engine), ("--brief", args.brief), ("--workdir", args.workdir)) if not str(val).strip()]
+    if missing:
+        parser.error(f"the following arguments are required: {', '.join(missing)}")
 
     brief_path = Path(args.brief).resolve()
     workdir = Path(args.workdir).resolve()
@@ -1852,6 +2287,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     qual_file = Path(args.qualification_file).resolve() if args.qualification_file else None
 
     try:
+        cli_pipeline_cfg = checkpoints.load_pipeline_config(
+            workdir,
+            project_config_path=project_cfg_path,
+            cli_mode=args.mode,
+            override_state_dir=args.state_dir or None,
+            agent_worktree=workdir,
+            writable_mounts=(workdir,),
+        )
         rc, _payload = dispatch_job(
             engine_name=args.engine,
             brief_path=brief_path,
@@ -1879,6 +2322,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             memory_enabled=False if args.no_memory else None,
             components=args.components,
             all_components=bool(args.all_components),
+            mode=cli_pipeline_cfg.mode,
+            state_dir=cli_pipeline_cfg.state_dir if cli_pipeline_cfg.state_dir_explicit else None,
         )
         return rc
     except (ValueError, GitSecurityError) as exc:

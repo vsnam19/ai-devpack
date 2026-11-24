@@ -40,6 +40,7 @@ from runner.memory import (  # noqa: E402
     MemoryValidationError,
     VALID_STATUSES,
     VALID_TYPES,
+    _ensure_memory_decision_checkpoint,
     add_memory_entry,
     approve_memory_entry,
     expire_memory_entry,
@@ -132,6 +133,8 @@ def _cmd_add(args: argparse.Namespace) -> int:
         title=args.title,
         patterns_file=args.patterns or None,
     )
+    if entry.status == "pending":
+        _ensure_memory_decision_checkpoint(root, entry, state_dir=args.state_dir or None)
     if args.json:
         print(json.dumps(entry.to_dict(), indent=2))
     else:
@@ -142,7 +145,12 @@ def _cmd_add(args: argparse.Namespace) -> int:
 def _cmd_approve(args: argparse.Namespace) -> int:
     """Execute the ``approve`` subcommand."""
     root = _resolve_memory_root(args)
-    entry = approve_memory_entry(root, args.id, patterns_file=args.patterns or None)
+    entry = approve_memory_entry(
+        root,
+        args.id,
+        patterns_file=args.patterns or None,
+        state_dir=args.state_dir or None,
+    )
     if args.json:
         print(json.dumps(entry.to_dict(), indent=2))
     else:
@@ -254,12 +262,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--workdir", default=".", help="Repository workdir (default: current directory)")
     common.add_argument("--memory-dir", default="", help="Explicit path to .devpack/memory directory")
+    common.add_argument("--state-dir", default="", help="Explicit checkpoint state directory")
     common.add_argument("--json", action="store_true", help="Emit JSON output")
     common.add_argument("--patterns", default="", help="Optional secret/PII patterns file")
 
     sub_common = argparse.ArgumentParser(add_help=False)
     sub_common.add_argument("--workdir", default=argparse.SUPPRESS, help="Repository workdir (default: current directory)")
     sub_common.add_argument("--memory-dir", default=argparse.SUPPRESS, help="Explicit path to .devpack/memory directory")
+    sub_common.add_argument("--state-dir", default=argparse.SUPPRESS, help="Explicit checkpoint state directory")
     sub_common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="Emit JSON output")
     sub_common.add_argument("--patterns", default=argparse.SUPPRESS, help="Optional secret/PII patterns file")
 

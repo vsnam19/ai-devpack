@@ -182,6 +182,7 @@ class DispatchGateRunTests(unittest.TestCase):
             allow_unsandboxed_local=True,
             agent_bin=str(agent),
             runs_root=base / "runs",
+            mode="autonomous",
         )
         kwargs.update(overrides)
         return devpack_dispatch.dispatch_job(**kwargs)
@@ -202,7 +203,7 @@ class DispatchGateRunTests(unittest.TestCase):
             base = Path(tmp)
             wt = _make_repo(base, with_gate_toml=True)
             project_cfg = base / "custom-project.toml"
-            project_cfg.write_text('data_class = "internal"\n', encoding="utf-8")
+            project_cfg.write_text('data_class = "internal"\n[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
             agent = _write_marker_agent(base / "fake_claude.py", base / "marker.txt")
             with mock.patch.object(devpack_dispatch, "_run_subprocess", side_effect=spy):
                 rc, payload = self._dispatch(

@@ -34,6 +34,7 @@ class DispatchReviewTests(unittest.TestCase):
                 rc, summary = devpack_run.run_task_workflow(
                     config, context, root, root / "logs", root,
                     isolation="local", allow_unsandboxed_local=True,
+                    mode="autonomous",
                 )
             self.assertEqual(0, rc)
             self.assertEqual(0.25, summary["cost_usd"])
