@@ -92,114 +92,127 @@ def _strip_toml_comment(line):
             continue
         if ch == '#' and in_quote is None:
             return line[:idx]
+    if in_quote is not None:
+        raise ValueError('unterminated string')
     return line
 
 
 def _parse_toml_scalar_or_array(raw):
-    """Parse a scalar or array TOML value for the Python 3.10 fallback."""
-    val = raw.strip()
-    if val in ('true', 'false'):
-        return val == 'true'
-    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-        inner = val[1:-1]
-        if val[0] == '"':
-            return inner.replace('\\"', '"').replace('\\\\', '\\')
-        return inner
-    if val.startswith('[') and val.endswith(']'):
-        inner = val[1:-1].strip()
-        if not inner:
-            return []
-        items, buf, in_q, esc = [], [], None, False
-        for ch in inner:
-            if esc:
-                buf.append(ch)
-                esc = False
-                continue
-            if ch == '\\' and in_q == '"':
-                buf.append(ch)
-                esc = True
-                continue
-            if ch in ('"', "'"):
-                if in_q is None:
-                    in_q = ch
-                elif in_q == ch:
-                    in_q = None
-                buf.append(ch)
-                continue
-            if ch == ',' and in_q is None:
-                part = ''.join(buf).strip()
-                if part:
-                    items.append(_parse_toml_scalar_or_array(part))
-                buf = []
-                continue
-            buf.append(ch)
-        tail = ''.join(buf).strip()
-        if tail:
-            items.append(_parse_toml_scalar_or_array(tail))
-        return items
-    try:
-        return int(val)
-    except ValueError:
-        return val
+    """Parse only scalar values and flat arrays; reject every leftover token."""
+    scalar = r"(?:true|false|[+-]?(?:0|[1-9](?:_?[0-9])*))"
+    string = r"(?:\"(?:[^\"\\\x00-\x08\x0a-\x1f\x7f]|\\(?:[\"\\btnfr]|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}))*\"|'[^'\x00-\x08\x0a-\x1f\x7f]*')"
+    token = re.compile(string + '|' + scalar)
+
+    def parse_one(text, offset):
+        match = token.match(text, offset)
+        if match is None:
+            raise ValueError('unsupported or malformed value')
+        value = match.group()
+        if value.startswith('"'):
+            escapes = {'b': '\b', 't': '\t', 'n': '\n', 'f': '\f', 'r': '\r',
+                       '"': '"', '\\': '\\'}
+            def decode(match):
+                code = match.group()[1:]
+                if code[0] in ('u', 'U'):
+                    number = int(code[1:], 16)
+                    if number > 0x10ffff or 0xd800 <= number <= 0xdfff:
+                        raise ValueError('invalid Unicode escape')
+                    return chr(number)
+                return escapes[code]
+            result = re.sub(r'\\(?:u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)', decode, value[1:-1])
+        elif value.startswith("'"):
+            result = value[1:-1]
+        elif value in ('true', 'false'):
+            result = value == 'true'
+        else:
+            result = int(value.replace('_', ''))
+        return result, match.end()
+
+    text = raw.strip()
+    if not text.startswith('['):
+        result, end = parse_one(text, 0)
+        if text[end:].strip():
+            raise ValueError('unexpected trailing value')
+        return result
+    if not text.endswith(']'):
+        raise ValueError('unclosed array')
+    inner = text[1:-1].strip()
+    values = []
+    while inner:
+        result, end = parse_one(inner, 0)
+        values.append(result)
+        inner = inner[end:].strip()
+        if inner:
+            if not inner.startswith(','):
+                raise ValueError('expected array comma')
+            inner = inner[1:].strip()
+    return values
 
 
 def loads_toml(text):
-    """Parse TOML text supporting [table] and [[array_of_tables]] on Python 3.10+."""
+    """Use tomllib when available, otherwise parse the documented strict subset."""
     if tomllib is not None:
-        data = tomllib.loads(text)
-        if not isinstance(data, dict):
-            raise ValueError('TOML root must be a table')
-        return data
+        return tomllib.loads(text)
     root = {}
     current = root
-    lines = text.splitlines()
-    idx = 0
-    while idx < len(lines):
-        cleaned = _strip_toml_comment(lines[idx]).strip()
-        idx += 1
-        if not cleaned:
-            continue
-        if cleaned.startswith('[[') and cleaned.endswith(']]'):
-            parts = [p.strip().strip('"').strip("'") for p in cleaned[2:-2].strip().split('.') if p.strip()]
-            if not parts:
-                raise ValueError(f'Invalid TOML array-of-tables header: {cleaned}')
-            target = root
-            for part in parts[:-1]:
-                nxt = target.setdefault(part, {})
-                if not isinstance(nxt, dict):
-                    raise ValueError(f'Conflicting TOML table path: {cleaned}')
-                target = nxt
-            arr = target.setdefault(parts[-1], [])
-            if not isinstance(arr, list):
-                raise ValueError(f'Conflicting TOML array-of-tables path: {cleaned}')
-            entry = {}
-            arr.append(entry)
-            current = entry
-            continue
-        if cleaned.startswith('[') and cleaned.endswith(']'):
-            parts = [p.strip().strip('"').strip("'") for p in cleaned[1:-1].strip().split('.') if p.strip()]
-            if not parts:
-                raise ValueError(f'Invalid TOML table header: {cleaned}')
-            target = root
-            for part in parts:
-                nxt = target.setdefault(part, {})
-                if not isinstance(nxt, dict):
-                    raise ValueError(f'Conflicting TOML table path: {cleaned}')
-                target = nxt
-            current = target
-            continue
-        if '=' not in cleaned:
-            raise ValueError(f'Invalid TOML line: {cleaned}')
-        key_raw, val_raw = cleaned.split('=', 1)
-        key = key_raw.strip().strip('"').strip("'")
-        val_str = val_raw.strip()
-        while val_str.startswith('[') and not val_str.endswith(']') and idx < len(lines):
-            nxt_line = _strip_toml_comment(lines[idx]).strip()
-            idx += 1
-            if nxt_line:
-                val_str = val_str + ' ' + nxt_line
-        current[key] = _parse_toml_scalar_or_array(val_str)
+    declared = set()
+    lines = iter(enumerate(text.splitlines(), 1))
+    name = r'[A-Za-z0-9_-]+'
+    for number, line in lines:
+        try:
+            cleaned = _strip_toml_comment(line).strip()
+            if not cleaned:
+                continue
+            if cleaned.startswith('['):
+                if not re.fullmatch(r'\[' + name + r'(?:\.' + name + r')*\]', cleaned):
+                    raise ValueError('unsupported table header')
+                path = tuple(cleaned[1:-1].split('.'))
+                if path in declared:
+                    raise ValueError('duplicate table')
+                declared.add(path)
+                current = root
+                for part in path:
+                    current = current.setdefault(part, {})
+                    if not isinstance(current, dict):
+                        raise ValueError('conflicting table path')
+                continue
+            match = re.fullmatch(r'(' + name + r')\s*=\s*(.*)', cleaned)
+            if match is None:
+                raise ValueError('expected bare key = value')
+            key, value = match.groups()
+            if key in current:
+                raise ValueError('duplicate key')
+            if value.startswith('['):
+                # Ignore brackets inside strings when finding the array's closing line.
+                quoted = r'''"(?:[^"\\]|\\.)*"|['][^']*[']'''
+                while not re.sub(quoted, '', value).rstrip().endswith(']'):
+                    next_line = next(lines, None)
+                    if next_line is None:
+                        raise ValueError('unclosed array')
+                    value += ' ' + _strip_toml_comment(next_line[1]).strip()
+            current[key] = _parse_toml_scalar_or_array(value)
+        except ValueError as error:
+            raise ValueError(f'line {number}: {error}') from error
     return root
+
+
+def check_types(raw, scope, strings=(), lists=(), tables=None):
+    """Reject supplied values of the wrong type; absent fields remain unknown."""
+    if not isinstance(raw, dict):
+        raise ValueError(scope + ' must be a table')
+    for key in strings:
+        if key in raw and not isinstance(raw[key], str):
+            raise ValueError(scope + '.' + key + ' must be a string')
+    for key in lists:
+        if key in raw and (not isinstance(raw[key], list) or
+                           not all(isinstance(item, str) for item in raw[key])):
+            raise ValueError(scope + '.' + key + ' must be a list of strings')
+    for key, members in (tables or {}).items():
+        if key in raw:
+            table = raw[key]
+            check_types(table, scope + '.' + key,
+                        strings=members if members is not None else tuple(table) if isinstance(table, dict) else ())
+    return raw
 
 
 def load(path, unknown):
@@ -211,6 +224,12 @@ def load(path, unknown):
             unknown('platform_profile: unknown; cannot read TOML profile (' + type(error).__name__ + ')')
     else:
         unknown('platform_profile: unknown; configure a workspace-relative TOML profile')
+    check_types(raw, 'platform_profile',
+                strings=STRINGS + ('skeleton_generator', 'file_contexts_tool'),
+                lists=('base_inherited_grants', 'banned'),
+                tables={'module_files': TABLES['module_files'], 'interfaces': None, 'build': ()})
+    if 'build' in raw:
+        check_types(raw['build'], 'platform_profile.build', lists=('include_variables',))
     return validate(raw, unknown)
 
 

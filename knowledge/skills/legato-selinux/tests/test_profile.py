@@ -11,7 +11,7 @@ BASE = Path(__file__).resolve().parents[1]
 
 
 class ProfileTests(unittest.TestCase):
-    def extract(self, profile=None):
+    def extract(self, profile=None, expected_code=0):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shutil.copytree(BASE / 'tests/fixtures/app', root / 'app')
@@ -21,7 +21,11 @@ class ProfileTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(BASE / 'scripts/extract_manifest.py'),
                                      'app/sample.adef', '--workspace', str(root), '--config',
                                      'project.toml', '--output', 'out'], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, expected_code, result.stderr)
+            if expected_code:
+                self.assertIn('must be a string', result.stderr)
+                self.assertFalse((root / 'out').exists())
+                return None
             return (json.loads((root / 'out/access-manifest.yaml').read_text()),
                     (root / 'out/QUESTIONS.md').read_text())
 
@@ -42,8 +46,8 @@ class ProfileTests(unittest.TestCase):
                 self.assertIn('platform_profile.build: unknown', questions)
 
     def test_invalid_profile_is_not_guessed(self):
-        _, questions = self.extract('prefix = 42\ndomain_pattern = "{bogus}"\n')
-        self.assertIn('platform_profile.prefix: unknown', questions)
+        self.extract('prefix = 42\n', expected_code=2)
+        _, questions = self.extract('domain_pattern = "{bogus}"\n')
         self.assertIn('platform_profile.domain_pattern: unknown', questions)
 
     def test_invalid_nested_values(self):
@@ -69,7 +73,8 @@ class ProfileTests(unittest.TestCase):
         _, questions = self.extract(text.replace('read-only/{app}.pp', '../{app}.pp') +
                                     '\n')
         self.assertIn('platform_profile.module_bundle_path: unknown', questions)
-        _, questions = self.extract('skeleton_generator = "{bad.attr}"\nfile_contexts_tool = 2\n')
+        self.extract('file_contexts_tool = 2\n', expected_code=2)
+        _, questions = self.extract('skeleton_generator = "{bad.attr}"\nfile_contexts_tool = "{bad.attr}"\n')
         self.assertIn('platform_profile.skeleton_generator: unknown', questions)
         self.assertIn('platform_profile.file_contexts_tool: unknown', questions)
 

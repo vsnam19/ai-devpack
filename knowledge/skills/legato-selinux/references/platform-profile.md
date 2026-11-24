@@ -38,12 +38,36 @@ explicit policy design and BSP verification.
 
 `python3 scripts/extract_manifest.py` loads and validates profiles through
 `scripts/platform_profile.py`. Missing/unreadable/malformed profiles, absent required
-keys, wrong types and invalid nested values become `unknown` entries in QUESTIONS.md;
+keys and invalid template/path values become `unknown` entries in QUESTIONS.md;
 valid values remain available for review. Optional tools are validated when present.
-Malformed workspace/config paths exit 2. The extractor records the validated contract
+Wrong config/profile types and malformed workspace/config paths exit 2 with a field-specific message. The extractor records the validated contract
 in questions, seeds one draft `inherited_grants` record per base entry with a stable
 `BASE-NNN` deviation ID, and asks for actual source evidence and affected processes.
 Profile line 1 is provenance for those draft records, not proof of a base-policy grant.
 Reconcile additional linked-policy grants, approve each deviation explicitly, and resolve
 all applicable unknowns before generation/build/release. It never substitutes a fictional
 example, runs profile commands or turns missing fields into guessed conventions.
+
+## Python 3.10 TOML subset
+
+When `tomllib` is unavailable, both config and profile loading use a strict subset:
+`[a]` and `[a.b]` tables with bare ASCII letters/digits/underscore/hyphen names;
+bare keys assigned double-quoted strings, single-quoted literal strings, decimal
+integers (optional sign and digit separators), `true`/`false`, or flat arrays of
+those scalar values. Arrays may span lines and have a trailing comma. Double-quoted
+strings support TOML basic escapes (`\\`, `\"`, `\b`, `\t`, `\n`, `\f`, `\r`,
+`\uXXXX`, `\UXXXXXXXX`). Unquoted `#` starts a comment.
+
+All other syntax raises `ValueError` with the starting line number, including
+unquoted values, unterminated strings, unclosed arrays, dotted or quoted assignment
+keys, inline tables, nested arrays, floats, dates, array-of-table headers and
+multi-line strings. Duplicate keys/tables and conflicting table paths are rejected.
+Python versions with `tomllib` use its full TOML parser. For portable profiles and
+configs, use the subset above.
+
+The config root and `selinux` must be tables. Supplied `app_globs` and `exclude`
+must be lists of strings; `platform_root`, `sdk_policy_include`, `linked_policy`,
+`platform_profile` and `manifest_name` must be strings. Profile string fields,
+string-list fields, and nested tables follow the contract above, including an
+`interfaces` table whose values are strings. Missing profile fields still become
+questions; supplied fields of the wrong type exit 2 before output is created.

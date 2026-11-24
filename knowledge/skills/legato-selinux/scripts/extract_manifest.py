@@ -258,9 +258,14 @@ def main():
         config = {}
         if config_path.exists():
             if config_path.suffix == '.json':
-                config = json.loads(config_path.read_text()).get('selinux', {})
+                document = json.loads(config_path.read_text())
             else:
-                config = platform_profile.loads_toml(config_path.read_text()).get('selinux', {})
+                document = platform_profile.loads_toml(config_path.read_text())
+            platform_profile.check_types(document, 'config')
+            config = document.get('selinux', {})
+        platform_profile.check_types(config, 'selinux',
+            strings=('platform_root', 'sdk_policy_include', 'linked_policy',
+                     'platform_profile', 'manifest_name'), lists=('app_globs', 'exclude'))
         for key in ('platform_root', 'sdk_policy_include', 'linked_policy'):
             if config.get(key):
                 contained(config[key])
