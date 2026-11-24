@@ -978,6 +978,129 @@ class PipelineModesTests(unittest.TestCase):
             self.assertEqual("APPROVED", pm_int[0]["status"])
             self.assertFalse(pm_int[0]["hard_stop"])
 
+    def test_dispatch_resume_restores_docker_bin_and_image_tag(self) -> None:
+        """devpack_dispatch --resume restores saved docker_bin and image_tag from resume_spec."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            brief_path = _make_sample_repo(wt)  # default hitl
+            state_dir = base / "dispatch_state"
+            runs_root = base / "dispatch_runs"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_pause, pause_payload = devpack_dispatch.dispatch_job(
+                    engine_name="haiku",
+                    brief_path=brief_path,
+                    workdir=wt,
+                    allow_globs=["src/**"],
+                    gate_cmd="true",
+                    runs_root=runs_root,
+                    isolation="docker",
+                    docker_bin="/custom/bin/docker",
+                    image_tag="custom-img:v42",
+                    state_dir=state_dir,
+                )
+            self.assertEqual(20, rc_pause, pause_payload)
+            aid = str(pause_payload["approval_id"])
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, devpack_approve.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "approve", aid,
+                ]))
+
+            captured: list[agent_exec.AgentRequest] = []
+
+            def _fake_run_agent(req: agent_exec.AgentRequest) -> agent_exec.AgentResult:
+                captured.append(req)
+                return agent_exec.AgentResult(status="ok", exit_code=0, final_text="ok")
+
+            with mock.patch.object(devpack_dispatch, "run_agent", side_effect=_fake_run_agent), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc_res = devpack_dispatch.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "--resume", aid,
+                ])
+            self.assertEqual(0, rc_res)
+            self.assertEqual(1, len(captured))
+            self.assertEqual("/custom/bin/docker", captured[0].docker_bin)
+            self.assertEqual("custom-img:v42", captured[0].image_tag)
+
+    def test_dispatch_resume_failing_start_does_not_consume_approval(self) -> None:
+        """If dispatch fails before starting the agent, the approval stays usable and error is reported."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            brief_path = _make_sample_repo(wt)  # default hitl
+            state_dir = base / "dispatch_state"
+            runs_root = base / "dispatch_runs"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_pause, pause_payload = devpack_dispatch.dispatch_job(
+                    engine_name="haiku",
+                    brief_path=brief_path,
+                    workdir=wt,
+                    allow_globs=["src/**"],
+                    gate_cmd="true",
+                    runs_root=runs_root,
+                    isolation="docker",
+                    state_dir=state_dir,
+                )
+            self.assertEqual(20, rc_pause, pause_payload)
+            aid = str(pause_payload["approval_id"])
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, devpack_approve.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "approve", aid,
+                ]))
+
+            # 1. Pre-start policy refusal (--isolation local without --allow-unsandboxed-local)
+            err_iso = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_iso):
+                rc_fail_iso = devpack_dispatch.main([
+                    "--workdir", str(wt),
+                    "--state-dir", str(state_dir),
+                    "--isolation", "local",
+                    "--resume", aid,
+                ])
+            self.assertEqual(1, rc_fail_iso)
+            self.assertTrue(err_iso.getvalue().strip())
+            rec_after_iso, _ = checkpoints.show_approval(state_dir, aid)
+            self.assertEqual(checkpoints.APPROVED, rec_after_iso["status"])
+            self.assertFalse(bool(rec_after_iso.get("consumed", False)))
+            self.assertFalse((state_dir / "runs" / f"{aid}.consumed").exists())
+
+            # 2. Pre-start exception inside dispatch_job (e.g. engine resolution fails)
+            err_exc = io.StringIO()
+            with mock.patch.object(
+                devpack_dispatch,
+                "resolve_engine",
+                side_effect=ValueError("engine boom"),
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_exc):
+                rc_fail_exc = devpack_dispatch.main([
+                    "--workdir", str(wt),
+                    "--state-dir", str(state_dir),
+                    "--resume", aid,
+                ])
+            self.assertEqual(1, rc_fail_exc)
+            self.assertIn("engine boom", err_exc.getvalue())
+            rec_after_exc, _ = checkpoints.show_approval(state_dir, aid)
+            self.assertEqual(checkpoints.APPROVED, rec_after_exc["status"])
+            self.assertFalse(bool(rec_after_exc.get("consumed", False)))
+            self.assertFalse((state_dir / "runs" / f"{aid}.consumed").exists())
+
+            # 3. Subsequent valid resume succeeds and consumes the approval
+            with mock.patch.object(
+                devpack_dispatch,
+                "run_agent",
+                return_value=agent_exec.AgentResult(status="ok", exit_code=0, final_text="ok"),
+            ), contextlib.redirect_stdout(io.StringIO()):
+                rc_ok = devpack_dispatch.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "--resume", aid,
+                ])
+            self.assertEqual(0, rc_ok)
+            rec_final, _ = checkpoints.show_approval(state_dir, aid)
+            self.assertTrue(bool(rec_final.get("consumed", False)))
+            self.assertTrue((state_dir / "runs" / f"{aid}.consumed").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

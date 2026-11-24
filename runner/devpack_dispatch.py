@@ -807,6 +807,8 @@ def dispatch_job(
     agent_worktree: Path | str | None = None,
     project_root: Path | str | None = None,
     record_memory_checkpoints: bool = True,
+    resume_approval_id: str = "",
+    resume_checkpoint_id: str = "",
 ) -> tuple[int, dict[str, Any]]:
     """Execute one dispatched worker job with policy checks, gate, scope, and test-lock.
 
@@ -992,6 +994,8 @@ def dispatch_job(
             eff_project_root=eff_project_root,
             agent_worktree=agent_worktree,
             record_memory_checkpoints=record_memory_checkpoints,
+            resume_approval_id=resume_approval_id,
+            resume_checkpoint_id=resume_checkpoint_id,
             resume_spec={
                 "kind": "dispatch",
                 "checkpoint_id": "brief",
@@ -1091,6 +1095,8 @@ def _dispatch_job_with_trusted_cfg(
     eff_project_root: Path | None = None,
     agent_worktree: Path | str | None = None,
     record_memory_checkpoints: bool = True,
+    resume_approval_id: str = "",
+    resume_checkpoint_id: str = "",
     resume_spec: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run one dispatched worker job using the pre-snapshotted ``trusted_cfg``."""
@@ -1418,6 +1424,36 @@ def _dispatch_job_with_trusted_cfg(
         git_config_sha256=git_snap.config_sha256,
         git_hooks_listing=git_snap.hooks_entries_for_log(),
     )
+    if resume_approval_id:
+        try:
+            checkpoints.consume_resume_approval(
+                pipeline_cfg.state_dir,
+                resume_approval_id,
+                expected_checkpoint=resume_checkpoint_id or None,
+            )
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            err_msg = f"error: {exc}"
+            sys.stderr.write(err_msg + "\n")
+            update_run_json(
+                run_dir,
+                outcome="refused",
+                gate="skipped",
+                refusal_reason=str(exc),
+                finished=datetime.now(timezone.utc).isoformat(),
+            )
+            payload = {
+                "run_dir": str(run_dir),
+                "status": "refused",
+                "gate": "skipped",
+                "scope": "ok",
+                "changed_files": [],
+                "final_text_tail": "",
+                "cost_usd": None if engine.is_local else 0.0,
+                "error": str(exc),
+            }
+            _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
+            _emit_json_line(payload)
+            return 1, payload
     agent_res = run_agent(req)
 
     git_ok, git_tamper_reason = check_git_metadata_unchanged(git_snap)
@@ -2088,10 +2124,13 @@ def _resume_dispatch_from_approval(
     saved_brief = Path(saved["brief_path"]).resolve()
     try:
         checkpoints.verify_brief_hash(saved_brief, str(saved.get("brief_sha256", "")))
-        checkpoints.consume_resume_approval(
-            pipeline_cfg.state_dir,
-            args.resume,
-            expected_checkpoint=checkpoint_id,
+        if bool(rec.get("consumed", False)) or bool(saved.get("consumed", False)):
+            raise ValueError(f"Approval '{args.resume}' has already been consumed")
+        saved_mode = str(saved.get("pipeline_mode") or "").strip()
+        resumed_mode = (
+            checkpoints.resolve_pipeline_mode(saved_mode, cli_mode=args.mode)
+            if saved_mode
+            else pipeline_cfg.mode
         )
     except (ValueError, FileNotFoundError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -2120,47 +2159,57 @@ def _resume_dispatch_from_approval(
     resumed_isolation = args.isolation if args.isolation != "docker" else str(saved.get("isolation", "docker"))
     resumed_allow_local = bool(args.allow_unsandboxed_local or saved.get("allow_unsandboxed_local", False))
     resumed_agent_bin = args.agent_bin if args.agent_bin != "claude" else str(saved.get("agent_bin", "claude"))
+    resumed_docker_bin = str(saved.get("docker_bin") or "docker")
+    resumed_image_tag = str(saved.get("image_tag") or agent_exec.DOCKER_IMAGE_TAG)
 
-    rc, _payload = dispatch_job(
-        engine_name=str(saved["engine_name"]),
-        brief_path=saved_brief,
-        workdir=saved_workdir,
-        allow_globs=list(saved.get("allow_globs", ())),
-        protected_globs=list(saved.get("protected_globs", ())),
-        base_ref=str(saved.get("base_ref", "")),
-        gate_cmd=str(saved.get("gate_cmd", "")),
-        no_gate=bool(saved.get("no_gate", False)),
-        runs_root=resumed_runs_root,
-        engines_config_path=resumed_engines,
-        project_config_path=resumed_proj_cfg,
-        isolation=resumed_isolation,
-        allow_unsandboxed_local=resumed_allow_local,
-        credentials_path=resumed_creds,
-        agent_bin=resumed_agent_bin,
-        role=str(saved.get("role", "worker")),
-        no_checklist=bool(saved.get("no_checklist", False)),
-        profile_path=resumed_profile,
-        qualification_file=resumed_qual,
-        allow_unqualified=bool(saved.get("allow_unqualified", False)),
-        deviation_id=str(saved.get("deviation_id", "")),
-        require_qualification=bool(saved.get("require_qualification", False)),
-        dry_run=False,
-        memory_enabled=saved.get("memory_enabled"),
-        memory_root=resumed_mem_root,
-        memory_top_k=saved.get("memory_top_k"),
-        memory_budget_tokens=saved.get("memory_budget_tokens"),
-        brief_lint_findings=saved.get("brief_lint_findings"),
-        components=saved.get("components"),
-        all_components=bool(saved.get("all_components", False)),
-        task_id=str(saved.get("task_id", "")),
-        trusted_git_dir=resumed_trusted_git,
-        mode=pipeline_cfg.mode,
-        state_dir=pipeline_cfg.state_dir,
-        brief_approved=True,
-        agent_worktree=saved.get("agent_worktree"),
-        project_root=saved.get("project_root"),
-        record_memory_checkpoints=bool(saved.get("record_memory_checkpoints", True)),
-    )
+    try:
+        rc, _payload = dispatch_job(
+            engine_name=str(saved["engine_name"]),
+            brief_path=saved_brief,
+            workdir=saved_workdir,
+            allow_globs=list(saved.get("allow_globs", ())),
+            protected_globs=list(saved.get("protected_globs", ())),
+            base_ref=str(saved.get("base_ref", "")),
+            gate_cmd=str(saved.get("gate_cmd", "")),
+            no_gate=bool(saved.get("no_gate", False)),
+            runs_root=resumed_runs_root,
+            engines_config_path=resumed_engines,
+            project_config_path=resumed_proj_cfg,
+            isolation=resumed_isolation,
+            allow_unsandboxed_local=resumed_allow_local,
+            credentials_path=resumed_creds,
+            agent_bin=resumed_agent_bin,
+            docker_bin=resumed_docker_bin,
+            image_tag=resumed_image_tag,
+            role=str(saved.get("role", "worker")),
+            no_checklist=bool(saved.get("no_checklist", False)),
+            profile_path=resumed_profile,
+            qualification_file=resumed_qual,
+            allow_unqualified=bool(saved.get("allow_unqualified", False)),
+            deviation_id=str(saved.get("deviation_id", "")),
+            require_qualification=bool(saved.get("require_qualification", False)),
+            dry_run=False,
+            memory_enabled=saved.get("memory_enabled"),
+            memory_root=resumed_mem_root,
+            memory_top_k=saved.get("memory_top_k"),
+            memory_budget_tokens=saved.get("memory_budget_tokens"),
+            brief_lint_findings=saved.get("brief_lint_findings"),
+            components=saved.get("components"),
+            all_components=bool(saved.get("all_components", False)),
+            task_id=str(saved.get("task_id", "")),
+            trusted_git_dir=resumed_trusted_git,
+            mode=resumed_mode,
+            state_dir=pipeline_cfg.state_dir,
+            brief_approved=True,
+            agent_worktree=saved.get("agent_worktree"),
+            project_root=saved.get("project_root"),
+            record_memory_checkpoints=bool(saved.get("record_memory_checkpoints", True)),
+            resume_approval_id=args.resume,
+            resume_checkpoint_id=checkpoint_id,
+        )
+    except (ValueError, FileNotFoundError, OSError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return rc
 
 
