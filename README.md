@@ -73,8 +73,10 @@ or **`autonomous`** mode (`policy/operating_modes.md`), configured in `.devpack/
   loosen `hitl` to `autonomous`; `[pipeline.checkpoints]` cannot set hard-stops to `auto`.
 - **Human/CI approvals:** `runner/devpack_approve.py` is restricted to human operators and CI
   (refused inside agent sandboxes and by `runner/devpack_broker.py`), with `--status pending`
-  available on `list` and `--note <text>` required on `reject` (optional on `approve`). Decisions
-  append to provenance (`policy/provenance.md`):
+  available on `list` and `--note <text>` required on `reject` (optional on `approve`). State
+  defaults to `$XDG_STATE_HOME/devpack/<project-hash>` outside the worktree. Resuming verifies
+  the brief SHA-256 is unchanged and consumes the approval once, and `devpack_run.py --target-branch`
+  checks merge-target protection (`pre-merge` fails closed if unknown):
 
 ```bash
 python3 runner/devpack_approve.py list
@@ -82,6 +84,7 @@ python3 runner/devpack_approve.py show <approval-id>
 python3 runner/devpack_approve.py approve <approval-id>
 python3 runner/devpack_approve.py reject <approval-id>
 python3 runner/devpack_run.py --resume <approval-id>
+python3 runner/devpack_dispatch.py --resume <approval-id>
 ```
 
 ## Reading agent logs

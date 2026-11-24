@@ -60,10 +60,10 @@ def _resolve_state_for_cli(args: argparse.Namespace) -> tuple[Path, Path]:
     workdir = Path(getattr(args, "workdir", ".")).resolve()
     raw_state = str(getattr(args, "state_dir", "") or "").strip()
     if raw_state:
-        return workdir, resolve_state_dir(raw_state, project_root=workdir, explicit=False)
+        return workdir, resolve_state_dir(raw_state, project_root=workdir, agent_worktree=workdir, explicit=True)
     proj_cfg_raw = str(getattr(args, "project_config", "") or "").strip()
     proj_cfg = Path(proj_cfg_raw).resolve() if proj_cfg_raw else None
-    cfg = load_pipeline_config(workdir, project_config_path=proj_cfg)
+    cfg = load_pipeline_config(workdir, project_config_path=proj_cfg, agent_worktree=workdir)
     return workdir, Path(cfg.state_dir)
 
 

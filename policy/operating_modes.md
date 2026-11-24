@@ -23,10 +23,17 @@ Each checkpoint is classified along two axes:
 - **Control-flow kind (`blocking` vs `terminal`):**
   - **Blocking (`plan`, `brief`, `deviation`, `selinux-manifest`):** Work cannot continue until
     decided. If the checkpoint evaluates to `PENDING` (in `hitl`, on a hard-stop, or on a red
-    gate), the runner stops with exit code `20` (`AWAITING_APPROVAL`) and writes
-    `<state_dir>/approvals/pending/<uuid>.json`. Once approved with
-    `runner/devpack_approve.py approve <uuid>`, the run continues via
-    `runner/devpack_run.py --resume <uuid>`.
+    gate), the runner stops with exit code `20` (`AWAITING_APPROVAL`), writes
+    `<state_dir>/approvals/pending/<uuid>.json`, and persists continuation state (job spec,
+    brief SHA-256 hash, checkpoint ID) in `<state_dir>/runs/<uuid>.json`. Once approved with
+    `runner/devpack_approve.py approve <uuid>`, the run continues via:
+    - `runner/devpack_run.py --resume <uuid>` (for `devpack_run` workflows),
+    - `runner/devpack_dispatch.py --resume <uuid>` (for direct `devpack_dispatch` jobs), or
+    - `runner/devpack_dispatch.py --submit --resume <uuid>` / `runner/devpack_broker.py --resume <uuid>`
+      (for host broker jobs).
+    Resuming verifies that the brief file is unchanged (SHA-256 match) and consumes the
+    approval atomically so it can run at most once; edited briefs or second resume attempts are
+    refused.
   - **Terminal (`pre-merge`, `escalation`, `memory-decision`):** Recorded when the run finishes.
     A terminal checkpoint writes an approval record (pending when human action is required) and
     **never changes the run's existing exit code** (a ready change still exits `0`, awaiting
@@ -38,7 +45,7 @@ Each checkpoint is classified along two axes:
 | `brief` | Brief | `blocking` | Each brief before worker dispatch | Tech lead (TL) | Auto-approves when `runner/brief_lint.py` reports 0 error-severity findings; otherwise `PENDING` | Auto-approvable |
 | `deviation` | Deviation | `blocking` | New deviation registration | TL / Safety manager (`policy/deviations.md`) | Auto-approves non-safety (QM / ASIL A) and non-security deviations with green evidence; **hard-stop** (`PENDING`) when safety-relevant (ASIL >= B per `policy/asil_boundaries.md`) or security-relevant | Conditional hard-stop |
 | `selinux-manifest` | Domain / SELinux | `blocking` | SELinux policy/manifest change | Security / data owner | Auto-approves non-release builds with green gate evidence; **hard-stop** (`PENDING`) for release builds | Conditional hard-stop |
-| `pre-merge` | Ready to merge | `terminal` | Change ready for merge after gate + review | Human reviewer (`policy/operating_model.md`) | Auto-records `APPROVED` on non-protected branches when gate + review passed (still never merges); **hard-stop** (`PENDING`) into protected branches (`main`, `master`, `release/*`) | Conditional hard-stop |
+| `pre-merge` | Ready to merge | `terminal` | Change ready for merge after gate + review | Human reviewer (`policy/operating_model.md`) | Auto-records `APPROVED` when merging into a known non-protected `--target-branch` and gate + review passed (still never merges); **hard-stop** (`PENDING`) when target branch is protected (`main`, `master`, `release/*`, `hotfix/*`) or unknown | Conditional hard-stop |
 | `escalation` | Escalation | `terminal` | Action after 2 failed fix rounds or STOP condition | Tech lead (TL) | Always writes `PENDING` approval record; keeps `ESCALATE_TO_HUMAN` (exit `1`) | Hard-stop |
 | `memory-decision` | Memory | `terminal` | Promotion of `decision` / `fact` memory proposals | Human reviewer (`policy/memory.md`) | Always writes `PENDING` approval record; keeps existing exit code | Hard-stop |
 
@@ -49,7 +56,11 @@ Configure mode and state location in trusted `.devpack/project.toml`:
 ```toml
 [pipeline]
 mode = "hitl"                 # "hitl" (default) | "autonomous"
-state_dir = ".devpack/state"  # trusted state directory (default ".devpack/state/")
+# state_dir defaults to $XDG_STATE_HOME/devpack/<project-hash> (outside the worktree).
+# If set explicitly, it must live outside the worktree and any writable worker mount.
+# state_dir = "/var/lib/devpack/state/my-project"
+target_branch = "main"        # merge target checked by pre-merge (defaults to first protected branch or "main")
+protected_branches = ["main", "master", "release/*", "hotfix/*"]
 
 [pipeline.checkpoints]
 # Optional per-checkpoint overrides ("auto" | "human"); may only make policy stricter.
@@ -67,10 +78,17 @@ Rules enforced by `runner/checkpoints.py`:
    - CLI `--mode` on `runner/devpack_run.py` and `runner/devpack_dispatch.py`, as well as
      `DEVPACK_MODE`, may only tighten (`autonomous` -> `hitl`), never loosen (`hitl` -> `autonomous`).
 3. **Trusted `state_dir`:**
-   - Resolved from trusted pre-run/host configuration (default `.devpack/state/`), never from
-     agent-writable working-tree edits.
-   - Any `state_dir` resolving inside an agent worktree (or explicit `state_dir` inside the
-     writable tree) is refused.
+   - Resolved from trusted pre-run/host configuration, defaulting to
+     `$XDG_STATE_HOME/devpack/<project-hash>` (outside the worktree and any writable worker
+     mounts such as in-worktree `runs/` or log directories), never from agent-writable
+     working-tree edits.
+   - Any `state_dir` resolving inside the worktree, `agent_worktree`, or any writable mount is
+     refused at startup, and Docker mount lists never include `state_dir`.
+4. **Target-branch `pre-merge` protection:**
+   - `pre-merge` evaluates the explicit merge destination (`--target-branch`, `DEVPACK_TARGET_BRANCH`,
+     or `[pipeline].target_branch`, defaulting to the first entry of `protected_branches` or
+     `"main"`), never only the current source branch. Unknown or empty target branches fail
+     closed as protected (`hard_stop = true`).
 
 ## 3. Approval CLI, sandbox isolation, and provenance
 

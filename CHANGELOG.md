@@ -5,6 +5,12 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Fixed
+- **Pipeline modes review fixes (`runner/checkpoints.py`, `runner/agent_exec.py`, `runner/devpack_run.py`, `runner/devpack_dispatch.py`, `runner/devpack_broker.py`, `runner/devpack_submit.py`, `runner/devpack_approve.py`, `runner/memory.py`, `policy/operating_modes.md`, `tests/test_pipeline_modes.py`)**:
+  - Default `state_dir` now resolves to `$XDG_STATE_HOME/devpack/<project-hash>` outside the worktree (never `.devpack/state/` inside the worktree); `resolve_state_dir`, `load_pipeline_config`, `checkpoints.request`, and `agent_exec.build_invocation` always receive the worktree and refuse any `state_dir` inside the worktree or any writable worker mount, and Docker mount lists never include `state_dir`.
+  - Paused `devpack_dispatch.py` and `devpack_broker.py` jobs now persist continuation state (`job spec`, `brief_sha256`, `checkpoint_id`) in the trusted `state_dir`; `devpack_dispatch.py --resume <approval-id>`, `devpack_dispatch.py --submit --resume <approval-id>`, `devpack_broker.py --resume <approval-id>`, and `devpack_run.py --resume <approval-id>` verify the brief SHA-256 is unchanged and atomically consume the approval exactly once (refusing second resumes and edited briefs).
+  - `pre-merge` protection now checks the explicit merge target branch (`--target-branch`, `DEVPACK_TARGET_BRANCH`, or `[pipeline].target_branch`, defaulting to the first entry of `[pipeline].protected_branches` or `"main"`) and fails closed (`PENDING` hard-stop) when the target branch is unknown.
+
 ### Added
 - **Pipeline operating modes (`policy/operating_modes.md`, `runner/checkpoints.py`, `runner/devpack_approve.py`, `runner/devpack_run.py`, `runner/devpack_dispatch.py`, `runner/devpack_broker.py`, `runner/devpack_submit.py`, `runner/memory.py`, `runner/devpack_memory.py`, `runner/agent_exec.py`, `eval/run_eval.py`, `tests/test_pipeline_modes.py`)**:
   - Added `[pipeline]` (`mode = "hitl" | "autonomous"`, default `"hitl"`, `state_dir = ".devpack/state"`) and `[pipeline.checkpoints]` tightening-only overrides to `.devpack/project.toml` parsing and validation; CLI `--mode` and `DEVPACK_MODE` may only tighten (`autonomous` -> `hitl`), never loosen.

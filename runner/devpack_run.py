@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -689,6 +690,8 @@ def run_task_workflow(
     brief_author: str = "human",
     brief_approved: bool = False,
     engines_config_path: Path | None = None,
+    target_branch: str | None = None,
+    task_file_path: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run the implement -> gate -> review -> fix workflow loop for a single task.
 
@@ -762,9 +765,13 @@ def run_task_workflow(
 
     pipeline_cfg = checkpoints.load_pipeline_config(
         worktree,
+        project_config_path=default_proj_path if default_proj_path.is_file() else None,
         trusted_project_bytes=pre_run_proj_bytes,
         override_mode=mode,
         override_state_dir=state_dir,
+        agent_worktree=worktree,
+        writable_mounts=(worktree,),
+        override_target_branch=target_branch,
     )
 
     impl_engine = _coerce_role_engine(config, "implementer")
@@ -814,16 +821,6 @@ def run_task_workflow(
 
     log_dir.mkdir(parents=True, exist_ok=True)
     active_run_dir = run_dir if run_dir is not None else log_dir
-    if state_dir is None and not pipeline_cfg.state_dir_explicit:
-        ext_root = run_dir.parent if run_dir is not None else log_dir
-        ext_state = checkpoints.external_state_dir_for_runs_root(worktree, ext_root)
-        if ext_state is not None:
-            pipeline_cfg = checkpoints.PipelineConfig(
-                mode=pipeline_cfg.mode,
-                state_dir=str(ext_state),
-                state_dir_explicit=False,
-                checkpoints=pipeline_cfg.checkpoints,
-            )
     (active_run_dir / "steps").mkdir(parents=True, exist_ok=True)
     role_engine_map = {
         "implementer": impl_engine.name,
@@ -929,6 +926,8 @@ def run_task_workflow(
             f"Brief checkpoint for task '{context['TASK_ID']}' ({context['TASK_TITLE']}).",
             pipeline_config=pipeline_cfg,
             project_root=worktree,
+            agent_worktree=worktree,
+            writable_mounts=(worktree,),
             requested_by="devpack_run",
             gate_passed=not brief_has_errors(brief_findings),
             repo_root=worktree,
@@ -943,9 +942,17 @@ def run_task_workflow(
             }
         )
         if not brief_decision.approved:
+            task_file_sha = ""
+            if task_file_path is not None and task_file_path.is_file() and not task_file_path.is_symlink():
+                task_file_sha = hashlib.sha256(task_file_path.read_bytes()).hexdigest()
             resume_payload: dict[str, Any] = {
+                "kind": "run",
                 "approval_id": brief_decision.approval_id,
                 "checkpoint_id": "brief",
+                "brief_sha256": hashlib.sha256(impl_brief.encode("utf-8")).hexdigest(),
+                "task_file": str(task_file_path.resolve()) if task_file_path is not None else "",
+                "task_file_sha256": task_file_sha,
+                "target_branch": pipeline_cfg.target_branch,
                 "task_id": context["TASK_ID"],
                 "context": dict(context),
                 "worktree": str(worktree),
@@ -1153,6 +1160,7 @@ def run_task_workflow(
             ),
             memory_task_id=context.get("TASK_ID", ""),
             trusted_git_dir=trusted_git_dir,
+            state_dir=Path(pipeline_cfg.state_dir),
         )
         res = run_agent(req)
         for mid in res.memory_ids:
@@ -1578,6 +1586,8 @@ def run_task_workflow(
             escalation_reason or "Escalation to human after fix rounds exhausted.",
             pipeline_config=pipeline_cfg,
             project_root=worktree,
+            agent_worktree=worktree,
+            writable_mounts=(worktree,),
             requested_by="devpack_run",
             gate_passed=False,
             metadata={"fix_rounds_used": fix_rounds_used, "max_fix_rounds": max_fix_rounds},
@@ -1594,7 +1604,11 @@ def run_task_workflow(
         )
 
     if final_status == "APPROVED":
-        protected_branch, branch_name = checkpoints.is_protected_branch(worktree)
+        protected_branch, branch_name = checkpoints.is_protected_target_branch(
+            pipeline_cfg.target_branch,
+            protected_branches=pipeline_cfg.protected_branches,
+        )
+        _, source_branch = checkpoints.is_protected_branch(worktree)
         pm_evidence: list[Path] = []
         gate_files = sorted((active_run_dir / "steps").glob("*-gate.txt"))
         if gate_files:
@@ -1609,9 +1623,16 @@ def run_task_workflow(
             f"Ready for merge approval: task '{context['TASK_ID']}' ({context['TASK_TITLE']}).",
             pipeline_config=pipeline_cfg,
             project_root=worktree,
+            agent_worktree=worktree,
+            writable_mounts=(worktree,),
             requested_by="devpack_run",
             gate_passed=True,
-            metadata={"protected_branch": protected_branch, "branch": branch_name},
+            metadata={
+                "protected_branch": protected_branch,
+                "target_branch": branch_name,
+                "source_branch": source_branch,
+                "branch": branch_name,
+            },
             repo_root=worktree,
             run_dir=active_run_dir,
         )
@@ -1855,6 +1876,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="human",
         help="Author mode passed to brief_lint (default: human)",
     )
+    parser.add_argument(
+        "--target-branch",
+        default=None,
+        help="Merge target branch for pre-merge protection check (default: [pipeline].target_branch or main)",
+    )
     return parser
 
 
@@ -1865,6 +1891,9 @@ def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
             worktree,
             cli_mode=args.mode,
             override_state_dir=args.state_dir or None,
+            agent_worktree=worktree,
+            writable_mounts=(worktree,),
+            cli_target_branch=args.target_branch,
         )
         rec, _rec_path = checkpoints.show_approval(pipeline_cfg.state_dir, args.resume)
     except (ValueError, FileNotFoundError, OSError) as exc:
@@ -1922,10 +1951,38 @@ def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
         print(f"error: resume state missing for approval '{args.resume}'", file=sys.stderr)
         return 1
 
+    saved_kind = str(saved.get("kind", "run")).strip()
+    if saved_kind and saved_kind != "run":
+        print(
+            f"error: approval '{args.resume}' belongs to a '{saved_kind}' job; use devpack_dispatch.py --resume",
+            file=sys.stderr,
+        )
+        return 1
+
     resumed_worktree = Path(saved.get("worktree") or worktree).resolve()
     resumed_repo_root = Path(args.repo_root).resolve() if args.repo_root else Path(saved.get("repo_root", ".")).resolve()
     resumed_log_dir = Path(args.log_dir).resolve() if args.log_dir else Path(saved["log_dir"]).resolve()
     resumed_run_dir = Path(saved["run_dir"]).resolve() if saved.get("run_dir") else resumed_log_dir
+
+    try:
+        task_file_saved = str(saved.get("task_file", "")).strip()
+        task_file_sha = str(saved.get("task_file_sha256", "")).strip()
+        if task_file_saved and task_file_sha:
+            checkpoints.verify_brief_hash(task_file_saved, task_file_sha)
+        expected_brief_sha = str(saved.get("brief_sha256", "")).strip()
+        if expected_brief_sha:
+            cur_brief, _ = render_implement_brief(resumed_repo_root, dict(saved["context"]))
+            cur_sha = hashlib.sha256(cur_brief.encode("utf-8")).hexdigest()
+            if cur_sha != expected_brief_sha:
+                raise ValueError("Refusing resume: task brief changed since checkpoint approval (sha256 mismatch)")
+        checkpoints.consume_resume_approval(
+            pipeline_cfg.state_dir,
+            args.resume,
+            expected_checkpoint=checkpoint_id,
+        )
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     cfg_path_str = str(args.config).strip() or str(saved.get("engines_config_path", "")).strip()
     if cfg_path_str and Path(cfg_path_str).is_file():
@@ -1957,6 +2014,7 @@ def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
     resumed_isolation = args.isolation if args.isolation != "docker" else str(saved.get("isolation", "docker"))
     resumed_allow_local = bool(args.allow_unsandboxed_local or saved.get("allow_unsandboxed_local", False))
     resumed_agent_bin = args.agent_bin if args.agent_bin != "claude" else str(saved.get("agent_bin", "claude"))
+    resumed_target_branch = args.target_branch if args.target_branch is not None else saved.get("target_branch")
 
     try:
         rc, _summary = run_task_workflow(
@@ -1980,10 +2038,11 @@ def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
             deviation_id=args.deviation or str(saved.get("deviation_id", "")),
             gate_config=gate_cfg,
             mode=pipeline_cfg.mode,
-            state_dir=pipeline_cfg.state_dir if pipeline_cfg.state_dir_explicit else None,
+            state_dir=pipeline_cfg.state_dir,
             brief_author=str(saved.get("brief_author", args.brief_author)),
             brief_approved=(checkpoint_id == "brief"),
             engines_config_path=resumed_cfg_path,
+            target_branch=resumed_target_branch,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -2014,6 +2073,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             worktree,
             cli_mode=args.mode,
             override_state_dir=args.state_dir or None,
+            agent_worktree=worktree,
+            writable_mounts=(worktree,),
+            cli_target_branch=args.target_branch,
         )
         config_path = Path(args.config).resolve() if args.config else Path(project_config["engines_config"])
         config = load_engine_config(config_path)
@@ -2081,6 +2143,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             state_dir=pipeline_cfg.state_dir if pipeline_cfg.state_dir_explicit else None,
             brief_author=args.brief_author,
             engines_config_path=config_path,
+            target_branch=args.target_branch,
+            task_file_path=task_file,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

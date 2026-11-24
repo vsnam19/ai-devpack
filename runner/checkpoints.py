@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import fnmatch
 import getpass
 import hashlib
 import json
@@ -54,7 +55,8 @@ PENDING = "PENDING"
 REJECTED = "REJECTED"
 
 DEFAULT_MODE = "hitl"
-DEFAULT_STATE_DIR_REL = ".devpack/state"
+DEFAULT_TARGET_BRANCH = "main"
+DEFAULT_PROTECTED_BRANCHES: tuple[str, ...] = ("main", "master", "release/*", "hotfix/*")
 VALID_MODES: tuple[str, ...] = ("hitl", "autonomous")
 VALID_CHECKPOINT_OVERRIDES: tuple[str, ...] = ("auto", "human")
 MODE_STRICTNESS: dict[str, int] = {"autonomous": 0, "hitl": 1}
@@ -141,8 +143,10 @@ class PipelineConfig:
     """Resolved ``[pipeline]`` configuration from trusted project settings."""
 
     mode: str = DEFAULT_MODE
-    state_dir: str = DEFAULT_STATE_DIR_REL
+    state_dir: str = ""
     state_dir_explicit: bool = False
+    target_branch: str = DEFAULT_TARGET_BRANCH
+    protected_branches: tuple[str, ...] = DEFAULT_PROTECTED_BRANCHES
     checkpoints: dict[str, str] = field(default_factory=dict)
 
 
@@ -187,15 +191,15 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically write redacted JSON to ``path`` without following symlinks."""
+def _atomic_write_json(path: Path, payload: Mapping[str, Any], *, redact: bool = True) -> None:
+    """Atomically write JSON (redacted by default) to ``path`` without following symlinks."""
     if path.is_symlink():
         raise ValueError(f"Refusing to write checkpoint record over symlink: {path}")
     for parent in (path.parent, path.parent.parent):
         if parent.is_symlink():
             raise ValueError(f"Refusing to write inside symlinked directory: {parent}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    safe_payload = redact_value(dict(payload))
+    safe_payload = redact_value(dict(payload)) if redact else dict(payload)
     tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
@@ -266,6 +270,17 @@ def validate_checkpoint_id(checkpoint_id: str) -> str:
     return cleaned
 
 
+def default_target_branch_for(
+    protected_branches: Sequence[str] = DEFAULT_PROTECTED_BRANCHES,
+) -> str:
+    """Return the first concrete entry of ``protected_branches``, or ``'main'``."""
+    for entry in protected_branches:
+        cleaned = str(entry or "").strip()
+        if cleaned and not any(ch in cleaned for ch in "*?["):
+            return cleaned
+    return DEFAULT_TARGET_BRANCH
+
+
 def validate_pipeline_dict(raw_pipeline: Any, *, source: str = "project.toml") -> dict[str, Any]:
     """Validate a parsed ``[pipeline]`` TOML table and reject loosening overrides."""
     if not isinstance(raw_pipeline, Mapping):
@@ -278,11 +293,37 @@ def validate_pipeline_dict(raw_pipeline: Any, *, source: str = "project.toml") -
         )
     mode = raw_mode.strip().lower()
 
-    raw_state_dir = raw_pipeline.get("state_dir", DEFAULT_STATE_DIR_REL)
-    if not isinstance(raw_state_dir, str) or not raw_state_dir.strip():
-        raise ValueError(f"[pipeline].state_dir must be a non-empty string in {source}")
-    state_dir = raw_state_dir.strip()
     state_dir_explicit = "state_dir" in raw_pipeline
+    if state_dir_explicit:
+        raw_state_dir = raw_pipeline.get("state_dir")
+        if not isinstance(raw_state_dir, str) or not raw_state_dir.strip():
+            raise ValueError(f"[pipeline].state_dir must be a non-empty string in {source}")
+        state_dir = raw_state_dir.strip()
+    else:
+        state_dir = ""
+
+    if "protected_branches" in raw_pipeline and raw_pipeline["protected_branches"] is not None:
+        raw_prot = raw_pipeline["protected_branches"]
+        if (
+            not isinstance(raw_prot, (list, tuple))
+            or not raw_prot
+            or any(not isinstance(item, str) or not item.strip() for item in raw_prot)
+        ):
+            raise ValueError(
+                f"[pipeline].protected_branches must be a non-empty list of branch names/globs in {source}"
+            )
+        protected_branches = [str(item).strip() for item in raw_prot]
+    else:
+        protected_branches = list(DEFAULT_PROTECTED_BRANCHES)
+
+    default_target = default_target_branch_for(protected_branches)
+    if "target_branch" in raw_pipeline:
+        raw_target = raw_pipeline.get("target_branch")
+        if not isinstance(raw_target, str):
+            raise ValueError(f"[pipeline].target_branch must be a string in {source}")
+        target_branch = raw_target.strip()
+    else:
+        target_branch = default_target
 
     raw_checkpoints = raw_pipeline.get("checkpoints", {})
     if raw_checkpoints is None:
@@ -316,6 +357,8 @@ def validate_pipeline_dict(raw_pipeline: Any, *, source: str = "project.toml") -
         "mode": mode,
         "state_dir": state_dir,
         "state_dir_explicit": state_dir_explicit,
+        "target_branch": target_branch,
+        "protected_branches": protected_branches,
         "checkpoints": overrides,
     }
 
@@ -369,6 +412,9 @@ def load_pipeline_config(
     override_mode: str | None = None,
     override_state_dir: Path | str | None = None,
     agent_worktree: Path | str | None = None,
+    writable_mounts: Sequence[Path | str] = (),
+    cli_target_branch: str | None = None,
+    override_target_branch: str | None = None,
 ) -> PipelineConfig:
     """Load trusted ``[pipeline]`` config, apply CLI/env tightening, and validate ``state_dir``."""
     raw_doc: dict[str, Any] = {}
@@ -392,7 +438,14 @@ def load_pipeline_config(
     if "pipeline" in raw_doc:
         parsed = validate_pipeline_dict(raw_doc["pipeline"], source=source_label)
     else:
-        parsed = {"mode": DEFAULT_MODE, "state_dir": DEFAULT_STATE_DIR_REL, "state_dir_explicit": False, "checkpoints": {}}
+        parsed = {
+            "mode": DEFAULT_MODE,
+            "state_dir": "",
+            "state_dir_explicit": False,
+            "target_branch": DEFAULT_TARGET_BRANCH,
+            "protected_branches": list(DEFAULT_PROTECTED_BRANCHES),
+            "checkpoints": {},
+        }
 
     if override_mode is not None:
         cleaned_override = str(override_mode).strip().lower()
@@ -414,16 +467,29 @@ def load_pipeline_config(
         state_explicit = True
 
     resolved_state = resolve_state_dir(
-        state_dir_val,
+        state_dir_val or None,
         project_root=workdir,
         agent_worktree=agent_worktree,
+        writable_mounts=writable_mounts,
         explicit=state_explicit,
+        env=source_env,
     )
+
+    if override_target_branch is not None:
+        effective_target = str(override_target_branch).strip()
+    elif cli_target_branch is not None:
+        effective_target = str(cli_target_branch).strip()
+    elif "DEVPACK_TARGET_BRANCH" in source_env:
+        effective_target = str(source_env.get("DEVPACK_TARGET_BRANCH", "")).strip()
+    else:
+        effective_target = str(parsed.get("target_branch", DEFAULT_TARGET_BRANCH)).strip()
 
     return PipelineConfig(
         mode=effective_mode,
         state_dir=str(resolved_state),
         state_dir_explicit=state_explicit,
+        target_branch=effective_target,
+        protected_branches=tuple(parsed.get("protected_branches", DEFAULT_PROTECTED_BRANCHES)),
         checkpoints=dict(parsed["checkpoints"]),
     )
 
@@ -443,21 +509,46 @@ def _check_no_symlinks_under(path: Path, stop_at: Path | None = None) -> None:
         checked += 1
 
 
+def default_state_dir(
+    project_root: Path | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Return the default external state directory ``$XDG_STATE_HOME/devpack/<project-hash>``."""
+    base_root = Path(project_root).resolve() if project_root is not None else Path.cwd().resolve()
+    project_hash = hashlib.sha256(str(base_root).encode("utf-8")).hexdigest()[:16]
+    source_env = os.environ if env is None else env
+    xdg_raw = str(source_env.get("XDG_STATE_HOME", "")).strip()
+    if xdg_raw:
+        xdg_base = Path(xdg_raw)
+        if not xdg_base.is_absolute():
+            raise ValueError(f"XDG_STATE_HOME must be an absolute path when set, got {xdg_raw!r}")
+    else:
+        home_raw = str(source_env.get("HOME", "")).strip()
+        home_path = Path(home_raw) if home_raw else Path.home()
+        xdg_base = home_path / ".local" / "state"
+    return xdg_base / "devpack" / project_hash
+
+
 def resolve_state_dir(
     configured_state_dir: Path | str | None = None,
     *,
     project_root: Path | str | None = None,
     agent_worktree: Path | str | None = None,
+    writable_mounts: Sequence[Path | str] = (),
     explicit: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> Path:
-    """Resolve checkpoint state directory and refuse paths inside an agent worktree."""
+    """Resolve checkpoint state directory and refuse paths inside a worktree or writable mount."""
+    del explicit  # Containment inside worktree/writable mounts is always refused.
     base_root = Path(project_root).resolve() if project_root is not None else Path.cwd().resolve()
     raw = str(configured_state_dir).strip() if configured_state_dir is not None else ""
     if not raw:
-        raw = DEFAULT_STATE_DIR_REL
-    cand = Path(raw)
-    if not cand.is_absolute():
-        cand = base_root / cand
+        cand = default_state_dir(base_root, env=env)
+    else:
+        cand = Path(raw)
+        if not cand.is_absolute():
+            cand = base_root / cand
     _check_no_symlinks_under(cand, base_root if cand.is_relative_to(base_root) else None)
     resolved = cand.resolve()
 
@@ -468,11 +559,19 @@ def resolve_state_dir(
                 f"Checkpoint state_dir '{resolved}' must live outside agent worktree '{aw_res}'"
             )
 
-    default_state = (base_root / DEFAULT_STATE_DIR_REL).resolve()
-    if explicit and project_root is not None and resolved != default_state:
+    for wm in writable_mounts:
+        if wm is None or not str(wm).strip():
+            continue
+        wm_res = Path(wm).resolve()
+        if resolved == wm_res or resolved.is_relative_to(wm_res):
+            raise ValueError(
+                f"Checkpoint state_dir '{resolved}' must live outside writable mount '{wm_res}'"
+            )
+
+    if project_root is not None:
         if resolved == base_root or resolved.is_relative_to(base_root):
             raise ValueError(
-                f"Explicit checkpoint state_dir '{resolved}' must live outside worktree '{base_root}'"
+                f"Checkpoint state_dir '{resolved}' must live outside worktree '{base_root}'"
             )
 
     return resolved
@@ -493,6 +592,34 @@ def external_state_dir_for_runs_root(
     return rr_res.with_name(f".{rr_res.name}-state-{digest}")
 
 
+def is_protected_target_branch(
+    target_branch: str | None,
+    *,
+    protected_branches: Sequence[str] = DEFAULT_PROTECTED_BRANCHES,
+) -> tuple[bool, str]:
+    """Return ``(is_protected, branch_name)`` for a merge target, failing closed when unknown."""
+    cleaned = str(target_branch or "").strip()
+    if not cleaned or cleaned.upper() in ("HEAD", "UNKNOWN", "FETCH_HEAD"):
+        return True, cleaned
+    candidates = [cleaned]
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if cleaned.startswith(prefix):
+            stripped = cleaned[len(prefix):].strip()
+            if stripped:
+                candidates.append(stripped)
+    patterns = tuple(str(p).strip() for p in protected_branches if str(p).strip()) or DEFAULT_PROTECTED_BRANCHES
+    for cand in candidates:
+        if cand in _PROTECTED_BRANCH_NAMES or cand.startswith(_PROTECTED_BRANCH_PREFIXES):
+            return True, cleaned
+        for pat in patterns:
+            if pat.endswith("/"):
+                if cand.startswith(pat):
+                    return True, cleaned
+            elif fnmatch.fnmatchcase(cand, pat):
+                return True, cleaned
+    return False, cleaned
+
+
 def is_hard_stop(checkpoint_id: str, metadata: Mapping[str, Any] | None = None) -> bool:
     """Return True when ``checkpoint_id`` with ``metadata`` always requires human approval."""
     cid = validate_checkpoint_id(checkpoint_id)
@@ -502,10 +629,20 @@ def is_hard_stop(checkpoint_id: str, metadata: Mapping[str, Any] | None = None) 
     if cid == "pre-merge":
         if bool(meta.get("protected_branch", False)):
             return True
-        branch = str(meta.get("branch", "")).strip()
-        if branch in _PROTECTED_BRANCH_NAMES or branch.startswith(_PROTECTED_BRANCH_PREFIXES):
-            return True
-        return False
+        prot_list = meta.get("protected_branches")
+        prot_patterns: Sequence[str] = (
+            tuple(str(x) for x in prot_list)
+            if isinstance(prot_list, (list, tuple)) and prot_list
+            else DEFAULT_PROTECTED_BRANCHES
+        )
+        if "target_branch" in meta:
+            prot, _ = is_protected_target_branch(meta.get("target_branch"), protected_branches=prot_patterns)
+            return prot
+        if meta.get("protected_branch") is False and str(meta.get("branch", "")).strip():
+            prot, _ = is_protected_target_branch(meta.get("branch"), protected_branches=prot_patterns)
+            return prot
+        # Fail closed when merge target branch is unknown.
+        return True
     if cid == "deviation":
         if bool(meta.get("safety_relevant", False)) or bool(meta.get("security_relevant", False)):
             return True
@@ -522,8 +659,15 @@ def is_hard_stop(checkpoint_id: str, metadata: Mapping[str, Any] | None = None) 
     return False
 
 
-def is_protected_branch(repo_root: Path | str) -> tuple[bool, str]:
-    """Detect whether ``repo_root`` HEAD is currently on a protected branch name."""
+def is_protected_branch(
+    repo_root: Path | str,
+    *,
+    target_branch: str | None = None,
+    protected_branches: Sequence[str] = DEFAULT_PROTECTED_BRANCHES,
+) -> tuple[bool, str]:
+    """Detect whether ``target_branch`` (or ``repo_root`` HEAD if omitted) is protected; fail closed if unknown."""
+    if target_branch is not None:
+        return is_protected_target_branch(target_branch, protected_branches=protected_branches)
     try:
         proc = run_git(
             ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -532,13 +676,11 @@ def is_protected_branch(repo_root: Path | str) -> tuple[bool, str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError, GitSecurityError):
-        return False, ""
+        return True, ""
     if proc.returncode != 0:
-        return False, ""
+        return True, ""
     branch = proc.stdout.strip()
-    if branch in _PROTECTED_BRANCH_NAMES or branch.startswith(_PROTECTED_BRANCH_PREFIXES):
-        return True, branch
-    return False, branch
+    return is_protected_target_branch(branch, protected_branches=protected_branches)
 
 
 def _inspect_evidence_file(checkpoint_id: str, path: Path) -> tuple[bool, bool, str, str]:
@@ -762,6 +904,7 @@ def request(
     state_dir: Path | str | None = None,
     project_root: Path | str | None = None,
     agent_worktree: Path | str | None = None,
+    writable_mounts: Sequence[Path | str] = (),
     requested_by: str = "runner",
     gate_passed: bool | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -777,27 +920,34 @@ def request(
     eff_project_root = Path(project_root).resolve() if project_root is not None else (
         Path(repo_root).resolve() if repo_root is not None else None
     )
+    cfg_protected_branches: tuple[str, ...] = DEFAULT_PROTECTED_BRANCHES
     if isinstance(pipeline_config, PipelineConfig):
         cfg_mode = pipeline_config.mode
         cfg_overrides = dict(pipeline_config.checkpoints)
         cfg_state_dir: Path | str | None = pipeline_config.state_dir
         cfg_explicit = pipeline_config.state_dir_explicit
+        cfg_protected_branches = pipeline_config.protected_branches
     elif isinstance(pipeline_config, Mapping):
         cfg_mode = str(pipeline_config.get("mode", DEFAULT_MODE)).strip().lower()
         cfg_overrides = dict(pipeline_config.get("checkpoints", {}) or {})
         cfg_state_dir = pipeline_config.get("state_dir")
         cfg_explicit = bool(pipeline_config.get("state_dir_explicit", False))
+        raw_pb = pipeline_config.get("protected_branches")
+        if isinstance(raw_pb, (list, tuple)) and raw_pb:
+            cfg_protected_branches = tuple(str(x) for x in raw_pb)
     elif eff_project_root is not None:
         loaded_cfg = load_pipeline_config(
             eff_project_root,
             override_mode=mode,
             override_state_dir=state_dir,
             agent_worktree=agent_worktree,
+            writable_mounts=writable_mounts,
         )
         cfg_mode = loaded_cfg.mode
         cfg_overrides = loaded_cfg.checkpoints
         cfg_state_dir = loaded_cfg.state_dir
         cfg_explicit = loaded_cfg.state_dir_explicit
+        cfg_protected_branches = loaded_cfg.protected_branches
     else:
         cfg_mode = DEFAULT_MODE
         cfg_overrides = {}
@@ -812,24 +962,26 @@ def request(
         eff_mode = cfg_mode
 
     if state_dir is not None and str(state_dir).strip():
-        is_explicit = True
-        if eff_project_root is not None and Path(state_dir).resolve() == (eff_project_root / DEFAULT_STATE_DIR_REL).resolve():
-            is_explicit = False
         resolved_state = resolve_state_dir(
             state_dir,
             project_root=eff_project_root,
             agent_worktree=agent_worktree,
-            explicit=is_explicit,
+            writable_mounts=writable_mounts,
+            explicit=True,
         )
     else:
         resolved_state = resolve_state_dir(
             cfg_state_dir,
             project_root=eff_project_root,
             agent_worktree=agent_worktree,
+            writable_mounts=writable_mounts,
             explicit=cfg_explicit,
         )
 
-    hard_stop = is_hard_stop(cid, metadata=metadata)
+    eff_meta = dict(metadata or {})
+    if cid == "pre-merge" and "protected_branches" not in eff_meta:
+        eff_meta["protected_branches"] = list(cfg_protected_branches)
+    hard_stop = is_hard_stop(cid, metadata=eff_meta)
     checkpoint_override = cfg_overrides.get(cid, "")
     requires_human = (eff_mode == "hitl") or hard_stop or (checkpoint_override == "human")
 
@@ -1092,7 +1244,7 @@ def save_resume_state(state_dir: Path | str, approval_id: str, payload: Mapping[
     """Persist workflow continuation metadata for ``--resume <approval_id>``."""
     aid = _validate_approval_id(approval_id)
     resume_path = Path(state_dir).resolve() / "runs" / f"{aid}.json"
-    _atomic_write_json(resume_path, payload)
+    _atomic_write_json(resume_path, payload, redact=False)
     return resume_path
 
 
@@ -1101,3 +1253,77 @@ def load_resume_state(state_dir: Path | str, approval_id: str) -> dict[str, Any]
     aid = _validate_approval_id(approval_id)
     resume_path = Path(state_dir).resolve() / "runs" / f"{aid}.json"
     return _read_record(resume_path)
+
+
+def verify_brief_hash(brief_path: Path | str, expected_sha256: str) -> bytes:
+    """Read ``brief_path`` without following symlinks and verify its SHA-256 matches ``expected_sha256``."""
+    expected = str(expected_sha256 or "").strip().lower()
+    if not expected:
+        raise ValueError("Resume state is missing brief_sha256")
+    path = Path(brief_path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"Refusing resume: brief file missing or symlinked: {path}")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as handle:
+        data = handle.read()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        raise ValueError(
+            f"Refusing resume: brief '{path.name}' changed since checkpoint approval "
+            f"(expected {expected[:12]}, got {actual[:12]})"
+        )
+    return data
+
+
+def consume_resume_approval(
+    state_dir: Path | str,
+    approval_id: str,
+    *,
+    expected_checkpoint: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Atomically verify and consume an ``APPROVED`` checkpoint once for resume."""
+    aid = _validate_approval_id(approval_id)
+    resolved_state = Path(state_dir).resolve()
+    rec, rec_path = show_approval(resolved_state, aid)
+    status = str(rec.get("status", "")).upper()
+    if status != APPROVED:
+        raise ValueError(f"Approval '{aid}' is not APPROVED (status={status})")
+    checkpoint_id = str(rec.get("checkpoint", ""))
+    if expected_checkpoint and checkpoint_id != expected_checkpoint:
+        raise ValueError(
+            f"Approval '{aid}' is for checkpoint '{checkpoint_id}', expected '{expected_checkpoint}'"
+        )
+    saved = load_resume_state(resolved_state, aid)
+    saved_cp = str(saved.get("checkpoint_id", "")).strip()
+    if saved_cp and checkpoint_id and saved_cp != checkpoint_id:
+        raise ValueError(
+            f"Resume state checkpoint '{saved_cp}' does not match approval '{checkpoint_id}'"
+        )
+
+    consumed_marker = resolved_state / "runs" / f"{aid}.consumed"
+    if bool(rec.get("consumed", False)) or bool(saved.get("consumed", False)) or consumed_marker.exists() or consumed_marker.is_symlink():
+        raise ValueError(f"Approval '{aid}' has already been consumed")
+    for parent in (consumed_marker.parent, consumed_marker.parent.parent):
+        if parent.is_symlink():
+            raise ValueError(f"Refusing to consume approval inside symlinked directory: {parent}")
+    consumed_marker.parent.mkdir(parents=True, exist_ok=True)
+    now_iso = _now_utc_iso()
+    try:
+        fd = os.open(consumed_marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise ValueError(f"Approval '{aid}' has already been consumed") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"id": aid, "checkpoint": checkpoint_id, "consumed_at": now_iso}, handle)
+            handle.write("\n")
+    except Exception:
+        consumed_marker.unlink(missing_ok=True)
+        raise
+
+    rec["consumed"] = True
+    rec["consumed_at"] = now_iso
+    _atomic_write_json(rec_path, rec)
+    saved["consumed"] = True
+    saved["consumed_at"] = now_iso
+    save_resume_state(resolved_state, aid, saved)
+    return rec, saved

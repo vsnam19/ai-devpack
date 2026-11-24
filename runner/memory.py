@@ -884,18 +884,21 @@ def _resolve_checkpoint_context(
     project_root: Path | None = None
     if mem_path.name == "memory" and mem_path.parent.name == ".devpack":
         project_root = mem_path.parent.parent
+    try:
+        from runner.checkpoints import load_pipeline_config, resolve_state_dir  # noqa: E402
+    except ModuleNotFoundError:  # pragma: no cover
+        from checkpoints import load_pipeline_config, resolve_state_dir  # type: ignore[no-redef] # noqa: E402
     if state_dir is not None and str(state_dir).strip():
-        return Path(state_dir).resolve(), project_root
+        resolved = resolve_state_dir(
+            state_dir,
+            project_root=project_root,
+            agent_worktree=project_root,
+            explicit=True,
+        )
+        return resolved, project_root
     if project_root is not None:
-        try:
-            from runner.checkpoints import load_pipeline_config  # noqa: E402
-        except ModuleNotFoundError:  # pragma: no cover
-            from checkpoints import load_pipeline_config  # type: ignore[no-redef] # noqa: E402
-        try:
-            cfg = load_pipeline_config(project_root)
-            return Path(cfg.state_dir), project_root
-        except ValueError:
-            return mem_path.parent / "state", project_root
+        cfg = load_pipeline_config(project_root, agent_worktree=project_root)
+        return Path(cfg.state_dir), project_root
     return None, None
 
 

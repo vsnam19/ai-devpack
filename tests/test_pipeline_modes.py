@@ -641,6 +641,343 @@ class PipelineModesTests(unittest.TestCase):
             self.assertEqual(1, rc_t)
             self.assertEqual("violation", payload_t["scope"])
 
+    def test_default_state_dir_external_and_docker_mounts_exclude_state_dir(self) -> None:
+        """Default state_dir resolves to XDG_STATE_HOME outside worktree; inside-worktree state_dir refused; Docker mounts never include state_dir."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _make_sample_repo(wt, project_toml='[pipeline]\nmode = "autonomous"\n')
+            xdg_home = base / "xdg_state"
+
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(xdg_home)}):
+                cfg = checkpoints.load_pipeline_config(wt, agent_worktree=wt)
+                resolved_state = Path(cfg.state_dir)
+                self.assertTrue(resolved_state.is_relative_to(xdg_home / "devpack"))
+                self.assertFalse(resolved_state.is_relative_to(wt))
+
+                # Even when runs_root/log_dir is inside worktree, devpack_run uses external XDG state_dir
+                engines_cfg_path = _write_engines_v2(base / "engines.toml")
+                engines_cfg = devpack_run.load_engine_config(engines_cfg_path)
+                ctx = devpack_run.load_task_data(None, "ext-1", "Ext", "Goal", "src/mod.cpp")
+                with mock.patch.object(
+                    devpack_run,
+                    "run_agent",
+                    side_effect=[
+                        agent_exec.AgentResult(status="ok", exit_code=0, final_text="ok"),
+                        agent_exec.AgentResult(status="ok", exit_code=0, final_text="VERDICT: APPROVE"),
+                    ],
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    rc_run, summary_run = devpack_run.run_task_workflow(
+                        engines_cfg, ctx, wt, wt / "runs" / "in_wt_logs", REPO_ROOT,
+                        isolation="local", allow_unsandboxed_local=True,
+                        engines_config_path=engines_cfg_path,
+                    )
+                self.assertEqual(0, rc_run, summary_run)
+                self.assertFalse(Path(summary_run["state_dir"]).is_relative_to(wt))
+                self.assertFalse((wt / ".devpack" / "state").exists())
+
+            # state_dir configured inside worktree or inside in-worktree runs/logs is refused
+            for bad_state in (
+                wt / ".devpack" / "state",
+                wt / "runs" / "state",
+                wt / "custom_state",
+            ):
+                with self.assertRaisesRegex(ValueError, "outside"):
+                    checkpoints.resolve_state_dir(bad_state, project_root=wt, agent_worktree=wt, writable_mounts=(wt,))
+
+            wt_bad = base / "wt_bad"
+            _make_sample_repo(wt_bad, project_toml='[pipeline]\nmode = "hitl"\nstate_dir = ".devpack/state"\n')
+            with self.assertRaisesRegex(ValueError, "outside"):
+                checkpoints.load_pipeline_config(wt_bad, agent_worktree=wt_bad)
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc_bad = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(wt_bad / "briefs" / "job.md"),
+                    "--workdir", str(wt_bad),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(base / "bad_runs"),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                ])
+            self.assertEqual(2, rc_bad)
+
+            # Docker mount list never includes external state_dir, and refuses state_dir inside workdir
+            eng = agent_exec.EngineConfig(name="haiku", model="haiku", engine_class="cloud")
+            ext_state = base / "ext_state"
+            req_ok = agent_exec.AgentRequest(
+                engine=eng,
+                prompt="test",
+                workdir=wt,
+                run_dir=base / "docker_run",
+                isolation="docker",
+                state_dir=ext_state,
+            )
+            argv_ok, _ = agent_exec.build_invocation(req_ok)
+            mounts = [argv_ok[i + 1] for i, tok in enumerate(argv_ok) if tok == "-v"]
+            mount_srcs = [Path(m.split(":", 1)[0]).resolve() for m in mounts]
+            for src in mount_srcs:
+                self.assertNotEqual(ext_state.resolve(), src)
+                self.assertFalse(ext_state.resolve().is_relative_to(src))
+
+            req_bad = agent_exec.AgentRequest(
+                engine=eng,
+                prompt="test",
+                workdir=wt,
+                run_dir=base / "docker_run_bad",
+                isolation="docker",
+                state_dir=wt / "inside_state",
+            )
+            with self.assertRaisesRegex(ValueError, "outside"):
+                agent_exec.build_invocation(req_bad)
+
+    def test_dispatch_pause_approve_resume_single_use_and_brief_hash(self) -> None:
+        """devpack_dispatch --resume continues once after approval, refuses second resume and edited brief."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            brief_path = _make_sample_repo(wt)  # default hitl
+            state_dir = base / "dispatch_state"
+            runs_root = base / "dispatch_runs"
+            calls_log = base / "worker_calls.txt"
+            worker = _write_exec(
+                base / "worker.py",
+                "#!/usr/bin/env python3\nimport json, pathlib\n"
+                f"with open({str(calls_log)!r}, 'a', encoding='utf-8') as f: f.write('1\\n')\n"
+                "print(json.dumps({'type':'result','is_error':False,'result':'ok'}))\n",
+            )
+
+            # 1. Pause -> approve -> resume runs once -> second resume refused
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_pause = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief_path),
+                    "--workdir", str(wt),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                    "--agent-bin", str(worker),
+                    "--state-dir", str(state_dir),
+                ])
+            self.assertEqual(20, rc_pause)
+            self.assertFalse(calls_log.exists())
+            pending = checkpoints.list_approvals(state_dir, status="pending", checkpoint_id="brief")
+            self.assertEqual(1, len(pending))
+            aid = pending[0]["id"]
+
+            # Still pending -> resume returns 20 and does not consume
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_still = devpack_dispatch.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "--resume", aid,
+                ])
+            self.assertEqual(20, rc_still)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, devpack_approve.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "approve", aid,
+                ]))
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_res = devpack_dispatch.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "--resume", aid,
+                ])
+            self.assertEqual(0, rc_res)
+            self.assertEqual(["1"], calls_log.read_text(encoding="utf-8").splitlines())
+
+            # Second resume refused
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc_res2 = devpack_dispatch.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "--resume", aid,
+                ])
+            self.assertEqual(1, rc_res2)
+            self.assertIn("consumed", err_buf.getvalue())
+            self.assertEqual(["1"], calls_log.read_text(encoding="utf-8").splitlines())
+
+            # 2. Edited brief after approval is refused
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_pause2 = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief_path),
+                    "--workdir", str(wt),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                    "--agent-bin", str(worker),
+                    "--state-dir", str(state_dir),
+                ])
+            self.assertEqual(20, rc_pause2)
+            aid2 = checkpoints.list_approvals(state_dir, status="pending", checkpoint_id="brief")[0]["id"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, devpack_approve.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "approve", aid2,
+                ]))
+            brief_path.write_text(brief_path.read_text(encoding="utf-8") + "\n<!-- edited -->\n", encoding="utf-8")
+            err_edit = io.StringIO()
+            with contextlib.redirect_stderr(err_edit):
+                rc_edit = devpack_dispatch.main([
+                    "--workdir", str(wt), "--state-dir", str(state_dir), "--resume", aid2,
+                ])
+            self.assertEqual(1, rc_edit)
+            self.assertIn("changed", err_edit.getvalue())
+            self.assertEqual(["1"], calls_log.read_text(encoding="utf-8").splitlines())
+
+    def test_broker_pause_approve_resume_single_use_and_brief_hash(self) -> None:
+        """Broker jobs pause in hitl, resume once after approval via queue/submit, and refuse replay or edited brief."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            brief_path = _make_sample_repo(wt)  # default hitl
+            state_dir = base / "broker_state"
+            calls_log = base / "broker_calls.txt"
+            worker = _write_exec(
+                base / "broker_worker.py",
+                "#!/usr/bin/env python3\nimport json, pathlib\n"
+                f"with open({str(calls_log)!r}, 'a', encoding='utf-8') as f: f.write('run\\n')\n"
+                "pathlib.Path('src/mod.cpp').write_text("
+                "'/**\\n * @file mod.cpp\\n * @brief Module.\\n */\\n"
+                "/**\\n * @brief Compute value.\\n * @return Value.\\n */\\n"
+                "int compute() { return 42; }\\n', encoding='utf-8')\n"
+                "print(json.dumps({'type':'result','is_error':False,'result':'done'}))\n",
+            )
+            broker = devpack_broker.Broker(
+                wt,
+                base / "broker_runs",
+                isolation="local",
+                allow_unsandboxed_local=True,
+                agent_bin=str(worker),
+                gate_cmd="true",
+                state_dir=state_dir,
+            )
+            try:
+                code1, p1 = broker.execute({"engine": "haiku", "brief": "briefs/job.md", "allow": ["src/**"]})
+                self.assertEqual(20, code1, p1)
+                self.assertEqual(checkpoints.AWAITING_APPROVAL, p1["status"])
+                aid1 = p1["approval_id"]
+                self.assertFalse(calls_log.exists())
+
+                # Pending resume keeps status 20 and does not consume
+                code_still, p_still = broker.execute({"resume": aid1})
+                self.assertEqual(20, code_still, p_still)
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(0, devpack_approve.main([
+                        "--workdir", str(wt), "--state-dir", str(state_dir), "approve", aid1,
+                    ]))
+
+                # Queue client (--submit --resume) resumes once
+                import threading
+                from runner import devpack_submit
+                stop_poll = threading.Event()
+
+                def _poll_loop() -> None:
+                    while not stop_poll.is_set():
+                        broker.poll()
+                        stop_poll.wait(0.02)
+
+                t = threading.Thread(target=_poll_loop, daemon=True)
+                t.start()
+                try:
+                    sub_out = io.StringIO()
+                    with contextlib.redirect_stdout(sub_out):
+                        rc_sub = devpack_submit.main(["--submit", "--workdir", str(wt), "--resume", aid1])
+                    resp = json.loads(sub_out.getvalue().strip())
+                finally:
+                    stop_poll.set()
+                    t.join(timeout=2)
+                self.assertEqual(0, rc_sub, resp)
+                self.assertEqual("ok", resp["status"], resp)
+                self.assertEqual("ok", resp["gate"], resp)
+                self.assertIn("return 42;", (wt / "src" / "mod.cpp").read_text(encoding="utf-8"))
+                self.assertEqual(["run"], calls_log.read_text(encoding="utf-8").splitlines())
+
+                # Second resume refused
+                code_replay, p_replay = broker.execute({"resume": aid1})
+                self.assertEqual(1, code_replay, p_replay)
+                self.assertEqual("refused", p_replay["status"])
+                self.assertIn("consumed", p_replay["error"])
+                self.assertEqual(["run"], calls_log.read_text(encoding="utf-8").splitlines())
+
+                # Pause -> approve -> edit brief -> resume refused
+                code2, p2 = broker.execute({"engine": "haiku", "brief": "briefs/job.md", "allow": ["src/**"]})
+                self.assertEqual(20, code2, p2)
+                aid2 = p2["approval_id"]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(0, devpack_approve.main([
+                        "--workdir", str(wt), "--state-dir", str(state_dir), "approve", aid2,
+                    ]))
+                brief_path.write_text(brief_path.read_text(encoding="utf-8") + "\n<!-- tampered -->\n", encoding="utf-8")
+                code_edit, p_edit = broker.execute({"resume": aid2})
+                self.assertEqual(1, code_edit, p_edit)
+                self.assertEqual("refused", p_edit["status"])
+                self.assertIn("changed", p_edit["error"])
+                self.assertEqual(["run"], calls_log.read_text(encoding="utf-8").splitlines())
+            finally:
+                broker.close()
+
+    def test_pre_merge_checks_target_branch_and_fails_closed_when_unknown(self) -> None:
+        """Running on feature/x targeting main keeps pre-merge PENDING; unknown target fails closed; unprotected target auto-approves."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _make_sample_repo(wt, project_toml='[pipeline]\nmode = "autonomous"\n', branch="feature/x")
+            engines_cfg_path = _write_engines_v2(base / "engines.toml")
+            engines_cfg = devpack_run.load_engine_config(engines_cfg_path)
+            ctx = devpack_run.load_task_data(None, "pm-target", "Target Check", "Goal", "src/mod.cpp")
+
+            def _run_with_target(state_subdir: str, target_branch: str | None) -> tuple[int, dict]:
+                st = base / state_subdir
+                with mock.patch.object(
+                    devpack_run,
+                    "run_agent",
+                    side_effect=[
+                        agent_exec.AgentResult(status="ok", exit_code=0, final_text="impl ok"),
+                        agent_exec.AgentResult(status="ok", exit_code=0, final_text="VERDICT: APPROVE"),
+                    ],
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    return devpack_run.run_task_workflow(
+                        engines_cfg, ctx, wt, base / f"logs_{state_subdir}", REPO_ROOT,
+                        isolation="local", allow_unsandboxed_local=True,
+                        state_dir=st, engines_config_path=engines_cfg_path,
+                        target_branch=target_branch,
+                    )
+
+            # 1. feature/x targeting main -> pre-merge stays PENDING (hard-stop)
+            rc_main, sum_main = _run_with_target("state_main", "main")
+            self.assertEqual(0, rc_main, sum_main)
+            pm_main = checkpoints.list_approvals(base / "state_main", checkpoint_id="pre-merge")
+            self.assertEqual(1, len(pm_main))
+            self.assertEqual("PENDING", pm_main[0]["status"])
+            self.assertTrue(pm_main[0]["hard_stop"])
+            self.assertEqual("main", pm_main[0]["metadata"]["target_branch"])
+
+            # 2. Default target_branch (omitted) defaults to main -> PENDING
+            rc_def, _ = _run_with_target("state_default", None)
+            self.assertEqual(0, rc_def)
+            pm_def = checkpoints.list_approvals(base / "state_default", checkpoint_id="pre-merge")
+            self.assertEqual("PENDING", pm_def[0]["status"])
+            self.assertTrue(pm_def[0]["hard_stop"])
+
+            # 3. Unknown/empty target_branch fails closed -> PENDING
+            rc_unk, _ = _run_with_target("state_unknown", "")
+            self.assertEqual(0, rc_unk)
+            pm_unk = checkpoints.list_approvals(base / "state_unknown", checkpoint_id="pre-merge")
+            self.assertEqual("PENDING", pm_unk[0]["status"])
+            self.assertTrue(pm_unk[0]["hard_stop"])
+            self.assertTrue(checkpoints.is_hard_stop("pre-merge", {}))
+            self.assertTrue(checkpoints.is_hard_stop("pre-merge", {"target_branch": "HEAD"}))
+
+            # 4. Non-protected target branch (e.g. integration/dev) -> auto-approved in autonomous
+            rc_int, _ = _run_with_target("state_int", "integration/dev")
+            self.assertEqual(0, rc_int)
+            pm_int = checkpoints.list_approvals(base / "state_int", checkpoint_id="pre-merge")
+            self.assertEqual("APPROVED", pm_int[0]["status"])
+            self.assertFalse(pm_int[0]["hard_stop"])
+
 
 if __name__ == "__main__":
     unittest.main()
