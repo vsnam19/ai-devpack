@@ -2121,21 +2121,38 @@ def _resume_dispatch_from_approval(
         )
         return 1
 
+    resumed_proj_cfg = project_cfg_path or (
+        Path(saved["project_config_path"]).resolve() if saved.get("project_config_path") else None
+    )
+    saved_project_root = Path(saved["project_root"]).resolve() if saved.get("project_root") else saved_workdir
+    saved_agent_worktree = Path(saved["agent_worktree"]).resolve() if saved.get("agent_worktree") else saved_workdir
+    saved_writable_mounts: tuple[Path, ...] = (
+        (saved_workdir, saved_agent_worktree) if saved_agent_worktree != saved_workdir else (saved_workdir,)
+    )
+
     saved_brief = Path(saved["brief_path"]).resolve()
     try:
         checkpoints.verify_brief_hash(saved_brief, str(saved.get("brief_sha256", "")))
         if bool(rec.get("consumed", False)) or bool(saved.get("consumed", False)):
             raise ValueError(f"Approval '{args.resume}' has already been consumed")
+        current_project_cfg = checkpoints.load_pipeline_config(
+            saved_project_root,
+            project_config_path=resumed_proj_cfg,
+            cli_mode=args.mode,
+            override_state_dir=pipeline_cfg.state_dir,
+            agent_worktree=saved_agent_worktree,
+            writable_mounts=saved_writable_mounts,
+        )
         saved_mode = str(saved.get("pipeline_mode") or "").strip()
         if saved_mode:
             saved_resolved = checkpoints.resolve_pipeline_mode(saved_mode, cli_mode=args.mode)
             resumed_mode = (
                 saved_resolved
-                if checkpoints.MODE_STRICTNESS[saved_resolved] >= checkpoints.MODE_STRICTNESS[pipeline_cfg.mode]
-                else pipeline_cfg.mode
+                if checkpoints.MODE_STRICTNESS[saved_resolved] >= checkpoints.MODE_STRICTNESS[current_project_cfg.mode]
+                else current_project_cfg.mode
             )
         else:
-            resumed_mode = pipeline_cfg.mode
+            resumed_mode = current_project_cfg.mode
     except (ValueError, FileNotFoundError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -2145,9 +2162,6 @@ def _resume_dispatch_from_approval(
     )
     resumed_engines = Path(args.engines).resolve() if args.engines else (
         Path(saved["engines_config_path"]).resolve() if saved.get("engines_config_path") else None
-    )
-    resumed_proj_cfg = project_cfg_path or (
-        Path(saved["project_config_path"]).resolve() if saved.get("project_config_path") else None
     )
     resumed_creds = Path(args.credentials).resolve() if args.credentials else (
         Path(saved["credentials_path"]).resolve() if saved.get("credentials_path") else None

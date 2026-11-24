@@ -1250,6 +1250,103 @@ class PipelineModesTests(unittest.TestCase):
             run2_json = json.loads((Path(payload2["run_dir"]) / "run.json").read_text(encoding="utf-8"))
             self.assertEqual("hitl", run2_json["pipeline_mode"])
 
+    def test_resume_from_unrelated_directory_reads_saved_project_mode(self) -> None:
+        """Resuming with --state-dir + --resume and no --workdir reads mode from the saved project."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            state_dir = base / "state"
+            runs_root = base / "runs"
+            unrelated_dir = base / "unrelated"
+            unrelated_dir.mkdir(parents=True, exist_ok=True)
+            worker = _write_exec(
+                base / "worker.py",
+                "#!/usr/bin/env python3\nimport json\n"
+                "print(json.dumps({'type':'result','is_error':False,'result':'ok'}))\n",
+            )
+
+            proj_a = base / "project_a"
+            brief_a = _make_sample_repo(
+                proj_a,
+                project_toml='[pipeline]\nmode = "autonomous"\n\n[pipeline.checkpoints]\nbrief = "human"\n',
+            )
+
+            # 1. Pause autonomous job in project A, resume from unrelated dir -> runs autonomous
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_pause1 = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief_a),
+                    "--workdir", str(proj_a),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                    "--agent-bin", str(worker),
+                    "--state-dir", str(state_dir),
+                ])
+            self.assertEqual(20, rc_pause1)
+            pending1 = checkpoints.list_approvals(state_dir, status="pending", checkpoint_id="brief")
+            self.assertEqual(1, len(pending1))
+            aid1 = pending1[0]["id"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, devpack_approve.main([
+                    "--workdir", str(proj_a), "--state-dir", str(state_dir), "approve", aid1,
+                ]))
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(unrelated_dir)
+                out1 = io.StringIO()
+                with contextlib.redirect_stdout(out1):
+                    rc_res1 = devpack_dispatch.main([
+                        "--state-dir", str(state_dir), "--resume", aid1,
+                    ])
+            finally:
+                os.chdir(prev_cwd)
+            self.assertEqual(0, rc_res1)
+            payload1 = json.loads(out1.getvalue().strip().splitlines()[-1])
+            run1_json = json.loads((Path(payload1["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("autonomous", run1_json["pipeline_mode"])
+
+            # 2. Pause autonomous job in project A, change project A config to hitl, resume from unrelated dir -> hitl
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_pause2 = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief_a),
+                    "--workdir", str(proj_a),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                    "--agent-bin", str(worker),
+                    "--state-dir", str(state_dir),
+                ])
+            self.assertEqual(20, rc_pause2)
+            pending2 = checkpoints.list_approvals(state_dir, status="pending", checkpoint_id="brief")
+            self.assertEqual(1, len(pending2))
+            aid2 = pending2[0]["id"]
+
+            (proj_a / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "hitl"\n', encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, devpack_approve.main([
+                    "--workdir", str(proj_a), "--state-dir", str(state_dir), "approve", aid2,
+                ]))
+
+            try:
+                os.chdir(unrelated_dir)
+                out2 = io.StringIO()
+                with contextlib.redirect_stdout(out2):
+                    rc_res2 = devpack_dispatch.main([
+                        "--state-dir", str(state_dir), "--resume", aid2,
+                    ])
+            finally:
+                os.chdir(prev_cwd)
+            self.assertEqual(0, rc_res2)
+            payload2 = json.loads(out2.getvalue().strip().splitlines()[-1])
+            run2_json = json.loads((Path(payload2["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("hitl", run2_json["pipeline_mode"])
+
 
 if __name__ == "__main__":
     unittest.main()
