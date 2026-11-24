@@ -1,0 +1,1275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Legato per-process access manifest",
+  "type": "object",
+  "required": [
+    "app",
+    "version",
+    "approval",
+    "unknowns",
+    "identity",
+    "files",
+    "data_dirs",
+    "devices",
+    "unix_sockets",
+    "ipc",
+    "fd_passing",
+    "network",
+    "capabilities",
+    "exec",
+    "proc_sys",
+    "config_tree",
+    "env_allowed",
+    "limits",
+    "inherited_grants",
+    "denied",
+    "processes"
+  ],
+  "properties": {
+    "app": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string"
+    },
+    "approval": {
+      "type": "object",
+      "required": [
+        "by",
+        "date",
+        "version"
+      ],
+      "properties": {
+        "by": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "unknowns": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "identity": {
+      "$ref": "#/$defs/identity"
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/files"
+      }
+    },
+    "data_dirs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/data_dirs"
+      }
+    },
+    "devices": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/devices"
+      }
+    },
+    "unix_sockets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/unix_sockets"
+      }
+    },
+    "ipc": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ipc"
+      }
+    },
+    "fd_passing": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fd_passing"
+      }
+    },
+    "network": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/network"
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/capabilities"
+      }
+    },
+    "exec": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/exec"
+      }
+    },
+    "proc_sys": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/proc_sys"
+      }
+    },
+    "config_tree": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/config_tree"
+      }
+    },
+    "env_allowed": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/env_allowed"
+      }
+    },
+    "limits": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/limits"
+      }
+    },
+    "inherited_grants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/inherited_grants"
+      }
+    },
+    "denied": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/denied"
+      }
+    },
+    "processes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/processes"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "runs_as",
+        "sandboxed",
+        "groups"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "runs_as": {
+          "type": "string"
+        },
+        "sandboxed": {
+          "enum": [
+            true,
+            false,
+            "unknown"
+          ]
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "files": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "path",
+        "access"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "access": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "data_dirs": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "path",
+        "access"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "access": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "devices": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "path",
+        "access",
+        "ioctls"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "access": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ioctls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "unix_sockets": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "path",
+        "access"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "access": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ipc": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "api",
+        "role",
+        "peers"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "api": {
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "client",
+            "server"
+          ]
+        },
+        "peers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "fd_passing": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "object",
+        "class",
+        "to",
+        "from"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "object": {
+          "type": "string"
+        },
+        "class": {
+          "type": "string"
+        },
+        "to": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "from": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "network": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "proto",
+        "addr",
+        "port",
+        "direction"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "proto": {
+          "type": "string"
+        },
+        "addr": {
+          "type": "string"
+        },
+        "port": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "inbound",
+            "outbound",
+            "both",
+            "unknown"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "exec": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "path",
+        "access"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "access": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "proc_sys": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "path",
+        "access"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "access": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "config_tree": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "path",
+        "access"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "access": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "env_allowed": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "name",
+        "value"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "inherited_grants": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "deviation_id",
+        "grant",
+        "source"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "deviation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "grant": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "denied": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "path"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "runs_as": {
+          "type": "string"
+        },
+        "sandboxed": {
+          "enum": [
+            true,
+            false,
+            "unknown"
+          ]
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "access": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ioctls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "api": {
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "client",
+            "server"
+          ]
+        },
+        "peers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "object": {
+          "type": "string"
+        },
+        "class": {
+          "type": "string"
+        },
+        "to": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "from": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "proto": {
+          "type": "string"
+        },
+        "addr": {
+          "type": "string"
+        },
+        "port": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "inbound",
+            "outbound",
+            "both",
+            "unknown"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "deviation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "grant": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "executable": {
+          "type": "string"
+        },
+        "declaration": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "processes": {
+      "type": "object",
+      "required": [
+        "id",
+        "why",
+        "evidence",
+        "status",
+        "executable",
+        "declaration"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "why": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^.+:[1-9][0-9]*$"
+          }
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved"
+          ]
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "candidate_denied": {
+          "type": "boolean"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        },
+        "executable": {
+          "type": "string"
+        },
+        "declaration": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

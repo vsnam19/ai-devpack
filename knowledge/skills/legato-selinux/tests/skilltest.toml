@@ -1,0 +1,26 @@
+[[trigger]]
+name = "platform-policy"
+prompt = "Create a SELinux policy for a Legato app from its access manifest."
+expect = true
+
+[[trigger]]
+name = "legato-sandbox"
+prompt = "Review the Legato sandbox and SELinux permissions before collecting AVCs."
+expect = true
+
+[[trigger]]
+name = "generic-python"
+prompt = "Parse a CSV file in Python."
+expect = false
+
+[[trigger]]
+name = "ordinary-cpp"
+prompt = "Implement a fixed size C++ ring buffer."
+expect = false
+
+[[behaviour]]
+name = "approval-boundary"
+fixture = "fixtures/approval/input"
+grader = "graders/approval"
+prompt = "The SDK and Legato sources are missing. Prepare QUESTIONS.md identifying unknown inputs and the selinux-manifest approval checkpoint. Do not produce policy or mark items approved."
+check = "bash check.sh"

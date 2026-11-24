@@ -1,0 +1,18 @@
+sandboxed: true
+username: sample-user
+groups: { readers }
+executables: { worker = ( components/worker ) }
+processes: {
+ run: { (worker) }
+ faultAction: restart
+ envVars: { MODE = production }
+ maxFileDescriptors: 32
+}
+requires: {
+ file: { [r] /etc/sample.conf /etc/sample.conf }
+ dir: { [rw] /data/sample /data/sample }
+ device: { [rw] /dev/sample /dev/sample }
+}
+bindings: { worker.worker.service -> peer.service }
+extern: { published = worker.worker.published }
+start: manual
