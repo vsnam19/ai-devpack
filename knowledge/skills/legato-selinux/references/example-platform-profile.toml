@@ -17,6 +17,7 @@ makefile = "Makefile"
 component = "Component.cdef"
 
 [build]
+makefile = "include $(SHAREDIR)/example-policy.mk"
 include_variables = ["SHAREDIR", "HEADERDIR", "TMPDIR", "OECORE_TARGET_SYSROOT", "TYPE", "MLS"]
 
 [interfaces]
@@ -28,3 +29,9 @@ private_data = "{prefix}manage_data({domain}, {data_type})"
 ipc_client = "{prefix}ipc_bind({client}, {server})"
 config_tree = "{prefix}use_config_tree({domain})"
 network = "{prefix}create_sockets({domain})"
+app_transition = "type_transition {admin_source_domain} {exec_type}:process {domain};"
+
+# Explicit fictional image paths; production profiles supply verified paths.
+[contexts]
+installed = "/framework/apps/{app}/read-only/bin/{executable} -- gen_context(system_u:object_r:{exec_type},s0)"
+writable = "/framework/appsWriteable/{app}(/.*)? gen_context(system_u:object_r:{data_type},s0)"

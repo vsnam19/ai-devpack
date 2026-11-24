@@ -81,6 +81,7 @@ module_dir = "{app_dir}/../selinux"
 sdk_policy_include = ""
 linked_policy = ""
 exclude = []
+sim_macros = [] # Additional project simulation-only preprocessor macros
 ```
 
 All configuration paths/globs are workspace-root-relative. Empty paths mean unknown.
@@ -110,3 +111,45 @@ bundle layout, inherited grants and build conventions. See [profile schema](refe
 and the [fictional example](references/example-platform-profile.toml). Missing/invalid fields
 are `unknown` questions; no example value is a fallback. Each base inherited grant seeds
 a draft deviation requiring human approval and effective-rule verification.
+
+## Policy tooling (offline, Python 3.10+ stdlib)
+
+Inputs use JSON flow YAML, as emitted by the extractor. The fixed schema has no root
+`status`: approval means matching nonempty root `approval.by/date/version`, every
+record `status: approved`, and no unresolved root unknowns. Never manufacture approval.
+Profile bindings and baseline changes need the same human review as the manifest.
+
+```sh
+python3 <skill-dir>/scripts/gen_policy.py --manifest approved.json --profile platform.toml --out module
+python3 <skill-dir>/scripts/sel_gate.py --module module --manifest approved.json --profile platform.toml
+python3 <skill-dir>/scripts/sel_gate.py --module module --manifest approved.json --profile platform.toml --linked-policy linked.policy --release
+python3 <skill-dir>/scripts/avc_triage.py --log audit.log --manifest approved.json --profile platform.toml
+```
+
+Generator: exit 2 rejects approval/format errors, 3 means incomplete mappings with
+TODOs and QUESTIONS.md; 0 means generated source, not compiled or release-approved.
+Use a new/empty module directory. Module names come from `module_files`; profile
+interfaces supply every grant. See [tooling contract](references/tooling.md) for explicit
+bindings, image contexts, baseline and skeleton execution. No unknown type is guessed.
+
+**Adjustment 5 — external labels:** installed and writable app paths belong in the
+profile-named `.fc`. `/{etc,data,var/lib,dev}` items go into a separate
+`<app>.platform.fc` for BSP integration, never silently into framework app contexts.
+Verify applied labels after integration and reboot/device recreation.
+
+Gate: JSON on stdout; exit 1 FAIL, 3 TOOL_MISSING, 0 PASS. Source checks always run.
+A source-only run cannot pass: supply linked policy and SETools. Release additionally
+requires captured global Enforcing evidence and no permissive domains. Target release
+checks in step 9 still apply; static artifacts cannot establish live target state.
+
+Triage: writes new `<log>.triage.json` and `<log>.draft-patch.json`, groups AVCs by
+source domain, and prints the report. Optional `--report-out`/`--patch-out` choose new
+paths. The patch contains only draft proposals, never approval or automatic policy edits.
+`covered-by-approved-item` means investigate a label/rule discrepancy; `likely-code-bug`
+means prohibited access; `label-problem` means generic labels; `missing-in-manifest`
+requires human intent review. Preserve the original AVC evidence.
+
+`sim_macros` augments SIMULATION/TEST/MOCK detection; matching branches remain
+`candidate_denied`, never approved denials. Bound required API `file ... OUT/INOUT`
+parameters seed client FD-reception records with unknown creator labels/object classes.
+Reconcile generated APIs, callbacks, dynamic bindings and build conditions manually.
