@@ -98,7 +98,7 @@ python3 <skill-dir>/scripts/extract_manifest.py --app-name sample --workspace . 
 ```
 
 Replace `<skill-dir>` with this installed skill directory. `--config` accepts project TOML
-(Python 3.11+) or a JSON object with a `selinux` member on older Python 3. Output uses JSON
+(Python 3.10+) or a JSON object with a `selinux` member. Output uses JSON
 flow syntax, valid YAML 1.2, in the configured manifest filename plus `QUESTIONS.md`.
 Existing manifests/questions are never overwritten. Missing files become unknowns;
 ambiguous discovery/config errors exit 2. The scanner is lexical and conservative:

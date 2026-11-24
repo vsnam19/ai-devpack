@@ -36,18 +36,25 @@ def sections(text):
             statement = buffer.strip()
             if token == '{':
                 stack.append(statement.rstrip(':').strip())
+                buffer = ''
+            elif token == '\n' and statement.endswith(':'):
+                # Keep section label across newlines/comments until its opening '{'.
+                line += 1
+                continue
             else:
                 if statement:
                     yield tuple(stack), statement, start
                 if token == '}' and stack:
                     stack.pop()
-            buffer = ''
+                buffer = ''
             line += token.count('\n')
             start = line
         else:
             if not buffer.strip():
                 start = line
             buffer += token
+    if buffer.strip():
+        yield tuple(stack), buffer.strip(), start
 
 
 class Extractor:
@@ -226,6 +233,8 @@ class Extractor:
                     fields.update(proto='unknown', addr='unknown', port='unknown', direction='unknown')
                 if category in ('files', 'exec', 'unix_sockets'):
                     fields.update(path=paths[0] if paths else 'unknown', access=['unknown'])
+                if denied:
+                    fields.setdefault('path', paths[0] if paths else 'unknown')
                 self.add('denied' if denied else category, path, line, candidate_denied=denied, **fields)
                 self.unknown(f'Resolve runtime arguments, process and object labels for {operation} at {self.relative(path)}:{line}')
 
@@ -251,11 +260,7 @@ def main():
             if config_path.suffix == '.json':
                 config = json.loads(config_path.read_text()).get('selinux', {})
             else:
-                try:
-                    import tomllib
-                except ImportError:
-                    raise ValueError('TOML needs Python 3.11+; supply JSON config on older Python') from None
-                config = tomllib.loads(config_path.read_text()).get('selinux', {})
+                config = platform_profile.loads_toml(config_path.read_text()).get('selinux', {})
         for key in ('platform_root', 'sdk_policy_include', 'linked_policy'):
             if config.get(key):
                 contained(config[key])
@@ -264,7 +269,13 @@ def main():
         if args.adef:
             adef = contained(args.adef)
         else:
-            matches = sorted({p for glob in config.get('app_globs', ['**/apps/*.adef'])
+            globs = config.get('app_globs', ['**/apps/*.adef'])
+            for glob in globs:
+                if (not isinstance(glob, str) or not glob.strip()
+                        or Path(glob).is_absolute() or glob.startswith('\\')
+                        or '..' in Path(glob.replace('\\', '/')).parts):
+                    raise ValueError(f'app_globs pattern must be workspace-relative without "..": {glob}')
+            matches = sorted({contained(p) for glob in globs
                               for p in root.glob(glob) if p.stem == args.app_name
                               and not any(fnmatch.fnmatch(p.relative_to(root).as_posix(), pat)
                                           for pat in config.get('exclude', []))})

@@ -3,7 +3,7 @@
 The adopting project supplies `[selinux] platform_profile = "profiles/platform.toml"`
 in its project config. The path is workspace-root-relative, including when the project
 config is elsewhere. Absolute paths outside the workspace, parent escapes and escaping
-symlinks are rejected. The profile itself is TOML (Python 3.11+). It is data, never an
+symlinks are rejected. The profile itself is TOML (Python 3.10+). It is data, never an
 executable hook. Keep proprietary profiles outside the pack. The
 [example](example-platform-profile.toml) uses fictional conventions only.
 

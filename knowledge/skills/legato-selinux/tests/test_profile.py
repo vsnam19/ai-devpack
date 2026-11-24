@@ -83,3 +83,26 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(data['processes'])
         self.assertIn('cannot read TOML profile', questions)
         self.assertEqual(data['approval']['by'], '')
+
+    def test_toml_python310_fallback_parses_profile_and_config(self):
+        sys.path.insert(0, str(BASE / 'scripts'))
+        try:
+            import platform_profile
+            original = platform_profile.tomllib
+            platform_profile.tomllib = None
+            try:
+                profile = platform_profile.loads_toml(
+                    (BASE / 'references/example-platform-profile.toml').read_text()
+                )
+                self.assertEqual(profile['prefix'], 'acme_')
+                self.assertEqual(profile['module_files']['te'], '{app}.te')
+                self.assertIn('SHAREDIR', profile['build']['include_variables'])
+                self.assertIn('ipc_client', profile['interfaces'])
+                proj = platform_profile.loads_toml('[selinux]\nplatform_profile = "profile.toml"\n')
+                self.assertEqual(proj['selinux']['platform_profile'], 'profile.toml')
+                with self.assertRaises(ValueError):
+                    platform_profile.loads_toml('not valid TOML !')
+            finally:
+                platform_profile.tomllib = original
+        finally:
+            sys.path.pop(0)
