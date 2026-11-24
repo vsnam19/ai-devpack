@@ -1101,6 +1101,155 @@ class PipelineModesTests(unittest.TestCase):
             self.assertTrue(bool(rec_final.get("consumed", False)))
             self.assertTrue((state_dir / "runs" / f"{aid}.consumed").exists())
 
+    def test_override_mode_cannot_loosen_configured_mode(self) -> None:
+        """load_pipeline_config and checkpoints.request never let override_mode/mode loosen config."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt_hitl = base / "wt_hitl"
+            _make_sample_repo(wt_hitl, project_toml='[pipeline]\nmode = "hitl"\n')
+            state_dir = base / "state"
+
+            cfg = checkpoints.load_pipeline_config(
+                wt_hitl, override_mode="autonomous", override_state_dir=state_dir, agent_worktree=wt_hitl
+            )
+            self.assertEqual("hitl", cfg.mode)
+
+            # Blocking checkpoint still pauses when project config is hitl even if mode="autonomous" is passed
+            receipt = base / "receipt.json"
+            receipt.write_text('{"ok": true}\n', encoding="utf-8")
+            decision = checkpoints.request(
+                "plan",
+                "plan-subj",
+                [receipt],
+                "summary",
+                mode="autonomous",
+                project_root=wt_hitl,
+                state_dir=state_dir,
+            )
+            self.assertTrue(decision.pending)
+            self.assertEqual("hitl", decision.mode)
+
+            wt_auto = base / "wt_auto"
+            _make_sample_repo(wt_auto, project_toml='[pipeline]\nmode = "autonomous"\n')
+            cfg_tight = checkpoints.load_pipeline_config(
+                wt_auto, override_mode="hitl", override_state_dir=state_dir, agent_worktree=wt_auto
+            )
+            self.assertEqual("hitl", cfg_tight.mode)
+            cfg_env = checkpoints.load_pipeline_config(
+                wt_auto,
+                override_mode="autonomous",
+                env={"DEVPACK_MODE": "hitl"},
+                override_state_dir=state_dir,
+                agent_worktree=wt_auto,
+            )
+            self.assertEqual("hitl", cfg_env.mode)
+
+    def test_resume_uses_stricter_of_saved_and_current_mode(self) -> None:
+        """Resume runs in the stricter of saved mode, current project config, and CLI/env tightening."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            state_dir = base / "state"
+            runs_root = base / "runs"
+            worker = _write_exec(
+                base / "worker.py",
+                "#!/usr/bin/env python3\nimport json\n"
+                "print(json.dumps({'type':'result','is_error':False,'result':'ok'}))\n",
+            )
+
+            # 1. Paused in autonomous (via brief = "human"), config changed to hitl -> resume runs as hitl
+            wt_a2h = base / "wt_a2h"
+            brief_a2h = _make_sample_repo(
+                wt_a2h,
+                project_toml='[pipeline]\nmode = "autonomous"\n\n[pipeline.checkpoints]\nbrief = "human"\n',
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_pause1 = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief_a2h),
+                    "--workdir", str(wt_a2h),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                    "--agent-bin", str(worker),
+                    "--state-dir", str(state_dir),
+                ])
+            self.assertEqual(20, rc_pause1)
+            pending1 = checkpoints.list_approvals(state_dir, status="pending", checkpoint_id="brief")
+            self.assertEqual(1, len(pending1))
+            aid1 = pending1[0]["id"]
+            self.assertEqual("autonomous", checkpoints.load_resume_state(state_dir, aid1)["pipeline_mode"])
+
+            # Change project config to hitl and approve
+            (wt_a2h / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "hitl"\n', encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, devpack_approve.main([
+                    "--workdir", str(wt_a2h), "--state-dir", str(state_dir), "approve", aid1,
+                ]))
+
+            out1 = io.StringIO()
+            with contextlib.redirect_stdout(out1):
+                rc_res1 = devpack_dispatch.main([
+                    "--workdir", str(wt_a2h), "--state-dir", str(state_dir), "--resume", aid1,
+                ])
+            self.assertEqual(0, rc_res1)
+            payload1 = json.loads(out1.getvalue().strip().splitlines()[-1])
+            run1_json = json.loads((Path(payload1["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("hitl", run1_json["pipeline_mode"])
+
+            # Verify blocking checkpoints pause under the updated hitl config even if mode="autonomous"
+            receipt = base / "receipt_a2h.json"
+            receipt.write_text('{"ok": true}\n', encoding="utf-8")
+            blk = checkpoints.request(
+                "plan",
+                "plan-after-resume",
+                [receipt],
+                "summary",
+                mode="autonomous",
+                project_root=wt_a2h,
+                state_dir=state_dir,
+            )
+            self.assertTrue(blk.pending)
+            self.assertEqual("hitl", blk.mode)
+
+            # 2. Paused in hitl, config changed to autonomous -> still hitl on resume
+            wt_h2a = base / "wt_h2a"
+            brief_h2a = _make_sample_repo(wt_h2a, project_toml='[pipeline]\nmode = "hitl"\n')
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_pause2 = devpack_dispatch.main([
+                    "--engine", "haiku",
+                    "--brief", str(brief_h2a),
+                    "--workdir", str(wt_h2a),
+                    "--allow", "src/**",
+                    "--gate-cmd", "true",
+                    "--runs-root", str(runs_root),
+                    "--isolation", "local",
+                    "--allow-unsandboxed-local",
+                    "--agent-bin", str(worker),
+                    "--state-dir", str(state_dir),
+                ])
+            self.assertEqual(20, rc_pause2)
+            pending2 = checkpoints.list_approvals(state_dir, status="pending", checkpoint_id="brief")
+            self.assertEqual(1, len(pending2))
+            aid2 = pending2[0]["id"]
+
+            (wt_h2a / ".devpack" / "project.toml").write_text('[pipeline]\nmode = "autonomous"\n', encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, devpack_approve.main([
+                    "--workdir", str(wt_h2a), "--state-dir", str(state_dir), "approve", aid2,
+                ]))
+
+            out2 = io.StringIO()
+            with contextlib.redirect_stdout(out2):
+                rc_res2 = devpack_dispatch.main([
+                    "--workdir", str(wt_h2a), "--state-dir", str(state_dir), "--resume", aid2,
+                ])
+            self.assertEqual(0, rc_res2)
+            payload2 = json.loads(out2.getvalue().strip().splitlines()[-1])
+            run2_json = json.loads((Path(payload2["run_dir"]) / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual("hitl", run2_json["pipeline_mode"])
+
 
 if __name__ == "__main__":
     unittest.main()

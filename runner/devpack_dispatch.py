@@ -2127,11 +2127,15 @@ def _resume_dispatch_from_approval(
         if bool(rec.get("consumed", False)) or bool(saved.get("consumed", False)):
             raise ValueError(f"Approval '{args.resume}' has already been consumed")
         saved_mode = str(saved.get("pipeline_mode") or "").strip()
-        resumed_mode = (
-            checkpoints.resolve_pipeline_mode(saved_mode, cli_mode=args.mode)
-            if saved_mode
-            else pipeline_cfg.mode
-        )
+        if saved_mode:
+            saved_resolved = checkpoints.resolve_pipeline_mode(saved_mode, cli_mode=args.mode)
+            resumed_mode = (
+                saved_resolved
+                if checkpoints.MODE_STRICTNESS[saved_resolved] >= checkpoints.MODE_STRICTNESS[pipeline_cfg.mode]
+                else pipeline_cfg.mode
+            )
+        else:
+            resumed_mode = pipeline_cfg.mode
     except (ValueError, FileNotFoundError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

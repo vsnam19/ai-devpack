@@ -447,17 +447,22 @@ def load_pipeline_config(
             "checkpoints": {},
         }
 
+    source_env = os.environ if env is None else env
+    effective_mode = resolve_pipeline_mode(parsed["mode"], cli_mode=cli_mode, env=source_env)
+    mode_configured = (
+        "pipeline" in raw_doc
+        or bool(str(source_env.get("DEVPACK_MODE", "")).strip())
+        or (cli_mode is not None and bool(str(cli_mode).strip()))
+    )
     if override_mode is not None:
         cleaned_override = str(override_mode).strip().lower()
         if cleaned_override not in VALID_MODES:
             raise ValueError(f"Invalid pipeline mode '{override_mode}' (expected 'hitl' or 'autonomous')")
-        effective_mode = cleaned_override
-    else:
-        effective_mode = resolve_pipeline_mode(parsed["mode"], cli_mode=cli_mode, env=env)
+        if not mode_configured or MODE_STRICTNESS[cleaned_override] > MODE_STRICTNESS[effective_mode]:
+            effective_mode = cleaned_override
 
     state_dir_val = parsed["state_dir"]
     state_explicit = bool(parsed["state_dir_explicit"])
-    source_env = os.environ if env is None else env
     env_state = str(source_env.get("DEVPACK_STATE_DIR", "")).strip()
     if override_state_dir is not None and str(override_state_dir).strip():
         state_dir_val = str(override_state_dir).strip()
@@ -958,6 +963,10 @@ def request(
         eff_mode = str(mode).strip().lower()
         if eff_mode not in VALID_MODES:
             raise ValueError(f"Invalid pipeline mode '{mode}' (expected 'hitl' or 'autonomous')")
+        if (pipeline_config is not None or eff_project_root is not None) and (
+            MODE_STRICTNESS[cfg_mode] > MODE_STRICTNESS[eff_mode]
+        ):
+            eff_mode = cfg_mode
     else:
         eff_mode = cfg_mode
 
