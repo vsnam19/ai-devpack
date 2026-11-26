@@ -89,6 +89,34 @@ class RenderTest(unittest.TestCase):
             ui.key("f")
             self.assertTrue(ui.follow)
 
+    def test_first_detail_paint_uses_second_selected_job(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from runner.dash.reader import Reader, Settings
+        from runner.tests.test_dashboard_reader import write
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            runs = root / "runs"
+            for name in ("first", "second"):
+                write(runs / name / "run.json", {"kind": "dispatch", "outcome": "running"})
+            snapshot = Reader(Settings(root, runs, root / "state")).snapshot()
+            screen = Screen(24, 80)
+            ui = UI()
+            ui.paint(screen, snapshot)
+            ui.key("j")
+            ui.key("ENTER")
+            ui.paint(screen, snapshot)
+            self.assertEqual(screen.lines[1].split()[0], snapshot["jobs"][1]["id"])
+
+            for shortcut in ("l", "g", "e"):
+                with self.subTest(shortcut=shortcut):
+                    ui.key(shortcut)
+                    ui.paint(screen, {**snapshot, "jobs": snapshot["jobs"][:1]})
+                    self.assertEqual(screen.lines[1].strip(), "Job not found")
+                    ui.key("ESC")
+
     def test_job_columns_at_80_100_and_160(self):
         from runner.dash.ui import job_columns, job_line
 

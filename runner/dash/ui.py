@@ -69,7 +69,7 @@ def job_line(job, width):
         field = fit(value, size)
         if label in ("State", "Health", "Role") and field != value:
             field = fit(value, size - 1) + "…"
-        fields.append(field + " " * (size - sum(cell_width(char) for char in field)))
+        fields.append(field + " " * (size - cell_width(field)))
     return " ".join(fields)
 
 
@@ -165,7 +165,7 @@ def plain(snapshot, command):
     yield "Sources " + " | ".join(f"{name} {status}" for name, status in snapshot["sources"].items() if status)
 
 
-def cell_width(char):
+def char_width(char):
     if unicodedata.combining(char):
         return 0
     return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
@@ -175,7 +175,7 @@ def fit(line, width):
     result = []
     cells = 0
     for char in line.replace("\n", " ").expandtabs(4):
-        size = cell_width(char)
+        size = char_width(char)
         if cells + size > width:
             break
         result.append(char)
@@ -334,8 +334,10 @@ class UI:
                 "Copy full operator commands with approvals --plain.",
                 FILTER_HELP,
             ], None
-        if jobs:
-            self.reconcile(jobs)
+        job = next((job for job in jobs if job["key"] == self.job_key), None)
+        if job is None:
+            return None, ["Job not found"], None
+        self.select_job(job)
         if self.view == "Events":
             heading = f"{self.kind} | {'following' if self.follow else 'paused'} | {display(snapshot['sources'].get('stream'))}"
             events = snapshot["events"]
@@ -343,8 +345,8 @@ class UI:
             self.event_lines = [event["sequence"] for event in events]
             if self.event_anchor in self.event_lines and not self.follow:
                 self.offset = self.event_lines.index(self.event_anchor)
-            return heading, lines or (jobs[0]["notices"] if jobs else []) or ["No events"], None
-        return None, list(job_lines(jobs[0], self.view)) if jobs else ["Job unavailable"], None
+            return heading, lines or job["notices"] or ["No events"], None
+        return None, list(job_lines(job, self.view)), None
 
     def paint(self, screen, snapshot, now=None):
         height, width = screen.getmaxyx()
@@ -402,7 +404,7 @@ class UI:
 
 
 def cell_width(text):
-    return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
+    return sum(char_width(char) for char in text)
 
 
 def poll_delay(snapshot, request, interval):
