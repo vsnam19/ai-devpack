@@ -1,425 +1,325 @@
 # CLI dashboard for pipeline and agent observability
 
-## Users and questions
-
-- Engineers watching a goal can see its pipeline, concurrent jobs and retries,
-  the stage in flight, and the agent and model serving each invocation.
-- On-call engineers can distinguish quiet work, stale telemetry, a missing process,
-  checkpoint waits and failures, then inspect gate evidence and attribution.
-- Authorized reviewers can see what needs their decision, why, and how to act.
-- Operators can see today's recorded spend and tokens, engine limits and the age
-  and coverage of reported quota and cooldowns.
+The dashboard reads local runner artifacts to answer four questions. Which jobs
+are active or waiting? What failed? What evidence supports an approval? Which
+measurements are available? The MVP provides Jobs, Job Detail, Events, Gates
+and Approvals in curses, plain text and JSON. It can read older runs before any
+producer changes ship.
 
 ## Views and navigation
 
-The header shows source health, refresh age and pending approvals. At 80×24 use
-one pane with drill-down. At 160×48 keep the master list and selected detail
-side by side. Sketches show populated rows within each viewport, with padding
-and spare rows omitted. Status words work in monochrome. Below 80 columns hide
-secondary columns first and wrap details.
+Default to Jobs. Use one pane with drill-down at 80×24 and a list with a detail
+pane at 160×48. Below 80 columns hide secondary columns and wrap details.
+The header shows source health, refresh age and the pending approval count.
+Preserve selection by stable key across refresh and resize.
 
-1 overview, 2 pipeline, 3 jobs, 4 approvals, 5 quota/cost, 6 incidents.
-j/k or arrows move, Page Up/Down scroll, Tab changes focus, Enter opens the
-selection, Esc goes back, ? opens help, r refreshes and q quits. Preserve
-selection by stable key across refresh and resize. / edits an AND filter by
-backend, goal, state, role, agent/model or literal text. Clear the filter with
-Esc in the filter editor. In detail, l opens events, g opens gates and p opens
-the linked pipeline. In events, c cycles all/command/message and f toggles
-follow. Scrolling back pauses follow. In approvals, a and x open confirmation
-for the selected pending record. Reject requires a reason.
+- Use arrows or `j/k` to move, Page Up/Down to scroll, Tab to change focus,
+  Enter in a list to open the selection, Esc to go back, `?` for help, `r` to
+  refresh and `q` to quit.
+- Use `/` to edit an AND filter on backend, state, role, agent, model or literal
+  text. Enter in the editor applies the filter and returns to the list. Esc
+  cancels the edit and keeps the applied filter. `C` clears it from the list.
+- Job Detail shows observed attempts and steps, agent/model, outcome, gate
+  state, times, process evidence, diagnostics and usage where available.
+  Use `l` for Events, `g` for Gates and `e` for bounded diagnostic excerpts.
+- Events uses `c` to cycle all, command, tool and message, and `f` to toggle
+  follow. Scrolling back pauses follow. Show bounded redacted command names and
+  args, exit codes and agent message excerpts. In plain-text mode show a
+  labeled stdout/stderr tail under the all filter.
+- Gates shows receipt, attempt or step number, status and the applicable
+  redacted output. A failed command and a failed gate are distinct observations.
+- Approvals lists pending and decided records. Enter opens Evidence with
+  summary, gate detail, brief lint findings and bounded redacted brief,
+  escalation or memory proposal text where safely linked. Show hard-stop and
+  blocking state when supported. Display an operator command for pending records.
+- V1 adds Overview, calendar-day accounting and Incidents. V2 adds Pipeline per
+  goal with explicitly linked jobs, dependency arrows and retry branches.
+  Unlinked jobs keep a flat timeline. Label expected stages and show skips
+  only when supported by workflow semantics or producer evidence.
 
-### Overview
+```text
+Jobs   Pack current | External current | 1 pending approval
+Job      Backend   State                 Agent/model
+R17      pack      waiting for approval  worker-a/model-1
+J12      external  running               worker-b/model-2
+R19      pack      running               worker-a/model-1
 
-80×24
-~~~
-Overview   Both sources | updated 2s ago | 1 approval
-Running 3   Queued 2   Waiting 1   Failed today 2
-> G17   Implement running / 2 concurrent jobs
-  G18   Brief waiting / review required
-  ext:J9   Running / goal unknown
-Recorded today $0.42   Coverage 6/9 completed jobs
-Enter Open   2 Pipeline   3 Jobs   4 Approvals
-~~~
+Detail R19  Process health unknown  No stream output yet
+/ Filter  C Clear  Enter Detail  l Events  g Gates  e Diagnostics
+```
 
-160×48
-~~~
-Overview   Pack current 2s | External current 1s | 1 pending approval
-Goals and standalone jobs                 | G17   Implementation in flight
-> G17  running    2 active                | pack:R17  implementer / worker-a   model-1   last event 2s
-  G18  waiting    1 approval              | ext:J12   verifier / worker-b      model-2   quiet 18s
-  J9   running    goal unknown            | Next dependency   gate after implementation
-                                          | Today $0.42 recorded / 6 of 9 completed jobs
-Enter Open selected   Tab Focus preview   4 Approvals   5 Quota/cost   6 Incidents
-~~~
+## Snapshot contract
 
-### Pipeline per goal
+Use a backend, configured source and native ID for each logical job, plus a child
+ID for each observed step or attempt. A broker request keeps its request key when
+the worker link arrives. Preserve run and attempt references as aliases and
+retarget any open selection during reconciliation. Keep native status and source
+references alongside normalized state. Use null in JSON and “unknown” in the UI
+when evidence is missing. Track observation time, last event time and process
+health independently. File modification time is an activity hint.
 
-80×24
-~~~
-Pipeline   G17   Pack + linked external job
-[plan OK] -> [brief OK] -> [implement RUN]
-                            +-- ext:J12 verifier RUN
-                            +-> [gate expected] -> [review expected]
-Enter Selected job/stage   3 Jobs   Esc Back
-~~~
+Normalize verified outcomes before considering stream or PID hints. A paused
+execution becomes ready to resume only with a linked approved checkpoint and
+eligible continuation. Keep terminal checkpoints alongside the execution outcome.
+A pre-merge checkpoint can remain pending after a successful execution. Preserve
+raw outcomes and expose conflicting receipts or missing links as source notices.
 
-160×48
-~~~
-Pipeline   G17                                           | Selected stage   implement
-[plan OK] -> [brief OK] -> [implement RUN]                | pack:R17/03   worker-a / model-1
-                              +-- [verifier RUN] ext:J12 | Last event 2s ago   Started 11:02
-                              +-> [gate expected] -> [review expected] -> [pre-merge expected]
-Retry path when observed   review -> fix #1 -> gate #2 -> review #2
-Enter Open observed job   Tab Focus stage evidence   Esc Back
-~~~
+### Pack mappings
 
-### Jobs and filters
+Each source below names the current producer or the relevant reader where the
+dashboard reuses field interpretation. Reuse field semantics with bounded
+readers. Values labeled as future appear in Phase 0.
 
-80×24
-~~~
-Jobs   / status=running   3 matches
-  Job       Backend  Status   Agent/model       Age
-> R17/03    pack     running  worker-a/model-1  2m
-  J12       external running  worker-b/model-2  1m
-  J9        external running  worker-c/model-1  8m
-/ Filter   Enter Detail   r Refresh
-~~~
-
-160×48
-~~~
-Jobs   / status=running   newest activity first                                  | Selected pack:R17/03
-  Job        Goal  Role          Backend  Status   Agent     Model    Last event | Run R17   Step 03
-> R17/03     G17   implementer   pack     running  worker-a  model-1  2s         | Started 11:02:00
-  J12        G17   verifier      external running  worker-b  model-2  18s        | Gate pending
-  J9         ?     ?             external running  worker-c  model-1  6m         | Usage unknown
-/ Filter   Enter Detail   Tab Focus preview
-~~~
-
-### Job detail
-
-80×24
-~~~
-Job   ext:J12   Goal G17   running
-Agent worker-b   Model model-2   Attempt 2
-PID verified alive   Last event 18s   Duration 1m
-  1  failed    exit 1
-> 2  running   result pending
-Gate pending   Changed files unknown   Cost unknown
-l Events   g Gates   p Pipeline   Esc Jobs
-~~~
-
-160×48
-~~~
-Job detail   ext:J12   G17   running                     | Selected attempt 2
-Agent worker-b / model-2   started 11:03:00               | PID verified alive   Last event 18s
-  1  worker-b / model-1    failed    exit 1               | Changed files unknown   Verdict pending
-> 2  worker-b / model-2    running   exit unknown         | Brief and reply available (restricted)
-Pipeline verifier   Gate pending                         | Usage unknown   Attribution unavailable
-l Events   g Gates   p Pipeline   Esc Jobs
-~~~
-
-### Live events
-
-80×24
-~~~
-Events   ext:J12 attempt 2   command only   following
-11:03:28  started    command   call 17
-11:03:29  completed  command   call 17  exit 0
-c All/command/message   f Follow   PgUp Scroll
-~~~
-
-160×48
-~~~
-Events   ext:J12 attempt 2   command only   following             | Selected event
-Time          Phase       Kind      Call  Summary                 | Call 17   exit 0
-11:03:28      started     command   17    Command started         | Source attempt 2 / stdout
-11:03:29    > completed   command   17    Command finished         | Command content restricted
-c Cycle filter   f Follow   PgUp Pause and scroll   Esc Detail
-~~~
-
-### Gate output
-
-80×24
-~~~
-Gates   ext:J12   attempt 1   gate/1.log
-Outcome fail   Source runner result
-> Test check failed   exit 1
-  <redacted diagnostic excerpt>
-j/k Scroll   Esc Detail
-~~~
-
-160×48
-~~~
-Gate receipts   ext:J12                       | gate/1.log   attempt 1
-> 1  fail    exit 1                           | Test check failed
-  2  pending                                  | <redacted diagnostic excerpt>
-                                              | Result: failed   Source: runner result
-Enter Select receipt   Tab Focus output   Esc Detail
-~~~
-
-### Approvals
-
-80×24
-~~~
-Approvals   Pending 1   Pack
-> A17   brief   blocking   G18   waiting 8m
-Owner tech lead   Brief lint passed
-a Approve   x Reject   Enter Evidence
-Confirm G18 / brief / A17   [Cancel]   Approve
-~~~
-
-160×48
-~~~
-Approvals   Pending 1   Decided 4                 | A17   brief   blocking
-> A17    pending   brief     G18   8m             | Required role   tech lead
-  A16    approved  pre-merge G15   26m            | Evidence   brief lint passed   fingerprint 7b2e...
-                                                  | On approval   operator can resume separately
-a Approve   x Reject   Enter Evidence             | Confirm G18 / brief / A17   [Cancel]   Approve
-~~~
-
-### Quota and cost
-
-80×24
-~~~
-Quota/cost   Today 00:00..now local
-Pack       $0.42 recorded   6/7 priced
-External   unknown          0/2 priced
-> worker-b  cooldown until 11:14   age 40s
-  worker-a  remaining quota unknown
-Enter Source details   Esc Back
-~~~
-
-160×48
-~~~
-Quota/cost   Today (local timezone)                     | Selected pool entry   worker-b
-Backend    Jobs  Priced  Known USD  Input/output tokens | Cooldown until 11:14   sampled 40s ago
-Pack          7       6      $0.42  29,000 / 6,100      | Remaining quota unknown
-External      2       0          ?  unknown             | Pack context/time limits shown separately
-Enter Source details   Tab Focus pool   Esc Back
-~~~
-
-### Incidents and attribution
-
-80×24
-~~~
-Incidents   Today   2 failures
-> R15   gate failed   TOOL (suspected, medium)
-  J11   exit 1        unknown
-Evidence  step 03 / gate receipt / exit 1
-Enter Evidence   Esc Back
-~~~
-
-160×48
-~~~
-Incidents   Today                                  | R15   Gate failed   step 03
-> pack:R15  gate failed  TOOL suspected (medium)   | Evidence   gate receipt, line 12
-  ext:J11   exit 1       unknown                   | Secondary ENV   Confirmation pending
-                                                   | Memory used   2 entries / provenance available
-Enter Job and evidence   Tab Focus attribution   Esc Back
-~~~
-
-## Data contract and adapters
-
-Adapters feed an in-memory store that produces one redacted snapshot contract for
-all renderers. A JobRecord is a logical execution with expandable invocation or
-attempt children. Keys contain backend, configured source and native ID plus
-child ID if applicable. Missing fields are null. Join goals, dependencies and
-approvals only through documented IDs or verified links. Unlinked jobs get a
-flat timeline. Step order provides display order. Render dependency arrows only
-from explicit links or known workflow semantics. Label unseen stages as expected
-and render observed retries, parallel branches and skips explicitly.
-
-| Type | Fields |
-| --- | --- |
-| JobRecord | Key, parent/goal/dependency keys, source and native status, normalized state, role, agent/engine, requested and observed model, start/end/duration, exit/verdict, changed files, gate and approval refs, usage and cost provenance, attribution and memory refs, last event and observation, process evidence, children |
-| StepEvent | Job/attempt key, stream generation and byte offset, optional source timestamp, observed time, kind, started/completed phase, native item/call ID if present, exit code, redacted summary, source location |
-| Approval | Source and UUID, checkpoint ID and kind, state, subject, blocking/hard-stop, required role, evidence fingerprint, job and continuation links, created/decided times, hashed or policy actor, redacted note |
-
-Normalize execution to queued, running, waiting for approval, ready to resume,
-succeeded, failed, refused, rejected, cancelled or unknown. Terminal receipts
-take precedence over stream and PID hints. A blocking checkpoint maps a paused
-run to waiting or ready to resume. A terminal checkpoint is displayed alongside
-the execution outcome. Keep activity inference and health separate from status.
-
-### Pack adapter
-
-| Input | Mapping |
-| --- | --- |
-| `runs/<run-id>/run.json` | run_id, kind, task, started, finished, outcome and engines feed the parent record. |
-| `steps/NN-<role>-<engine>.meta.json` | Role/engine/model/status, duration seconds or milliseconds, token counts and cost from the supported aliases. Stem supplies fallback identity. Prompt or stream may exist before final metadata. |
-| Matching .jsonl | Reuse event interpretation in runner/devpack_logs.py for message and tool variants. Command execution maps to command, other tools to tool. Preserve file order. |
-| Matching .prompt.md, NN-gate.txt, transcript.md | Prompt and transcript availability in detail. Read bounded redacted gate output and use run/step receipts for gate state. Generated transcript is a snapshot. |
-| `.devpack/queue/<id>.{request,response}.json` | A complete request lacking a response is queued or active/unconfirmed. Match the broker's copied request filename under a run or a validated response run_dir. Merge linked records once and ignore temporary requests. |
-| `<state_dir>/approvals/{pending,decided}/<id>.json` | Checkpoint decision, evidence and subject. Decided record wins during transition. |
-| `<state_dir>/runs/<id>.json` and `<id>.consumed` | Continuation keyed by approval ID. Show approved/resumable only with a valid unconsumed continuation. Withhold the saved payload. |
-| attribution.json and step/run memory provenance | Causes, confidence, evidence and human confirmations. Use memory IDs/counts and proposal states where recorded. |
-
-A dispatch can run independently of the broker. The serial broker retains request
-and response artifacts. A submit timeout never establishes a job outcome and
-request age alone cannot establish that processing has started.
-
-### External job runner adapter
-
-| Input under `<jobs-root>/<job-id>/` | Mapping |
-| --- | --- |
-| request.json, brief.md | Directory ID, requested identity and explicit goal metadata when available. Brief availability in detail. |
-| result.json | status, exit_code, agent, model, started, ended, duration_s, attempts, changed_files and verdict. Attempt result fields override filename hints. |
-| pid | Candidate local PID. Verify host and process identity before believing liveness. |
-| `attempts/<n>-<agent>-<model>/stdout` | thread.started maps to lifecycle. item.started/completed with command_execution or agent_message maps to command or message. Pair item IDs within the attempt. |
-| Attempt stderr, reply.md, `gate/<n>.log` | Diagnostic output, reply availability and ordered gate receipts. Join gates to attempts where the numbering contract establishes a link. |
-| jobs, `show <id>`, pool | Files cover jobs and detail. Pool requires a vetted local snapshot or an explicitly verified local-only machine-readable command. |
-
-A missing result means final state is unknown. A verified live process or active
-attempt can support a running state. Approval, attribution, usage and goal links
-are unavailable until a source provides mapped evidence. A linked pack approval
-is actionable only through the pack adapter.
-
-### Tailing, scale and health
-
-- Poll active streams and approvals every 1s, active metadata and pool every 3s,
-  and discover job/run directories every 5s, backing off to 30s when idle. Stop
-  active polling for finalized, drained jobs. Manual refresh wakes all scans.
-  Optional inotify wakes the same reader. Periodic discovery reconciles missed
-  notifications and mounts with limited notification support.
-- Track binary offsets by device/inode and generation. Buffer partial UTF-8 and
-  JSONL bytes until newline. On replacement or truncation reset offset and partial
-  buffer, emit a gap marker, and distinguish new event IDs. Bound any drain of the
-  old descriptor. Count malformed or oversized complete records without dumping
-  raw text. On a terminal stream allow a bounded valid final JSON record without
-  newline after two stable polls.
-- Parse changed snapshots off the UI thread. On transient parse failure keep the
-  last good snapshot with its age and error badge. Distinguish empty, inaccessible
-  and stale sources. Keep open details marked source-removed when a file vanishes.
-- Discover with scandir in batches of 500, prioritize active and selected jobs,
-  keep 10,000 recent terminal summaries and page older ranges on demand. Keep
-  1,000 events per selected stream, cap records at 256 KiB and spend up to 2 MiB
-  of event reads per tick round-robin. Occasional full reconciliation catches
-  inactive entries becoming active. Report partial totals and unread backlog.
-  Target keyboard response under 100 ms in a local fixture with 10,000 historical
-  runs and 100 active jobs. Coalesce snapshots when the renderer falls behind.
-- After 5 minutes without meaningful activity, mark running jobs quiet. Show
-  suspected stuck/orphaned when the process is verified gone and there is no
-  terminal receipt. Use local host and process start identity where recorded to
-  detect PID reuse. A remote root, PID-only record or permission denial leaves
-  identity unverified. Quiet with a live or unverified PID remains quiet. Exclude
-  known waits, queued jobs and terminal jobs. Use monotonic polling and UTC
-  timestamps with local display.
-
-### Accounting and incidents
-
-Use calendar-day completion time in the local timezone. Count each independently
-measured invocation or retry once. Prefer an authoritative scoped run total where
-available, otherwise sum step measurements. Keep undated breakdowns in a labeled
-completion-day total. Track explicit numeric zero separately from missing values
-and parser defaults. Show known spend, priced/eligible counts, tokens with their
-own coverage and scan completeness. Configured context/time limits from
-runner/engines.example.toml's schema are capacity hints. Remaining quota and
-cooldown require dated local evidence. Rate-limit errors belong in incidents.
-
-Show the latest valid human confirmation alongside heuristic evidence, timestamp
-and confidence. Use BRIEF, CONTEXT, SKILL, TOOL, MODEL and ENV, with unknown when
-absent. Read existing attribution.json first. On-demand pack analysis may use
-analyze_run_dir with write=False and bounded inputs. Existing analyze/attribute
-CLI writes stay outside the dashboard. Reuse runner/devpack_memory.py's read-side
-semantics for memory links. Show provenance without loading raw memory bodies
-into search or invoking a memory mutation directly.
-
-## Runtime, CLI and config
-
-Use Python 3.10+ stdlib for the data layer, plain text, JSON and curses. Curses
-handles keyboard focus, resize and differential painting with noutrefresh and
-doupdate. Restore terminal state on exit. Degrade to plain for pipes, missing
-curses, unsupported terminfo or TERM=dumb. In v2 an operator-selected richer UI
-can use an already installed library. It shares snapshots and action semantics
-and falls back to curses, then plain. The design uses the DB0 research patterns
-for master/detail, adaptive refresh and GenAI-style agent, operation and usage
-fields. There is no telemetry exporter or mandatory dependency.
-
-~~~
-devpack_dash.py [--backend pack|external|both] [--runs-root PATH]
-                [--state-dir PATH] [--jobs-root PATH] [--plain|--json] [--once]
-                [overview | pipeline GOAL | jobs [--filter QUERY] | show JOB
-                 | tail JOB [--kind all|command|message] | gate JOB
-                 | approvals [--status pending|decided|all] | quota | incidents
-                 | approve ID [--note TEXT] | reject ID --note TEXT]
-~~~
-
-Default to overview and curses on a usable TTY. Plain/JSON return one snapshot
-unless the explicit tail command is used. --once takes one snapshot or drains a
-bounded initial tail page, then exits. Without an explicit renderer --once uses
-plain. JSON carries a schema version, observation time, source health and nullable
-fields. Streaming JSON uses one record per event or notice. Qualify job selectors
-by backend and reject ambiguity. Exit 0 for successful reads and recorded
-decisions, 1 for action/read failure or all selected roots unavailable, 2 for
-invalid arguments/config. A job failure is data in a successful read.
-
-Use .devpack/project.toml [dashboard] for backend, runs_root, state_dir, jobs_root,
-poll intervals, quiet threshold, history limit and optional renderer. CLI flags
-override config, then defaults apply (pack, project runs/, standard pipeline
-state resolution, no external root until configured). Resolve relative config
-paths against the project config directory. Validate known keys with the existing
-Python 3.10-compatible parser. Resolve write paths independently from trusted host
-pipeline configuration. Project display settings cannot grant decision authority.
-
-## Security and decisions
-
-- Open bounded regular files read-only under configured roots using
-  directory-relative no-follow opens where supported. Scope known filenames and
-  reject escapes and symlinks. Treat payload paths and text as untrusted. No
-  network, queue writes, command execution from logs, or signal delivery.
-- Allowlist fields, remove terminal control sequences and controls, and use
-  runner/redaction.py for every display and output, including errors, filter
-  results and JSON. Withhold raw prompts, briefs, replies and command/message
-  bodies by default. Use only bounded redacted excerpts and trusted literal
-  patterns. Redact complete logical records before excerpting. Drop oversized or
-  incomplete records where safe redaction cannot be established. Fall back to metadata-only for sources that cannot meet display policy.
-  Keep raw text out of snapshots, caches and exports.
-- Decisions go through trusted host runner/devpack_approve.py semantics, including
-  validation, hashed OS-user audit identity, provenance and existing memory
-  side effects. Tech leads own plan/brief/escalation, tech leads or safety managers
-  own deviations, security/data owners own security manifests and human reviewers
-  own pre-merge/memory. Authorized CI may use the existing operator path where
-  policy permits. The hash supports audit; host permissions and roles authorize.
-- Refuse actions within agent sandboxes and through broker forwarding. Separate
-  agent and operator accounts and permissions. Keep trusted action entry points
-  and state outside agent mounts. A TTY or caller-controlled environment marker
-  alone cannot establish operator identity. Disable actions where an agent shares
-  the operator's state write permissions. Attribute existing deterministic
-  auto-approvals to policy; the dashboard issues only explicit operator decisions.
-- Pin the pending ID, trusted state path and evidence fingerprint at review.
-  Verify them again at decision time and require renewed review on changes.
-  Default confirmation to Cancel. Require a nonempty reject reason. Invoke the
-  trusted CLI with fixed argv and no shell, capture and redact outputs, then
-  re-read state. The current check/write sequence needs shared serialization
-  across decision writers, holding the same lock for the final recheck and decision,
-  or a common atomic compare-and-decide primitive before
-  enabling concurrent dashboard writes. Use existing resume commands separately;
-  those validate the brief digest and consume approval once. A decision does not
-  resume, merge or change gate policy.
-
-## Phased delivery
-
-Each row is scoped for one agent. Tests use temporary fixtures and simulated
-processes/time without running real agents or contacting services.
-
-| Phase | Task | Acceptance |
+| Artifact | Fields and interpretation | Code |
 | --- | --- | --- |
-| MVP | Contract and pack adapter | Assert broker/run reconciliation without duplicate rows, direct dispatch, early steps and blocking versus terminal checkpoints. |
-| MVP | External adapter | Assert attempts and event pairing, missing result, reused PID, unknown quota and colliding native IDs. |
-| MVP | Incremental reader and store | Assert partial UTF-8/JSONL, replacement, truncation, oversize records and stale metadata. Measure bounded reads and UI response under fixture load. |
-| MVP | CLI and curses navigation | Assert schema and exit codes, command/message filters, no writes in read mode and dependency-free fallback. Walk both viewport sizes and resize over SSH/tmux. |
-| MVP | Operator decisions | Assert allowed roles and CI path, hashed identity, sandbox refusal, rejection note, stale confirmation and one decision across concurrent supported writers. Enable only with protected host state and shared writer safety. |
-| V1 | Accounting and incidents | Assert local-day boundaries, missing versus zero, no double counting, aged pool data and human confirmation precedence. |
-| V2 | Optional renderer and notifications | Assert renderer parity, fallback and periodic reconciliation after dropped notifications. |
-| V2 | Explicit cross-backend goal links | Assert verified joins, retry edges and standalone views when producer IDs are absent. |
+| `<runs-root>/<run-id>/run.json` | `run_id` (directory fallback), `kind`, `task` (task label), `started`, `finished`, `outcome`, `engines` (configured aliases, list or role mapping). Wall duration is derived from valid start/end times. | `runner/agent_exec.py:new_run_dir`, `runner/agent_exec.py:update_run_json`, `runner/devpack_logs.py:load_run_dir` |
+| Task `run.json` | `checkpoints[].approval_id/checkpoint/status` links approval records. `git_metadata_tampered`, `scope_violation`, `tamper_reason` and any `refusal_reason` explain early failures or refusals. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:_resume_from_approval` |
+| Dispatch `run.json` | `approval_id`, `gate` (ok/fail/skipped where written), `scope`, `brief_lint`, `refusal_reason`, `memory_ids`, `memory_hashes`, `memory_tokens`, `memory_proposals` when present. | `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/devpack_dispatch.py:_resume_dispatch_from_approval` |
+| `run_summary.json` | Task `status`, `verdict`, `escalation_reason`, `step_logs`, `memory_ids`, `memory_tokens`, `memory_proposals`, `cost_usd`, `tokens_in/out` and `duration_s`. Duration is accumulated invocation time. Legacy totals use the accounting rules below. The summary can precede or lag the corresponding run state on resume. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:_resume_from_approval` |
+| `steps/NN-<role>-<engine>.meta.json` | Step number and fallback role/engine from stem. Read `role`, `engine`, `model` (may fall back to configured model), `init_model` (observed where present), `status`, `exit_code`, `duration_s` or legacy `duration_ms`, `error`, `stderr`, `final_text` and memory IDs/hashes/tokens. | `runner/agent_exec.py:run_agent` (includes `_write_meta_and_return`), `runner/agent_exec.py:AgentResult.to_dict`, `runner/devpack_logs.py:_parse_step_stem`, `runner/devpack_logs.py:_apply_step_meta` |
+| Same step metadata | Input aliases `tokens_in/input_tokens/in_tokens`, output aliases `tokens_out/output_tokens/out_tokens`, legacy nested `tokens.in/out` if the corresponding flat value is absent, and `cost_usd/total_cost_usd/cost`. Preserve explicit values only with the applicable provenance below. | `runner/devpack_logs.py:_apply_step_meta`, `runner/agent_exec.py:parse_stream`, `runner/agent_exec.py:run_agent` |
+| Matching `.jsonl` and `.prompt.md` | Discover a step before its metadata appears. Use stream item/tool/message variants for event kind, phase, call ID, exit and text when present. Pair IDs within the step and keep byte order. Use bounded prompt excerpts on request. | `runner/agent_exec.py:run_agent`, `runner/devpack_logs.py:load_run_dir`, `runner/devpack_logs.py:parse_stream_jsonl` |
+| `step_NN_gate.json` | Task gate by step index and round. `gate_passed` is authoritative for the attempt. Show `returncode`, `command`, `duration_s`, `timestamp`, lint/static counts and clean flags, stdout and stderr. Read under the run directory or an explicitly configured, verified log directory. `--log-dir` can put numbered JSON logs elsewhere even when the summary is copied to the run directory. A basename in `step_logs` alone cannot identify that directory. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:write_step_log`, `runner/devpack_run.py:main` |
+| `steps/02-gate-receipt.json` | Dispatch trusted gate config path may produce this receipt. Show `gate_status`, `first_failed_check`, `timestamp_utc`, `checks` and `error`. Use it for the gate invocation and the dispatch `run.json.gate` for the overall dispatch gate decision. | `runner/devpack_dispatch.py:_resolve_gate_command`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `enforcement/gate/gate.py:write_receipt` |
+| `steps/NN-gate.txt`, `transcript.md` | Gate text is evidence. Without a structured status, accept an unambiguous standalone gate marker from a known marker-producing gate. Otherwise show gate unknown. Task gate commands can fail without any marker. Transcript is a generated snapshot. | `runner/devpack_run.py:write_gate_step_file`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/devpack_logs.py:load_run_dir`, `runner/devpack_logs.py:write_rendered_outputs` |
+| `.devpack/queue/<id>.{request,response}.json`, wrapper copies | Queue filename identifies request. Wrapper has `task=broker-request` and the copied request. Response `run_dir` may identify worker. Use worker outcome plus response `status`, `error`, `changed_files`, `served_model_id`, and available usage as corroborating evidence. Keep wrapper outcome as broker disposition and use its explicit status and approval ID for wrapper-only requests. | `runner/devpack_broker.py:Broker.poll`, `runner/devpack_broker.py:Broker.execute`, `runner/devpack_broker.py:Broker._execute_sandboxed_worker`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg` |
+| `<state_dir>/approvals/{pending,decided}/<id>.json` | `id`, `checkpoint`, `kind`, `hard_stop`, `status`, `subject`, `created`, `decided_at`, `decided_by`, `summary`, `note`, `gate_detail`, `gate_receipts`, `evidence`, `run_dir` and allowlisted `metadata`. Prefer valid decided record during transition. Join by explicit run reference or approval ID. Blocking status comes from an explicit paused execution or checkpoint semantics. | `runner/checkpoints.py:request`, `runner/checkpoints.py:decide_approval`, `runner/checkpoints.py:list_approvals` |
+| `<state_dir>/runs/<id>.json`, `<id>.consumed` | Look up by approval ID. Require an approved record, matching supported continuation and absence of consumed flags/marker. Report eligibility as observed, with actual validation and consumption left to the resume command. Withhold saved payload. | `runner/checkpoints.py:save_resume_state`, `runner/checkpoints.py:load_resume_state`, `runner/checkpoints.py:consume_resume_approval` |
+| Linked evidence and memory proposal | Use linked run `brief_lint`, task `escalation_reason`, approval `summary` and `gate_detail`, and exact validated evidence files. Resolve memory proposal text only by a recorded ID under a trusted memory root. Skip missing, redacted-away or unsafe references. | `runner/checkpoints.py:request`, `runner/devpack_run.py:run_task_workflow`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/memory.py:_ensure_memory_decision_checkpoint`, `runner/memory.py:find_memory_entry` |
+| `attribution.json` (V1) | `suspected_cause`, `secondary`, `confidence`, `signals`, `evidence`, `analyzed_at`; latest valid `confirmed[]` with `cause`, `secondary`, `note`, `by`, `timestamp`. | `runner/devpack_logs.py:analyze_run_dir`, `runner/devpack_logs.py:attribute_run_dir` |
 
-## Risks and open questions
+Task `APPROVED` means execution succeeded. `ESCALATE_TO_HUMAN` means
+escalated and maps to failed unless a linked checkpoint actually paused the
+execution. `awaiting_approval` maps to waiting, or ready to resume with the
+continuation evidence above. `rejected` maps to rejected. A
+`git_metadata_tampered` flag or scope violation of that name maps to failed
+with a tampering reason even if the summary carries a different verdict.
+Dispatch `pass` maps to succeeded, `fail` and `timeout` to failed with
+reason, `refused` to refused and `running` to running with independent
+health. Missing or unrecognized values map to unknown.
 
-- Confirm stable external goal, attempt and gate IDs and local-only pool export.
-  Coverage is partial until producers expose those fields.
-- Confirm producer host/start metadata for PID checking. Tune quiet thresholds
-  against buffered output, long commands and mounted filesystems.
-- Validate accounting provenance for default zeros and aggregate-only runs.
-  Record coverage before treating totals as spend.
-- Validate operator isolation and shared decision writer safety before rollout.
-  The existing separate existence check and write permit competing writers.
+#### Broker reconciliation
+
+Correlate queue request ID → wrapper copy of `<id>.request.json` → worker
+directory named by a validated wrapper response or queue response. The wrapper
+response can exist before the queue response. Check that the target is a
+distinct direct child of the configured runs root, with a compatible run ID and
+kind, and reject conflicting links. Treat legacy terminal response links as
+valid only after those checks. Collapse the wrapper and worker into the request
+row and retain both sources in detail. A refusal before worker creation remains
+a single request row with no worker. A response naming the wrapper itself is
+a wrapper-only outcome (for example, refusal or an approval pause). Direct
+dispatch continues to appear by its own run ID. Ignore temporary request files.
+
+Before Phase 0, a queued request without a matching wrapper has unconfirmed
+processing status. A wrapper without a worker link shows “worker link unknown”.
+Keep any observed worker as an independent run with broker membership unknown.
+The same active job can therefore occupy two unresolved rows on legacy data.
+Never infer links from start times, engine names or task names. A submit timeout
+does not establish a job outcome.
+
+### External adapter
+
+The external runner has no producer function in this repository. These are
+candidate fields for an operator-configured local file contract. Enable each
+mapping only after validating it against local fixtures from the selected
+producer. Pack stream interpretation is a reference for event variants only.
+
+| Input beneath `<jobs-root>/<job-id>/` | Mapping and validation |
+| --- | --- |
+| Directory, `request.json`, `brief.md` | Directory ID; requested role/agent/model where the producer declares them. A bounded brief excerpt is available on request. Goal ID requires an explicit contract in V2. |
+| `result.json` and attempt results where supported | `status`, `exit_code`, `agent`, `model`, `started`, `ended`, `duration_s`, `attempts`, `changed_files`, `verdict` where verified. Attempt result fields take precedence over filename hints. Without a result, final state is unknown. |
+| `pid` | Candidate local PID. See health rules for local absence, PID reuse and remote roots. |
+| `attempts/<n>-<agent>-<model>/stdout` | Attempt number and filename identity hints where the naming contract is unambiguous. Recognized `thread.started` and `item.started/completed` variants yield lifecycle, command, tool or message events. Pair IDs within an attempt. Reference `runner/devpack_logs.py:parse_stream_jsonl` for Pack variants. |
+| Attempt stderr, `reply.md`, `gate/<n>.log` | Bounded redacted diagnostics. Link gate to attempt only with a verified numbering contract. Gate status requires explicit structured outcome or a known marker contract. |
+| Optional dated local pool snapshot (V1) | Use only explicitly documented quota, cooldown and sample time fields. Missing, stale and unverified sources report unknown current quota. |
+
+A verified active attempt or local process identity can support running.
+Usage, approvals and attribution remain unknown unless a validated source
+supplies the fields. Cross-source links require explicit producer IDs.
+
+## Phase 0 data prerequisites
+
+Each row is a separate producer change with an offline acceptance test.
+Ship existing-artifact reads independently. Legacy degradation applies
+per run and per field, including in mixed-version roots.
+
+| Producer change | Acceptance test | MVP when absent |
+| --- | --- | --- |
+| Write atomic per-run `heartbeat.json` from the host workflow or dispatch owner, starting at run creation. Record schema version, run ID, PID, boot ID, process start identity, heartbeat time and nullable `last_event_at`. Refresh during waits for subprocesses, keep heartbeat and event times separate, and stop updates on pause or completion. Bind local checks to a trusted local source. | With fake time and processes, assert a quiet live child leaves the host heartbeat fresh, a killed owner leaves stale data, and boot mismatch, PID reuse and permission errors never verify liveness. Assert terminal and paused execution overrides health hints. | Process health unknown for Pack. Show available event time and elapsed age. |
+| Publish one atomic broker correlation record under the wrapper as soon as dispatch allocates the worker directory, before worker steps start. Include request ID, wrapper run ID and worker run ID. Retain response link as a completion fallback. Preserve an allocated link through errors and keep requests that allocate no worker distinguishable. | Pause a stub worker before step 01 and assert the queue, wrapper and worker produce one request row. Assert the same key after completion, refusal before allocation, failure after allocation and a concurrent direct dispatch. Reject conflicting or escaping links. | Use validated terminal response links. Show unresolved linkage during execution. |
+| Preserve nullable measured cost through `runner/agent_exec.py:parse_stream`, `runner/agent_exec.py:run_agent` and task/dispatch serialization. Record schema or explicit provenance distinguishing measured values from defaults. Expose per-direction token availability too. | Parse fixtures with explicit zero, positive cost, missing result, truncated stream and local unpriced execution. Assert zero survives, absent values serialize as null, and a mixed run contributes known spend with partial coverage. Assert legacy consumers still handle nullable values. | Default zeros without explicit evidence are unknown. |
+| Standardize run-level totals in each run directory's `run_summary.json`. Extend task summary with measurement scope and known/eligible counts. Emit the same summary for direct dispatch. Store cost, tokens and invocation duration with coverage, separately from wall duration. Publish the final snapshot atomically and refresh it coherently on resume. | Assert task retries are counted once, a direct dispatch has matching step and summary, early refusal has unknown measurements, and replay/re-read never adds totals twice. Assert external task log directories still leave the summary discoverable. | Read existing task summary and step metadata with legacy provenance rules. Use step fallback or unknown for missing totals. |
+| Mirror task `step_NN_gate.json` into the run directory when an explicit log directory differs. Preserve raw gate output and publish the structured result atomically for each attempt. | Use a failing stub gate with exit 1 and no marker, followed by a successful retry. Assert both verdicts and round links are visible from the run root with a separate log directory. | Use a verified log root if available, otherwise show the gate transcript with unknown status when structured evidence is missing. |
+
+## Incremental reading and health
+
+- Use stdlib polling. Discover directories via bounded `scandir` batches.
+  Prioritize selected, known active and recent-mtime entries. Hydrate historical
+  metadata progressively with an in-memory summary cache keyed by file revision.
+  Show partial counts and backlog. `--once` uses a bounded initial scan and
+  reports coverage. Age out older summaries and page them on demand.
+- Sample selected stream and approvals every 1s, background active file
+  size/mtime and metadata every 3s, and discovery every 5s. Back off to 30s
+  when idle. Full reconciliation runs incrementally. Stop active polls for
+  finalized, drained streams and wake readers on manual refresh.
+- Parse stream records only for the selected Events view or explicit tail.
+  Work off the UI thread and coalesce snapshots. Keep 1,000 selected events,
+  records up to 256 KiB, and a 2 MiB read budget per tick shared with evidence
+  reads. Preserve the last good snapshot with age and error badges during
+  partial writes. Show empty, removed, inaccessible and stale sources distinctly.
+- Track binary offsets and device/inode per generation. Buffer incomplete UTF-8
+  and records. Mark a gap and reset offset on replacement or truncation.
+  Count oversized or malformed complete records in recognized JSONL mode.
+  A bounded valid final record without newline may be accepted after terminal
+  state and two stable polls. For plain text, tail complete redacted lines.
+- Classify streams as empty, recognized JSONL or plain text from bounded samples
+  of complete records. An empty file shows “No stream output yet (buffered or
+  non-streaming)” with elapsed age and available mtime. Plain text displays as
+  activity and never contributes to JSONL error counts. Surface uncertain format
+  explicitly. Use observed time when event timestamps are unavailable.
+- With a known running job and a meaningful activity baseline, five minutes
+  without activity can yield quiet. An empty stream alone provides no baseline.
+  Heartbeat freshness contributes to health, independently of event silence.
+  Use monotonic polling and UTC source timestamps with local display.
+- For trusted local Pack heartbeats, match boot and process start identity before
+  showing verified alive. On stale heartbeat and confirmed owner absence or
+  confirmed PID reuse under the same boot, show suspected stuck/orphaned only
+  while the execution is still nonterminal. External PID-only evidence supports
+  suspected orphaned on local `ESRCH` after a re-read of unchanged attempt/PID
+  and absent terminal result. A PID-only process that exists remains unverified.
+  Remote roots, permission denial and unverifiable identities leave health
+  unknown. Exclude queued jobs, known waits and terminal receipts.
+- Target keyboard response below 100 ms on a local fixture with 10,000
+  historical runs and 100 active jobs during scan and tail. Measure input
+  latency, bytes read and backlog separately from time to full coverage.
+
+## Usage provenance
+
+Prefer a scoped authoritative run summary and count each retry once. If
+coverage or scope is unavailable, use eligible step measurements. Never add a
+run total to the steps it covers. Show token coverage separately from cost
+coverage.
+
+Legacy Pack cost defaults to zero in `runner/agent_exec.py:AgentResult`,
+`runner/agent_exec.py:parse_stream` and task aggregation in
+`runner/devpack_run.py:run_task_workflow`. Accept positive finite historical
+cost where attributable to the invocation. Accept zero only with explicit
+numeric zero on a recognized result event (`total_cost_usd/cost_usd/cost`) or
+versioned measured provenance. Cloud class by itself establishes no measurement.
+Recover explicit legacy zero only within the read budget or from cached,
+validated evidence. Unverified aggregate zero stays unknown. Use the same
+principle for defaulted zeros in token fields. Configured time and context limits
+are capacity hints from `runner/agent_exec.py:load_engines`.
+
+## Accounting and incidents (V1)
+
+Use the local calendar day of completion. Distinguish known subtotal, fully
+priced jobs, eligible jobs and incomplete historical coverage.
+
+Read existing attribution directly with bounded metadata reads. Show latest
+valid human confirmation alongside suspected cause, confidence, timestamp and
+evidence. Display unknown when absent. Keep analysis and attribution writes in
+their existing CLI. The dashboard never invokes `analyze_run_dir`, which also
+loads entire streams and can scan the repository. Incidents show bounded
+redacted gate, stderr, error, refusal reason or reply excerpts.
+
+## Runtime, CLI and configuration
+
+Use Python 3.10+ stdlib with curses differential painting and terminal restoration.
+Use plain text for pipes, missing curses, unsupported terminfo or `TERM=dumb`.
+Use the same redacted snapshot contract for all views.
+
+```text
+devpack_dash.py [--backend pack|external|both] [--workdir PATH]
+                [--project-config PATH] [--runs-root PATH] [--jobs-root PATH]
+                [--state-dir PATH] [--plain|--json] [--once]
+                [jobs [--filter QUERY] | show JOB | gate JOB
+                 | tail JOB [--kind all|command|tool|message]
+                 | approvals [--status pending|decided|all]]
+```
+
+Plain and JSON return one snapshot except for explicit continuous tail.
+`--once` uses plain by default and returns a bounded snapshot or initial tail
+page. JSON includes schema version, observation time, source health, nullable
+fields and scan completeness. Streaming JSON uses one record per event or
+notice. Require backend qualification for ambiguous IDs. Exit 0 for successful
+reads, 1 for read failure or all selected roots unavailable, 2 for invalid
+arguments or config. A failed job is data in a successful read.
+
+Resolve workdir and project config the same way as
+`runner/devpack_approve.py:_resolve_state_for_cli`. Resolve approvals from
+explicit `--state-dir` via `runner/checkpoints.py:resolve_state_dir` or from
+trusted host pipeline settings via `runner/checkpoints.py:load_pipeline_config`.
+A dashboard display config cannot redirect approval state. For a broker with
+external storage, pass the host broker's `--runs-root` to the dashboard and
+resolve the same trusted checkpoint state as the broker. Keep the queue root
+relative to the selected project workdir. See `runner/devpack_broker.py:Broker.__init__`.
+
+Use operator-selected project `[dashboard]` settings for backend, runs root,
+jobs root, optional verified task log/evidence roots, poll intervals, quiet
+threshold and history limit. CLI overrides config. Relative config paths
+resolve from the config file's directory. Default to Pack, project `runs/`,
+normal pipeline state resolution and no external backend until configured.
+For standalone task runs, point the dashboard at the task runner’s
+`--runs-root` (its default is `/tmp/devpack-run/runs`), or configure a parent
+containing the standalone `--log-dir` run. See `runner/devpack_run.py:main`.
+Validate poll intervals and quiet threshold as positive integer seconds and
+reject fractional or string values to support the Python 3.10 fallbacks.
+See `runner/agent_exec.py:_minimal_toml_loads` and
+`runner/workspace_scope.py:parse_toml_with_arrays`.
+
+## Read boundaries and decisions
+
+- Read bounded regular files under configured roots. Restrict recognized
+  filenames and reject escapes and symlinks using directory-relative no-follow
+  opens where supported. Treat payload paths and content as untrusted.
+  The MVP performs no writes, network requests, signal delivery or execution
+  of commands found in artifacts.
+- Strip ANSI escape sequences and terminal controls, including split escape
+  sequences across input chunks. Allowlist fields and reuse one
+  `runner/redaction.py:Redactor` instance per reader configuration. Redact
+  complete logical records before excerpting. If oversized or incomplete
+  records cannot be redacted safely, show metadata only. Apply to terminal,
+  plain, JSON, diagnostics and filters. Keep raw text out of snapshots and caches.
+- Evidence is visible only through bounded excerpts under these rules. Include
+  diagnostics for failures before the first step. Constrain any brief,
+  escalation or memory evidence path to trusted roots and exact recorded links.
+  Follow the sanitization rules in [the logging policy](../../policy/logging.md).
+- MVP displays shell-quoted commands for the operator to run separately.
+  Build them from the trusted CLI path, resolved target workdir and state,
+  selected config if explicit, and validated approval ID. A note is required
+  for rejection. If required paths cannot be shown safely, mark the command
+  unavailable. With all overrides set, the command forms are:
+
+```text
+python3 /trusted/runner/devpack_approve.py --workdir /target --project-config /trusted/project.toml --state-dir /trusted/state approve APPROVAL_ID
+python3 /trusted/runner/devpack_approve.py --workdir /target --project-config /trusted/project.toml --state-dir /trusted/state reject APPROVAL_ID --note 'Reason for rejection'
+```
+
+V1 may enable dashboard decisions after every supported writer uses shared
+serialization in `runner/checkpoints.py:decide_approval` and the trusted
+`runner/devpack_approve.py` CLI accepts an expected evidence fingerprint.
+Compute it over the reviewed approval and evidence digests. Under the shared
+lock, re-read and compare the current pending ID, state and fingerprint before
+deciding. Require renewed review on mismatch. Default confirmation to Cancel,
+require a nonempty rejection reason, invoke fixed argv without a shell, redact
+the result and reload approval state. Use protected operator state outside agent
+mounts and host filesystem permissions. Keep hashed identity and provenance
+notes through the existing CLI, using the target workdir. Resume through the
+existing separate command, which verifies the brief digest and consumes approval
+once.
+
+## Delivery and acceptance
+
+Use temporary offline fixtures, simulated process state and fake time.
+
+| Phase | Deliverable | Acceptance |
+| --- | --- | --- |
+| Phase 0 | Separate producer changes above | Run each producer acceptance test independently and verify mixed-version fixtures. |
+| MVP | Pack and External readers | Assert linked and unresolved broker runs, refusals before step 01, direct runs, a non-marker gate failure, alternate log location, plain-text and buffered output, missing results, reused PID, unknown fields and colliding native IDs. |
+| MVP | Incremental store and renderers | Assert split UTF-8/JSONL and escape sequences, truncation, replacement, stale snapshots, selected-stream-only parsing, backlog and bounded reads. Measure keyboard latency under fixture load. |
+| MVP | Navigation and read-only Approvals | Assert filter apply/cancel/clear, tool filtering, redacted evidence, exact command arguments for a target outside the current directory, no writes or subprocess launches, schema and exit codes, and both viewport sizes. |
+| V1 | Overview, accounting and incidents | Assert local-day boundaries, unknown versus measured zero, retry deduplication, partial scan coverage, aged quota data, attribution confirmation precedence and diagnostics without an analyzer run. |
+| V1 | Protected decision execution | Assert stale evidence/fingerprint refusals, one decision across competing supported writers, refusal from agent context, reject note enforcement and provenance in the target repository. |
+| V2 | Pipeline per goal | Assert explicit cross-backend joins, observed retry edges and standalone views for missing goal IDs. |
