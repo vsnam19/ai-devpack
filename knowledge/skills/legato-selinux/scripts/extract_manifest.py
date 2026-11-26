@@ -66,6 +66,7 @@ class Extractor:
                          processes=[], unknowns=[])
         self.data.update({key: [] for key in CATEGORIES})
         self.seen = set()
+        self.definitions = {}
 
     def relative(self, path):
         return path.resolve().relative_to(self.root).as_posix()
@@ -124,6 +125,7 @@ class Extractor:
         except (OSError, UnicodeError):
             self.unknown('Missing/unreadable definition: ' + self.relative(path))
             return
+        self.definitions[path] = text
         for context, statement, line in sections(text):
             key, sep, value = statement.partition(':')
             key, value = key.strip(), value.strip()
@@ -176,8 +178,12 @@ class Extractor:
                 self.add('limits', path, line, name=key if sep else 'run', value=value if sep else statement)
             elif leaf == 'configTree':
                 self.add('config_tree', path, line, path=statement, access=['unknown'])
-        self.received_files(path, text)
         self.unknown('Verify build-expanded definitions, includes, shared libraries and per-process component ownership: ' + self.relative(path))
+
+    def resolve_bindings(self):
+        # Provider bindings require the complete executable inventory.
+        for path, text in sorted(self.definitions.items()):
+            self.received_files(path, text)
 
     def resolve_api(self, name, parent):
         """Search only explicit interface directories, preserving their order."""
@@ -413,6 +419,7 @@ def main():
         if profile_path is not None and profile_path.is_file():
             platform_profile.review(profile, extractor, profile_path)
         extractor.definition(adef)
+        extractor.resolve_bindings()
         platform_profile.reconcile(profile, extractor)
         for key in ('platform_root', 'sdk_policy_include', 'linked_policy'):
             if not config.get(key) or not contained(config[key]).exists():

@@ -59,6 +59,27 @@ class ApiTests(ExtractTests):
             with self.assertRaisesRegex(ValueError, 'Invalid enum'):
                 validate(data, schema, schema)
 
+    def test_required_component_order_does_not_change_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            (root / 'helper').mkdir()
+            (root / 'helper/Component.cdef').write_text('')
+            client = root / 'client/Component.cdef'
+            manifests = []
+            for order in ('../server ../helper', '../helper ../server'):
+                client.write_text(
+                    f'requires: {{ api: {{ feed = feed.api }} component: {{ {order} }} }}')
+                data = self.extract_config(root, {'api_search_paths': ['interfaces']})
+                data['unknowns'].sort()
+                manifests.append(json.dumps(data, sort_keys=True))
+                (root / 'out/access-manifest.yaml').unlink()
+                (root / 'out/QUESTIONS.md').unlink()
+            self.assertEqual(*manifests)
+            self.assertEqual({(x['processes'][0], x['function']) for x in data['fd_passing']},
+                             {('client', 'Fetch'), ('client', 'Update'), ('server', 'Store')})
+            self.assertNotIn('Resolve binding for provided API: feed', data['unknowns'])
+
     def test_external_two_part_binding_is_not_local_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
