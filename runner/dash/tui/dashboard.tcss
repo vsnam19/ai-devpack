@@ -1,0 +1,152 @@
+Screen {
+    background: $background;
+    color: $foreground;
+    layout: vertical;
+}
+#top {
+    height: 2;
+    padding: 0 2;
+    background: $panel;
+    content-align: left middle;
+}
+#workspace {
+    height: 1fr;
+}
+#sidebar {
+    width: 51;
+    height: 1fr;
+}
+.panel {
+    height: 1fr;
+    border: solid $panel-lighten-2;
+    background: $surface;
+}
+.panel.active-panel {
+    border: solid $primary;
+}
+#plans-panel { height: 5; }
+#tasks-panel { height: 10; }
+#approvals-panel { height: 4; }
+.panel-heading {
+    height: 1;
+    background: $panel;
+    padding: 0 1;
+}
+.panel-number {
+    width: 4;
+    color: $accent;
+    text-style: bold;
+}
+.panel-title {
+    width: 1fr;
+    color: $foreground;
+    text-style: bold;
+    height: 1;
+}
+Panel {
+    padding: 0 1;
+    height: 1fr;
+    background: $surface;
+    scrollbar-size: 1 1;
+    border: none;
+}
+Panel:focus {
+    border: none;
+}
+Panel > .option-list--option-highlighted {
+    background: $panel;
+    color: $foreground;
+}
+Panel:focus > .option-list--option-highlighted {
+    background: $primary 22%;
+    color: $foreground;
+}
+#main {
+    width: 1fr;
+    height: 1fr;
+    border: solid $panel-lighten-2;
+    background: $surface;
+}
+#context {
+    height: 1;
+    background: $panel;
+    padding: 0 2;
+    text-style: bold;
+}
+#tabs {
+    height: 2;
+    padding: 0 1;
+}
+Tab {
+    padding: 0 1;
+}
+#detail-status {
+    height: 2;
+    padding: 1 2 0 2;
+    color: $secondary;
+    text-style: bold;
+}
+#reading, #log {
+    height: 1fr;
+    padding: 0 2;
+    scrollbar-size: 1 1;
+    background: $surface;
+}
+#detail {
+    padding: 1 0 0 0;
+}
+#brief {
+    margin: 0;
+    padding: 0;
+}
+#keys {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    color: $foreground;
+    text-wrap: nowrap;
+    text-overflow: clip;
+}
+#filter {
+    height: 3;
+}
+.compact #sidebar {
+    width: 28;
+}
+.compact .panel {
+    height: 1;
+    border: none;
+}
+.compact .panel.active-panel {
+    height: 1fr;
+    border: solid $primary;
+}
+.compact #keys {
+    height: 2;
+    text-wrap: wrap;
+}
+Help {
+    align: center middle;
+    background: $background 70%;
+}
+#keymap {
+    width: 67;
+    height: auto;
+    padding: 1 2;
+    border: heavy $primary;
+    border-title-align: left;
+    background: $surface;
+}
+.compact #plans-panel, .compact #tasks-panel, .compact #approvals-panel {
+    height: 1;
+}
+.compact #plans-panel.active-panel, .compact #tasks-panel.active-panel,
+.compact #approvals-panel.active-panel {
+    height: 1fr;
+}
+.panel-heading:hover {
+    background: $panel-lighten-1;
+}
+.compact .panel-title {
+    text-wrap: nowrap;
+}
