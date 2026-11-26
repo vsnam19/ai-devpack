@@ -23,9 +23,10 @@ def parse(line):
 
 
 def object_class(item, profile, category):
-    return profile.get('bindings', {}).get(item['id'], {}).get('class', item.get('class',
+    klass = profile.get('bindings', {}).get(item['id'], {}).get('class', item.get('class',
         dict(files='file', data_dirs='dir', devices='chr_file', unix_sockets='sock_file',
              denied='file').get(category)))
+    return None if klass == 'unknown' else klass
 
 
 def match(item, avc, manifest, profile, category=None):

@@ -76,6 +76,8 @@ Document this optional section in `.devpack/project.toml` (do not invent local p
 platform_profile = "profiles/platform.toml"
 platform_root = ""
 app_globs = ["**/apps/*.adef"]
+api_search_paths = ["interfaces"] # Workspace-relative directories, in search order
+sdef_globs = [] # Optional workspace-relative .sdef patterns
 manifest_name = "access-manifest.yaml"
 module_dir = "{app_dir}/../selinux"
 sdk_policy_include = ""
@@ -152,4 +154,17 @@ requires human intent review. Preserve the original AVC evidence.
 `sim_macros` augments SIMULATION/TEST/MOCK detection; matching branches remain
 `candidate_denied`, never approved denials. Bound required API `file ... OUT/INOUT`
 parameters seed client FD-reception records with unknown creator labels/object classes.
-Reconcile generated APIs, callbacks, dynamic bindings and build conditions manually.
+Registered handler/event `file ... IN/INOUT` parameters also seed client reception;
+provided APIs symmetrically seed server reception from function IN/INOUT and callback
+OUT/INOUT parameters. Each draft records direction, API alias, function and API evidence.
+Handler registration is lexical: its type must appear in a FUNCTION or EVENT signature.
+Reconcile generated APIs, dynamic bindings and build conditions manually.
+
+API lookup tries the component `.cdef` directory, then `api_search_paths` in order,
+then `interfaceSearch` entries from definitions matched by optional `sdef_globs`.
+Patterns follow configuration order; matching definitions are sorted by path and entries
+retain declaration order. `interfaceSearch` entries are relative to their `.sdef` directory.
+All resolved references, including symlinks, must remain inside the workspace and respect
+`exclude`. No workspace-wide API fallback is used. Unresolved APIs remain unknown with
+a question naming the API and every attempted path. Variables, includes and conditional
+build expansion require manual reconciliation; no build flags are read automatically.

@@ -45,3 +45,19 @@ The extractor recognizes definition blocks lexically, follows resolvable compone
 source declarations, and preserves evidence. It cannot evaluate build variables or infer
 runtime arguments. `candidate_denied` marks simulation/test branches for human review;
 production `#else` observations remain draft grants. Review all conditional evidence.
+
+API FD reception uses `direction: receive`, `api` (the bound alias), `function`
+(function, handler or event name), and API `path:line` evidence. Client reception
+covers function `file ... OUT/INOUT` and registered handler/event `file ... IN/INOUT`;
+server reception covers the symmetric parameter directions. Handler types must appear
+in a function/event signature to count as lexically registered. Creator domains and
+object classes remain unknown until reviewed; `unknown` classes never match AVCs.
+
+Configure workspace-relative `[selinux] api_search_paths = ["interfaces"]` and optional
+`sdef_globs = ["systems/*.sdef"]`. API resolution tries the `.cdef` directory first,
+then configured directories in order, then `interfaceSearch` directories in matched
+`.sdef` files (pattern order, sorted matches, declaration order). Those entries resolve
+relative to their `.sdef`. All references use workspace containment and exclusions,
+including symlink targets. Missing APIs generate questions with their names and paths
+tried. Reconcile build `-i` flags manually into configuration; variables/includes and
+conditional definitions are not build-expanded by this lexical extractor.

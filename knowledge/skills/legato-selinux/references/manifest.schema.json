@@ -580,6 +580,18 @@
         "expression": {
           "type": "string"
         },
+        "api": {
+          "type": "string"
+        },
+        "function": {
+          "type": "string"
+        },
+        "direction": {
+          "enum": [
+            "send",
+            "receive"
+          ]
+        },
         "object": {
           "type": "string"
         },
