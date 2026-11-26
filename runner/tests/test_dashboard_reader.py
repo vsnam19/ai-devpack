@@ -278,3 +278,108 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(len(stream.events), 1000)
         self.assertEqual(len(stream.batch), 1100)
         self.assertEqual((stream.batch[0]["sequence"], stream.batch[-1]["sequence"]), (1, 1100))
+
+    def test_checkpoint_writer_statuses_and_escalation(self):
+        state = self.settings.state
+        for status, expected in (("PENDING", "waiting for approval"),
+                                 ("APPROVED", "ready to resume"), ("REJECTED", "rejected")):
+            with self.subTest(status=status):
+                name = status.lower()
+                self.run_record(name, outcome="awaiting_approval", approval_id=name, checkpoint_id="brief")
+                folder = "pending" if status == "PENDING" else "decided"
+                write(state / "approvals" / folder / f"{name}.json",
+                      {"id": name, "status": status, "checkpoint": "brief"})
+                if status == "APPROVED":
+                    write(state / "runs" / f"{name}.json",
+                          {"approval_id": name, "checkpoint_id": "brief", "kind": "run"})
+                snapshot = self.reader.snapshot(job_id=name)
+                self.assertEqual(snapshot["sources"]["approvals"], "current")
+                self.assertEqual(snapshot["pending_approvals"], 1)
+                self.assertEqual(snapshot["jobs"][0]["state"], expected)
+                approval = next(item for item in snapshot["approvals"] if item["id"] == name)
+                self.assertEqual(approval["status"], name)
+                if status == "PENDING":
+                    self.assertTrue(approval["commands"])
+
+        (state / "runs" / "approved.consumed").touch()
+        self.run_record("approved", outcome="ESCALATE_TO_HUMAN", approval_id="approved",
+                        checkpoint_id="brief", checkpoints=[{"checkpoint": "escalation"}])
+        self.assertEqual(self.reader.snapshot(query="state=failed")["jobs"][0]["id"], "approved")
+        self.run_record("later", outcome="ESCALATE_TO_HUMAN", approval_id="later", checkpoint_id="deviation")
+        write(state / "approvals" / "pending" / "later.json",
+              {"id": "later", "status": "pending", "checkpoint": "deviation"})
+        self.assertEqual(self.reader.snapshot(job_id="later")["jobs"][0]["state"], "waiting for approval")
+        self.run_record("later", outcome="ESCALATE_TO_HUMAN", approval_id="later",
+                        checkpoint_id="pre-merge", checkpoints=[{"checkpoint": "escalation"}])
+        self.assertEqual(self.reader.snapshot(job_id="later")["jobs"][0]["state"], "failed")
+
+    def test_large_diagnostics_and_isolated_gate_errors(self):
+        run = self.run_record("large", outcome="fail", approval_id="brief-id", checkpoint_id="brief")
+        diagnostic = "compiler failure " + "x" * 20000
+        write(self.settings.state / "approvals" / "pending" / "brief-id.json",
+              {"id": "brief-id", "status": "PENDING", "checkpoint": "brief"})
+        write(run / "steps" / "01-worker-engine.meta.json",
+              {"stderr": diagnostic, "final_text": "x" * 280000})
+        (run / "steps" / "01-worker-engine.prompt.md").write_text(diagnostic)
+        write(run / "step_01_gate.json", {"gate_passed": False, "returncode": 11, "stderr": "x" * 1100000})
+        write(run / "step_02_gate.json", {"gate_passed": True, "stderr": diagnostic})
+        write(run / "step_03_gate.json", {}).write_text("{")
+        write(run / "steps" / "02-gate-receipt.json", {}).write_text("{")
+        (run / "steps" / "01-gate.txt").write_text(diagnostic)
+        (run / "steps" / "03-gate.txt").write_text("fallback diagnostic")
+        (run / "steps" / "01-worker-engine.jsonl").write_text(
+            json.dumps({"type": "tool_result", "content": diagnostic}) + "\n")
+        snapshot = self.reader.snapshot(job_id="large", event_kind="all", include_evidence=True)
+        job = snapshot["jobs"][0]
+        self.assertFalse(job["read_failed"])
+        self.assertEqual(job["steps"][0]["stderr"], diagnostic[:1600])
+        self.assertEqual(job["steps"][0]["final_text"], "[Text exceeds display limit]")
+        self.assertEqual(snapshot["approvals"][0]["evidence"]["brief"], diagnostic[:1600])
+        gates = job["gates"]
+        self.assertEqual((gates[0]["status"], gates[0]["returncode"]), ("fail", 11))
+        self.assertEqual(gates[0]["transcript"], diagnostic[:1600])
+        self.assertEqual((gates[1]["status"], gates[1]["stderr"]), ("pass", diagnostic[:1600]))
+        self.assertEqual(gates[2]["transcript"], "fallback diagnostic")
+        self.assertEqual(snapshot["events"][0]["text"], diagnostic[:1600])
+        self.assertIn("exceeds read limit", gates[0]["artifact_notice"])
+        self.assertIn("Gate receipt unreadable for step 2", job["notices"])
+        write(run / "steps" / "02-gate-receipt.json",
+              {"gate_status": "GATE_FAIL", "checks": [{"stderr": "x" * 1100000}]})
+        gates = self.reader.snapshot(job_id="large")["jobs"][0]["gates"]
+        self.assertEqual(gates[1]["status"], "GATE_FAIL")
+        self.assertIn("exceeds read limit", gates[1]["artifact_notice"])
+
+        unreadable = self.run_record("unreadable", outcome="fail")
+        write(unreadable / "step_01_gate.json", {}).write_text("{")
+        self.assertTrue(self.reader.snapshot(job_id="unreadable")["jobs"][0]["read_failed"])
+
+    def test_interactive_broker_selection_refreshes_native_runs(self):
+        from unittest.mock import patch
+
+        request = "a" * 32
+        wrapper = self.run_record("wrapper", kind="broker", outcome="pass")
+        self.run_record("worker", kind="dispatch", outcome="pass")
+        write(wrapper / f"{request}.request.json", {})
+        write(wrapper / f"{request}.response.json", {"run_dir": "/target/worker"})
+        self.reader.snapshot(interactive=True)
+        with patch.object(self.reader, "refresh_run", wraps=self.reader.refresh_run) as refresh:
+            snapshot = self.reader.snapshot(job_id=request, interactive=True)
+        self.assertEqual([call.args[0] for call in refresh.call_args_list], ["wrapper", "worker"])
+        self.assertTrue(snapshot["scan"]["complete"])
+        self.assertEqual(snapshot["scan"]["scanned"], 2)
+        self.assertEqual(snapshot["jobs"][0]["worker_id"], "worker")
+
+    def test_configured_root_below_linked_parent(self):
+        from dataclasses import replace
+
+        parent = self.root / "linked-parent"
+        parent.symlink_to(self.root, target_is_directory=True)
+        self.run_record("visible", outcome="pass")
+        reader = Reader(replace(self.settings, runs=parent / "runs"))
+        self.assertEqual(reader.snapshot(job_id="visible")["jobs"][0]["id"], "visible")
+        (self.settings.runs / "linked-run").symlink_to(self.settings.runs / "visible", target_is_directory=True)
+        self.assertEqual(reader.snapshot(job_id="linked-run")["jobs"], [])
+        linked_root = self.root / "linked-root"
+        linked_root.symlink_to(self.settings.runs, target_is_directory=True)
+        self.assertEqual(Reader(replace(self.settings, runs=linked_root)).snapshot()["sources"]["runs"],
+                         "inaccessible")

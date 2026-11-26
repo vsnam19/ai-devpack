@@ -15,9 +15,9 @@ if __name__ == "__main__":
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from runner.checkpoints import load_pipeline_config, resolve_state_dir  # noqa: E402
+from runner.checkpoints import default_state_dir, load_pipeline_config, resolve_state_dir  # noqa: E402
 from runner.workspace_scope import parse_toml_with_arrays  # noqa: E402
-from runner.dash.files import Files, JSON_LIMIT, identifier, mapping  # noqa: E402
+from runner.dash.files import Files, JSON_LIMIT, identifier, mapping, resolve_root_parent  # noqa: E402
 from runner.dash.reader import FILTER_HELP, Settings, Reader, TERMINAL, terms  # noqa: E402
 from runner.dash.ui import event_line, interface, plain  # noqa: E402
 
@@ -75,11 +75,22 @@ def config(args):
 
     raw = read_config(project_file, optional=project_config is None)
     project = parse_toml_with_arrays(raw.decode("utf-8"))
+
+    def state_root(value):
+        candidate = workdir / value
+        if Path(os.path.abspath(candidate)).is_relative_to(workdir):
+            raise ValueError("state directory must be outside the workdir")
+        return resolve_root_parent(candidate)
+
     if args.state_dir:
-        state = resolve_state_dir(args.state_dir, project_root=workdir, agent_worktree=workdir, explicit=True)
+        state_path = args.state_dir.strip() or default_state_dir(workdir)
+        state = resolve_state_dir(state_root(state_path), project_root=workdir, agent_worktree=workdir, explicit=True)
     else:
-        state = Path(load_pipeline_config(workdir, project_config_path=project_config,
-                                         trusted_project_bytes=raw, agent_worktree=workdir).state_dir)
+        configured = mapping(project.get("pipeline")).get("state_dir")
+        configured = configured.strip() if isinstance(configured, str) else ""
+        state_path = os.environ.get("DEVPACK_STATE_DIR", "").strip() or configured or default_state_dir(workdir)
+        state = Path(load_pipeline_config(workdir, project_config_path=project_config, trusted_project_bytes=raw,
+                                         override_state_dir=state_root(state_path), agent_worktree=workdir).state_dir)
     options = {}
     if args.dashboard_config:
         dashboard_path = Path(os.path.abspath(args.dashboard_config))
@@ -215,7 +226,8 @@ def main(argv=None):
                         return curses.wrapper(run)
                     except curses.error:
                         if entered:
-                            raise
+                            print("dashboard read failed", file=sys.stderr)
+                            return 1
         if command == "tail":
             return tail(reader, args)
         snapshot = reader.snapshot(query=query, job_id=job, approval_status=getattr(args, "status", "all"),

@@ -86,3 +86,42 @@ class RenderTest(unittest.TestCase):
             self.assertFalse(ui.follow)
             ui.key("f")
             self.assertTrue(ui.follow)
+
+    def test_job_columns_at_80_and_120(self):
+        from runner.dash.ui import job_columns, job_line
+
+        job = {"id": "20261126T223127Z-a540cc", "key": ["task"], "aliases": [],
+               "kind": "task", "state": "running", "role": "worker",
+               "agent": "engine", "model": "model-standard-v123", "current_step": None, "age_s": 0,
+               "duration_s": None, "cost_usd": None, "process_health": None}
+        for width in (80, 120):
+            with self.subTest(width=width):
+                available = width - 3
+                screen = Screen(24, width)
+                UI().paint(screen, {"jobs": [job], "approvals": [], "sources": {}, "pending_approvals": 0})
+                line = screen.lines[2]
+                fields = {}
+                offset = 2
+                for label, size in job_columns(available):
+                    fields[label] = line[offset:offset + size].strip()
+                    offset += size + 1
+                self.assertLess(len(line), width)
+                self.assertEqual(fields["Job"], job["id"])
+                self.assertEqual(fields["Agent"], "engine:model-standard-v123")
+                self.assertEqual(fields["#"], "?")
+                if width == 120:
+                    self.assertIn("a" * 32, job_line({**job, "id": "a" * 32}, available))
+
+    def test_idle_poll_delay(self):
+        from runner.dash.ui import poll_delay
+
+        idle = {"scan": {"scanned": 1, "discovered": 1}, "active_jobs": False, "stream_drained": False,
+                "sources": {"runs": "current", "stream": "jsonl"}}
+        self.assertEqual(poll_delay(idle, {}, 1), 30)
+        self.assertEqual(poll_delay(idle, {"event_kind": "all"}, 1), 1)
+        self.assertEqual(poll_delay({**idle, "stream_drained": True}, {"event_kind": "all"}, 1), 30)
+        self.assertEqual(poll_delay({**idle, "active_jobs": True}, {}, 1), 1)
+        missing = {**idle, "sources": {"runs": "missing", "stream": "missing"}}
+        self.assertEqual(poll_delay(missing, {"event_kind": "all"}, 1), 30)
+        backlog = {**idle, "scan": {"scanned": 1, "discovered": 2}}
+        self.assertEqual(poll_delay(backlog, {}, 1), 1)

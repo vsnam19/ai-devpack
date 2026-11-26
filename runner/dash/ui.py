@@ -40,22 +40,27 @@ def rows(record):
 def job_columns(width):
     if width < 77:
         return (("Job", 22), ("Kind", 5), ("State", 9), ("Role", 10), ("Agent:model", 14))
-    return (("Job", 22), ("Kind", 4), ("State", 9), ("Role", 11),
-            ("Agent", min(45, width - 72)), ("#", 2), ("Age", 4), ("Cost", 5), ("Health", 7))
-
+    if width < 97:
+        return (("Job", 23), ("Kind", 4), ("State", 7), ("Agent", width - 51),
+                ("#", 2), ("Age", 3), ("Health", 6))
+    job_width = min(32, width - 74)
+    return (("Job", job_width), ("Kind", 4), ("State", 9), ("Role", 11),
+            ("Agent", min(45, width - job_width - 50)), ("#", 2), ("Age", 4), ("Cost", 5), ("Health", 7))
 
 def job_line(job, width):
     kind = {"dispatch": "disp", "broker": "brkr"}.get(job["kind"], job["kind"])
     state = {"waiting for approval": "waiting", "ready to resume": "ready"}.get(job["state"], job["state"])
     agent = job["agent"] or "?"
     model = job["model"] or "?"
-    if width < 100 and job["model"]:
-        agent = agent[:4]
     age = job["duration_s"] if job["duration_s"] is not None else job["age_s"]
-    values = (job["id"], kind, state, job["role"], f"{agent}:{model}",
-              job["current_step"], elapsed(age), cost(job["cost_usd"]), job["process_health"])
-    return " ".join(f"{display(value)[:size]:<{size}}" for (_, size), value in zip(job_columns(width), values))
-
+    agent_model = agent if agent == model else f"{agent}:{model}"
+    values = {
+        "Job": job["id"], "Kind": kind, "State": state, "Role": job["role"],
+        "Agent": agent_model, "Agent:model": agent_model,
+        "#": "?" if job["current_step"] is None else job["current_step"],
+        "Age": elapsed(age), "Cost": cost(job["cost_usd"]), "Health": job["process_health"],
+    }
+    return " ".join(f"{display(values[label])[:size]:<{size}}" for label, size in job_columns(width))
 
 def job_heading(width):
     return " ".join(f"{label:<{size}}" for label, size in job_columns(width))
@@ -74,7 +79,7 @@ def job_lines(job, view):
                 if step.get(key):
                     yield f"{step['id']} {key}: {step[key]}"
         for gate in job["gates"]:
-            for key in ("stderr", "error", "transcript"):
+            for key in ("stderr", "error", "transcript", "artifact_notice"):
                 if gate.get(key):
                     yield f"Gate {gate['step']} {key}: {gate[key]}"
     else:
@@ -383,6 +388,19 @@ def cell_width(text):
     return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
 
 
+def poll_delay(snapshot, request, interval):
+    if not isinstance(snapshot, dict) or snapshot["active_jobs"]:
+        return interval
+    scan = snapshot["scan"]
+    if scan["scanned"] < scan["discovered"] and snapshot["sources"]["runs"] == "current":
+        return interval
+    stream_pending = (
+        request.get("event_kind") and not snapshot["stream_drained"]
+        and snapshot["sources"]["stream"] not in (None, "missing")
+    )
+    return interval if stream_pending else 30
+
+
 def interface(screen, curses, reader):
     ui = UI()
     screen.keypad(True)
@@ -408,8 +426,7 @@ def interface(screen, curses, reader):
                 pass
             updates.put_nowait(update)
             generation = current
-            idle = isinstance(update[1], dict) and update[1]["stream_drained"]
-            wake.wait(30 if idle and args.get("event_kind") else reader.settings.stream_poll_s)
+            wake.wait(poll_delay(update[1], args, reader.settings.stream_poll_s))
             wake.clear()
 
     worker = Thread(target=poll, daemon=True)

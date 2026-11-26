@@ -130,3 +130,58 @@ class CLITest(unittest.TestCase):
                 with patch("runner.devpack_dash.interface", side_effect=RuntimeError):
                     self.assertEqual(main(args), 1)
             self.assertEqual(calls, ["entered", "restored", "entered", "restored"])
+
+    def test_curses_failure_after_entry(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        class TerminalError(Exception):
+            pass
+
+        def wrapper(run):
+            return run(None)
+
+        curses = SimpleNamespace(error=TerminalError, wrapper=wrapper)
+        with (
+            TemporaryDirectory() as directory,
+            patch.dict("sys.modules", {"curses": curses}),
+            patch.dict("os.environ", {"TERM": "test-terminal"}),
+            patch("sys.stdin.isatty", return_value=True),
+            patch("sys.stdout.isatty", return_value=True),
+            patch("runner.devpack_dash.interface", side_effect=TerminalError("screen failed")),
+            redirect_stderr(io.StringIO()) as errors,
+        ):
+            target = Path(directory) / "target"
+            target.mkdir()
+            self.assertEqual(main(["--workdir", str(target), "--state-dir", str(target.parent / "state")]), 1)
+            self.assertEqual(errors.getvalue(), "dashboard read failed\n")
+
+    def test_state_directory_under_linked_parent(self):
+        from unittest.mock import patch
+
+        from runner.tests.test_dashboard_reader import write
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.mkdir()
+            parent = root / "linked-parent"
+            parent.symlink_to(root, target_is_directory=True)
+            state = parent / "state"
+            write(root / "state" / "approvals" / "pending" / "brief-id.json",
+                  {"id": "brief-id", "status": "PENDING", "checkpoint": "brief"})
+            args = ["--workdir", str(target), "--json"]
+            for options, environment in ((["--state-dir", str(state)], {}),
+                                         ([], {"DEVPACK_STATE_DIR": str(state)})):
+                with (
+                    self.subTest(options=options),
+                    patch.dict("os.environ", environment),
+                    redirect_stdout(io.StringIO()) as output,
+                ):
+                    self.assertEqual(main([*args, *options, "approvals"]), 0)
+                    self.assertEqual(json.loads(output.getvalue())["pending_approvals"], 1)
+            linked_state = root / "linked-state"
+            linked_state.symlink_to(root / "state", target_is_directory=True)
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failure:
+                main([*args, "--state-dir", str(linked_state), "approvals"])
+            self.assertEqual(failure.exception.code, 2)

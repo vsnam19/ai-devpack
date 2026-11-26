@@ -4,20 +4,21 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import json
 import math
 from pathlib import Path
 import re
 import shlex
 import time
 
-from runner.checkpoints import BLOCKING_CHECKPOINTS, CHECKPOINT_SPECS
+from runner.checkpoints import BLOCKING_CHECKPOINTS, CHECKPOINT_SPECS, TERMINAL_CHECKPOINTS
 from runner.memory import scope_dir_name
 from runner.redaction import Redactor
 
 from .events import Stream
 from .files import (
-    Controls, DeferredRead, Files, JSON_LIMIT, TICK_LIMIT, array, clean,
-    identifier, mapping, names, stamp,
+    Controls, DeferredRead, Files, JSON_LIMIT, OversizedArtifact, TICK_LIMIT, array, clean,
+    identifier, mapping,
 )
 
 FILTER_HELP = (
@@ -128,7 +129,8 @@ class Reader:
         self.settings = settings
         self.clock = clock
         self.monotonic = monotonic
-        self.files = Files()
+        self.files = Files(settings.runs, settings.state, *settings.log_roots,
+                           *settings.evidence_roots, settings.workdir)
         self.redactor = Redactor()
         self.models = dict(settings.models)
         self.runs = {}
@@ -152,7 +154,7 @@ class Reader:
         self.stream = None
         self.activity = {}
         self.gate_key = None
-        self.gate_snapshot = []
+        self.gate_snapshot = [], []
 
     def text(self, value, limit=1600):
         return clean(self.redactor, value, limit)
@@ -207,7 +209,7 @@ class Reader:
 
     def children(self, path):
         try:
-            return names(path)
+            return self.files.names(path)
         except FileNotFoundError:
             return []
 
@@ -216,7 +218,7 @@ class Reader:
         for candidate, folder in ((path, True), (path / "run.json", False),
                                   (path / "steps", True), (path / "run_summary.json", False)):
             try:
-                signatures.append(stamp(candidate, folder=folder))
+                signatures.append(self.files.stamp(candidate, folder=folder))
             except FileNotFoundError:
                 signatures.append(None)
         return tuple(signatures)
@@ -330,17 +332,17 @@ class Reader:
                 previous[3] if previous else None,
             )
 
-    def discover(self, *, full, force, selected):
+    def discover(self, *, full, force, selected, queue):
         now = self.monotonic()
         health = self.run_health
         discovery = full or force or now >= self.discovery_at
         if discovery or self.root_stamp is None:
             self.discovery_at = now + self.settings.discovery_poll_s
             try:
-                signature = stamp(self.settings.runs, folder=True)
+                signature = self.files.stamp(self.settings.runs, folder=True)
                 health = "current"
                 if signature != self.root_stamp or full or force:
-                    self.ids = [name for name in names(self.settings.runs, folders=True) if self.safe_id(name)]
+                    self.ids = [name for name in self.files.names(self.settings.runs, folders=True) if self.safe_id(name)]
                     self.root_stamp = signature
                     known = set(self.ids)
                     self.runs = {key: value for key, value in self.runs.items() if key in known}
@@ -357,6 +359,12 @@ class Reader:
             candidates = []
             if selected:
                 candidates.append(selected)
+                for native, (_, run, _, _) in self.runs.items():
+                    if run and selected in run["wrapper_requests"]:
+                        candidates.append(native)
+                        response = run.get("responses", {}).get(selected, {})
+                        candidates.append(response.get("target"))
+                candidates.append(queue.get(selected, {}).get("response", {}).get("target"))
             if now >= self.active_at or force:
                 self.active_at = now + self.settings.active_poll_s
                 candidates.extend(key for key, (_, run, _, _) in self.runs.items()
@@ -372,7 +380,10 @@ class Reader:
             initial = sorted(set(self.ids) - seen, reverse=True)[:32]
             candidates.extend(sorted(self.deferred, reverse=True)[:32])
             candidates.extend(initial)
+        known = set(self.ids)
         for native in dict.fromkeys(candidates):
+            if native not in known:
+                continue
             self.refresh_run(native)
             if self.files.remaining == 0:
                 break
@@ -380,7 +391,7 @@ class Reader:
         return health
 
     def retained_file(self, cache, path, transform):
-        signature = stamp(path)
+        signature = self.files.stamp(path)
         previous = cache.get(path)
         if previous and previous[0] == signature:
             return previous[1]
@@ -397,7 +408,7 @@ class Reader:
         result = {}
         health = "current"
         try:
-            for name in names(queue):
+            for name in self.files.names(queue):
                 match = QUEUE.fullmatch(name)
                 if not match or not self.safe_id(match[1]):
                     continue
@@ -452,16 +463,17 @@ class Reader:
     def approval(self, source, aid, folder):
         raw = self.files.json(source)
         status = raw.get("status")
+        status = status.strip().lower() if isinstance(status, str) else None
         if raw.get("id") != aid or status not in (("pending",) if folder == "pending" else ("approved", "rejected")):
             raise ValueError("invalid approval record")
         checkpoint = raw.get("checkpoint")
         if not isinstance(checkpoint, str) or checkpoint not in CHECKPOINT_SPECS:
             raise ValueError("unknown checkpoint")
-        record = self.select(raw, "checkpoint", "kind", "hard_stop", "status", "subject", "created",
+        record = self.select(raw, "checkpoint", "kind", "hard_stop", "subject", "created",
                              "decided_at", "decided_by", "summary", "note", "requested_by", "consumed")
         metadata = mapping(raw.get("metadata"))
         record.update(
-            id=aid, target=self.safe_id(basename(raw.get("run_dir"))),
+            id=aid, status=status, target=self.safe_id(basename(raw.get("run_dir"))),
             target_recorded=bool(raw.get("run_dir")), gate_detail=self.detail_value(raw.get("gate_detail")),
             gate_receipts=self.findings(raw.get("gate_receipts")),
             memory_id=self.safe_id(metadata.get("memory_id") or raw.get("subject")),
@@ -479,7 +491,7 @@ class Reader:
         state = self.settings.state / "runs"
         aid = record["id"]
         try:
-            stamp(state / f"{aid}.consumed")
+            self.files.stamp(state / f"{aid}.consumed")
         except FileNotFoundError:
             def check(path):
                 saved = self.files.json(path)
@@ -517,7 +529,7 @@ class Reader:
             for folder in ("pending", "decided"):
                 base = self.settings.state / "approvals" / folder
                 try:
-                    files = names(base)
+                    files = self.files.names(base)
                 except FileNotFoundError:
                     continue
                 available = True
@@ -558,7 +570,7 @@ class Reader:
         }
         if not available:
             try:
-                stamp(self.settings.state, folder=True)
+                self.files.stamp(self.settings.state, folder=True)
                 available = True
             except READ_ERRORS:
                 pass
@@ -616,11 +628,49 @@ class Reader:
                 step["duration_s"] = meta["duration_ms"] / 1000
         return step
 
+    def gate_prefix(self, path):
+        """Recover complete top-level verdict fields before an oversized value."""
+        data = self.files.read(path, JSON_LIMIT, prefix=True).decode("utf-8", errors="replace").lstrip()
+        result = {}
+        if not data.startswith("{"):
+            return result
+        decoder = json.JSONDecoder()
+        whitespace = re.compile(r"\s*")
+        cursor = 1
+        while cursor < len(data):
+            try:
+                key, end = decoder.raw_decode(data, whitespace.match(data, cursor).end())
+                colon = whitespace.match(data, end).end()
+                if not isinstance(key, str) or data[colon:colon + 1] != ":":
+                    break
+                value, end = decoder.raw_decode(data, whitespace.match(data, colon + 1).end())
+            except (ValueError, RecursionError):
+                break
+            separator = whitespace.match(data, end).end()
+            if data[separator:separator + 1] not in (",", "}"):
+                break
+            if key in ("gate_passed", "gate_status", "returncode", "step_index", "round",
+                       "duration_s", "lint_clean", "static_clean") and type(value) in (bool, int, float, str):
+                result[key] = value
+            if data[separator] == "}":
+                break
+            cursor = separator + 1
+        return result
+
     def gate_at(self, path, step, receipt=False):
-        raw = self.files.json(path)
+        oversized = False
+        try:
+            raw = self.files.json(path)
+        except OversizedArtifact:
+            raw = self.gate_prefix(path)
+            if not raw:
+                raise
+            oversized = True
         flags = self.select(raw, "gate_status", "step_index", "round", "returncode", "command",
                             "duration_s", "timestamp", "timestamp_utc", "lint_clean", "static_clean",
                             "stdout", "stderr", "first_failed_check", "error")
+        if oversized:
+            flags["artifact_notice"] = "Gate artifact exceeds read limit. Showing available verdict fields."
         if isinstance(raw.get("command"), list):
             flags["command"] = self.text(shlex.join([part for part in raw["command"] if isinstance(part, str)]))
         verdict = raw.get("gate_passed")
@@ -645,11 +695,16 @@ class Reader:
             if summary.get("run_id") == native or basename(summary.get("run_dir")) == native:
                 directories.append(configured)
         result = {}
+        notices = []
         for directory in directories:
             for name in self.children(directory):
                 match = GATE.fullmatch(name)
                 if match and int(match[1]) not in result:
-                    result[int(match[1])] = self.gate_at(directory / name, int(match[1]))
+                    step = int(match[1])
+                    try:
+                        result[step] = self.gate_at(directory / name, step)
+                    except READ_ERRORS:
+                        notices.append(f"Gate artifact unreadable for step {step}")
         for name in self.children(root / "steps"):
             match = GATE_TEXT.fullmatch(name)
             if match:
@@ -658,8 +713,11 @@ class Reader:
                 gate["transcript"] = self.excerpt(root / "steps" / name)
         receipt = root / "steps" / "02-gate-receipt.json"
         if receipt.name in self.children(receipt.parent):
-            result[2] = {**result.get(2, {}), **self.gate_at(receipt, 2, receipt=True)}
-        return [result[step] for step in sorted(result)]
+            try:
+                result[2] = {**result.get(2, {}), **self.gate_at(receipt, 2, receipt=True)}
+            except READ_ERRORS:
+                notices.append("Gate receipt unreadable for step 2")
+        return [result[step] for step in sorted(result)], notices
 
     def make_job(self, native, run, approvals, request=None, wrapper=None, response=None, notices=()):
         source = self.settings.runs
@@ -676,7 +734,13 @@ class Reader:
         related = approvals.get(native, [])
         pause = next((approval for approval in related if approval["id"] == run.get("approval_id")), None)
         messages = list(notices)
-        if state == "waiting for approval" or (outcome == "ESCALATE_TO_HUMAN" and pause and pause["blocking"]):
+        escalation_pause = (
+            outcome == "ESCALATE_TO_HUMAN" and pause and pause["blocking"]
+            and not pause.get("consumed") and pause["checkpoint"] != "brief"
+            and pause["checkpoint"] == (run.get("checkpoint_id") or run.get("checkpoint"))
+            and all(checkpoint not in TERMINAL_CHECKPOINTS for _, checkpoint in run["approval_links"])
+        )
+        if state == "waiting for approval" or escalation_pause:
             state = "waiting for approval"
             if pause:
                 if pause.get("status") == "rejected":
@@ -849,8 +913,9 @@ class Reader:
             self.stream = Stream(self.redactor, self.clock)
         stream = self.stream
         budget = TICK_LIMIT if self.files.remaining is None else self.files.remaining
-        status, used = stream.poll(self.settings.runs / key[0] / "steps" / key[1],
-                                   terminal=job["state"] in TERMINAL, budget=budget, collect=collect)
+        path = self.settings.runs / key[0] / "steps" / key[1]
+        status, used = stream.poll(path, terminal=job["state"] in TERMINAL, budget=budget,
+                                   collect=collect, root=self.files.root_for(path))
         if self.files.remaining is not None:
             self.files.remaining -= used
         if stream.last_event is not None:
@@ -877,7 +942,7 @@ class Reader:
             self.files.remaining -= TICK_LIMIT // 2
         queue, queue_health = self.queue(force or not interactive)
         approval_records, approval_health = self.approvals(force or not interactive)
-        run_health = self.discover(full=not interactive, force=force, selected=look_up)
+        run_health = self.discover(full=not interactive, force=force, selected=look_up, queue=queue)
         if interactive:
             targets = list(dict.fromkeys(record["target"] for record in approval_records.values()
                                          if record["target"] and record["target"] not in self.runs))
@@ -888,6 +953,7 @@ class Reader:
         runs = {native: run for native, (_, run, _, _) in self.runs.items() if run}
         linked, approvals = self.join_approvals(runs, approval_records)
         jobs = self.broker_jobs(runs, queue, linked)
+        active_jobs = any(run.get("outcome") == "running" for run in runs.values())
         jobs.sort(key=lambda job: (job["activity_time"] or 0, job["id"]), reverse=True)
         ambiguous = False
         if look_up:
@@ -908,13 +974,19 @@ class Reader:
                 try:
                     self.gate_snapshot = self.gates(native)
                     self.gate_key = native
+                    gates, notices = self.gate_snapshot
+                    job["read_failed"] = bool(notices and not any(
+                        gate.get(field) is not None for gate in gates
+                        for field in ("status", "returncode", "transcript", "stderr")
+                    ))
                 except DeferredRead:
                     job["notices"].append("Gate reads deferred")
                 except READ_ERRORS:
                     job["notices"].append("Gate artifact unreadable")
                     job["read_failed"] = True
                 if self.gate_key == native:
-                    job["gates"] = self.gate_snapshot
+                    job["gates"], gate_notices = self.gate_snapshot
+                    job["notices"].extend(gate_notices)
                     if not job["gate"] and run["kind"] == "task" and job["gates"]:
                         job["gate"] = job["gates"][-1]["status"]
             if event_kind:
@@ -949,4 +1021,5 @@ class Reader:
             "pending_approvals": pending_count, "jobs": jobs, "approvals": approvals,
             "events": [event for event in events if event_kind == "all" or event["kind"] in (event_kind, "notice")],
             "stream_drained": stream_drained, "ambiguous": ambiguous,
+            **({"active_jobs": active_jobs} if interactive else {}),
         }

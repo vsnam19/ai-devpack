@@ -147,11 +147,11 @@ class Stream:
         else:
             self.partial += last
 
-    def poll(self, path, *, terminal=False, budget=TICK_LIMIT, collect=False):
+    def poll(self, path, *, terminal=False, budget=TICK_LIMIT, collect=False, root=None):
         self.batch = [] if collect else None
         used = 0
         try:
-            with regular(path) as (fd, info):
+            with regular(path, root) as (fd, info):
                 identity = (info.st_dev, info.st_ino)
                 prefix = os.pread(fd, min(len(self.prefix), budget), 0)
                 used += len(prefix)
