@@ -22,10 +22,13 @@ Preserve selection by stable key across refresh and resize.
 - Job Detail shows observed attempts and steps, agent/model, outcome, gate
   state, times, process evidence, diagnostics and usage where available.
   Use `l` for Events, `g` for Gates and `e` for bounded diagnostic excerpts.
-- Events uses `c` to cycle all, command, tool and message, and `f` to toggle
-  follow. Scrolling back pauses follow. Show bounded redacted command names and
-  args, exit codes and agent message excerpts. In plain-text mode show a
-  labeled stdout/stderr tail under the all filter.
+  Press `a` from Jobs or Job Detail to open Approvals, including when no job
+  is selected. Esc returns to the originating view.
+- Events uses `c` to cycle all, tool and message, and `f` to toggle
+  follow. Scrolling back pauses follow. Shell tool calls and results appear
+  under tool with bounded redacted input/output and any error flag. Per-command
+  exit codes are unavailable for these records. The all filter can tail plain
+  stdout, while step stderr becomes available in Diagnostics after completion.
 - Gates shows receipt, attempt or step number, status and the applicable
   redacted output. A failed command and a failed gate are distinct observations.
 - Approvals lists pending and decided records. Enter opens Evidence with
@@ -38,14 +41,13 @@ Preserve selection by stable key across refresh and resize.
   only when supported by workflow semantics or producer evidence.
 
 ```text
-Jobs   Pack current | External current | 1 pending approval
+Jobs   Pack current | 1 pending approval
 Job      Backend   State                 Agent/model
 R17      pack      waiting for approval  worker-a/model-1
-J12      external  running               worker-b/model-2
 R19      pack      running               worker-a/model-1
 
 Detail R19  Process health unknown  No stream output yet
-/ Filter  C Clear  Enter Detail  l Events  g Gates  e Diagnostics
+/ Filter  C Clear  Enter Detail  l Events  g Gates  e Diagnostics  a Approvals
 ```
 
 ## Snapshot contract
@@ -72,36 +74,85 @@ readers. Values labeled as future appear in Phase 0.
 
 | Artifact | Fields and interpretation | Code |
 | --- | --- | --- |
-| `<runs-root>/<run-id>/run.json` | `run_id` (directory fallback), `kind`, `task` (task label), `started`, `finished`, `outcome`, `engines` (configured aliases, list or role mapping). Wall duration is derived from valid start/end times. | `runner/agent_exec.py:new_run_dir`, `runner/agent_exec.py:update_run_json`, `runner/devpack_logs.py:load_run_dir` |
-| Task `run.json` | `checkpoints[].approval_id/checkpoint/status` links approval records. `git_metadata_tampered`, `scope_violation`, `tamper_reason` and any `refusal_reason` explain early failures or refusals. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:_resume_from_approval` |
+| `<runs-root>/<run-id>/run.json` | `run_id` (directory fallback), `kind`, `task` (task label), `started`, `finished`, `outcome`, `engines` (configured aliases, list or role mapping). Derive final wall duration from valid start/end times for terminal outcomes. A pause can populate `finished`; use normalized state to interpret it and include pause time in end-to-end wall duration. | `runner/agent_exec.py:new_run_dir`, `runner/agent_exec.py:update_run_json`, `runner/devpack_logs.py:load_run_dir` |
+| Task `run.json` | `approval_id` and `checkpoint_id` link a brief pause. Completion adds `checkpoints[]` with `approval_id`, `checkpoint` and `status`. `git_metadata_tampered`, `scope_violation`, `tamper_reason` and any `refusal_reason` explain early failures or refusals. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:_resume_from_approval` |
 | Dispatch `run.json` | `approval_id`, `gate` (ok/fail/skipped where written), `scope`, `brief_lint`, `refusal_reason`, `memory_ids`, `memory_hashes`, `memory_tokens`, `memory_proposals` when present. | `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/devpack_dispatch.py:_resume_dispatch_from_approval` |
-| `run_summary.json` | Task `status`, `verdict`, `escalation_reason`, `step_logs`, `memory_ids`, `memory_tokens`, `memory_proposals`, `cost_usd`, `tokens_in/out` and `duration_s`. Duration is accumulated invocation time. Legacy totals use the accounting rules below. The summary can precede or lag the corresponding run state on resume. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:_resume_from_approval` |
+| `run_summary.json` | Task `status`, `verdict`, `escalation_reason`, `step_logs`, `memory_ids`, `memory_tokens`, `memory_proposals`, `cost_usd`, `tokens_in/out` and `duration_s`. Duration is accumulated invocation time. Legacy totals use the accounting rules below. The summary can precede or lag the corresponding run state on resume. Isolation refusal can leave no summary. Rejected resume can replace only the log-directory copy with decision fields, leaving a stale run-directory copy. For refusal and rejection use `run.json` for state and reason when present, and use run-local step artifacts when summary fields are absent or stale. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:_resume_from_approval` |
 | `steps/NN-<role>-<engine>.meta.json` | Step number and fallback role/engine from stem. Read `role`, `engine`, `model` (may fall back to configured model), `init_model` (observed where present), `status`, `exit_code`, `duration_s` or legacy `duration_ms`, `error`, `stderr`, `final_text` and memory IDs/hashes/tokens. | `runner/agent_exec.py:run_agent` (includes `_write_meta_and_return`), `runner/agent_exec.py:AgentResult.to_dict`, `runner/devpack_logs.py:_parse_step_stem`, `runner/devpack_logs.py:_apply_step_meta` |
-| Same step metadata | Input aliases `tokens_in/input_tokens/in_tokens`, output aliases `tokens_out/output_tokens/out_tokens`, legacy nested `tokens.in/out` if the corresponding flat value is absent, and `cost_usd/total_cost_usd/cost`. Preserve explicit values only with the applicable provenance below. | `runner/devpack_logs.py:_apply_step_meta`, `runner/agent_exec.py:parse_stream`, `runner/agent_exec.py:run_agent` |
-| Matching `.jsonl` and `.prompt.md` | Discover a step before its metadata appears. Use stream item/tool/message variants for event kind, phase, call ID, exit and text when present. Pair IDs within the step and keep byte order. Use bounded prompt excerpts on request. | `runner/agent_exec.py:run_agent`, `runner/devpack_logs.py:load_run_dir`, `runner/devpack_logs.py:parse_stream_jsonl` |
-| `step_NN_gate.json` | Task gate by step index and round. `gate_passed` is authoritative for the attempt. Show `returncode`, `command`, `duration_s`, `timestamp`, lint/static counts and clean flags, stdout and stderr. Read under the run directory or an explicitly configured, verified log directory. `--log-dir` can put numbered JSON logs elsewhere even when the summary is copied to the run directory. A basename in `step_logs` alone cannot identify that directory. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:write_step_log`, `runner/devpack_run.py:main` |
+| Same step metadata | Input aliases `tokens_in/input_tokens/in_tokens`, output aliases `tokens_out/output_tokens/out_tokens`, legacy nested `tokens.in/out` when the legacy flat value is absent or defaulted to zero, and `cost_usd/total_cost_usd/cost`. Preserve explicit values only with the applicable provenance below. | `runner/devpack_logs.py:_apply_step_meta`, `runner/agent_exec.py:parse_stream`, `runner/agent_exec.py:run_agent` |
+| Operator-selected `engines.toml` | Resolve an identified step engine alias to its configured model, labeled configured rather than observed. Match the runner's configuration when available. | `runner/agent_exec.py:load_engines`, `runner/devpack_run.py:load_engine_config` |
+| Matching `.jsonl` and `.prompt.md` | Discover a step before its metadata appears. Use recognized stream variants for tool/message kind, phase, call ID, text and error flag when present. Pair IDs within the step and keep byte order. Use bounded prompt excerpts on request. | `runner/agent_exec.py:run_agent`, `runner/devpack_logs.py:load_run_dir`, `runner/devpack_logs.py:parse_stream_jsonl` |
+| `step_NN_gate.json` | Task gate by step index and round. `gate_passed` is authoritative for the attempt. Show `step_index`, `round`, `returncode`, `command`, `duration_s`, `timestamp`, `lint_findings`, `lint_clean`, `static_findings`, `static_clean`, `stdout` and `stderr`. Read under the run directory or an explicitly configured, verified log directory. `--log-dir` can put numbered JSON logs elsewhere even when the summary is copied to the run directory. A basename in `step_logs` alone cannot identify that directory. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_run.py:write_step_log`, `runner/devpack_run.py:main` |
 | `steps/02-gate-receipt.json` | Dispatch trusted gate config path may produce this receipt. Show `gate_status`, `first_failed_check`, `timestamp_utc`, `checks` and `error`. Use it for the gate invocation and the dispatch `run.json.gate` for the overall dispatch gate decision. | `runner/devpack_dispatch.py:_resolve_gate_command`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `enforcement/gate/gate.py:write_receipt` |
 | `steps/NN-gate.txt`, `transcript.md` | Gate text is evidence. Without a structured status, accept an unambiguous standalone gate marker from a known marker-producing gate. Otherwise show gate unknown. Task gate commands can fail without any marker. Transcript is a generated snapshot. | `runner/devpack_run.py:write_gate_step_file`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/devpack_logs.py:load_run_dir`, `runner/devpack_logs.py:write_rendered_outputs` |
-| `.devpack/queue/<id>.{request,response}.json`, wrapper copies | Queue filename identifies request. Wrapper has `task=broker-request` and the copied request. Response `run_dir` may identify worker. Use worker outcome plus response `status`, `error`, `changed_files`, `served_model_id`, and available usage as corroborating evidence. Keep wrapper outcome as broker disposition and use its explicit status and approval ID for wrapper-only requests. | `runner/devpack_broker.py:Broker.poll`, `runner/devpack_broker.py:Broker.execute`, `runner/devpack_broker.py:Broker._execute_sandboxed_worker`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg` |
-| `<state_dir>/approvals/{pending,decided}/<id>.json` | `id`, `checkpoint`, `kind`, `hard_stop`, `status`, `subject`, `created`, `decided_at`, `decided_by`, `summary`, `note`, `gate_detail`, `gate_receipts`, `evidence`, `run_dir` and allowlisted `metadata`. Prefer valid decided record during transition. Join by explicit run reference or approval ID. Blocking status comes from an explicit paused execution or checkpoint semantics. | `runner/checkpoints.py:request`, `runner/checkpoints.py:decide_approval`, `runner/checkpoints.py:list_approvals` |
-| `<state_dir>/runs/<id>.json`, `<id>.consumed` | Look up by approval ID. Require an approved record, matching supported continuation and absence of consumed flags/marker. Report eligibility as observed, with actual validation and consumption left to the resume command. Withhold saved payload. | `runner/checkpoints.py:save_resume_state`, `runner/checkpoints.py:load_resume_state`, `runner/checkpoints.py:consume_resume_approval` |
+| `.devpack/queue/<id>.{request,response}.json`, wrapper copies | Queue filename identifies request. Wrapper has `task=broker-request` and the copied request. The basename of redacted response `run_dir` may identify the worker under the configured root. Use worker outcome as execution state. Show response `status`, `error`, `changed_files`, `served_model_id`, `cost_usd`, `tokens_in`, `tokens_out` and `duration_s` where present as corroborating evidence. Response status may describe the agent invocation and cannot establish workflow success. Keep wrapper outcome as broker disposition and use its explicit status and approval ID for wrapper-only requests. | `runner/devpack_broker.py:Broker.poll`, `runner/devpack_broker.py:Broker.execute`, `runner/devpack_broker.py:Broker._execute_sandboxed_worker`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg` |
+| `<state_dir>/approvals/{pending,decided}/<id>.json` | `id`, `checkpoint`, `kind`, `hard_stop`, `status`, `subject`, `created`, `decided_at`, `decided_by`, `summary`, `note`, `gate_detail`, `gate_receipts`, `evidence`, `requested_by`, redacted `run_dir`, `consumed` and allowlisted `metadata`. Prefer valid decided record during transition. Apply the approval joins below. Blocking status comes from an explicit paused execution or checkpoint semantics. | `runner/checkpoints.py:request`, `runner/checkpoints.py:decide_approval`, `runner/checkpoints.py:list_approvals`, `runner/checkpoints.py:consume_resume_approval` |
+| `<state_dir>/runs/<id>.json`, `<id>.consumed` | Look up by approval ID. Require an approved record, matching supported continuation with a compatible `checkpoint_id` and workflow, and absence of `consumed` flags or marker. Report eligibility as observed, with actual validation and consumption left to the resume command. Withhold saved payload. | `runner/checkpoints.py:save_resume_state`, `runner/checkpoints.py:load_resume_state`, `runner/checkpoints.py:consume_resume_approval` |
 | Linked evidence and memory proposal | Use linked run `brief_lint`, task `escalation_reason`, approval `summary` and `gate_detail`, and exact validated evidence files. Resolve memory proposal text only by a recorded ID under a trusted memory root. Skip missing, redacted-away or unsafe references. | `runner/checkpoints.py:request`, `runner/devpack_run.py:run_task_workflow`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/memory.py:_ensure_memory_decision_checkpoint`, `runner/memory.py:find_memory_entry` |
 | `attribution.json` (V1) | `suspected_cause`, `secondary`, `confidence`, `signals`, `evidence`, `analyzed_at`; latest valid `confirmed[]` with `cause`, `secondary`, `note`, `by`, `timestamp`. | `runner/devpack_logs.py:analyze_run_dir`, `runner/devpack_logs.py:attribute_run_dir` |
 
-Task `APPROVED` means execution succeeded. `ESCALATE_TO_HUMAN` means
-escalated and maps to failed unless a linked checkpoint actually paused the
-execution. `awaiting_approval` maps to waiting, or ready to resume with the
-continuation evidence above. `rejected` maps to rejected. A
-`git_metadata_tampered` flag or scope violation of that name maps to failed
-with a tampering reason even if the summary carries a different verdict.
-Dispatch `pass` maps to succeeded, `fail` and `timeout` to failed with
-reason, `refused` to refused and `running` to running with independent
-health. Missing or unrecognized values map to unknown.
+For an active step without metadata, pick the latest numbered prompt/stream
+stem using `runner/devpack_logs.py:_parse_step_stem`. Treat an unmatched
+prompt/stream as a step hint while execution is running. Label its role and
+engine from the stem and model from the configured alias when available.
+Configured task role mappings describe the run plan. Show observed model only
+when evidence identifies it. `runner/agent_exec.py:run_agent` publishes
+step metadata and buffered stderr after exit.
+
+#### Outcome normalization
+
+Apply these rules to Task and Dispatch/Broker. `run.json` takes precedence
+over a stale summary. For a linked broker job show worker execution state and
+broker disposition separately so a later broker failure remains visible.
+
+| Native evidence | Dashboard state | Code |
+| --- | --- | --- |
+| `running` | Running, with independent health | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg` |
+| `awaiting_approval` | Waiting for approval, or ready to resume with eligible approved continuation. A linked rejection displays rejected even before a resume attempt updates the run. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/devpack_broker.py:Broker.execute`, `runner/checkpoints.py:decide_approval` |
+| `rejected` | Rejected | `runner/devpack_run.py:_resume_from_approval`, `runner/devpack_dispatch.py:_resume_dispatch_from_approval`, `runner/devpack_broker.py:Broker.execute` |
+| `refused`, or wrapper `response.status=refused` with wrapper `outcome=fail` | Refused, with available reason | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/devpack_broker.py:Broker.execute` |
+| `fail`, `timeout` | Failed, with timeout reason where recorded | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/devpack_broker.py:Broker.execute` |
+| `pass`, `APPROVED` | Succeeded. A pending pre-merge approval remains separately visible. | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`, `runner/devpack_broker.py:Broker.execute` |
+| `ESCALATE_TO_HUMAN` | Failed with escalation reason, or waiting when a linked checkpoint explicitly paused execution | `runner/devpack_run.py:run_task_workflow` |
+| `git_metadata_tampered` outcome, flag or `scope_violation` value | Failed with tampering reason, overriding a success verdict | `runner/devpack_run.py:run_task_workflow`, `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg` |
+| Missing or unrecognized | Unknown | Adapter fallback |
+
+#### Approval joins and evidence
+
+1. Match exact approval IDs from top-level `run.json.approval_id` or
+   `checkpoints[].approval_id`. Validate the checkpoint where recorded.
+2. Use the basename of approval `run_dir` only as a candidate native ID
+   within the configured source. `runner/checkpoints.py:request` redacts the
+   path through `runner/redaction.py:redact_sensitive_text`. Never open it
+   as a filesystem path. Require a unique discovered match and surface
+   conflicting or redacted-away IDs as unresolved.
+3. For memory decisions, match `requested_by=run:<run-id>` when present
+   and corroborate with `memory_proposals.pending` when available. Match
+   `metadata.memory_id` (or exact subject ID) against pending proposal IDs
+   in Task summaries or Dispatch run metadata. See
+   `runner/memory.py:_ensure_memory_decision_checkpoint`,
+   `runner/devpack_run.py:run_task_workflow` and
+   `runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`.
+   Keep unresolved or standalone approvals visible and independent of
+   execution blocking state.
+
+Read `00-brief-lint.json` from the run root (broker) or `steps/` (Task
+and Dispatch), as written by `runner/devpack_broker.py:Broker.execute`,
+`runner/devpack_run.py:run_task_workflow` and
+`runner/devpack_dispatch.py:_dispatch_job_with_trusted_cfg`. Read its `brief_lint` findings and reported `error_count`. Direct runs paused
+at brief may have no prompt artifact yet. Use a linked step-01 prompt or, for
+a broker pause, resolve the request's relative `brief` reference within the
+trusted workdir and require the recorded `brief_sha256` to match before
+showing a bounded redacted excerpt. The request stores a reference, as read
+by `runner/devpack_broker.py:Broker._validate`, and the wrapper records the
+digest in `runner/devpack_broker.py:Broker.execute`. If evidence is absent
+or fails validation, show brief text unavailable. Use continuation files
+only for allowlisted eligibility checks.
 
 #### Broker reconciliation
 
 Correlate queue request ID → wrapper copy of `<id>.request.json` → worker
-directory named by a validated wrapper response or queue response. The wrapper
+directory identified by a validated Phase 0 correlation record or the basename of a wrapper or queue response's redacted `run_dir`. The wrapper
 response can exist before the queue response. Check that the target is a
 distinct direct child of the configured runs root, with a compatible run ID and
 kind, and reject conflicting links. Treat legacy terminal response links as
@@ -118,7 +169,7 @@ The same active job can therefore occupy two unresolved rows on legacy data.
 Never infer links from start times, engine names or task names. A submit timeout
 does not establish a job outcome.
 
-### External adapter
+### External adapter (V1)
 
 The external runner has no producer function in this repository. These are
 candidate fields for an operator-configured local file contract. Enable each
@@ -129,7 +180,7 @@ producer. Pack stream interpretation is a reference for event variants only.
 | --- | --- |
 | Directory, `request.json`, `brief.md` | Directory ID; requested role/agent/model where the producer declares them. A bounded brief excerpt is available on request. Goal ID requires an explicit contract in V2. |
 | `result.json` and attempt results where supported | `status`, `exit_code`, `agent`, `model`, `started`, `ended`, `duration_s`, `attempts`, `changed_files`, `verdict` where verified. Attempt result fields take precedence over filename hints. Without a result, final state is unknown. |
-| `pid` | Candidate local PID. See health rules for local absence, PID reuse and remote roots. |
+| `pid` and producer identity | Candidate PID. The producer contract must supply host ID, boot ID and PID namespace identity for local probing. Missing or mismatched identity leaves health unknown. |
 | `attempts/<n>-<agent>-<model>/stdout` | Attempt number and filename identity hints where the naming contract is unambiguous. Recognized `thread.started` and `item.started/completed` variants yield lifecycle, command, tool or message events. Pair IDs within an attempt. Reference `runner/devpack_logs.py:parse_stream_jsonl` for Pack variants. |
 | Attempt stderr, `reply.md`, `gate/<n>.log` | Bounded redacted diagnostics. Link gate to attempt only with a verified numbering contract. Gate status requires explicit structured outcome or a known marker contract. |
 | Optional dated local pool snapshot (V1) | Use only explicitly documented quota, cooldown and sample time fields. Missing, stale and unverified sources report unknown current quota. |
@@ -146,28 +197,45 @@ per run and per field, including in mixed-version roots.
 
 | Producer change | Acceptance test | MVP when absent |
 | --- | --- | --- |
-| Write atomic per-run `heartbeat.json` from the host workflow or dispatch owner, starting at run creation. Record schema version, run ID, PID, boot ID, process start identity, heartbeat time and nullable `last_event_at`. Refresh during waits for subprocesses, keep heartbeat and event times separate, and stop updates on pause or completion. Bind local checks to a trusted local source. | With fake time and processes, assert a quiet live child leaves the host heartbeat fresh, a killed owner leaves stale data, and boot mismatch, PID reuse and permission errors never verify liveness. Assert terminal and paused execution overrides health hints. | Process health unknown for Pack. Show available event time and elapsed age. |
+| Write atomic per-run `heartbeat.json` from the host workflow or dispatch owner, starting at run creation. Record schema version, run ID, PID, host and boot IDs, PID namespace, process start identity, heartbeat time and nullable `last_event_at`. Refresh during waits for subprocesses, keep heartbeat and event times separate, and stop updates on pause or completion. Bind local checks to a trusted local source. | With fake time and processes, assert a quiet live child leaves the host heartbeat fresh, a killed owner leaves stale data, and boot mismatch, PID reuse and permission errors never verify liveness. Assert terminal and paused execution overrides health hints. | Process health unknown for Pack. Show available event time and elapsed age. |
+| Publish the Task resume transition in `runner/devpack_run.py:_resume_from_approval` after successful consumption and before role execution. Set `outcome=running`, clear the pause's `finished` and preserve the original run ID and start time. Finalize subsequent failures with an explicit outcome. | Pause a stub role after resuming a previously approved task. Assert the original row moves to running with no finish time, a failed continuation gets a terminal outcome, and a second resume cannot consume the same approval. | A consumed continuation with legacy pause metadata shows resume status unknown until the next authoritative outcome. |
 | Publish one atomic broker correlation record under the wrapper as soon as dispatch allocates the worker directory, before worker steps start. Include request ID, wrapper run ID and worker run ID. Retain response link as a completion fallback. Preserve an allocated link through errors and keep requests that allocate no worker distinguishable. | Pause a stub worker before step 01 and assert the queue, wrapper and worker produce one request row. Assert the same key after completion, refusal before allocation, failure after allocation and a concurrent direct dispatch. Reject conflicting or escaping links. | Use validated terminal response links. Show unresolved linkage during execution. |
-| Preserve nullable measured cost through `runner/agent_exec.py:parse_stream`, `runner/agent_exec.py:run_agent` and task/dispatch serialization. Record schema or explicit provenance distinguishing measured values from defaults. Expose per-direction token availability too. | Parse fixtures with explicit zero, positive cost, missing result, truncated stream and local unpriced execution. Assert zero survives, absent values serialize as null, and a mixed run contributes known spend with partial coverage. Assert legacy consumers still handle nullable values. | Default zeros without explicit evidence are unknown. |
+| Preserve nullable measured cost through `runner/agent_exec.py:parse_stream`, `runner/agent_exec.py:run_agent` and task/dispatch serialization. Record schema or explicit provenance distinguishing measured values from defaults. Expose per-direction token availability too. | Parse fixtures with explicit zero, positive cost, missing result, truncated stream and local unpriced execution. Assert zero survives, absent values serialize as null, and a mixed run contributes known spend with partial coverage. Assert legacy consumers still handle nullable values. | Legacy default zeros are unknown in MVP. Versioned measured zero is displayed as zero. |
 | Standardize run-level totals in each run directory's `run_summary.json`. Extend task summary with measurement scope and known/eligible counts. Emit the same summary for direct dispatch. Store cost, tokens and invocation duration with coverage, separately from wall duration. Publish the final snapshot atomically and refresh it coherently on resume. | Assert task retries are counted once, a direct dispatch has matching step and summary, early refusal has unknown measurements, and replay/re-read never adds totals twice. Assert external task log directories still leave the summary discoverable. | Read existing task summary and step metadata with legacy provenance rules. Use step fallback or unknown for missing totals. |
-| Mirror task `step_NN_gate.json` into the run directory when an explicit log directory differs. Preserve raw gate output and publish the structured result atomically for each attempt. | Use a failing stub gate with exit 1 and no marker, followed by a successful retry. Assert both verdicts and round links are visible from the run root with a separate log directory. | Use a verified log root if available, otherwise show the gate transcript with unknown status when structured evidence is missing. |
+| Mirror task `step_NN_gate.json` into the run directory when an explicit log directory differs. Preserve redacted gate output and publish the structured result atomically for each attempt. | Use a failing stub gate with exit 1 and no marker, followed by a successful retry. Assert both verdicts and round links are visible from the run root with a separate log directory. | Use a verified log root if available, otherwise show the gate transcript with unknown status when structured evidence is missing. |
+
+Legacy Task resume can reuse a directory while leaving its prior
+`awaiting_approval` outcome until completion
+(`runner/devpack_run.py:_resume_from_approval`,
+`runner/devpack_run.py:run_task_workflow`). A consumed approval with a paused
+run and no newer execution state shows “resume status unknown”. A new prompt,
+stream or file mtime alone cannot verify that the resumed execution is active.
 
 ## Incremental reading and health
 
-- Use stdlib polling. Discover directories via bounded `scandir` batches.
-  Prioritize selected, known active and recent-mtime entries. Hydrate historical
-  metadata progressively with an in-memory summary cache keyed by file revision.
-  Show partial counts and backlog. `--once` uses a bounded initial scan and
-  reports coverage. Age out older summaries and page them on demand.
-- Sample selected stream and approvals every 1s, background active file
-  size/mtime and metadata every 3s, and discovery every 5s. Back off to 30s
-  when idle. Full reconciliation runs incrementally. Stop active polls for
+- Use stdlib polling with a bounded history window. Enumerate run IDs and
+  prioritize selected and known active runs, then use parsed run ID timestamps
+  and `run.json` and `steps/` activity hints to rank remaining candidates.
+  Refresh activity hints for historical runs so older resumed jobs can
+  re-enter the window. `runner/agent_exec.py:update_run_json` writes inside
+  the run directory, `runner/agent_exec.py:run_agent` writes under `steps/`,
+  and `runner/devpack_run.py:_resume_from_approval` reuses the run directory.
+  The run directory's own mtime is insufficient.
+- Expose the history limit and coverage for interactive Jobs. One-shot Jobs
+  enumerates all IDs and evaluates metadata for all candidates before filtering
+  and applying the output history limit. Report matched, returned and unreadable
+  counts. Resolve show, gate and tail directly by validated run ID or broker
+  request ID (through queue and wrapper lookup), outside the history window.
+  V1 adds progressive historical hydration and paging at 10,000-run scale.
+- Sample selected stream and approvals every 1s, known active metadata every
+  3s and discovery every 5s. Back off to 30s when idle. Stop active polls for
   finalized, drained streams and wake readers on manual refresh.
-- Parse stream records only for the selected Events view or explicit tail.
-  Work off the UI thread and coalesce snapshots. Keep 1,000 selected events,
-  records up to 256 KiB, and a 2 MiB read budget per tick shared with evidence
-  reads. Preserve the last good snapshot with age and error badges during
-  partial writes. Show empty, removed, inaccessible and stale sources distinctly.
+- Parse stream records only for selected Events or explicit tail. Use a
+  background polling worker and coalesce snapshots. Keep 1,000 selected events,
+  records up to 256 KiB, and a 2 MiB read budget per background tick shared with
+  evidence reads. Preserve the last good snapshot with age and error badges
+  during partial writes. Distinguish empty, removed, inaccessible and stale
+  sources.
 - Track binary offsets and device/inode per generation. Buffer incomplete UTF-8
   and records. Mark a gap and reset offset on replacement or truncation.
   Count oversized or malformed complete records in recognized JSONL mode.
@@ -182,15 +250,15 @@ per run and per field, including in mixed-version roots.
   without activity can yield quiet. An empty stream alone provides no baseline.
   Heartbeat freshness contributes to health, independently of event silence.
   Use monotonic polling and UTC source timestamps with local display.
-- For trusted local Pack heartbeats, match boot and process start identity before
+- For trusted local Pack heartbeats, match host, boot, PID namespace and process start identity before
   showing verified alive. On stale heartbeat and confirmed owner absence or
   confirmed PID reuse under the same boot, show suspected stuck/orphaned only
-  while the execution is still nonterminal. External PID-only evidence supports
-  suspected orphaned on local `ESRCH` after a re-read of unchanged attempt/PID
-  and absent terminal result. A PID-only process that exists remains unverified.
+  while the execution is still nonterminal. For V1 External, probe only after matching producer host, boot and PID namespace.
+  Local `ESRCH` supports suspected orphaned after a re-read of unchanged
+  identity, attempt and PID and confirmation that no terminal result appeared. A PID-only process that exists remains unverified.
   Remote roots, permission denial and unverifiable identities leave health
   unknown. Exclude queued jobs, known waits and terminal receipts.
-- Target keyboard response below 100 ms on a local fixture with 10,000
+- In V1, target keyboard response below 100 ms on a local fixture with 10,000
   historical runs and 100 active jobs during scan and tail. Measure input
   latency, bytes read and backlog separately from time to full coverage.
 
@@ -204,13 +272,12 @@ coverage.
 Legacy Pack cost defaults to zero in `runner/agent_exec.py:AgentResult`,
 `runner/agent_exec.py:parse_stream` and task aggregation in
 `runner/devpack_run.py:run_task_workflow`. Accept positive finite historical
-cost where attributable to the invocation. Accept zero only with explicit
-numeric zero on a recognized result event (`total_cost_usd/cost_usd/cost`) or
-versioned measured provenance. Cloud class by itself establishes no measurement.
-Recover explicit legacy zero only within the read budget or from cached,
-validated evidence. Unverified aggregate zero stays unknown. Use the same
-principle for defaulted zeros in token fields. Configured time and context limits
-are capacity hints from `runner/agent_exec.py:load_engines`.
+cost where attributable to the invocation. MVP accepts zero only with
+versioned measured provenance. Legacy zero and absent values are unknown,
+including defaulted token counts. V1 may recover measured legacy zero from a
+recognized result event (`total_cost_usd/cost_usd/cost`) during explicit
+accounting, with bounded reads and validated provenance. Configured time and
+context limits are capacity hints from `runner/agent_exec.py:load_engines`.
 
 ## Accounting and incidents (V1)
 
@@ -231,17 +298,16 @@ Use plain text for pipes, missing curses, unsupported terminfo or `TERM=dumb`.
 Use the same redacted snapshot contract for all views.
 
 ```text
-devpack_dash.py [--backend pack|external|both] [--workdir PATH]
-                [--project-config PATH] [--runs-root PATH] [--jobs-root PATH]
+devpack_dash.py [--workdir PATH] [--dashboard-config PATH]
+                [--project-config PATH] [--runs-root PATH]
                 [--state-dir PATH] [--plain|--json] [--once]
                 [jobs [--filter QUERY] | show JOB | gate JOB
-                 | tail JOB [--kind all|command|tool|message]
+                 | tail JOB [--kind all|tool|message]
                  | approvals [--status pending|decided|all]]
 ```
 
 Plain and JSON return one snapshot except for explicit continuous tail.
-`--once` uses plain by default and returns a bounded snapshot or initial tail
-page. JSON includes schema version, observation time, source health, nullable
+`--once` uses plain by default and returns a snapshot or initial tail page. V1 adds backend selection and `--jobs-root`. JSON includes schema version, observation time, source health, nullable
 fields and scan completeness. Streaming JSON uses one record per event or
 notice. Require backend qualification for ambiguous IDs. Exit 0 for successful
 reads, 1 for read failure or all selected roots unavailable, 2 for invalid
@@ -256,11 +322,16 @@ external storage, pass the host broker's `--runs-root` to the dashboard and
 resolve the same trusted checkpoint state as the broker. Keep the queue root
 relative to the selected project workdir. See `runner/devpack_broker.py:Broker.__init__`.
 
-Use operator-selected project `[dashboard]` settings for backend, runs root,
-jobs root, optional verified task log/evidence roots, poll intervals, quiet
-threshold and history limit. CLI overrides config. Relative config paths
-resolve from the config file's directory. Default to Pack, project `runs/`,
-normal pipeline state resolution and no external backend until configured.
+Read `[dashboard]` only from an explicitly selected operator-controlled
+`--dashboard-config` outside worker-writable trees. Accept runs root, verified
+task log/evidence roots, poll intervals, quiet threshold and history limit.
+V1 adds external roots. CLI overrides config. Resolve relative root paths
+from workdir, matching the runner's project-relative convention
+(`runner/agent_exec.py:load_project_config`,
+`runner/devpack_dispatch.py:dispatch_job`). Project config supplies
+project context through the trusted runner resolver. It cannot supply dashboard
+roots or authorize evidence locations. Default to Pack, workdir-relative
+`runs/` and normal trusted pipeline state resolution.
 For standalone task runs, point the dashboard at the task runner’s
 `--runs-root` (its default is `/tmp/devpack-run/runs`), or configure a parent
 containing the standalone `--log-dir` run. See `runner/devpack_run.py:main`.
@@ -317,9 +388,10 @@ Use temporary offline fixtures, simulated process state and fake time.
 | Phase | Deliverable | Acceptance |
 | --- | --- | --- |
 | Phase 0 | Separate producer changes above | Run each producer acceptance test independently and verify mixed-version fixtures. |
-| MVP | Pack and External readers | Assert linked and unresolved broker runs, refusals before step 01, direct runs, a non-marker gate failure, alternate log location, plain-text and buffered output, missing results, reused PID, unknown fields and colliding native IDs. |
-| MVP | Incremental store and renderers | Assert split UTF-8/JSONL and escape sequences, truncation, replacement, stale snapshots, selected-stream-only parsing, backlog and bounded reads. Measure keyboard latency under fixture load. |
-| MVP | Navigation and read-only Approvals | Assert filter apply/cancel/clear, tool filtering, redacted evidence, exact command arguments for a target outside the current directory, no writes or subprocess launches, schema and exit codes, and both viewport sizes. |
+| MVP | Pack reader | Assert linked and unresolved broker runs, refusals before step 01, direct runs, a non-marker gate failure, alternate log location, plain-text and buffered output, missing results, reused PID, unknown fields and conflicting broker links. |
+| MVP | Bounded store and renderers | Assert split UTF-8/JSONL and escape sequences, truncation, replacement, stale snapshots, selected-stream-only parsing and bounded reads. Assert an older resumed run re-enters the window, an older failed run appears in filtered one-shot Jobs, and detail commands resolve IDs outside the window. |
+| MVP | Navigation and read-only Approvals | Assert `a` opens Approvals from both views without a selected job, redacted-path and memory approval joins, pause-to-ready eligibility, filter apply/cancel/clear, tool filtering, redacted evidence, exact command arguments for a target outside the current directory, no writes or subprocess launches, schema and exit codes, and both viewport sizes. |
+| V1 | External adapter and progressive history | Assert configured fixtures, remote or unknown identity skipping PID probes, matching local identity with stale attempts, colliding IDs, paging coverage and the input latency target. |
 | V1 | Overview, accounting and incidents | Assert local-day boundaries, unknown versus measured zero, retry deduplication, partial scan coverage, aged quota data, attribution confirmation precedence and diagnostics without an analyzer run. |
 | V1 | Protected decision execution | Assert stale evidence/fingerprint refusals, one decision across competing supported writers, refusal from agent context, reject note enforcement and provenance in the target repository. |
 | V2 | Pipeline per goal | Assert explicit cross-backend joins, observed retry edges and standalone views for missing goal IDs. |
