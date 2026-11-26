@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from runner import devpack_dispatch, devpack_run
+from runner import devpack_dispatch, devpack_logs, devpack_run
 from runner.tests.test_devpack_dispatch import _init_git_repo
 from runner.agent_exec import (
     AgentRequest, check_data_class_allowed, compute_engine_config_hash, load_engines, run_agent,
@@ -124,6 +124,161 @@ implementer = "implement"
             role="implementer", allow_globs=["literal;touch marker"],
         ))
         self.assertEqual((result.status, result.final_text), ("ok", "Brief passed by file."))
+
+    def test_docker_launch_and_timeout_cleanup(self):
+        docker = self.root / "devpack-test-docker"
+        receipt = self.root / "docker.jsonl"
+        docker.write_text(f"#!{sys.executable}\n" + """
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+
+args = sys.argv[1:]
+record = {"args": args, "env": dict(os.environ)}
+if args[0] == "run":
+    mounts = [args[i + 1].split(":") for i, arg in enumerate(args) if arg == "-v"]
+    record["modes"] = {
+        dest: stat.S_IMODE(Path(src).stat().st_mode) for src, dest, _ in mounts
+    }
+    brief = next(Path(src) for src, dest, _ in mounts if dest.endswith("/brief.md"))
+    record["staging_mode"] = stat.S_IMODE(brief.parent.stat().st_mode)
+""" + f"""
+with Path({str(receipt)!r}).open("a") as handle:
+    print(json.dumps(record), file=handle)
+if args[0] == "run":
+    time.sleep(10)
+""")
+        docker.chmod(0o755)
+        expected_env = {
+            "PATH": str(self.root), "HOME": str(self.root / "home"),
+            "TMPDIR": str(self.root), "DOCKER_HOST": "unix:///fake.sock",
+            "DOCKER_CONFIG": str(self.root / "config"), "XDG_RUNTIME_DIR": str(self.root),
+            "LANG": "C", "LC_ALL": "C", "FIXTURE_TOKEN": "fixture-secret",
+        }
+        engine = load_engines(self.configuration()).engines["external"]
+        previous_umask = os.umask(0o077)
+        try:
+            result = run_agent(AgentRequest(
+                engine=engine, prompt="Check Docker invocation.", workdir=self.root,
+                run_dir=self.root / "run", isolation="docker", role="implementer",
+                docker_bin=docker.name, env_overrides={**expected_env, "HIDDEN": "hidden"},
+            ))
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(result.status, "timeout", result.error)
+        launch, cleanup = map(json.loads, receipt.read_text().splitlines())
+        for call in (launch, cleanup):
+            self.assertEqual({key: call["env"].get(key) for key in expected_env}, expected_env)
+            self.assertNotIn("HIDDEN", call["env"])
+        args = launch["args"]
+        self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == "-e"],
+                         ["FIXTURE_TOKEN"])
+        self.assertEqual(cleanup["args"], ["rm", "-f", args[args.index("--name") + 1]])
+        self.assertEqual(launch["modes"]["/workspace/external/brief.md"], 0o644)
+        self.assertEqual(launch["modes"]["/workspace/external/output"], 0o777)
+        self.assertEqual(launch["staging_mode"], 0o700)
+
+    def run_artifact_job(self, script):
+        config = self.configuration()
+        original = config.read_text()
+        job = self.root / "artifact_job.py"
+        job.write_text(script, encoding="utf-8")
+        command = [sys.executable, str(job), "{run_dir}"]
+        config.write_text(original.replace(
+            next(line for line in original.splitlines() if line.startswith("command = ")),
+            f"command = {json.dumps(command)}",
+        ))
+        return run_agent(AgentRequest(
+            engine=load_engines(config).engines["external"], prompt="Check artifacts.",
+            workdir=self.root, run_dir=self.root / "run", isolation="local",
+            allow_unsandboxed_local=True, role="implementer",
+        ))
+
+    def test_oversized_external_output_is_harness_error(self):
+        for name, write in (
+            ("stdout", "sys.stdout.write(large)"),
+            ("stderr", "sys.stderr.write(large)"),
+            ("reply", 'reply.write_text(large)'),
+            ("events", '(output / "events").write_text(large)'),
+        ):
+            with self.subTest(name=name):
+                result = self.run_artifact_job(f"""
+import json
+from pathlib import Path
+import sys
+
+output = Path(sys.argv[1])
+reply = output / "reply.md"
+reply.write_text("ok")
+large = ("!" * 1023 + chr(10)) * 4096 + "!"
+{write}
+print(json.dumps(dict(status="ok", exit_code=0, reply_path=str(reply))))
+""")
+                self.assertEqual(result.status, "harness_error", result.error)
+                self.assertIn(f"external {name} exceeds", result.error)
+
+    def test_external_events_preserve_unicode_line_separator(self):
+        message = "first\u2028second"
+        event = json.dumps({
+            "type": "item.completed", "item": {"type": "agent_message", "text": message},
+        }, ensure_ascii=False) + "\n"
+        result = self.run_artifact_job(f"""
+import json
+from pathlib import Path
+import sys
+
+output = Path(sys.argv[1])
+reply = output / "reply.md"
+reply.write_text("ok")
+(output / "events").write_text({event!r}, encoding="utf-8")
+print(json.dumps(dict(status="ok", exit_code=0, reply_path=str(reply))))
+""")
+        self.assertEqual(result.status, "ok", result.error)
+        transcript = self.root / "run/steps/01-implementer-external.jsonl"
+        self.assertEqual(json.loads(transcript.read_text())["item"]["text"], message)
+
+    def test_external_token_limits_must_be_positive_integers(self):
+        config = self.configuration()
+        original = config.read_text()
+        config.write_text(original.replace("timeout_s = 1", """
+timeout_s = 1
+context_tokens = 128000
+brief_tokens_max = 8000
+"""))
+        self.assertIn("external", load_engines(config).engines)
+        for key in ("context_tokens", "brief_tokens_max"):
+            for value in ("0", "-1", "true", '"8000"', "1.5"):
+                with self.subTest(key=key, value=value):
+                    config.write_text(original.replace("timeout_s = 1", f"timeout_s = 1\n{key} = {value}"))
+                    with self.assertRaisesRegex(ValueError, f"{key} must be a positive integer"):
+                        load_engines(config)
+
+    def test_fixer_and_reviewer_require_distinct_engines(self):
+        config = self.configuration()
+        implementer = config.read_text()
+        reviewer = (implementer.replace("engines.external", "engines.review")
+                    .replace("worker:test", "reviewer:test"))
+        config.write_text(implementer + reviewer + """
+[roles]
+implementer = "external"
+fixer = "review"
+reviewer = "review"
+""")
+        with self.assertRaisesRegex(ValueError, "different engine"):
+            load_engines(config)
+
+    def test_log_parser_ignores_invalid_external_message_text(self):
+        transcript = self.root / "step.jsonl"
+        transcript.write_text("\n".join(json.dumps({
+            "type": "item.completed", "item": {"type": "agent_message", "text": value},
+        }) for value in (None, "", 42, "valid")))
+        step = devpack_logs.StepRecord("01", "01-implementer-external", "implementer", "external")
+        devpack_logs.parse_stream_jsonl(transcript, devpack_logs.Redactor(), step)
+        self.assertEqual([item.text for item in step.items], ["valid"])
+        self.assertEqual(step.num_turns, 1)
 
     def test_local_policy_refuses_before_launch(self):
         engine = load_engines(self.configuration()).engines["external"]

@@ -281,10 +281,10 @@ def parse_stream_jsonl(
         if ev_type == "item.completed" and isinstance(event.get("item"), dict):
             external_item = event["item"]
             if external_item.get("type") == "agent_message":
-                step.items.append(StreamItem(
-                    kind="text", text=redactor.redact(str(external_item.get("text", ""))),
-                ))
-                assistant_turns += 1
+                txt = external_item.get("text")
+                if isinstance(txt, str) and txt:
+                    step.items.append(StreamItem(kind="text", text=redactor.redact(txt)))
+                    assistant_turns += 1
                 continue
             if external_item.get("type") == "command_execution":
                 step.tool_counts["Bash"] = step.tool_counts.get("Bash", 0) + 1

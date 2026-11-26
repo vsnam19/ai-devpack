@@ -40,7 +40,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 import uuid
 
 try:
@@ -177,7 +177,8 @@ def _load_external(spec: Mapping[str, Any]) -> ExternalConfig:
     required = {"model", "command", "result", "reply_from", "max_data_class",
                 "timeout_s", "env_allow", "role_map"}
     missing = required - spec.keys()
-    unknown = spec.keys() - required - {"class", "events_from", "min_context_tokens"}
+    token_limits = ("context_tokens", "brief_tokens_max")
+    unknown = spec.keys() - required - {"class", "events_from", "min_context_tokens", *token_limits}
     if missing or unknown:
         raise ValueError(f"missing fields {sorted(missing)}, unknown fields {sorted(unknown)}")
     for key in ("model", "result", "reply_from", "max_data_class"):
@@ -193,6 +194,9 @@ def _load_external(spec: Mapping[str, Any]) -> ExternalConfig:
         type(spec["min_context_tokens"]) is not int or spec["min_context_tokens"] < 0
     ):
         raise ValueError("min_context_tokens must be a nonnegative integer")
+    for key in token_limits:
+        if key in spec and (type(spec[key]) is not int or spec[key] <= 0):
+            raise ValueError(f"{key} must be a positive integer")
     command = spec["command"]
     if not isinstance(command, list) or not command or not all(
         isinstance(arg, str) and arg and "\0" not in arg for arg in command
@@ -671,8 +675,10 @@ def load_engines(path: Path | str) -> EnginesConfig:
             else:
                 raise ValueError(f"Invalid role specification for '{role_name}'")
 
-        if "implementer" in role_engines and "reviewer" in role_engines:
-            check_external_review_pair(role_engines["implementer"], role_engines["reviewer"])
+        if "reviewer" in role_engines:
+            for role in ("implementer", "fixer"):
+                if role in role_engines:
+                    check_external_review_pair(role_engines[role], role_engines["reviewer"])
 
         for engine in [*engines.values(), *role_engines.values()]:
             engine.role_permissions = role_permissions
@@ -2476,7 +2482,20 @@ _EXTERNAL_STATUSES = {
 }
 
 
-def _read_external_artifact(value: str, output: Path, visible_output: Path) -> str:
+_EXTERNAL_READ_LIMIT = 4 * 1024 * 1024
+_DOCKER_HOST_ENV = (
+    "PATH", "HOME", "TMPDIR", "DOCKER_HOST", "DOCKER_CONFIG", "XDG_RUNTIME_DIR", "LANG", "LC_ALL",
+)
+
+
+def _read_external_text(handle: BinaryIO, label: str) -> str:
+    data = handle.read(_EXTERNAL_READ_LIMIT + 1)
+    if len(data) > _EXTERNAL_READ_LIMIT:
+        raise ValueError(f"external {label} exceeds the {_EXTERNAL_READ_LIMIT}-byte limit")
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_external_artifact(value: str, output: Path, visible_output: Path, *, label: str) -> str:
     """Read only regular files inside this step's private output directory."""
     path = Path(value)
     if path.is_absolute():
@@ -2487,10 +2506,10 @@ def _read_external_artifact(value: str, output: Path, visible_output: Path) -> s
     if not path.is_relative_to(output):
         raise ValueError("external artifact path escapes {run_dir}")
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    with os.fdopen(fd, encoding="utf-8", errors="replace") as handle:
+    with os.fdopen(fd, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise ValueError("external artifact must be a regular file")
-        return handle.read()
+        return _read_external_text(handle, label)
 
 
 def _run_external(
@@ -2506,7 +2525,7 @@ def _run_external(
     res = AgentResult(
         tokens_in=None, tokens_out=None, input_tokens=None, output_tokens=None, cost_usd=None,
     )
-    events: list[str] = []
+    stream = ""
     try:
         with tempfile.TemporaryDirectory(prefix="devpack-external-") as staging:
             root = Path(staging).resolve()
@@ -2523,7 +2542,14 @@ def _run_external(
             visible_workdir = workdir
             docker_prefix: list[str] = []
             container_name = ""
+            process_env = env
             if request.isolation == "docker":
+                # The private staging parent protects these paths on the host.
+                output.chmod(0o777)
+                brief.chmod(0o644)
+                docker_env = {key: source_env[key] for key in _DOCKER_HOST_ENV if key in source_env}
+                docker_env.update(env)
+                process_env = docker_env
                 git_decision = docker_git_mount_decision(workdir, request.trusted_git_dir)
                 update_run_json(
                     request.run_dir, git_metadata_mounted=git_decision.mounted,
@@ -2580,7 +2606,7 @@ def _run_external(
 
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
                 with subprocess.Popen(
-                    argv, cwd=workdir, env=env, stdin=subprocess.DEVNULL,
+                    argv, cwd=workdir, env=process_env, stdin=subprocess.DEVNULL,
                     stdout=stdout, stderr=stderr, start_new_session=True,
                 ) as proc:
                     try:
@@ -2596,7 +2622,7 @@ def _run_external(
                         res.error = f"External engine timed out after {request.timeout}s"
                         if container_name:
                             subprocess.run(
-                                [request.docker_bin, "rm", "-f", container_name], env=env,
+                                [request.docker_bin, "rm", "-f", container_name], env=process_env,
                                 cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, timeout=5, check=False,
                             )
@@ -2609,8 +2635,8 @@ def _run_external(
                                 pass
                 stdout.seek(0)
                 stderr.seek(0)
-                text = stdout.read().decode("utf-8", errors="replace")
-                res.stderr = stderr.read().decode("utf-8", errors="replace")
+                text = _read_external_text(stdout, "stdout")
+                res.stderr = _read_external_text(stderr, "stderr")
 
             payload: dict[str, Any] = {}
             if res.status != "timeout":
@@ -2645,7 +2671,10 @@ def _run_external(
                              else config.reply_from[5:])
                     if isinstance(reply, str) and reply:
                         try:
-                            res.final_text = _read_external_artifact(reply, output, visible_output).strip()
+                            reply_text = _read_external_artifact(
+                                reply, output, visible_output, label="reply",
+                            )
+                            res.final_text = reply_text.replace("\r\n", "\n").replace("\r", "\n").strip()
                         except FileNotFoundError:
                             if res.status == "ok":
                                 raise
@@ -2665,26 +2694,29 @@ def _run_external(
 
             if config.events_from:
                 try:
-                    stream = _read_external_artifact(expand(config.events_from), output, visible_output)
+                    stream = _read_external_artifact(
+                        expand(config.events_from), output, visible_output, label="events",
+                    )
                 except FileNotFoundError:
-                    stream = ""
-                for line in stream.splitlines():
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(event, dict):
-                        events.append(json.dumps(event))
+                    pass
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         res.status = "harness_error"
         res.exit_code = res.exit_code or 126
         res.error = f"External engine: {exc}"
         res.failure_attribution = "ENV/TOOL"
 
-    if not events:
-        events.append(json.dumps({"type": "result", "result": res.final_text}))
     with jsonl_path.open("w", encoding="utf-8") as transcript:
-        for event in events:
+        wrote_event = False
+        for line in stream.split("\n"):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                transcript.write(redact_event(json.dumps(event)).rstrip("\n") + "\n")
+                wrote_event = True
+        if not wrote_event:
+            event = json.dumps({"type": "result", "result": res.final_text})
             transcript.write(redact_event(event).rstrip("\n") + "\n")
     res.duration_s = round(time.monotonic() - started, 4)
     return res
