@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 import getpass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import platform
@@ -2526,8 +2527,11 @@ def _run_external(
         tokens_in=None, tokens_out=None, input_tokens=None, output_tokens=None, cost_usd=None,
     )
     stream = ""
+    staging = None
     try:
-        with tempfile.TemporaryDirectory(prefix="devpack-external-") as staging:
+        with tempfile.TemporaryDirectory(
+            prefix="devpack-external-", ignore_cleanup_errors=True,
+        ) as staging:
             root = Path(staging).resolve()
             output = root / "output"
             output.mkdir()
@@ -2654,7 +2658,9 @@ def _run_external(
                         res.error = f"External engine reported {status}"
                     if res.status == "timeout" and res.exit_code == 0:
                         res.exit_code = 124
-                    if res.status == "engine_unavailable":
+                    if res.status == "agent_error" and res.exit_code == 0:
+                        res.exit_code = 1
+                    if res.status in ("engine_unavailable", "harness_error"):
                         res.failure_attribution = "ENV/TOOL"
                     if "agent" in payload or "model" in payload:
                         reported = f"{payload.get('agent')}:{payload.get('model')}"
@@ -2704,6 +2710,9 @@ def _run_external(
         res.exit_code = res.exit_code or 126
         res.error = f"External engine: {exc}"
         res.failure_attribution = "ENV/TOOL"
+    finally:
+        if staging is not None and os.path.lexists(staging):
+            logging.getLogger(__name__).warning("External engine staging remains at %r", staging)
 
     with jsonl_path.open("w", encoding="utf-8") as transcript:
         wrote_event = False

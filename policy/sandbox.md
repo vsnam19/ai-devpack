@@ -87,6 +87,10 @@ defaults and variables created by the job are controlled by that image and
 job. Approval state and the persistent run log directory remain outside the
 container mounts.
 
+The pack attempts to remove the private staging directory after collecting
+artifacts. If container-owned files prevent removal, it preserves the run
+result and logs a warning with the staging path for operator cleanup.
+
 A job runner that provides its own isolation remains subject to the outer
 container boundary. The runner must enforce role-specific command and path
 restrictions and any tighter network controls inside that boundary. If the

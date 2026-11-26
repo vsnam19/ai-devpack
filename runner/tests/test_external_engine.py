@@ -181,6 +181,50 @@ if args[0] == "run":
         self.assertEqual(launch["modes"]["/workspace/external/output"], 0o777)
         self.assertEqual(launch["staging_mode"], 0o700)
 
+    def test_docker_reports_protected_staging_without_changing_result(self):
+        docker = self.root / "fake-docker"
+        docker.write_text(f"#!{sys.executable}\n" + """
+import json
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+mounts = [args[i + 1].split(":") for i, arg in enumerate(args) if arg == "-v"]
+output = next(Path(src) for src, dest, _ in mounts if dest.endswith("/output"))
+(output / "reply.md").write_text("Completed.")
+(output / "events").write_text('{"type": "engine_event"}\\n')
+attempt = output / "attempt"
+attempt.mkdir()
+(attempt / "container-owned").write_text("attempt output")
+attempt.chmod(0o555)
+print(json.dumps({"status": "ok", "exit_code": 0, "reply_path": "reply.md"}))
+""")
+        docker.chmod(0o755)
+        engine = load_engines(self.configuration()).engines["external"]
+        unlink = os.unlink
+
+        def unlink_as_host(path, *args, **kwargs):
+            # Simulate a different owner even when the test runs as the container UID.
+            if Path(path).name == "container-owned":
+                raise PermissionError("container-owned file")
+            return unlink(path, *args, **kwargs)
+
+        with self.assertLogs("runner.agent_exec", level="WARNING") as logs:
+            with patch("runner.agent_exec.tempfile.tempdir", str(self.root)):
+                with patch("runner.agent_exec.os.unlink", side_effect=unlink_as_host):
+                    result = run_agent(AgentRequest(
+                        engine=engine, prompt="Check staging cleanup.", workdir=self.root,
+                        run_dir=self.root / "run", isolation="docker", role="implementer",
+                        docker_bin=str(docker),
+                    ))
+
+        self.assertEqual((result.status, result.exit_code, result.final_text), ("ok", 0, "Completed."))
+        staging, = self.root.glob("devpack-external-*")
+        self.assertIn(str(staging), logs.output[0])
+        self.assertTrue((staging / "output" / "attempt" / "container-owned").is_file())
+        events = self.root / "run" / "steps" / "01-implementer-external.jsonl"
+        self.assertEqual(json.loads(events.read_text()), {"type": "engine_event"})
+
     def run_artifact_job(self, script):
         config = self.configuration()
         original = config.read_text()
@@ -196,6 +240,18 @@ if args[0] == "run":
             workdir=self.root, run_dir=self.root / "run", isolation="local",
             allow_unsandboxed_local=True, role="implementer",
         ))
+
+    def test_json_stdout_normalizes_failure_status(self):
+        for reported, expected, attribution, exit_code in (
+            ("unknown_state", "harness_error", "ENV/TOOL", 0),
+            ("failed", "agent_error", "", 1),
+        ):
+            with self.subTest(reported=reported):
+                payload = json.dumps({"status": reported, "exit_code": 0})
+                result = self.run_artifact_job(f"print({payload!r})\n")
+                self.assertEqual(result.status, expected)
+                self.assertEqual(result.exit_code, exit_code)
+                self.assertEqual(result.failure_attribution, attribution)
 
     def test_oversized_external_output_is_harness_error(self):
         for name, write in (
