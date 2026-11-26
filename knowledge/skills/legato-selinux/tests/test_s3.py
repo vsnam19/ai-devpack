@@ -9,6 +9,7 @@ from test_extract import ExtractTests, BASE
 
 sys.path.insert(0, str(BASE / 'scripts'))
 import avc_triage
+from validate_schema import validate
 
 
 class ApiTests(ExtractTests):
@@ -42,6 +43,56 @@ class ApiTests(ExtractTests):
             self.assertTrue(all(x['api'] == 'feed' and x['status'] == 'draft'
                                 and x['evidence'][0].startswith('interfaces/feed.api:')
                                 for x in data['fd_passing']))
+
+    def test_fixture_manifest_matches_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            data = self.extract_config(root, {'api_search_paths': ['interfaces']})
+            self.assertEqual(len(data['fd_passing']), 3)
+            schema = json.loads((BASE / 'references/manifest.schema.json').read_text())
+            validate(data, schema, schema)
+            for direction in ('send', 'receive'):
+                data['fd_passing'][0]['direction'] = direction
+                validate(data, schema, schema)
+            data['fd_passing'][0]['direction'] = 'outbound'
+            with self.assertRaisesRegex(ValueError, 'Invalid enum'):
+                validate(data, schema, schema)
+
+    def test_external_two_part_binding_is_not_local_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            app = root / 'demo.adef'
+            app.write_text(app.read_text().replace('server.server.feed', 'otherApp.feed'))
+            data = self.extract_config(root, {'api_search_paths': ['interfaces']})
+            self.assertEqual({(x['processes'][0], x['function']) for x in data['fd_passing']},
+                             {('client', 'Fetch'), ('client', 'Update')})
+
+    def test_optional_function_return_type_and_handler_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            (root / 'interfaces/feed.api').write_text(
+                'FUNCTION le_result_t OpenFd(file fd OUT);\n'
+                'FUNCTION le_result_t RegisterCb(Update cb);\n'
+                'HANDLER Update(file incoming IN);\n')
+            data = self.extract_config(root, {'api_search_paths': ['interfaces']})
+            self.assertEqual({(x['processes'][0], x['function']) for x in data['fd_passing']},
+                             {('client', 'OpenFd'), ('client', 'Update')})
+
+    def test_sdef_multiple_search_directories_on_one_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            (root / 'second').mkdir()
+            (root / 'second/other.api').write_text('FUNCTION Other(file fd OUT);')
+            client = root / 'client/Component.cdef'
+            client.write_text('requires: { api: { feed = other.api } }')
+            (root / 'system.sdef').write_text('interfaceSearch: { interfaces second }')
+            data = self.extract_config(root, {'sdef_globs': ['*.sdef']})
+            self.assertEqual({(x['processes'][0], x['function']) for x in data['fd_passing']},
+                             {('client', 'Other'), ('server', 'Store')})
 
     def test_sdef_search(self):
         with tempfile.TemporaryDirectory() as directory:

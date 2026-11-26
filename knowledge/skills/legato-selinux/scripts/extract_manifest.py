@@ -195,7 +195,8 @@ class Extractor:
                     continue
                 for context, statement, _ in sections(text):
                     if context and context[-1] == 'interfaceSearch':
-                        directories.append(definition.parent / statement.strip('"'))
+                        directories.extend(definition.parent / entry.strip('"')
+                                           for entry in re.findall(r'"[^"]*"|[^\s,]+', statement))
         tried = []
         for directory in directories:
             candidate = directory / name
@@ -237,6 +238,8 @@ class Extractor:
                             # Component-qualified endpoints prevent same-alias cross attribution.
                             parts = endpoint.split('.')
                             if (parts[-1] == alias and
+                                    (not server or (len(parts) == 3 and parts[0] in
+                                     {item['executable'] for item in self.data['processes']})) and
                                     (path.parent == self.root or len(parts) < 3 or parts[-2] == path.parent.name)):
                                 bindings.append((parts[0], client if server else peer))
             if not bindings:
@@ -254,7 +257,7 @@ class Extractor:
             content = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/',
                              lambda m: '\n' * m[0].count('\n'), content)
             signatures = list(re.finditer(
-                r'\b(FUNCTION|HANDLER|EVENT)\s+(\w+)\s*\((.*?)\)\s*;', content, re.S))
+                r'\b(FUNCTION|HANDLER|EVENT)\s+(?:\w+\s+)?(\w+)\s*\((.*?)\)\s*;', content, re.S))
             registered = {handler[2] for handler in signatures if handler[1] == 'HANDLER'
                           and any(re.search(r'\b' + re.escape(handler[2]) + r'\b', sig[3])
                                   for sig in signatures if sig[1] in ('FUNCTION', 'EVENT'))}
