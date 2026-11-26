@@ -154,6 +154,8 @@ before inventory. See [the skill](../knowledge/skills/legato-selinux/SKILL.md).
 platform_profile = "profiles/platform.toml"
 platform_root = ""
 app_globs = ["**/apps/*.adef"]
+api_search_paths = ["interfaces"] # Workspace-relative directories, in search order
+sdef_globs = [] # Optional workspace-relative .sdef patterns
 manifest_name = "access-manifest.yaml"
 module_dir = "{app_dir}/../selinux"
 sdk_policy_include = ""
@@ -186,3 +188,12 @@ simulation branches to the built-in SIMULATION/TEST/MOCK recognition. Such evide
 is `candidate_denied` and draft; it never authorizes a production grant or confirms a
 denial. `#else` production evidence remains in ordinary draft resource categories.
 See [Legato SELinux](../knowledge/skills/legato-selinux/SKILL.md) for the full config.
+
+API lookup tries the component `.cdef` directory, then `api_search_paths` in order,
+then `interfaceSearch` entries from definitions matched by optional `sdef_globs`.
+Patterns follow configuration order; matching definitions are sorted by path and entries
+retain declaration order. `interfaceSearch` entries are relative to their `.sdef` directory.
+All resolved references, including symlinks, must remain inside the workspace and respect
+`exclude`. No workspace-wide API fallback is used. Unresolved APIs remain unknown with
+a question naming the API and every attempted path. Variables, includes and conditional
+build expansion require manual reconciliation; no build flags are read automatically.

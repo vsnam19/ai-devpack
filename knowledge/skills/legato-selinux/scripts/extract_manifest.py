@@ -66,6 +66,7 @@ class Extractor:
                          processes=[], unknowns=[])
         self.data.update({key: [] for key in CATEGORIES})
         self.seen = set()
+        self.definitions = {}
 
     def relative(self, path):
         return path.resolve().relative_to(self.root).as_posix()
@@ -124,6 +125,7 @@ class Extractor:
         except (OSError, UnicodeError):
             self.unknown('Missing/unreadable definition: ' + self.relative(path))
             return
+        self.definitions[path] = text
         for context, statement, line in sections(text):
             key, sep, value = statement.partition(':')
             key, value = key.strip(), value.strip()
@@ -176,14 +178,52 @@ class Extractor:
                 self.add('limits', path, line, name=key if sep else 'run', value=value if sep else statement)
             elif leaf == 'configTree':
                 self.add('config_tree', path, line, path=statement, access=['unknown'])
-        self.received_files(path, text)
         self.unknown('Verify build-expanded definitions, includes, shared libraries and per-process component ownership: ' + self.relative(path))
 
-    def received_files(self, path, text):
-        """Inventory OUT file parameters on required, bound API aliases; never infer labels."""
-        for context, statement, _ in sections(text):
-            if not context or context[-1] != 'api' or 'requires' not in context:
+    def resolve_bindings(self):
+        # Provider bindings require the complete executable inventory.
+        for path, text in sorted(self.definitions.items()):
+            self.received_files(path, text)
+
+    def resolve_api(self, name, parent):
+        """Search only explicit interface directories, preserving their order."""
+        directories = [parent]
+        directories.extend(self.root / entry for entry in self.config.get('api_search_paths', []))
+        for pattern in self.config.get('sdef_globs', []):
+            for definition in sorted(self.root.glob(pattern)):
+                definition = self.safe(definition)
+                if definition is None:
+                    continue
+                try:
+                    text = definition.read_text()
+                except (OSError, UnicodeError):
+                    self.unknown('Missing/unreadable definition: ' + self.relative(definition))
+                    continue
+                for context, statement, _ in sections(text):
+                    if context and context[-1] == 'interfaceSearch':
+                        directories.extend(definition.parent / entry.strip('"')
+                                           for entry in re.findall(r'"[^"]*"|[^\s,]+', statement))
+        tried = []
+        for directory in directories:
+            candidate = directory / name
+            tried.append(str(candidate.relative_to(self.root))
+                         if candidate.is_relative_to(self.root) else str(candidate))
+            if '$' in str(candidate):
                 continue
+            candidate = self.safe(candidate)
+            if candidate is not None and candidate.is_file():
+                return candidate
+        self.unknown('API ' + name + ': unknown; which interface path resolves it? Paths tried: '
+                     + ', '.join(tried))
+        return None
+
+    def received_files(self, path, text):
+        """Inventory client and server API reception; labels remain unknown."""
+        for context, statement, _ in sections(text):
+            if not context or context[-1] != 'api' or not any(
+                    role in context for role in ('requires', 'provides')):
+                continue
+            server = 'provides' in context
             match = re.search(r'(?:(\w+)\s*=\s*)?([\w./-]+\.api)\b', statement)
             if not match:
                 continue
@@ -199,13 +239,20 @@ class Extractor:
                         continue
                     for ctx, stmt, _ in sections(definition_text):
                         if ctx and ctx[-1] == 'bindings' and '->' in stmt:
-                            client, peer = stmt.split('->', 1)
-                            if client.strip().endswith('.' + alias):
-                                bindings.append((client.strip().split('.')[0], peer.strip()))
+                            client, peer = (part.strip() for part in stmt.split('->', 1))
+                            endpoint = peer if server else client
+                            # Component-qualified endpoints prevent same-alias cross attribution.
+                            parts = endpoint.split('.')
+                            if (parts[-1] == alias and
+                                    (not server or (len(parts) == 3 and parts[0] in
+                                     {item['executable'] for item in self.data['processes']})) and
+                                    (path.parent == self.root or len(parts) < 3 or parts[-2] == path.parent.name)):
+                                bindings.append((parts[0], client if server else peer))
             if not bindings:
-                self.unknown('Resolve binding for required API: ' + alias)
+                self.unknown('Resolve binding for ' + ('provided' if server else 'required')
+                             + ' API: ' + alias)
                 continue
-            api = self.resolve(match[2], path.parent)
+            api = self.resolve_api(match[2], path.parent)
             if not api:
                 continue
             try:
@@ -215,15 +262,32 @@ class Extractor:
                 continue
             content = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/',
                              lambda m: '\n' * m[0].count('\n'), content)
-            for signature in re.finditer(r'\bFUNCTION\s+(\w+)\s*\((.*?)\)\s*;', content, re.S):
-                for parameter in signature[2].split(','):
-                    if re.search(r'\bfile\s+\w+\s+(?:OUT|INOUT)\b', parameter):
-                        for receiver, peer in bindings:
-                            self.add('fd_passing', api, content[:signature.start()].count('\n') + 1,
-                                     object=signature[1] + ': ' + parameter.strip(),
-                                     **{'class': 'unknown', 'to': [receiver], 'from': [peer]},
-                                     processes=[receiver])
-                        self.unknown('Resolve received FD creator domain and underlying object class: ' + signature[1])
+            signatures = list(re.finditer(
+                r'\b(FUNCTION|HANDLER|EVENT)\s+(?:\w+\s+)?(\w+)\s*\((.*?)\)\s*;', content, re.S))
+            registered = {handler[2] for handler in signatures if handler[1] == 'HANDLER'
+                          and any(re.search(r'\b' + re.escape(handler[2]) + r'\b', sig[3])
+                                  for sig in signatures if sig[1] in ('FUNCTION', 'EVENT'))}
+            for signature in signatures:
+                kind, function, parameters = signature.groups()
+                if kind == 'HANDLER' and function not in registered:
+                    continue
+                for parameter in parameters.split(','):
+                    fd = re.search(r'\bfile\s+\w+\s+(OUT|INOUT|IN)\b', parameter)
+                    if not fd:
+                        continue
+                    # Functions flow server-to-client on OUT; callbacks reverse that flow.
+                    incoming = ('IN', 'INOUT') if server else ('OUT', 'INOUT')
+                    if kind != 'FUNCTION':
+                        incoming = ('OUT', 'INOUT') if server else ('IN', 'INOUT')
+                    if fd[1] not in incoming:
+                        continue
+                    for process, peer in bindings:
+                        self.add('fd_passing', api, content[:signature.start()].count('\n') + 1,
+                                 object=function + ': ' + parameter.strip(), api=alias,
+                                 function=function, direction='receive',
+                                 **{'class': 'unknown', 'to': [process], 'from': [peer]},
+                                 processes=[process])
+                    self.unknown('Resolve received FD creator domain and underlying object class: ' + function)
 
     def source(self, path):
         path = self.safe(path)
@@ -315,7 +379,15 @@ def main():
             config = document.get('selinux', {})
         platform_profile.check_types(config, 'selinux',
             strings=('platform_root', 'sdk_policy_include', 'linked_policy',
-                     'platform_profile', 'manifest_name'), lists=('app_globs', 'exclude', 'sim_macros'))
+                     'platform_profile', 'manifest_name'), lists=('app_globs', 'exclude', 'sim_macros', 'api_search_paths', 'sdef_globs'))
+        for entry in config.get('api_search_paths', []):
+            if not entry.strip() or Path(entry).is_absolute() or entry.startswith('\\'):
+                raise ValueError('api_search_paths must be workspace-relative directories')
+            contained(entry)
+        for pattern in config.get('sdef_globs', []):
+            if (not pattern.strip() or Path(pattern).is_absolute() or pattern.startswith('\\')
+                    or '..' in Path(pattern.replace('\\', '/')).parts):
+                raise ValueError('sdef_globs must be workspace-relative without ".."')
         if any(not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', macro) for macro in config.get('sim_macros', [])):
             raise ValueError('sim_macros must contain macro identifiers')
         for key in ('platform_root', 'sdk_policy_include', 'linked_policy'):
@@ -347,6 +419,7 @@ def main():
         if profile_path is not None and profile_path.is_file():
             platform_profile.review(profile, extractor, profile_path)
         extractor.definition(adef)
+        extractor.resolve_bindings()
         platform_profile.reconcile(profile, extractor)
         for key in ('platform_root', 'sdk_policy_include', 'linked_policy'):
             if not config.get(key) or not contained(config[key]).exists():
