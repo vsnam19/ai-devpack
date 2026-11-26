@@ -38,6 +38,28 @@ internally.
 | `eval/` | `run_eval.py` (`single`, `runner`, `orchestrator`, `memory`), `Dockerfile`, `eval/README.md`, unit tests in `eval/tests/` |
 | `tests/` | repo-level tests (`test_no_project_leaks.py`, `test_doc_links.py`, `verify_orchestrator_goals.py`, etc.) and `run_all.sh` |
 
+## Dashboard
+
+Run `python3 runner/devpack_dash.py --workdir PATH` to inspect Pack runs in a
+terminal. Use `--runs-root PATH` for a different run store, `--once` for a
+plain snapshot or `--json` for structured output. Subcommands include
+`jobs`, `show JOB`, `gate JOB`, `tail JOB --kind tool` and
+`approvals --status pending --plain`. The approvals output prints full
+operator commands on separate lines for copying.
+
+Use arrows or `j/k` to move, Page Up/Down to scroll, Enter to open, Esc to go
+back, `r` to refresh, `?` for help and `q` to quit. From Job Detail,
+`l` opens Events, `g` opens Gates and `e` opens Diagnostics. In Events,
+`c` cycles all/tool/message and `f` toggles follow. Use `a` from Jobs or
+Detail to open Approvals, then Enter to open Evidence.
+
+Use `/` or `jobs --filter 'state=failed role="broker-worker"'` to filter
+Jobs. Terms are case-insensitive and combined with AND. Use `key=value`
+with `backend`, `state`, `role`, `agent` or `model`, or bare text to match
+against ID, role, agent or model. Double-quote values with spaces. In the
+editor, Enter applies, Esc cancels and `C` clears the applied filter from
+Jobs.
+
 ## Orchestration topologies
 
 Three deployment topologies are supported through `runner/engines.example.toml` and `orchestrator/`:
