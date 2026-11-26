@@ -278,6 +278,21 @@ def parse_stream_jsonl(
             continue
 
         ev_type = event.get("type")
+        if ev_type == "item.completed" and isinstance(event.get("item"), dict):
+            external_item = event["item"]
+            if external_item.get("type") == "agent_message":
+                step.items.append(StreamItem(
+                    kind="text", text=redactor.redact(str(external_item.get("text", ""))),
+                ))
+                assistant_turns += 1
+                continue
+            if external_item.get("type") == "command_execution":
+                step.tool_counts["Bash"] = step.tool_counts.get("Bash", 0) + 1
+                step.items.append(StreamItem(
+                    kind="tool_use", tool_name="Bash",
+                    tool_input_json=json.dumps(redactor.redact_value(external_item)),
+                ))
+                continue
         if not isinstance(ev_type, str) or ev_type not in _KNOWN_EVENT_TYPES:
             step.unknown_events += 1
             continue
@@ -1908,6 +1923,13 @@ def analyze_run_dir(
             except (OSError, json.JSONDecodeError):
                 meta_obj = {}
             if isinstance(meta_obj, dict):
+                if meta_obj.get("failure_attribution") == "ENV/TOOL":
+                    quota_net_detected = quota_net_detected or step.status == "engine_unavailable"
+                    scores["ENV"] += 4
+                    _add_evidence(
+                        evidence_by_cause["ENV"], seen_ev["ENV"], step.step_id, 1,
+                        f"External engine status: {step.status}", active_redactor,
+                    )
                 err_txt = str(meta_obj.get("error") or "")
                 if err_txt:
                     if _TIMEOUT_TEXT_RE.search(err_txt):

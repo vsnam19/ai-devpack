@@ -78,3 +78,15 @@ To share an agent run with the project owner or a colleague who has repository a
    the repository's confidentiality class. Because `index.html` is a single self-contained
    file with inline CSS and no external dependencies, colleagues can open it directly in
    any browser.
+
+### External engine steps
+
+The standard step files contain the redacted effective brief, JSONL evidence,
+and result metadata. The transcript copies JSON object events from the optional
+`events_from` path after the job exits. Jobs that buffer their output are
+supported. When no events are available, one synthetic result event records
+the reply. Keep reply and event files under the private step output directory
+and use the pack step files for persistent evidence. The pack records unknown
+token counts and cost as JSON null. Quota and exhaustion map to
+`engine_unavailable` with an ENV/TOOL attribution hint. An external job's gate
+status is execution evidence. The pack records its own gate outcome separately.

@@ -87,6 +87,36 @@ python3 runner/devpack_run.py --resume <approval-id>
 python3 runner/devpack_dispatch.py --resume <approval-id>
 ```
 
+## Engines
+
+Use `runner/engines.example.toml` as the starting point. Select a configured engine
+for each role or pass its name to dispatch. Broker deployments use an
+operator-owned engine file outside the product worktree.
+
+An engine with `class = "external"` runs an argv array in the task working
+directory. Set `model` to the configured `agent:model` identity, and specify
+`command`, `result`, `reply_from`, `max_data_class`, `timeout_s`, `env_allow`,
+and `role_map`. Unmapped roles keep their pack names. Argument templates accept
+`{brief}`, `{workdir}`, `{role}`, `{model}`, and `{run_dir}`. Use `{allow_args}`
+as its own argument to expand the task scope into repeated `--allow <glob>`
+pairs. The reviewer receives no writable scope.
+
+With `result = "json-stdout"`, the command writes one JSON object containing
+`status` and `exit_code`. When provided, `agent` and `model` must match the
+configured identity. With `result = "exit-code"`, zero means success.
+`reply_from` accepts `stdout`, `file:<relative>`, or `json:reply_path`.
+Artifact paths are relative to the private `{run_dir}` output directory, or
+may use an absolute path inside that directory as seen by the job. A reviewer
+supplies a final `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES` line, or the
+equivalent JSON `verdict` value.
+
+The commented external job runner example shows how a wrapper can send a brief
+to another agent and write a reply and an optional event stream. Package the
+executable in the sandbox image selected with `--image-tag`. Select an independent reviewer
+engine with a different name and, when both engines are external, a different
+`agent:model`. Data classification, brief lint, checkpoint approvals, scope
+checks, test locks, and pack-run gates still apply.
+
 ## Reading agent logs
 
 Every execution via `runner/agent_exec.py` writes a redacted run directory under

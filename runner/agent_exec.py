@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -100,7 +102,7 @@ DEFAULT_GATE_CMD: tuple[str, ...] = (
     "--config",
     ".devpack/project.toml:gate_config",
 )
-VALID_ENGINE_CLASSES = ("cloud", "local")
+VALID_ENGINE_CLASSES = ("cloud", "local", "external")
 VALID_RUN_KINDS = ("task", "eval", "dispatch", "skilltest")
 DATA_CLASS_ORDER: tuple[str, ...] = (
     "public",
@@ -149,6 +151,87 @@ class HarnessError(RuntimeError):
 
 
 @dataclass
+class ExternalConfig:
+    command: list[str]
+    result: str
+    reply_from: str
+    events_from: str
+    env_allow: list[str]
+    role_map: dict[str, str]
+
+
+_EXTERNAL_FIELDS = {"brief", "workdir", "role", "allow_args", "model", "run_dir"}
+_EXTERNAL_PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
+
+
+def _validate_external_template(value: str, *, argv: bool = False) -> None:
+    fields = _EXTERNAL_PLACEHOLDER.findall(value)
+    remainder = _EXTERNAL_PLACEHOLDER.sub("", value)
+    if set(fields) - _EXTERNAL_FIELDS or "{" in remainder or "}" in remainder:
+        raise ValueError("unknown or malformed external placeholder")
+    if "allow_args" in fields and (not argv or value != "{allow_args}"):
+        raise ValueError("{allow_args} must occupy an entire command argument")
+
+
+def _load_external(spec: Mapping[str, Any]) -> ExternalConfig:
+    required = {"model", "command", "result", "reply_from", "max_data_class",
+                "timeout_s", "env_allow", "role_map"}
+    missing = required - spec.keys()
+    unknown = spec.keys() - required - {"class", "events_from", "min_context_tokens"}
+    if missing or unknown:
+        raise ValueError(f"missing fields {sorted(missing)}, unknown fields {sorted(unknown)}")
+    for key in ("model", "result", "reply_from", "max_data_class"):
+        if not isinstance(spec[key], str) or not spec[key].strip():
+            raise ValueError(f"{key} must be a nonempty string")
+    if not re.fullmatch(r"[^:\s]+:[^\s]+", spec["model"]):
+        raise ValueError("external model must identify agent:model")
+    if spec["max_data_class"] not in DATA_CLASS_ORDER:
+        raise ValueError("invalid max_data_class")
+    if type(spec["timeout_s"]) is not int or spec["timeout_s"] <= 0:
+        raise ValueError("timeout_s must be a positive integer")
+    if "min_context_tokens" in spec and (
+        type(spec["min_context_tokens"]) is not int or spec["min_context_tokens"] < 0
+    ):
+        raise ValueError("min_context_tokens must be a nonnegative integer")
+    command = spec["command"]
+    if not isinstance(command, list) or not command or not all(
+        isinstance(arg, str) and arg and "\0" not in arg for arg in command
+    ):
+        raise ValueError("command must be a nonempty array of nonempty strings")
+    for arg in command:
+        _validate_external_template(arg, argv=True)
+    if "{" in command[0]:
+        raise ValueError("command executable must be literal")
+    result = spec["result"]
+    if result not in ("json-stdout", "exit-code"):
+        raise ValueError("result must be json-stdout or exit-code")
+    reply = spec["reply_from"]
+    if reply.startswith("file:"):
+        path = Path(reply[5:])
+        if path == Path(".") or path.is_absolute() or ".." in path.parts or "\0" in reply:
+            raise ValueError("reply_from file path must be relative to {run_dir}")
+    elif reply != "stdout" and not (reply == "json:reply_path" and result == "json-stdout"):
+        raise ValueError("invalid reply_from for result protocol")
+    events = spec.get("events_from", "")
+    if not isinstance(events, str) or ("events_from" in spec and not events.strip()) or "\0" in events:
+        raise ValueError("events_from must be a nonempty path template")
+    _validate_external_template(events)
+    env = spec["env_allow"]
+    if not isinstance(env, list) or not all(
+        isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name)
+        for name in env
+    ):
+        raise ValueError("env_allow must be an array of environment variable names")
+    roles = spec["role_map"]
+    if not isinstance(roles, dict) or not all(
+        isinstance(role, str) and role.strip() and isinstance(target, str) and target.strip()
+        and "\0" not in target for role, target in roles.items()
+    ):
+        raise ValueError("role_map must map role names to nonempty strings")
+    return ExternalConfig(command, result, reply, events, env, roles)
+
+
+@dataclass
 class EngineConfig:
     """Configuration for a single cloud or local agent execution engine."""
 
@@ -161,6 +244,7 @@ class EngineConfig:
     min_context_tokens: int = 0
     timeout_s: int = 900
     cmd: list[str] | None = None
+    external: ExternalConfig | None = None
     role_permissions: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
 
     def __init__(
@@ -174,6 +258,7 @@ class EngineConfig:
         min_context_tokens: int = 0,
         timeout_s: int = 900,
         cmd: list[str] | None = None,
+        external: ExternalConfig | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize an EngineConfig, accepting ``class`` or ``kind`` as alias for ``engine_class``."""
@@ -194,6 +279,7 @@ class EngineConfig:
         self.min_context_tokens = int(min_context_tokens or 0)
         self.timeout_s = int(timeout_s or 900)
         self.cmd = list(cmd) if cmd is not None else None
+        self.external = external
         self.role_permissions = {}
 
     @property
@@ -209,6 +295,8 @@ class EngineConfig:
     def to_dict(self) -> dict[str, Any]:
         """Serialize the engine configuration into a plain dictionary."""
         data = asdict(self)
+        if self.external is None:
+            data.pop("external")
         data["class"] = self.engine_class
         return data
 
@@ -394,16 +482,10 @@ def _minimal_toml_loads(text: str) -> dict[str, Any]:
                     break
             val_str = " ".join(buf)
         if val_str.startswith("[") and val_str.endswith("]"):
-            inner = val_str[1:-1].strip()
-            if not inner:
-                current[key] = []
-            else:
-                items = [
-                    item.strip().strip('"').strip("'")
-                    for item in inner.split(",")
-                    if item.strip()
-                ]
-                current[key] = items
+            try:
+                current[key] = ast.literal_eval(val_str)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError(f"Invalid TOML array for {key}") from exc
         elif val_str.startswith(('"', "'")) and val_str.endswith(('"', "'")):
             current[key] = val_str[1:-1]
         elif val_str.lower() in ("true", "false"):
@@ -513,8 +595,16 @@ def load_engines(path: Path | str) -> EnginesConfig:
             eng_class = str(eng_spec.get("class", eng_spec.get("engine_class", "cloud"))).strip()
             if eng_class not in VALID_ENGINE_CLASSES:
                 raise ValueError(
-                    f"Engine '{eng_name}' has invalid class '{eng_class}' (must be cloud or local)"
+                    f"Engine '{eng_name}' has invalid class '{eng_class}' (must be cloud, local, or external)"
                 )
+            external = None
+            if eng_class == "external":
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", eng_name):
+                    raise ValueError(f"Invalid external engine name: {eng_name}")
+                try:
+                    external = _load_external(eng_spec)
+                except ValueError as exc:
+                    raise ValueError(f"Engine '{eng_name}': {exc}") from exc
             max_data_class = str(eng_spec.get("max_data_class", "internal")).strip()
             base_url_env = str(eng_spec.get("base_url_env", "")).strip()
             auth_token_env = str(eng_spec.get("auth_token_env", "")).strip()
@@ -537,6 +627,7 @@ def load_engines(path: Path | str) -> EnginesConfig:
                 min_context_tokens=min_ctx,
                 timeout_s=timeout_s,
                 cmd=cmd_list,
+                external=external,
             )
 
         raw_roles = data.get("roles", {})
@@ -579,6 +670,9 @@ def load_engines(path: Path | str) -> EnginesConfig:
                 roles[role_name] = model
             else:
                 raise ValueError(f"Invalid role specification for '{role_name}'")
+
+        if "implementer" in role_engines and "reviewer" in role_engines:
+            check_external_review_pair(role_engines["implementer"], role_engines["reviewer"])
 
         for engine in [*engines.values(), *role_engines.values()]:
             engine.role_permissions = role_permissions
@@ -655,6 +749,16 @@ def load_engines(path: Path | str) -> EnginesConfig:
         )
 
     raise ValueError(f"Configuration in {config_path} defines neither [engines] (v2) nor [roles] (v0.1)")
+
+
+def check_external_review_pair(implementer: EngineConfig, reviewer: EngineConfig) -> None:
+    """Require separate engines and separate external identities for paired review."""
+    if not (implementer.external or reviewer.external):
+        return
+    if implementer.name == reviewer.name or (
+        implementer.external and reviewer.external and implementer.model == reviewer.model
+    ):
+        raise ValueError("Reviewer must use a different engine and external agent:model")
 
 
 def default_engine_config(name: str) -> EngineConfig:
@@ -1103,6 +1207,8 @@ def compute_engine_config_hash(engine: EngineConfig) -> str:
         "timeout_s": int(engine.timeout_s),
         "cmd": list(engine.cmd) if engine.cmd is not None else None,
     }
+    if engine.external is not None:
+        payload["external"] = asdict(engine.external)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -1172,6 +1278,7 @@ class AgentRequest:
     operator_config_path: Path | None = None
     trusted_git_dir: Path | None = None
     state_dir: Path | None = None
+    allow_globs: Sequence[str] = ()
 
     def __init__(
         self,
@@ -1212,6 +1319,7 @@ class AgentRequest:
         operator_config_path: Path | str | None = None,
         trusted_git_dir: Path | str | None = None,
         state_dir: Path | str | None = None,
+        allow_globs: Sequence[str] = (),
         **kwargs: Any,
     ) -> None:
         """Initialize AgentRequest with support for SPEC parameter aliases (timeout, engine_config, prompt_text)."""
@@ -1283,6 +1391,7 @@ class AgentRequest:
             if operator_config_path is not None and str(operator_config_path)
             else None
         )
+        self.allow_globs = tuple(allow_globs)
         self.state_dir = (
             Path(state_dir)
             if state_dir is not None and str(state_dir).strip()
@@ -1312,16 +1421,16 @@ class AgentResult:
     status: str = "ok"
     exit_code: int = 0
     final_text: str = ""
-    cost_usd: float = 0.0
-    tokens_in: int = 0
-    tokens_out: int = 0
+    cost_usd: float | None = 0.0
+    tokens_in: int | None = 0
+    tokens_out: int | None = 0
     duration_s: float = 0.0
     num_turns: int = 0
     tool_calls: dict[str, int] = field(default_factory=dict)
     transcript_path: Path = field(default_factory=Path)
     tool_protocol_errors: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: int | None = 0
+    output_tokens: int | None = 0
     error: str = ""
     stderr: str = ""
     permission_denials: list[Any] = field(default_factory=list)
@@ -1339,6 +1448,7 @@ class AgentResult:
     memory_hashes: dict[str, str] = field(default_factory=dict)
     memory_tokens: int = 0
     memory_enabled: bool = True
+    failure_attribution: str = ""
 
     def __post_init__(self) -> None:
         """Synchronize token field aliases and coerce transcript_path to Path."""
@@ -1371,7 +1481,7 @@ class AgentResult:
     @property
     def harness_error(self) -> bool:
         """Return True when the run terminated due to a harness error or timeout."""
-        return self.status in ("harness_error", "timeout")
+        return self.status in ("harness_error", "timeout", "engine_unavailable")
 
     @property
     def harness_error_reason(self) -> str:
@@ -2354,6 +2464,232 @@ def _resolve_step_stem(request: AgentRequest) -> str:
     return f"{request.step_index:02d}-{role}-{request.engine.name}"
 
 
+_EXTERNAL_STATUSES = {
+    "ok": "ok",
+    "failed": "agent_error",
+    "timeout": "timeout",
+    "gate-failed": "agent_error",
+    "exhausted": "engine_unavailable",
+    "quota": "engine_unavailable",
+    "quota-exhausted": "engine_unavailable",
+    "engine-unavailable": "engine_unavailable",
+}
+
+
+def _read_external_artifact(value: str, output: Path, visible_output: Path) -> str:
+    """Read only regular files inside this step's private output directory."""
+    path = Path(value)
+    if path.is_absolute():
+        path = path.relative_to(visible_output)
+    if ".." in path.parts:
+        raise ValueError("external artifact path escapes {run_dir}")
+    path = (output / path).resolve()
+    if not path.is_relative_to(output):
+        raise ValueError("external artifact path escapes {run_dir}")
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, encoding="utf-8", errors="replace") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("external artifact must be a regular file")
+        return handle.read()
+
+
+def _run_external(
+    request: AgentRequest,
+    jsonl_path: Path,
+    source_env: Mapping[str, str],
+    redact_event: Callable[[str], str],
+) -> AgentResult:
+    engine = request.engine
+    config = engine.external
+    assert config is not None
+    started = time.monotonic()
+    res = AgentResult(
+        tokens_in=None, tokens_out=None, input_tokens=None, output_tokens=None, cost_usd=None,
+    )
+    events: list[str] = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="devpack-external-") as staging:
+            root = Path(staging).resolve()
+            output = root / "output"
+            output.mkdir()
+            brief = root / "brief.md"
+            brief.write_text(request.prompt, encoding="utf-8")
+            workdir = request.workdir.resolve()
+            role = config.role_map.get(request.role, request.role)
+            reviewer = request.role == "reviewer"
+            env = {name: source_env[name] for name in config.env_allow if name in source_env}
+            visible_output = output
+            visible_brief = brief
+            visible_workdir = workdir
+            docker_prefix: list[str] = []
+            container_name = ""
+            if request.isolation == "docker":
+                git_decision = docker_git_mount_decision(workdir, request.trusted_git_dir)
+                update_run_json(
+                    request.run_dir, git_metadata_mounted=git_decision.mounted,
+                    git_metadata_reason=git_decision.reason,
+                )
+                visible_output = Path("/workspace/external/output")
+                visible_brief = Path("/workspace/external/brief.md")
+                visible_workdir = Path(DOCKER_TASK_DIR)
+                container_name = f"devpack-external-{uuid.uuid4().hex}"
+                docker_prefix = [
+                    request.docker_bin, "run", "--rm", "--name", container_name,
+                    "--network", "default", "--user", "1000:1000",
+                    "--workdir", str(visible_workdir),
+                    "-v", f"{_validate_mount_source(workdir)}:{visible_workdir}:{'ro' if reviewer else 'rw'}",
+                    "-v", f"{_validate_mount_source(brief)}:{visible_brief}:ro",
+                    "-v", f"{_validate_mount_source(output)}:{visible_output}:rw",
+                    *git_decision.mounts,
+                ]
+                for key in env:
+                    docker_prefix.extend(["-e", key])
+                docker_prefix.extend(["--entrypoint", config.command[0], request.image_tag])
+            elif request.isolation != "local":
+                raise ValueError(f"Unsupported isolation mode: {request.isolation}")
+
+            state = request.state_dir or source_env.get("DEVPACK_STATE_DIR")
+            if state:
+                state_path = (workdir / state).resolve()
+                if state_path.is_relative_to(workdir) or (
+                    docker_prefix and workdir.is_relative_to(state_path)
+                ):
+                    raise ValueError("Approval state overlaps the external engine workdir")
+                mounts = [Path(docker_prefix[i + 1].split(":", 1)[0]).resolve()
+                          for i, flag in enumerate(docker_prefix[:-2]) if flag == "-v"]
+                if any(state_path.is_relative_to(mount) or mount.is_relative_to(state_path)
+                       for mount in mounts):
+                    raise ValueError("Approval state overlaps an external engine mount")
+
+            values = {
+                "brief": str(visible_brief), "workdir": str(visible_workdir),
+                "role": role, "model": engine.model, "run_dir": str(visible_output),
+            }
+
+            def expand(template: str) -> str:
+                return _EXTERNAL_PLACEHOLDER.sub(lambda match: values[match[1]], template)
+
+            argv = list(docker_prefix) if docker_prefix else [config.command[0]]
+            for arg in config.command[1:]:
+                if arg == "{allow_args}":
+                    if not reviewer:
+                        for glob in request.allow_globs:
+                            argv.extend(["--allow", glob])
+                else:
+                    argv.append(expand(arg))
+
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                with subprocess.Popen(
+                    argv, cwd=workdir, env=env, stdin=subprocess.DEVNULL,
+                    stdout=stdout, stderr=stderr, start_new_session=True,
+                ) as proc:
+                    try:
+                        proc.wait(timeout=request.timeout)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        proc.wait()
+                        res.status = "timeout"
+                        res.exit_code = 124
+                        res.error = f"External engine timed out after {request.timeout}s"
+                        if container_name:
+                            subprocess.run(
+                                [request.docker_bin, "rm", "-f", container_name], env=env,
+                                cwd=workdir, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=5, check=False,
+                            )
+                    else:
+                        res.exit_code = proc.returncode
+                        if not container_name:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                stdout.seek(0)
+                stderr.seek(0)
+                text = stdout.read().decode("utf-8", errors="replace")
+                res.stderr = stderr.read().decode("utf-8", errors="replace")
+
+            payload: dict[str, Any] = {}
+            if res.status != "timeout":
+                if config.result == "json-stdout":
+                    payload = json.loads(text)
+                    if not isinstance(payload, dict):
+                        raise ValueError("external result must be a JSON object")
+                    status = payload.get("status")
+                    code = payload.get("exit_code")
+                    if not isinstance(status, str) or type(code) is not int:
+                        raise ValueError("external result requires string status and integer exit_code")
+                    res.status = _EXTERNAL_STATUSES.get(status.strip().lower().replace("_", "-"), "harness_error")
+                    res.exit_code = res.exit_code or code
+                    if res.status != "ok":
+                        res.error = f"External engine reported {status}"
+                    if res.status == "timeout" and res.exit_code == 0:
+                        res.exit_code = 124
+                    if res.status == "engine_unavailable":
+                        res.failure_attribution = "ENV/TOOL"
+                    if "agent" in payload or "model" in payload:
+                        reported = f"{payload.get('agent')}:{payload.get('model')}"
+                        if reported != engine.model:
+                            raise ValueError("external result agent:model differs from configuration")
+                if res.status == "ok" and res.exit_code:
+                    res.status = "agent_error"
+                    res.error = f"External engine exited with {res.exit_code}"
+
+                if config.reply_from == "stdout":
+                    res.final_text = text.strip()
+                else:
+                    reply = (payload.get("reply_path") if config.reply_from == "json:reply_path"
+                             else config.reply_from[5:])
+                    if isinstance(reply, str) and reply:
+                        try:
+                            res.final_text = _read_external_artifact(reply, output, visible_output).strip()
+                        except FileNotFoundError:
+                            if res.status == "ok":
+                                raise
+                    elif res.status == "ok":
+                        raise ValueError("external result requires a reply_path")
+
+                if reviewer and res.status == "ok" and "verdict" in payload:
+                    verdict = payload["verdict"]
+                    if verdict not in ("APPROVE", "REQUEST_CHANGES"):
+                        raise ValueError("invalid external review verdict")
+                    last_line = res.final_text.split("\n")[-1].strip()
+                    verdict_line = f"VERDICT: {verdict}"
+                    if last_line.startswith("VERDICT:") and last_line != verdict_line:
+                        raise ValueError("conflicting external review verdicts")
+                    if last_line != verdict_line:
+                        res.final_text = f"{res.final_text}\n\n{verdict_line}".lstrip()
+
+            if config.events_from:
+                try:
+                    stream = _read_external_artifact(expand(config.events_from), output, visible_output)
+                except FileNotFoundError:
+                    stream = ""
+                for line in stream.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict):
+                        events.append(json.dumps(event))
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        res.status = "harness_error"
+        res.exit_code = res.exit_code or 126
+        res.error = f"External engine: {exc}"
+        res.failure_attribution = "ENV/TOOL"
+
+    if not events:
+        events.append(json.dumps({"type": "result", "result": res.final_text}))
+    with jsonl_path.open("w", encoding="utf-8") as transcript:
+        for event in events:
+            transcript.write(redact_event(event).rstrip("\n") + "\n")
+    res.duration_s = round(time.monotonic() - started, 4)
+    return res
+
+
 def run_agent(request: AgentRequest) -> AgentResult:
     """Launch an agent in isolation, stream redacted JSONL to ``steps/``, and return ``AgentResult``.
 
@@ -2452,6 +2788,11 @@ def run_agent(request: AgentRequest) -> AgentResult:
     source_env: dict[str, str] = dict(os.environ)
     if request.env_overrides:
         source_env.update(request.env_overrides)
+    if request.engine.external is not None:
+        secrets_list.extend(
+            source_env[name] for name in request.engine.external.env_allow
+            if name in source_env and len(source_env[name]) >= 4 and name != "PATH"
+        )
     if request.engine.auth_token_env:
         tok_val = source_env.get(request.engine.auth_token_env, "").strip()
         if tok_val:
@@ -2492,6 +2833,10 @@ def run_agent(request: AgentRequest) -> AgentResult:
 
     def _write_meta_and_return(res: AgentResult) -> AgentResult:
         """Populate metadata fields, write .meta.json, and return the result."""
+        if request.engine.external is not None:
+            res.cost_usd = None
+            res.tokens_in = res.input_tokens = None
+            res.tokens_out = res.output_tokens = None
         res.transcript_path = jsonl_path
         res.model = res.model or request.engine.model
         res.engine = request.engine.name
@@ -2561,6 +2906,24 @@ def run_agent(request: AgentRequest) -> AgentResult:
         if ignored_opt_out:
             warn_updates["ignored_workdir_sandbox_opt_out"] = True
         update_run_json(request.run_dir, **warn_updates)
+
+    if request.engine.engine_class == "external" and request.engine.external is None:
+        jsonl_path.write_text("", encoding="utf-8")
+        return _write_meta_and_return(AgentResult(
+            status="harness_error", exit_code=126, error="External engine configuration is missing",
+        ))
+
+    if request.engine.external is not None:
+        def redact_external_event(line: str) -> str:
+            return redact_stream_line(
+                line, extra_secrets=secrets_list, path_replacements=request.path_replacements,
+                home_placeholder=request.home_placeholder, identities=os_identities,
+                credentials_path=cred_path,
+            )
+
+        return _write_meta_and_return(
+            _run_external(effective_request, jsonl_path, source_env, redact_external_event)
+        )
 
     # Set up temporary isolation directories if not already provided by caller
     created_temp_iso: Path | None = None

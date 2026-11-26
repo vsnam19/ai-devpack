@@ -75,3 +75,22 @@ Sandboxing reduces impact; it does not remove the need for the gate and human re
 - A sandbox self-check script or CI job prints the mounts, user, and network policy at
   the start of each task and fails when a host path or a secret variable is visible.
 - Quarterly: adversarial test with a planted instruction file; the agent must ignore it.
+
+## External engines
+
+The pack starts external commands as argv in the task working copy. In
+container mode it uses the existing git mount policy and adds a read-only
+brief and a private writable artifact directory. The task mount is read-only
+during review. The operator supplies the image and its network policy. Only
+variables named in `env_allow` are forwarded from the host to the job. Image
+defaults and variables created by the job are controlled by that image and
+job. Approval state and the persistent run log directory remain outside the
+container mounts.
+
+A job runner that provides its own isolation remains subject to the outer
+container boundary. The runner must enforce role-specific command and path
+restrictions and any tighter network controls inside that boundary. If the
+operator chooses the explicitly authorized local isolation deviation, host
+filesystem and network access, including enforcement of the reviewer's
+read-only role, depend on the external runner's sandbox. The pack still
+checks scope, protected tests and git metadata and runs its own gates.

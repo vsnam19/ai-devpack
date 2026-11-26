@@ -47,3 +47,22 @@ top_k = 5
 budget_tokens = 800
 reviewer_sees_handoffs = false
 
+
+# External job runner example. Install the executable in the operator-selected
+# sandbox image. Set roles.implementer = "ext_a" to select it.
+# [engines.ext_a]
+# class = "external"
+# model = "worker:standard"
+# command = ["/usr/local/bin/job-runner", "run", "--role", "{role}", "--agent", "{model}", "--brief", "{brief}", "-d", "{workdir}", "{allow_args}", "--output-dir", "{run_dir}", "--json"]
+# result = "json-stdout"
+# reply_from = "json:reply_path"
+# events_from = "{run_dir}/attempts/1-worker-standard/stdout"
+# max_data_class = "internal"
+# timeout_s = 900
+# env_allow = ["JOB_RUNNER_TOKEN"]
+# [engines.ext_a.role_map]
+# implementer = "implement"
+# reviewer = "review"
+# fixer = "implement"
+# worker = "implement"
+# broker-worker = "implement"
