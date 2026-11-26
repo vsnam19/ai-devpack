@@ -473,6 +473,15 @@ def _coerce_role_engine(config: EnginesConfig | dict[str, Any], role: str, fallb
                 return EngineConfig(name=raw, **e)
         return EngineConfig(name=raw, model=raw, engine_class="cloud")
     if isinstance(raw, dict):
+        if raw.get("class") == "external":
+            external = raw.get("external")
+            if not isinstance(external, dict):
+                raise ValueError(f"External engine configuration is missing for '{role}'")
+            return EngineConfig(
+                name=raw["name"], model=raw["model"], engine_class="external",
+                timeout_s=raw["timeout_s"], max_data_class=raw["max_data_class"],
+                external=agent_exec.ExternalConfig(**external),
+            )
         model = str(raw.get("model", "sonnet"))
         cmd = raw.get("cmd")
         cmd_list = [str(x) for x in cmd] if isinstance(cmd, list) else None
@@ -778,6 +787,15 @@ def run_task_workflow(
     rev_engine = _coerce_role_engine(config, "reviewer")
     fix_engine = _coerce_role_engine(config, "fixer", fallback_role="implementer")
 
+    agent_exec.check_external_review_pair(impl_engine, rev_engine)
+    agent_exec.check_external_review_pair(fix_engine, rev_engine)
+    data_class = agent_exec.load_project_config(worktree)["data_class"]
+    for engine in (impl_engine, rev_engine, fix_engine):
+        if engine.external is not None:
+            allowed, reason = agent_exec.check_data_class_allowed(engine, data_class)
+            if not allowed:
+                raise ValueError(reason)
+
     impl_brief, impl_tpl_src = render_implement_brief(repo_root, context)
 
     if dry_run:
@@ -886,6 +904,8 @@ def run_task_workflow(
         update_run_json(active_run_dir, **warn_iso)
 
     base_ref = _resolve_git_base_ref(worktree)
+    if base_ref is None and any(engine.external for engine in (impl_engine, rev_engine, fix_engine)):
+        raise ValueError("External task engines require a committed git baseline for scope and test locks")
     git_snap = snapshot_git_metadata(worktree)
     update_run_json(
         active_run_dir,
@@ -970,12 +990,13 @@ def run_task_workflow(
                 "allow_unsandboxed_local": bool(allow_unsandboxed_local),
                 "credentials_path": str(credentials_path) if credentials_path is not None else "",
                 "agent_bin": agent_bin,
+                "image_tag": image_tag,
                 "skills_enabled": bool(skills_enabled),
                 "brief_author": brief_author,
                 "pipeline_mode": pipeline_cfg.mode,
                 "engines_config_path": str(engines_config_path) if engines_config_path is not None else "",
                 "roles": {
-                    role_k: {
+                    role_k: eng_v.to_dict() if eng_v.external is not None else {
                         "name": eng_v.name,
                         "model": eng_v.model,
                         "class": eng_v.engine_class,
@@ -1161,6 +1182,7 @@ def run_task_workflow(
             memory_task_id=context.get("TASK_ID", ""),
             trusted_git_dir=trusted_git_dir,
             state_dir=Path(pipeline_cfg.state_dir),
+            allow_globs=resolved_allow_globs,
         )
         res = run_agent(req)
         for mid in res.memory_ids:
@@ -1178,7 +1200,7 @@ def run_task_workflow(
         total_tool_protocol_errors += int(res.tool_protocol_errors or 0)
         if res.status == "timeout":
             any_timeout = True
-        elif res.status == "harness_error":
+        elif res.status in ("harness_error", "engine_unavailable"):
             any_harness_error = True
             if not first_harness_error:
                 first_harness_error = res.error or "agent harness_error"
@@ -1191,6 +1213,7 @@ def run_task_workflow(
     # Step 1: Implement
     step_index += 1
     impl_res = _invoke_role("implementer", impl_engine, impl_brief)
+    writer_engine, writer_res = impl_engine, impl_res
     if impl_res.status == "ok" and impl_res.final_text and not git_tampered:
         pending_proposal_texts.append(impl_res.final_text)
     log_file = write_step_log(
@@ -1398,6 +1421,7 @@ def run_task_workflow(
                 failure_details=failure_details,
             )
             fix_res = _invoke_role("fixer", fix_engine, fix_brief)
+            writer_engine, writer_res = fix_engine, fix_res
             if fix_res.status == "ok" and fix_res.final_text:
                 pending_proposal_texts.append(fix_res.final_text)
             log_file = write_step_log(
@@ -1426,6 +1450,10 @@ def run_task_workflow(
             if not _check_post_step_enforcement():
                 break
             continue
+
+        if writer_engine.external is not None and writer_res.status != "ok":
+            escalation_reason = writer_res.error or writer_res.status
+            break
 
         # Gate passed -> accept queued implementer/fixer memory proposals, then Run Reviewer
         if pending_proposal_texts:
@@ -1462,6 +1490,8 @@ def run_task_workflow(
         if git_tampered:
             final_status = "git_metadata_tampered"
             escalation_reason = git_tamper_reason
+            break
+        if rev_engine.external is not None and not _check_post_step_enforcement():
             break
         verdict = (
             parse_review_verdict(rev_res.final_text)
@@ -1534,6 +1564,7 @@ def run_task_workflow(
             failure_details=failure_details,
         )
         fix_res = _invoke_role("fixer", fix_engine, fix_brief)
+        writer_engine, writer_res = fix_engine, fix_res
         if fix_res.status == "ok" and fix_res.final_text:
             pending_proposal_texts.append(fix_res.final_text)
         log_file = write_step_log(
@@ -1809,6 +1840,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Human deviation ID verified against DEVPACK_DEVIATIONS (for --max-fix-rounds > 2)",
     )
+    parser.add_argument("--image-tag", default=None, help="Operator-selected sandbox image")
     parser.add_argument(
         "--isolation",
         choices=("docker", "local"),
@@ -2031,6 +2063,7 @@ def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
             allow_unsandboxed_local=resumed_allow_local,
             credentials_path=credentials_path,
             agent_bin=resumed_agent_bin,
+            image_tag=args.image_tag or saved.get("image_tag") or agent_exec.DOCKER_IMAGE_TAG,
             skills_enabled=bool(args.skills or saved.get("skills_enabled", False)),
             components=args.components if args.components is not None else saved.get("components"),
             all_components=bool(args.all_components or saved.get("all_components", False)),
@@ -2134,6 +2167,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_unsandboxed_local=args.allow_unsandboxed_local,
             credentials_path=credentials_path,
             agent_bin=args.agent_bin,
+            image_tag=args.image_tag or agent_exec.DOCKER_IMAGE_TAG,
             skills_enabled=args.skills,
             components=args.components,
             all_components=bool(args.all_components),

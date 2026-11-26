@@ -1110,7 +1110,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if engine.is_local else 0.0,
+                "cost_usd": None if not engine.is_cloud else 0.0,
                 "error": data_reason,
             }
         if not iso_ok:
@@ -1122,7 +1122,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if engine.is_local else 0.0,
+                "cost_usd": None if not engine.is_cloud else 0.0,
                 "error": iso_msg,
             }
         if not qual_ok and not allow_unqualified:
@@ -1134,7 +1134,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if engine.is_local else 0.0,
+                "cost_usd": None if not engine.is_cloud else 0.0,
                 "error": qual_reason,
             }
         plan = {
@@ -1195,7 +1195,7 @@ def _dispatch_job_with_trusted_cfg(
             "scope": "ok",
             "changed_files": [],
             "final_text_tail": "",
-            "cost_usd": None if engine.is_local else 0.0,
+            "cost_usd": None if not engine.is_cloud else 0.0,
             "error": data_reason,
         }
         _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
@@ -1221,7 +1221,7 @@ def _dispatch_job_with_trusted_cfg(
             "scope": "ok",
             "changed_files": [],
             "final_text_tail": "",
-            "cost_usd": None if engine.is_local else 0.0,
+            "cost_usd": None if not engine.is_cloud else 0.0,
             "error": iso_msg,
         }
         _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
@@ -1251,7 +1251,7 @@ def _dispatch_job_with_trusted_cfg(
             "scope": "ok",
             "changed_files": [],
             "final_text_tail": "",
-            "cost_usd": None if engine.is_local else 0.0,
+            "cost_usd": None if not engine.is_cloud else 0.0,
             "error": qual_reason,
             "qualification": "unqualified",
         }
@@ -1307,7 +1307,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if engine.is_local else 0.0,
+                "cost_usd": None if not engine.is_cloud else 0.0,
                 "error": refusal,
             }
             _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
@@ -1385,7 +1385,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if engine.is_local else 0.0,
+                "cost_usd": None if not engine.is_cloud else 0.0,
             }
             _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
             _emit_json_line(payload)
@@ -1416,6 +1416,7 @@ def _dispatch_job_with_trusted_cfg(
         memory_task_id=task_id,
         trusted_git_dir=trusted_git_dir,
         state_dir=Path(pipeline_cfg.state_dir),
+        allow_globs=allow_globs,
     )
     control_before = _control_snapshot(workdir)
     git_snap = snapshot_git_metadata(workdir)
@@ -1448,7 +1449,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if engine.is_local else 0.0,
+                "cost_usd": None if not engine.is_cloud else 0.0,
                 "error": str(exc),
             }
             _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
@@ -1472,7 +1473,7 @@ def _dispatch_job_with_trusted_cfg(
             finished=datetime.now(timezone.utc).isoformat(),
         )
         _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
-        cost_val_tamper: float | None = None if engine.is_local else round(float(agent_res.cost_usd or 0.0), 6)
+        cost_val_tamper: float | None = None if not engine.is_cloud else round(float(agent_res.cost_usd or 0.0), 6)
         payload = {
             "run_dir": str(run_dir),
             "status": agent_res.status,
@@ -1523,7 +1524,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": agent_res.final_text[-800:],
-                "cost_usd": None if engine.is_local else round(float(agent_res.cost_usd or 0.0), 6),
+                "cost_usd": None if not engine.is_cloud else round(float(agent_res.cost_usd or 0.0), 6),
                 "error": model_reason,
                 "qualification": "unqualified",
                 "model_changed": True,
@@ -1649,7 +1650,7 @@ def _dispatch_job_with_trusted_cfg(
     test_lock_status = "skipped"
     gate_logs: list[str] = []
 
-    if agent_res.status == "ok":
+    if agent_res.status == "ok" or engine.external is not None:
         if no_gate:
             gate_status = "skipped"
         else:
@@ -1809,7 +1810,7 @@ def _dispatch_job_with_trusted_cfg(
     )
     _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
 
-    cost_val: float | None = None if engine.is_local else round(float(agent_res.cost_usd or 0.0), 6)
+    cost_val: float | None = None if not engine.is_cloud else round(float(agent_res.cost_usd or 0.0), 6)
     payload: dict[str, Any] = {
         "run_dir": str(run_dir),
         "status": agent_res.status,
@@ -1934,6 +1935,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional path to project.toml (default: <workdir>/.devpack/project.toml)",
     )
+    parser.add_argument("--image-tag", default=None, help="Operator-selected sandbox image")
     parser.add_argument(
         "--isolation",
         choices=("docker", "local"),
@@ -2178,7 +2180,7 @@ def _resume_dispatch_from_approval(
     resumed_allow_local = bool(args.allow_unsandboxed_local or saved.get("allow_unsandboxed_local", False))
     resumed_agent_bin = args.agent_bin if args.agent_bin != "claude" else str(saved.get("agent_bin", "claude"))
     resumed_docker_bin = str(saved.get("docker_bin") or "docker")
-    resumed_image_tag = str(saved.get("image_tag") or agent_exec.DOCKER_IMAGE_TAG)
+    resumed_image_tag = str(args.image_tag or saved.get("image_tag") or agent_exec.DOCKER_IMAGE_TAG)
 
     try:
         rc, _payload = dispatch_job(
@@ -2311,6 +2313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_unsandboxed_local=args.allow_unsandboxed_local,
             credentials_path=credentials_path,
             agent_bin=args.agent_bin,
+            image_tag=args.image_tag or agent_exec.DOCKER_IMAGE_TAG,
             role=args.role,
             no_checklist=args.no_checklist,
             profile_path=profile_path,
