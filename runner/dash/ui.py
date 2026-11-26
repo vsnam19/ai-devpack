@@ -38,29 +38,40 @@ def rows(record):
 
 
 def job_columns(width):
-    if width < 77:
-        return (("Job", 22), ("Kind", 5), ("State", 9), ("Role", 10), ("Agent:model", 14))
-    if width < 97:
-        return (("Job", 23), ("Kind", 4), ("State", 7), ("Agent", width - 51),
-                ("#", 2), ("Age", 3), ("Health", 6))
-    job_width = min(32, width - 74)
-    return (("Job", job_width), ("Kind", 4), ("State", 9), ("Role", 11),
-            ("Agent", min(45, width - job_width - 50)), ("#", 2), ("Age", 4), ("Cost", 5), ("Health", 7))
+    columns = [("Job", 23), ("State", 9), ("Role", 10), ("Agent", 16),
+               ("#", 2), ("Age", 5), ("Cost", 6)]
+    remaining = width - sum(size for _, size in columns) - (len(columns) - 1)
+    for label, size in (("Health", 7), ("Kind", 8)):
+        if remaining < size + 1:
+            break
+        columns.append((label, size))
+        remaining -= size + 1
+    columns[3] = ("Agent", min(34, 16 + max(0, remaining)))
+    return tuple(columns)
+
 
 def job_line(job, width):
-    kind = {"dispatch": "disp", "broker": "brkr"}.get(job["kind"], job["kind"])
-    state = {"waiting for approval": "waiting", "ready to resume": "ready"}.get(job["state"], job["state"])
+    state = {"waiting for approval": "awaiting", "ready to resume": "ready"}.get(job["state"], job["state"])
     agent = job["agent"] or "?"
     model = job["model"] or "?"
     age = job["duration_s"] if job["duration_s"] is not None else job["age_s"]
-    agent_model = agent if agent == model else f"{agent}:{model}"
     values = {
-        "Job": job["id"], "Kind": kind, "State": state, "Role": job["role"],
-        "Agent": agent_model, "Agent:model": agent_model,
+        "Job": job["id"], "Kind": job["kind"], "State": state, "Role": job["role"],
+        "Agent": agent if agent == model else f"{agent}:{model}",
         "#": "?" if job["current_step"] is None else job["current_step"],
         "Age": elapsed(age), "Cost": cost(job["cost_usd"]), "Health": job["process_health"],
     }
-    return " ".join(f"{display(values[label])[:size]:<{size}}" for label, size in job_columns(width))
+    fields = []
+    for label, size in job_columns(width):
+        value = display(values[label])
+        if label == "Job":
+            value = value[-size:]
+        field = fit(value, size)
+        if label in ("State", "Health", "Role") and field != value:
+            field = fit(value, size - 1) + "…"
+        fields.append(field + " " * (size - sum(cell_width(char) for char in field)))
+    return " ".join(fields)
+
 
 def job_heading(width):
     return " ".join(f"{label:<{size}}" for label, size in job_columns(width))
@@ -154,11 +165,17 @@ def plain(snapshot, command):
     yield "Sources " + " | ".join(f"{name} {status}" for name, status in snapshot["sources"].items() if status)
 
 
+def cell_width(char):
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
 def fit(line, width):
     result = []
     cells = 0
     for char in line.replace("\n", " ").expandtabs(4):
-        size = 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        size = cell_width(char)
         if cells + size > width:
             break
         result.append(char)

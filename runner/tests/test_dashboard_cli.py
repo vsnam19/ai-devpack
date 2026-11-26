@@ -99,6 +99,45 @@ class CLITest(unittest.TestCase):
             self.assertEqual((event["schema_version"], event["kind"], event["text"]), (1, "message", "sample"))
             self.assertEqual(missing["jobs"], [])
 
+    def test_job_suffix_lookup_and_ambiguity(self):
+        from runner.tests.test_dashboard_reader import write
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / "target"
+            suffix = "a" * 23
+            first = "1" * 9 + suffix
+            second = "2" * 9 + suffix
+            run = workdir / "runs" / first
+            write(run / "run.json", {"kind": "dispatch", "outcome": "pass"})
+            stream = run / "steps" / "01-implement-engine.jsonl"
+            stream.parent.mkdir()
+            stream.write_text('{"type":"message","content":"sample"}\n')
+            args = ["--workdir", str(workdir), "--state-dir", str(root / "state"), "--plain", "--once"]
+            for command, expected in (("show", first), ("gate", "Overall gate"), ("tail", "sample")):
+                with self.subTest(command=command):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(main([*args, command, suffix]), 0)
+                    self.assertIn(expected, output.getvalue())
+
+            write(workdir / "runs" / second / "run.json", {"kind": "dispatch", "outcome": "pass"})
+            for command in ("show", "gate", "tail"):
+                with self.subTest(command=command):
+                    output, error = io.StringIO(), io.StringIO()
+                    with redirect_stdout(output), redirect_stderr(error):
+                        self.assertEqual(main([*args, command, suffix]), 1)
+                    diagnostic = output.getvalue() + error.getvalue()
+                    self.assertIn("Ambiguous", diagnostic)
+                    self.assertIn(first, diagnostic)
+                    self.assertIn(second, diagnostic)
+
+            write(workdir / "runs" / suffix / "run.json", {"kind": "dispatch", "outcome": "pass"})
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main([*args, "show", suffix]), 0)
+            self.assertEqual(output.getvalue().split()[0], suffix)
+
     def test_curses_wrapper_restores_on_interrupt_and_exception(self):
         import os
         import sys

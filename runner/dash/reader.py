@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 import re
 import shlex
+import sys
 import time
 
 from runner.checkpoints import BLOCKING_CHECKPOINTS, CHECKPOINT_SPECS, TERMINAL_CHECKPOINTS
@@ -958,8 +959,12 @@ class Reader:
         ambiguous = False
         if look_up:
             direct = [job for job in jobs if look_up == job["id"] or look_up in job["aliases"]]
-            ambiguous = len(direct) > 1
-            jobs = direct if not ambiguous else []
+            candidates = direct or [job for job in jobs if job["id"].endswith(look_up)]
+            ambiguous = len(candidates) > 1
+            if ambiguous and (not interactive or event_kind):
+                ids = ", ".join(sorted(job["id"] for job in candidates))
+                print(f"Ambiguous Pack job ID {look_up}: {ids}", file=sys.stderr)
+            jobs = candidates if not ambiguous else []
         else:
             jobs = [job for job in jobs if matches(job, terms(query))]
         matched = len(jobs)
