@@ -13,6 +13,7 @@ import sys
 import time
 
 from runner.checkpoints import BLOCKING_CHECKPOINTS, CHECKPOINT_SPECS, TERMINAL_CHECKPOINTS
+from runner.devpack_plan import load_plan, progress
 from runner.memory import scope_dir_name
 from runner.redaction import Redactor
 
@@ -56,6 +57,7 @@ class Settings:
     active_poll_s: int = 3
     discovery_poll_s: int = 5
     quiet_threshold_s: int = 300
+    plans: Path | None = None
 
 
 def terms(query):
@@ -132,6 +134,8 @@ class Reader:
         self.monotonic = monotonic
         self.files = Files(settings.runs, settings.state, *settings.log_roots,
                            *settings.evidence_roots, settings.workdir)
+        self.plans_root = settings.plans if settings.plans is not None else settings.workdir / "plans"
+        self.plan_files = Files(settings.workdir, self.plans_root)
         self.redactor = Redactor()
         self.models = dict(settings.models)
         self.runs = {}
@@ -269,6 +273,10 @@ class Reader:
                           "gate", "refusal_reason", "tamper_reason", "scope", "scope_violation",
                           "git_metadata_tampered", "started", "finished", "sandbox_warning", "isolation_refusal_reason",
                           "brief_sha256", "pid")
+        if self.safe_id(raw.get("plan_id")):
+            task_id = self.safe_id(raw.get("task_id", raw.get("task")))
+            if task_id is not None:
+                run.update(plan_id=raw["plan_id"], task_id=task_id, plan_dir=self.text(raw.get("plan_dir")))
         run.update(native=native, kind="broker" if wrapper else kind, steps=steps,
                    activity=max((item[3] / 1e9 for item in signature if item), default=0),
                    brief_lint=self.findings(raw.get("brief_lint")), started=run.get("started"),
@@ -803,6 +811,8 @@ class Reader:
             "evidence": {"brief_lint": run.get("brief_lint", []),
                          "escalation_reason": summary.get("escalation_reason")},
         }
+        if "plan_id" in run:
+            job.update({key: run[key] for key in ("plan_id", "plan_dir", "task_id")})
         if wrapper and wrapper["native"] != native:
             job["approval_ids"].extend(record["id"] for record in approvals.get(wrapper["native"], []))
         if response and response.get("error"):
@@ -932,8 +942,52 @@ class Reader:
             job["notices"].append("No stream output yet (buffered or non-streaming)")
         return stream.batch if collect else list(stream.events), status, stream
 
+    def read_plans(self, runs, plan_id):
+        """Load contained plan artifacts and attach redacted, joined attempt metadata."""
+        files = self.plan_files
+        files.remaining = TICK_LIMIT
+        try:
+            names = files.names(self.plans_root, folders=True)
+        except FileNotFoundError:
+            return [], "missing"
+        except READ_ERRORS:
+            return [], "unreadable"
+        linked = defaultdict(list)
+        for run in runs.values():
+            if run.get("plan_id"):
+                linked[run["plan_id"]].append({**run, "run_id": run["native"]})
+        plans = []
+        health = "current"
+        for name in names if plan_id is None else ([plan_id] if plan_id in names else []):
+            if not self.safe_id(name):
+                continue
+            try:
+                plan, briefs = load_plan(self.plans_root / name, files=files)
+                if plan["id"] != name:
+                    raise ValueError("plan directory disagrees with ID")
+            except DeferredRead:
+                health = "partial"
+                break
+            except READ_ERRORS:
+                health = "partial"
+                continue
+            entry = progress(plan, linked[name])
+            for key in ("title", "goal", "created", "owner_role"):
+                if key in entry:
+                    entry[key] = self.text(entry[key])
+            for task in entry["tasks"]:
+                task["brief_excerpt"] = self.text(briefs[task["id"]])
+                for key in ("id", "title", "brief", "role"):
+                    if key in task:
+                        task[key] = self.text(task[key])
+                for key in ("depends_on", "blocked_by", "requirement_ids"):
+                    if key in task:
+                        task[key] = [self.text(value) for value in task[key]]
+            plans.append(entry)
+        return plans, health
+
     def snapshot(self, *, query="", job_id=None, event_kind=None, approval_id=None, approval_status="all",
-                 interactive=False, force=False, include_evidence=False, include_gates=True, stream_batch=False):
+                 interactive=False, force=False, include_evidence=False, include_gates=True, stream_batch=False, plan_id=None):
         self.files.remaining = TICK_LIMIT if interactive else None
         look_up = job_id.removeprefix("pack:") if job_id else None
         if look_up and not identifier(look_up):
@@ -952,6 +1006,7 @@ class Reader:
                 if native in known:
                     self.refresh_run(native)
         runs = {native: run for native, (_, run, _, _) in self.runs.items() if run}
+        plans, plan_health = self.read_plans(runs, plan_id)
         linked, approvals = self.join_approvals(runs, approval_records)
         jobs = self.broker_jobs(runs, queue, linked)
         active_jobs = any(run.get("outcome") == "running" for run in runs.values())
@@ -1018,12 +1073,12 @@ class Reader:
         return {
             "schema_version": 1, "observed_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
             "observed_epoch": now, "sources": {"runs": run_health, "queue": queue_health,
-                                               "approvals": approval_health, "stream": stream_health},
+                                               "approvals": approval_health, "stream": stream_health, "plans": plan_health},
             "scan": {"complete": run_health == "current" and len(self.ids) == len(self.runs)
                                   and not self.deferred and not unreadable and queue_health in ("current", "missing"),
                      "discovered": len(self.ids), "scanned": len(self.runs), "matched": matched,
                      "returned": len(jobs), "unreadable": unreadable, "history_limit": self.settings.history_limit},
-            "pending_approvals": pending_count, "jobs": jobs, "approvals": approvals,
+            "pending_approvals": pending_count, "jobs": jobs, "approvals": approvals, "plans": plans,
             "events": [event for event in events if event_kind == "all" or event["kind"] in (event_kind, "notice")],
             "stream_drained": stream_drained, "ambiguous": ambiguous,
             **({"active_jobs": active_jobs} if interactive else {}),

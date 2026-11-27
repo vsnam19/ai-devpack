@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from shutil import copytree
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -26,6 +27,37 @@ class ReaderTest(unittest.TestCase):
         path = self.settings.runs / name
         write(path / "run.json", {"kind": "task", **fields})
         return path
+
+    def test_plan_snapshot_joins_attempts_and_redacts_briefs(self):
+        example = Path(__file__).resolve().parents[2] / "workflow/templates/plan.example"
+        root = self.root / "custom-plans"
+        plan = copytree(example, root / "example")
+        brief = plan / "briefs/T1.md"
+        brief.write_text(brief.read_text() + "\nTOKEN=fixture-secret-value\n")
+        self.run_record("linked", plan_id="example", task_id="T1", outcome="pass")
+        self.run_record("legacy", task="T1", outcome="fail")
+        self.run_record("other", plan_id="another-plan", task_id="T1", outcome="fail")
+        outside = copytree(example, self.root / "outside")
+        outside_manifest = outside / "plan.toml"
+        outside_manifest.write_text(outside_manifest.read_text().replace('id = "example"', 'id = "linked-plan"'))
+        (root / "linked-plan").symlink_to(outside, target_is_directory=True)
+        bad = copytree(example, root / "bad")
+        bad_manifest = bad / "plan.toml"
+        bad_manifest.write_text(bad_manifest.read_text().replace('id = "example"', 'id = "bad"'))
+        (bad / "briefs/T1.md").unlink()
+        (bad / "briefs/T1.md").symlink_to(outside / "briefs/T1.md")
+        settings = Settings(self.root, self.settings.runs, self.settings.state, plans=root)
+        snapshot = Reader(settings).snapshot()
+        self.assertEqual(snapshot["sources"]["plans"], "partial")
+        self.assertEqual([entry["id"] for entry in snapshot["plans"]], ["example"])
+        entry = snapshot["plans"][0]
+        self.assertEqual((entry["done"], entry["total"]), (1, 3))
+        first, second, third = entry["tasks"]
+        self.assertEqual([record["run_id"] for record in first["runs"]], ["linked"])
+        self.assertIn("Draft the guide", first["brief_excerpt"])
+        self.assertNotIn("fixture-secret-value", first["brief_excerpt"])
+        self.assertEqual(second["state"], "ready")
+        self.assertEqual(third["blocked_by"], ["T2"])
 
     def test_detail_outside_window_and_legacy_cost(self):
         run = self.run_record("old", outcome="fail")
