@@ -31,6 +31,7 @@ def parser():
     result.add_argument("--dashboard-config")
     result.add_argument("--project-config")
     result.add_argument("--runs-root")
+    result.add_argument("--plans-root")
     result.add_argument("--state-dir")
     mode = result.add_mutually_exclusive_group()
     mode.add_argument("--plain", action="store_true")
@@ -43,6 +44,8 @@ def parser():
         command.add_argument("job")
         if name == "tail":
             command.add_argument("--kind", choices=("all", "tool", "message"), default="all")
+    commands.add_parser("plans")
+    commands.add_parser("plan").add_argument("plan_id")
     approvals = commands.add_parser("approvals")
     approvals.add_argument("--status", choices=("pending", "decided", "all"), default="all")
     approvals.add_argument("--plain", action="store_true", default=argparse.SUPPRESS)
@@ -98,7 +101,7 @@ def config(args):
             raise ValueError("dashboard config must be outside the worker workdir")
         document = parse_toml_with_arrays(read_config(dashboard_path).decode("utf-8"))
         options = document.get("dashboard", {})
-        if not isinstance(options, dict) or options.keys() - (INTERVALS | ROOTS | {"runs_root", "engines_config"}):
+        if not isinstance(options, dict) or options.keys() - (INTERVALS | ROOTS | {"runs_root", "plans_root", "engines_config"}):
             raise ValueError("invalid dashboard settings")
     for key in INTERVALS & options.keys():
         if type(options[key]) is not int or options[key] <= 0:
@@ -109,9 +112,11 @@ def config(args):
         options[key] = tuple(relative(value) for value in options[key])
     configured_runs = options.pop("runs_root", "runs")
     runs = relative(args.runs_root if args.runs_root is not None else configured_runs)
+    configured_plans = options.pop("plans_root", project.get("plans_root", "plans"))
+    plans = relative(args.plans_root if args.plans_root is not None else configured_plans)
     if args.dashboard_config and any(
         dashboard_path.is_relative_to(root)
-        for root in (runs, *options.get("log_roots", ()), *options.get("evidence_roots", ()))
+        for root in (runs, plans, *options.get("log_roots", ()), *options.get("evidence_roots", ()))
     ):
         raise ValueError("dashboard config must be outside artifact roots")
     engine_file = options.pop("engines_config", None)
@@ -135,7 +140,7 @@ def config(args):
     engines = parse_toml_with_arrays(engine_bytes.decode("utf-8"))
     models = tuple((key, spec["model"]) for key, spec in mapping(engines.get("engines")).items()
                    if isinstance(spec, dict) and isinstance(spec.get("model"), str))
-    return Settings(workdir, runs, state, project_config, models=models, **options)
+    return Settings(workdir, runs, state, project_config, plans=plans, models=models, **options)
 
 
 def dumps(value):
@@ -144,6 +149,10 @@ def dumps(value):
 
 def available(snapshot, command):
     sources = snapshot["sources"]
+    if command == "plans":
+        return sources["plans"] in ("current", "partial", "missing")
+    if command == "plan":
+        return bool(snapshot["plans"])
     if command == "approvals":
         return sources["approvals"] in ("current", "stale", "partial")
     if command in ("show", "gate", "tail"):
@@ -201,6 +210,9 @@ def main(argv=None):
         job = getattr(args, "job", None)
         if job is not None and not identifier(job.removeprefix("pack:")):
             raise ValueError("invalid Pack job ID")
+        plan_id = getattr(args, "plan_id", None)
+        if plan_id is not None and not identifier(plan_id):
+            raise ValueError("invalid plan ID")
         settings = config(args)
     except (OSError, ValueError, RecursionError):
         # Configuration errors can carry secrets or untrusted path text.
@@ -231,7 +243,8 @@ def main(argv=None):
         if command == "tail":
             return tail(reader, args)
         snapshot = reader.snapshot(query=query, job_id=job, approval_status=getattr(args, "status", "all"),
-                                   include_evidence=command == "approvals", include_gates=command in ("show", "gate"))
+                                   include_evidence=command == "approvals", include_gates=command in ("show", "gate"),
+                                   plan_id=plan_id)
         if args.json:
             print(dumps(snapshot))
         else:

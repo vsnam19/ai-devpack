@@ -216,6 +216,8 @@ def parse_toml_with_arrays(text: str) -> dict[str, Any]:
             idx += 1
             if nxt_line:
                 val_str = val_str + " " + nxt_line
+        if key in current:
+            raise ValueError(f"Duplicate TOML key: {key}")
         current[key] = _parse_toml_scalar_or_array(val_str)
     return root
 

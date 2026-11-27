@@ -1,0 +1,25 @@
+id = "example"
+title = "Document a command-line workflow"
+goal = "Publish a short guide with a reproducible example."
+created = "2026-01-01"
+owner_role = "tech-lead"
+
+[[tasks]]
+id = "T1"
+title = "Draft the guide"
+depends_on = []
+brief = "briefs/T1.md"
+size_limit = 80
+
+[[tasks]]
+id = "T2"
+title = "Add a worked example"
+depends_on = ["T1"]
+brief = "briefs/T2.md"
+requirement_ids = ["DOC-1"]
+
+[[tasks]]
+id = "T3"
+title = "Verify the guide"
+depends_on = ["T2"]
+brief = "briefs/T3.md"

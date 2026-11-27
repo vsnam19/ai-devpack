@@ -2397,6 +2397,7 @@ def new_run_dir(
     engines: Sequence[str] | Mapping[str, Any] | None = None,
     outcome: str = "running",
     run_id: str | None = None,
+    plan_link: Mapping[str, str] | None = None,
 ) -> Path:
     """Create a new ``runs/<run-id>/`` directory with ``steps/`` and initial ``run.json``."""
     now = datetime.now(timezone.utc)
@@ -2421,6 +2422,7 @@ def new_run_dir(
         "engines": engines_val,
         "task": task,
         "outcome": outcome,
+        **(plan_link or {}),
     }
     (run_dir / "run.json").write_text(
         json.dumps(run_payload, indent=2) + "\n",

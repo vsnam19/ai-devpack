@@ -466,6 +466,15 @@ def _extract_scope_entries(sections: Sequence[dict[str, Any]], lines: Sequence[s
     return has_scope, scope_line, [entry for _, entry in items]
 
 
+def brief_allowed_files(text: str) -> list[str]:
+    """Extract allowed file globs using the same syntax the linter validates."""
+    lines = text.splitlines()
+    globs = _extract_scope_entries(_parse_sections(lines), lines)[2]
+    if any(glob.startswith("-") or "\x00" in glob for glob in globs):
+        raise ValueError("invalid allowed-files glob")
+    return globs
+
+
 def _extract_contradiction_targets(text: str) -> set[str]:
     """Extract normalized file paths or test-target keywords from a line or phrase."""
     targets: set[str] = set()
@@ -490,6 +499,8 @@ def lint_brief_text(
     engines_config: Path | str | None = None,
     author: str = "orchestrator",
     project_config: Path | str | None = None,
+    check_references: bool = True,
+    prerequisite_briefs: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     """Lint ``brief_text`` against ``repo_root`` and return a list of finding dictionaries.
 
@@ -497,6 +508,8 @@ def lint_brief_text(
     all findings are emitted with ``severity = "warning"``. When ``author == "orchestrator"``,
     structural, path, line-range, budget, scope, and contradiction findings use
     ``severity = "error"`` while ``BRIEF-SYMBOL-MISSING`` remains ``"warning"``.
+    Set ``check_references=False`` to skip file, line, and symbol checks when inspecting
+    a plan. Expected output paths from ``prerequisite_briefs`` may be missing.
     """
     if author not in ("orchestrator", "human"):
         raise ValueError(f"Unsupported author mode: {author}")
@@ -620,9 +633,12 @@ def lint_brief_text(
     seen_missing_paths: dict[str, dict[str, Any]] = {}
     seen_oob: set[tuple[int, str, int]] = set()
     last_existing_file: Path | None = None
-    expected_paths = _collect_expected_output_paths(sections, repo, top_dirs)
+    reference_sections = sections if check_references else []
+    expected_paths = _collect_expected_output_paths(reference_sections, repo, top_dirs)
+    for prerequisite in prerequisite_briefs:
+        expected_paths.update(_collect_expected_output_paths(_parse_sections(prerequisite.splitlines()), repo, top_dirs))
 
-    for sec in sections:
+    for sec in reference_sections:
         sec_canon = _effective_canonical_section(sec)
         in_fence = False
         for lineno, line in sec["body_lines"]:
@@ -717,7 +733,7 @@ def lint_brief_text(
                     re.search(r"\b(create|add|new|implement|declare|define|introduce)\b", line, re.IGNORECASE)):
                 created_symbols.update(re.findall(r"\b[A-Za-z_]\w*\b", line))
     seen_missing_syms: set[tuple[int, str]] = set()
-    for sec in sections:
+    for sec in reference_sections:
         in_fence = False
         for lineno, line in sec["body_lines"]:
             if _FENCE_RE.match(line):
