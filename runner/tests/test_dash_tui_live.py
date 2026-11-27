@@ -1,6 +1,7 @@
 """Headless checks for the read-only terminal dashboard."""
 
 from contextlib import ExitStack
+from dataclasses import replace
 from datetime import datetime, timezone
 import io
 import json
@@ -65,6 +66,23 @@ class LiveDashboardTests(unittest.IsolatedAsyncioTestCase):
                 return
             await pilot.pause()
         self.assertTrue(condition(), "Dashboard did not show the expected update")
+
+    async def test_today_shows_measured_subtotal_and_unknown_cost(self):
+        dt = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        self.reader.clock = lambda: dt.timestamp()
+        self.reader.settings = replace(self.settings, history_limit=1)
+        measured = self.run_record("measured", started=dt.isoformat(), outcome="pass")
+        write(measured / "steps" / "01-build-engine.meta.json",
+              {"schema_version": 1, "usage_provenance": "measured", "cost_usd": 0})
+        priced = self.run_record("priced", started=dt.isoformat(), outcome="pass")
+        write(priced / "steps" / "01-build-engine.meta.json",
+              {"schema_version": 1, "usage_provenance": "measured", "cost_usd": 0.125})
+        self.run_record("unpriced", started=dt.isoformat(), outcome="pass")
+        async with self.app.run_test(size=(120, 35)) as pilot:
+            await self.wait_for(pilot, lambda: self.app.snapshot["cost_today"] == 0.125)
+            self.assertTrue(self.app.snapshot["cost_today_incomplete"])
+            self.assertEqual(len(self.app.snapshot["jobs"]), 1)
+            self.assertIn("Today $0.125 + ?", self.app.query_one("#top").content.plain)
 
     async def test_machine_readable_plan(self):
         from textual.widgets import Tabs

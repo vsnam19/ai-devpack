@@ -197,10 +197,10 @@ per run and per field, including in mixed-version roots.
 
 | Producer change | Acceptance test | MVP when absent |
 | --- | --- | --- |
-| Write atomic per-run `heartbeat.json` from the host workflow or dispatch owner, starting at run creation. Record schema version, run ID, PID, host and boot IDs, PID namespace, process start identity, heartbeat time and nullable `last_event_at`. Refresh during waits for subprocesses, keep heartbeat and event times separate, and stop updates on pause or completion. Bind local checks to a trusted local source. | With fake time and processes, assert a quiet live child leaves the host heartbeat fresh, a killed owner leaves stale data, and boot mismatch, PID reuse and permission errors never verify liveness. Assert terminal and paused execution overrides health hints. | Process health unknown for Pack. Show available event time and elapsed age. |
+| **Done.** Write atomic per-run `heartbeat.json` from the host workflow or dispatch owner, starting at run creation. Record schema version, run ID, PID, host and boot IDs, PID namespace, process start identity, heartbeat time and nullable `last_event_at`. Refresh during waits for subprocesses, keep heartbeat and event times separate, and stop updates on pause or completion. Bind local checks to a trusted local source. | With fake time and processes, assert a quiet live child leaves the host heartbeat fresh, a killed owner leaves stale data, and boot mismatch, PID reuse and permission errors never verify liveness. Assert terminal and paused execution overrides health hints. | Process health unknown for Pack. Show available event time and elapsed age. |
 | Publish the Task resume transition in `runner/devpack_run.py:_resume_from_approval` after successful consumption and before role execution. Set `outcome=running`, clear the pause's `finished` and preserve the original run ID and start time. Finalize subsequent failures with an explicit outcome. | Pause a stub role after resuming a previously approved task. Assert the original row moves to running with no finish time, a failed continuation gets a terminal outcome, and a second resume cannot consume the same approval. | A consumed continuation with legacy pause metadata shows resume status unknown until the next authoritative outcome. |
 | Publish one atomic broker correlation record under the wrapper as soon as dispatch allocates the worker directory, before worker steps start. Include request ID, wrapper run ID and worker run ID. Retain response link as a completion fallback. Preserve an allocated link through errors and keep requests that allocate no worker distinguishable. | Pause a stub worker before step 01 and assert the queue, wrapper and worker produce one request row. Assert the same key after completion, refusal before allocation, failure after allocation and a concurrent direct dispatch. Reject conflicting or escaping links. | Use validated terminal response links. Show unresolved linkage during execution. |
-| Preserve nullable measured cost through `runner/agent_exec.py:parse_stream`, `runner/agent_exec.py:run_agent` and task/dispatch serialization. Record schema or explicit provenance distinguishing measured values from defaults. Expose per-direction token availability too. | Parse fixtures with explicit zero, positive cost, missing result, truncated stream and local unpriced execution. Assert zero survives, absent values serialize as null, and a mixed run contributes known spend with partial coverage. Assert legacy consumers still handle nullable values. | Legacy default zeros are unknown in MVP. Versioned measured zero is displayed as zero. |
+| **Done.** Preserve nullable measured cost through `runner/agent_exec.py:parse_stream`, `runner/agent_exec.py:run_agent` and task/dispatch serialization. Record schema or explicit provenance distinguishing measured values from defaults. Expose per-direction token availability too. | Parse fixtures with explicit zero, positive cost, missing result, truncated stream and local unpriced execution. Assert zero survives, absent values serialize as null, and a mixed run contributes known spend with partial coverage. Assert legacy consumers still handle nullable values. | Legacy default zeros are unknown in MVP. Versioned measured zero is displayed as zero. |
 | Standardize run-level totals in each run directory's `run_summary.json`. Extend task summary with measurement scope and known/eligible counts. Emit the same summary for direct dispatch. Store cost, tokens and invocation duration with coverage, separately from wall duration. Publish the final snapshot atomically and refresh it coherently on resume. | Assert task retries are counted once, a direct dispatch has matching step and summary, early refusal has unknown measurements, and replay/re-read never adds totals twice. Assert external task log directories still leave the summary discoverable. | Read existing task summary and step metadata with legacy provenance rules. Use step fallback or unknown for missing totals. |
 | Mirror task `step_NN_gate.json` into the run directory when an explicit log directory differs. Preserve redacted gate output and publish the structured result atomically for each attempt. | Use a failing stub gate with exit 1 and no marker, followed by a successful retry. Assert both verdicts and round links are visible from the run root with a separate log directory. | Use a verified log root if available, otherwise show the gate transcript with unknown status when structured evidence is missing. |
 
@@ -250,14 +250,14 @@ stream or file mtime alone cannot verify that the resumed execution is active.
   without activity can yield quiet. An empty stream alone provides no baseline.
   Heartbeat freshness contributes to health, independently of event silence.
   Use monotonic polling and UTC source timestamps with local display.
-- For trusted local Pack heartbeats, match host, boot, PID namespace and process start identity before
-  showing verified alive. On stale heartbeat and confirmed owner absence or
-  confirmed PID reuse under the same boot, show suspected stuck/orphaned only
-  while the execution is still nonterminal. For V1 External, probe only after matching producer host, boot and PID namespace.
-  Local `ESRCH` supports suspected orphaned after a re-read of unchanged
-  identity, attempt and PID and confirmation that no terminal result appeared. A PID-only process that exists remains unverified.
-  Remote roots, permission denial and unverifiable identities leave health
-  unknown. Exclude queued jobs, known waits and terminal receipts.
+- For trusted local Pack heartbeats, show alive when the heartbeat is less
+  than 15 seconds old and the host and process start identity match. Linux
+  also requires matching boot and PID namespace IDs. Platforms without a
+  boot ID use process start identity where available. An old heartbeat is
+  stale when the owner identity still matches or the local PID is absent. Remote hosts,
+  permission denial and identity mismatches leave health unknown. Exclude
+  queued jobs, paused runs and terminal receipts. V1 External liveness
+  requires its own producer identity and verification.
 - In V1, target keyboard response below 100 ms on a local fixture with 10,000
   historical runs and 100 active jobs during scan and tail. Measure input
   latency, bytes read and backlog separately from time to full coverage.
@@ -269,12 +269,12 @@ coverage or scope is unavailable, use eligible step measurements. Never add a
 run total to the steps it covers. Show token coverage separately from cost
 coverage.
 
-Legacy Pack cost defaults to zero in `runner/agent_exec.py:AgentResult`,
-`runner/agent_exec.py:parse_stream` and task aggregation in
-`runner/devpack_run.py:run_task_workflow`. Accept positive finite historical
-cost where attributable to the invocation. MVP accepts zero only with
-versioned measured provenance. Legacy zero and absent values are unknown,
-including defaulted token counts. V1 may recover measured legacy zero from a
+Versioned step metadata records cost provenance and nullable fields for
+cost and each token direction. Existing task summaries include a measured
+subtotal and per-field coverage for the invocations they summarize. The live
+header shows the known subtotal with `+ ?` when coverage is incomplete.
+Accept positive finite historical cost where attributable to the invocation.
+Legacy zero and absent values are unknown, including defaulted token counts. V1 may recover measured legacy zero from a
 recognized result event (`total_cost_usd/cost_usd/cost`) during explicit
 accounting, with bounded reads and validated provenance. Configured time and
 context limits are capacity hints from `runner/agent_exec.py:load_engines`.
@@ -419,6 +419,7 @@ These findings were not yet resolved when the design was submitted for approval.
   **MVP pairs the structured verdict with the gate transcript. Live stage evidence remains open.**
 
 - low — docs/design/dashboard.md:200 (also `:253, :259`) — Requiring Linux PID namespace and boot ID matching before showing `verified alive` leaves local process health permanently `unknown` on macOS hosts. — Concrete failure scenario: Although the research target explicitly covers Linux and macOS workstations, macOS lacks `/proc/<pid>/ns/pid` and Linux `boot_id`, so every local Pack/External job fails identity verification and stays `Process health unknown`. Fix: gate PID-namespace matching on platforms that support PID namespaces and specify a Darwin boot-time/process-start fallback. — Evidence: read `.research/dashboard/report_db0_research.md:62-73, 117` and `docs/design/dashboard.md:200, 253, 259`.
+  **Resolved for Pack in Phase 0. Darwin uses kernel process start time when available.**
 
 - low — docs/design/dashboard.md:17-27 (also `:45-50, :366-369`) — MVP `curses` scope is slightly over-engineered in layout/query machinery while leaving `Jobs` columns, `/` filter syntax, and copy-safe approval commands underspecified. — Concrete failure scenario: Implementers spend MVP effort building synchronized 160×48 split-pane + 80×24 drill-down rendering and an AND-query filter without a defined `key=value`/quoting grammar or wide-mode column spec (the mockup omits task, health, duration, and cost), while ~140-character `devpack_approve.py` commands wrap inside an 80-column `curses` pane and break SSH/tmux copy-paste. Fix: defer the 160×48 side-by-side split pane to V1, specify exact `Jobs` columns and `/` filter syntax, and provide an unwrapped/borderless command view or `--plain` output for copying approval commands. — Evidence: read `docs/design/dashboard.md:17-27, 45-57, 366-369`.
   **Resolved in MVP with single-pane navigation, documented Jobs filters and unwrapped plain approval commands.**

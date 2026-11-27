@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -12,6 +12,7 @@ import shlex
 import sys
 import time
 
+from runner import heartbeat
 from runner.checkpoints import BLOCKING_CHECKPOINTS, CHECKPOINT_SPECS, TERMINAL_CHECKPOINTS
 from runner.devpack_plan import load_plan, progress
 from runner.memory import scope_dir_name
@@ -110,9 +111,13 @@ def basename(value):
 
 
 def measured(record, aliases, direction=None):
-    allow_zero = (
-        type(record.get("schema_version")) is int and record["schema_version"] > 0
-        and mapping(record.get("usage_provenance")).get(aliases[0]) == "measured"
+    provenance = record.get("usage_provenance")
+    versioned = type(record.get("schema_version")) is int and record["schema_version"] > 0
+    if versioned and provenance == "unknown" and direction is None:
+        return None
+    allow_zero = versioned and (
+        provenance == "measured" or (provenance == "unknown" and direction is not None)
+        or mapping(provenance).get(aliases[0]) == "measured"
     )
     values = [record.get(key) for key in aliases]
     if direction:
@@ -125,6 +130,32 @@ def usage(record):
         "cost_usd": measured(record, ("cost_usd", "total_cost_usd", "cost")),
         "tokens_in": measured(record, ("tokens_in", "input_tokens", "in_tokens"), "in"),
         "tokens_out": measured(record, ("tokens_out", "output_tokens", "out_tokens"), "out"),
+    }
+
+
+def daily_cost(jobs, now, scan_complete):
+    local = datetime.fromtimestamp(now)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start, end = midnight.timestamp(), (midnight + timedelta(days=1)).timestamp()
+    incomplete = not scan_complete
+    known = []
+    for job in jobs:
+        if not job["native_id"]:
+            continue
+        started = timestamp(job["started"])
+        if started is None:
+            incomplete = True
+        elif start <= started < end:
+            cost = job["cost_usd"]
+            coverage = job["cost_usd_coverage"]
+            if cost is not None:
+                known.append(cost)
+            if cost is None or (coverage["known"] is not None and coverage["known"] < coverage["eligible"]):
+                incomplete = True
+    total = sum(known)
+    return {
+        "cost_today": total if math.isfinite(total) and (known or not incomplete) else None,
+        "cost_today_incomplete": incomplete,
     }
 
 
@@ -294,6 +325,7 @@ class Reader:
         run["summary"] = {
             **self.select(summary, "status", "verdict", "escalation_reason", "harness_error_reason", "duration_s"),
             **usage(summary),
+            "usage_coverage": mapping(summary.get("usage_coverage")),
         }
         proposals = mapping(raw.get("memory_proposals") or summary.get("memory_proposals"))
         run["memory_ids"] = [
@@ -797,7 +829,20 @@ class Reader:
             worker = native if wrapper and native != wrapper["native"] else None
         else:
             worker = None
+        process_health = None
         last_event = self.activity.get(native)
+        if state == "running" and status == "current" and native:
+            try:
+                record = self.optional(source / native / "heartbeat.json")
+            except (DeferredRead, *READ_ERRORS):
+                process_health = "unknown"
+            else:
+                if record:
+                    now = self.clock()
+                    process_health = heartbeat.process_health(record, native, now)
+                    event_time = number(record.get("last_event_at"))
+                    if event_time is not None and event_time <= now:
+                        last_event = max(last_event, event_time) if last_event is not None else event_time
         event_age = max(0, self.clock() - last_event) if last_event is not None else None
         quiet = state == "running" and event_age is not None and event_age >= self.settings.quiet_threshold_s
         job = {
@@ -812,7 +857,7 @@ class Reader:
             "model_source": latest.get("model_source"), "current_step": latest.get("index"),
             "started": run.get("started"), "finished": run.get("finished"), "age_s": age,
             "duration_s": duration, "invocation_duration_s": summary.get("duration_s"),
-            "process_health": None, "last_event_time": last_event, "last_event_age_s": event_age,
+            "process_health": process_health, "last_event_time": last_event, "last_event_age_s": event_age,
             "activity_time": run.get("activity"), "activity": "quiet" if quiet else None, "health": status,
             "last_good_at": observation, "read_failed": False, "gate": run.get("gate"), "approval_ids": [record["id"] for record in related],
             "steps": [{key: value for key, value in step.items() if key != "files"} for step in steps],
@@ -833,12 +878,20 @@ class Reader:
             job["diagnostics"]["harness_error_reason"] = summary["harness_error_reason"]
         for field in ("cost_usd", "tokens_in", "tokens_out"):
             known = [step[field] for step in steps if step[field] is not None]
-            summary_value = summary.get(field) if run.get("outcome") in (None, summary.get("status"), summary.get("verdict")) else None
-            job[field] = summary_value if summary_value is not None else number(sum(known)) if known else None
-            job[field + "_coverage"] = (
-                {"source": "summary", "known": None, "eligible": None} if summary_value is not None else
-                {"source": "steps", "known": len(known), "eligible": len(steps)}
-            )
+            matching = outcome in (None, summary.get("status"), summary.get("verdict"))
+            summary_value = summary.get(field) if matching else None
+            coverage = mapping(mapping(summary.get("usage_coverage")).get(field)) if matching else {}
+            count, eligible = coverage.get("known"), coverage.get("eligible")
+            if (type(count) is int and type(eligible) is int and 0 <= count <= eligible
+                    and (count > 0) == (summary_value is not None)):
+                job[field] = summary_value
+                job[field + "_coverage"] = {"source": "summary", "known": count, "eligible": eligible}
+            elif summary_value is not None:
+                job[field] = summary_value
+                job[field + "_coverage"] = {"source": "summary", "known": None, "eligible": None}
+            else:
+                job[field] = number(sum(known)) if known else None
+                job[field + "_coverage"] = {"source": "steps", "known": len(known), "eligible": len(steps)}
         return job
 
     def broker_jobs(self, runs, queue, linked):
@@ -943,11 +996,15 @@ class Reader:
             self.files.remaining -= used
         if stream.last_event is not None:
             observed = timestamp(stream.last_event_timestamp)
-            job["last_event_time"] = stream.last_event if observed is None else observed
-            self.activity[run["native"]] = job["last_event_time"]
+            event_time = stream.last_event if observed is None else observed
+            self.activity[run["native"]] = event_time
+            last = job["last_event_time"]
+            job["last_event_time"] = max(last, event_time) if last is not None else event_time
             job["last_event_age_s"] = max(0, self.clock() - job["last_event_time"])
-            if job["state"] == "running" and job["last_event_age_s"] >= self.settings.quiet_threshold_s:
-                job["activity"] = "quiet"
+            job["activity"] = (
+                "quiet" if job["state"] == "running" and job["last_event_age_s"] >= self.settings.quiet_threshold_s
+                else None
+            )
         job["stream_mtime"] = stream.mtime
         job["stream_errors"] = stream.errors
         if status == "empty":
@@ -999,7 +1056,8 @@ class Reader:
         return plans, health
 
     def snapshot(self, *, query="", job_id=None, event_kind=None, approval_id=None, approval_status="all",
-                 interactive=False, force=False, include_evidence=False, include_gates=True, stream_batch=False, plan_id=None):
+                 interactive=False, force=False, include_evidence=False, include_gates=True,
+                 stream_batch=False, plan_id=None, include_daily_cost=False):
         self.files.remaining = TICK_LIMIT if interactive else None
         look_up = job_id.removeprefix("pack:") if job_id else None
         if look_up and not identifier(look_up):
@@ -1035,6 +1093,10 @@ class Reader:
         else:
             jobs = [job for job in jobs if matches(job, terms(query))]
         matched = len(jobs)
+        unreadable = sum(health != "current" for _, _, health, _ in self.runs.values())
+        scan_complete = (run_health == "current" and len(self.ids) == len(self.runs)
+                         and not self.deferred and not unreadable and queue_health in ("current", "missing"))
+        cost_jobs = jobs if include_daily_cost else ()
         jobs = jobs[:self.settings.history_limit]
         events = []
         stream_health = None
@@ -1080,18 +1142,17 @@ class Reader:
                     approval["evidence"] = None
             for key in ("target", "target_recorded", "evidence_paths", "memory_scope", "continuation_kind", "continuation_target"):
                 approval.pop(key, None)
-        unreadable = sum(health != "current" for _, _, health, _ in self.runs.values())
         now = self.clock()
         return {
             "schema_version": 1, "observed_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
             "observed_epoch": now, "sources": {"runs": run_health, "queue": queue_health,
                                                "approvals": approval_health, "stream": stream_health, "plans": plan_health},
-            "scan": {"complete": run_health == "current" and len(self.ids) == len(self.runs)
-                                  and not self.deferred and not unreadable and queue_health in ("current", "missing"),
+            "scan": {"complete": scan_complete,
                      "discovered": len(self.ids), "scanned": len(self.runs), "matched": matched,
                      "returned": len(jobs), "unreadable": unreadable, "history_limit": self.settings.history_limit},
             "pending_approvals": pending_count, "jobs": jobs, "approvals": approvals, "plans": plans,
             "events": [event for event in events if event_kind == "all" or event["kind"] in (event_kind, "notice")],
             "stream_drained": stream_drained, "ambiguous": ambiguous,
+            **(daily_cost(cost_jobs, now, scan_complete) if include_daily_cost else {}),
             **({"active_jobs": active_jobs} if interactive else {}),
         }

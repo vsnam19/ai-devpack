@@ -46,6 +46,7 @@ print(json.dumps({
     "model": model_id,
     "agent": agent,
     **({"verdict": "APPROVE"} if mode == "workflow-review" else {}),
+    **({"cost_usd": 0, "usage": {"input_tokens": 0}} if mode == "measured" else {}),
     "role": role,
     "scope": scope,
 }))

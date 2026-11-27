@@ -12,6 +12,7 @@ plus random hex suffix, `yyyymmddThhmmssZ-<6hex>`):
 | Path | Content |
 |---|---|
 | `runs/<run-id>/run.json` | Run metadata: `run_id`, `kind` (`task`, `eval`, `dispatch`, `skilltest`), `started`, `finished`, `engines`, `task`, `outcome`, total cost and duration |
+| `runs/<run-id>/heartbeat.json` | Atomic run owner identity, last heartbeat time and nullable last event time |
 | `runs/<run-id>/steps/NN-<role>-<engine>.prompt.md` | Exact prompt sent to the agent for step `NN` |
 | `runs/<run-id>/steps/NN-<role>-<engine>.jsonl` | Redacted raw `stream-json` event stream from the agent CLI |
 | `runs/<run-id>/steps/NN-<role>-<engine>.meta.json` | Step execution summary: status, exit code, model, duration, turns, tokens in/out, cost in USD, tool-call counts, `tool_protocol_errors`, and prompt SHA-256 |
@@ -19,6 +20,13 @@ plus random hex suffix, `yyyymmddThhmmssZ-<6hex>`):
 | `runs/<run-id>/steps/NN-gate-receipt.json` | Machine-readable receipt from the pack gate at step `NN`, including each gate attempt after a fix |
 | `runs/<run-id>/transcript.md` | Human-readable Markdown transcript rendered across all steps in order |
 | `runs/<run-id>/index.html` | Self-contained static HTML page (inline CSS, light/dark mode, no JavaScript or external assets) |
+
+Task, dispatch and broker owners refresh the heartbeat every five seconds
+during execution and stop when the run pauses or finishes. Heartbeat and
+event times are UTC Unix seconds. Step metadata includes a schema version
+and `usage_provenance` for cost. Cost and each token count use `null` when
+unavailable and keep explicit measured zeros. Legacy unversioned zeros are
+treated as unknown by the dashboards.
 
 Logs are rendered, listed, and indexed with `runner/devpack_logs.py`:
 

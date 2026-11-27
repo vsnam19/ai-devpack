@@ -387,6 +387,12 @@ class DevpackDispatchTests(unittest.TestCase):
             self.assertIsNone(local_data["cost_usd"])
             self.assertEqual(100, local_data["tokens_in"])
             self.assertEqual(40, local_data["tokens_out"])
+            meta_path, = (Path(local_data["run_dir"]) / "steps").glob("*.meta.json")
+            metadata = json.loads(meta_path.read_text())
+            self.assertEqual(metadata["schema_version"], 1)
+            self.assertEqual(metadata["usage_provenance"], "unknown")
+            self.assertIsNone(metadata["cost_usd"])
+            self.assertEqual(metadata["tokens_in"], 100)
 
     def test_sandbox_defaults_and_refusals_across_dispatch_and_skilltest(self) -> None:
         """Verify dispatch and skilltest default to docker and refuse --isolation local without allow flag."""
@@ -469,6 +475,10 @@ class DevpackDispatchTests(unittest.TestCase):
                 transcript = Path(response["run_dir"]) / "transcript.md"
                 self.assertTrue(transcript.is_file())
                 self.assertIn("broker worker done", transcript.read_text(encoding="utf-8"))
+                wrapper, = broker.runs_root.glob(f"*/{request_id}.request.json")
+                record = json.loads((wrapper.parent / "heartbeat.json").read_text())
+                self.assertEqual(record["run_id"], wrapper.parent.name)
+                self.assertIsNotNone(record["last_event_at"])
             finally:
                 broker.close()
 

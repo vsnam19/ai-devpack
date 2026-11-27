@@ -439,7 +439,9 @@ class Dashboard(App):
             text.append(f"   ● {data['running']} run", style=self.color("primary"))
             text.append(f"   ✗ {data['failed']} fail", style=self.color("error"))
             text.append(f"   ⏸ {data['awaiting']} wait", style=self.color("warning"))
-            text.append(f"   Today {amount(data['cost_today'])}")
+            cost_today = data["cost_today"]
+            suffix = " + ?" if cost_today is not None and data["cost_today_incomplete"] else ""
+            text.append(f"   Today {amount(cost_today)}{suffix}")
             text.append(f"   Source {data['health']}   Age {age}", style="dim")
             self.query_one("#top", Static).update(text)
             return
@@ -802,7 +804,8 @@ class Dashboard(App):
                 return Text(f"{task['task_id']}  ·  No attempts yet.")
             fields = {
                 "Run ID": task["run_id"], "Kind": task["kind"], "Task": task["task_id"],
-                "Health": task["health"], "Attempt": f"{task['attempt']}/{task['attempts']}",
+                "Health": task["health"], "Process health": task.get("process_health") or "unknown",
+                "Attempt": f"{task['attempt']}/{task['attempts']}",
                 "Attempts": ", ".join(task["runs"]), "Started": task["started"], "Finished": task["finished"],
             }
             if self.step:
@@ -824,7 +827,7 @@ class Dashboard(App):
                 **self.step["files"],
             }
         for label, value in fields.items():
-            text.append(f"{label:<13}", style=self.color("secondary"))
+            text.append(f"{label:<15}", style=self.color("secondary"))
             text.append(f"{value if value is not None else '?'}\n")
         return text
 

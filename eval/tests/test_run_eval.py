@@ -726,6 +726,71 @@ class HarnessErrorTests(unittest.TestCase):
             self.assertIn("450/120", md)
             self.assertNotIn("0.1974", md)
 
+    def test_summary_usage_coverage_appears_in_matching_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, tasks_dir = _create_mini_fixture_and_task(Path(tmp))
+            task = run_eval.load_and_validate_tasks(tasks_dir, "all")[0]
+            trial = run_eval.TrialResult(
+                task_id=task.task_id, category=task.category, model="haiku:sonnet",
+                run_index=1, passed=True, agent_returncode=0, check_returncode=0,
+                cost_usd=0.015, turns=1, duration_s=1.0, mode="runner",
+                tokens_in=100, tokens_out=42,
+                usage_coverage={
+                    "cost_usd": {"known": 3, "eligible": 4},
+                    "tokens_out": {"known": 2, "eligible": 4},
+                },
+            )
+            tasks, categories = run_eval.aggregate_results([task], [trial.model], 1, [trial])
+            md = run_eval.render_summary_markdown(
+                "r", "2026-11-23", "local", 1, [trial.model], tasks, categories, mode="runner",
+            )
+            for section in ("Per-Category Summary", "Per-Task Summary", "Per-Trial Runs"):
+                with self.subTest(section=section):
+                    table = md.split(f"## {section}\n", 1)[1].split("\n## ", 1)[0]
+                    self.assertIn("| 0.0150 (cost_usd 3/4) | 100/42 (tokens_out 2/4) |", table)
+
+    def test_nullable_usage_reports_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            agent = _write_agent(
+                base,
+                "(cwd / 'src' / 'sample.cpp').write_text('int value() { return 42; }\\n')\n"
+                "print(json.dumps({'type': 'result', 'result': 'done', 'total_cost_usd': 0.1974, "
+                "'num_turns': 2, 'duration_ms': 1234, 'usage': {'input_tokens': 450, 'output_tokens': None}}))\n",
+            )
+            out = base / "out"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DEVPACK_LOCAL_BASE_URL": "http://127.0.0.1:11434",
+                    "DEVPACK_LOCAL_AUTH_TOKEN": "LOCAL_TOK",
+                },
+                clear=False,
+            ):
+                rc = run_eval.main(
+                    [
+                        "--isolation", "local", "--allow-unsandboxed-local",
+                        "--engines", "local", "--k", "1",
+                        "--tasks", "01-mini-bugfix",
+                        "--work-root", str(base / "wr"), "--fixture-dir", str(fixture_dir),
+                        "--tasks-dir", str(tasks_dir), "--agent-bin", str(agent),
+                        "--out", str(out),
+                    ]
+                )
+            self.assertEqual(0, rc)
+            results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+            ts = results["tasks"][0]
+            self.assertIsNone(ts["mean_cost_usd"])
+            self.assertIsNone(ts["runs"][0]["cost_usd"])
+            self.assertEqual(450, ts["runs"][0]["tokens_in"])
+            self.assertIsNone(ts["runs"][0]["tokens_out"])
+            self.assertEqual({"known": 0, "eligible": 1}, ts["usage_coverage"]["tokens_out"])
+            md = (out / "summary.md").read_text(encoding="utf-8")
+            self.assertIn("n/a", md)
+            self.assertIn("450/n/a", md)
+            self.assertNotIn("0.1974", md)
+
     def test_devpack_root_set_in_check_env_and_bare_exit_2_is_fail_not_harness_error(self) -> None:
         """check.sh receives DEVPACK_ROOT; a bare exit 2 without a marker is a fail, not a harness error."""
         with tempfile.TemporaryDirectory() as tmp:

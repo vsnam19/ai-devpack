@@ -44,6 +44,23 @@ implementer = "implement"
 """, encoding="utf-8")
         return config
 
+    def test_external_json_result_preserves_measured_zero(self):
+        engine = load_engines(self.configuration("measured")).engines["external"]
+        run_dir = self.root / "run"
+        result = run_agent(AgentRequest(
+            engine=engine, prompt="Inspect the project.", workdir=self.root,
+            run_dir=run_dir, isolation="local", allow_unsandboxed_local=True,
+            role="implementer", allow_globs=["literal;touch marker"],
+            env_overrides={"FIXTURE_TOKEN": "external-test-secret"},
+        ))
+        self.assertEqual(result.status, "ok", result.error)
+        self.assertEqual((result.cost_usd, result.tokens_in, result.input_tokens), (0, 0, 0))
+        self.assertIsNone(result.tokens_out)
+        metadata, = (run_dir / "steps").glob("*.meta.json")
+        record = json.loads(metadata.read_text())
+        self.assertEqual(record["usage_provenance"], "measured")
+        self.assertEqual((record["cost_usd"], record["tokens_in"], record["tokens_out"]), (0, 0, None))
+
     def test_results_and_evidence(self):
         for mode, status in (("success", "ok"), ("quiet", "ok"),
                              ("failed", "agent_error"), ("quota", "engine_unavailable"),
