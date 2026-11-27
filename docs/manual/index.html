@@ -21,6 +21,7 @@ pre{background:var(--panel);padding:.8rem 1rem;border-left:3px solid var(--accen
 <strong>ai-devpack</strong>
 <ol>
 <li><a href="#overview">Overview</a></li>
+<li><a href="#quickstart">Quick start</a></li>
 <li><a href="#architecture">Architecture</a></li>
 <li><a href="#workflow">Workflow</a></li>
 <li><a href="#logs">Runs and logs</a></li>
@@ -43,7 +44,64 @@ pre{background:var(--panel);padding:.8rem 1rem;border-left:3px solid var(--accen
 <dl><dt>Brief</dt><dd>A bounded task with goals, inputs, outputs, scope and verification commands.</dd><dt>Engine</dt><dd>A configured model and invocation protocol.</dd><dt>Gate</dt><dd>A trusted set of checks whose receipt records individual outcomes.</dd><dt>Checkpoint</dt><dd>A recorded policy or human decision tied to a subject and evidence.</dd><dt>Oracle</dt><dd>A human-authored clarification for an eval task. Hidden graders check the result independently.</dd><dt>Component</dt><dd>A named subtree selected within the configured source workspace.</dd></dl>
 </section>
 
-<section id="architecture"><h2>2. Architecture</h2>
+<section id="quickstart"><h2>2. Quick start</h2>
+<p>Install an offline release outside any project or worker worktree, verify prerequisites with <code>devpack doctor</code>, scaffold the project with <code>devpack init</code>, configure engines and the gate, and run your first plan.</p>
+<h3>Verify checksum and install</h3>
+<p>Use a machine with Bash, Python 3.10 or newer (3.11+ for <code>enforcement/gate/gate.py</code>), Git, <code>tar</code>, <code>gzip</code>, <code>sha256sum</code>, and ShellCheck (required for the installer self-test unless <code>--no-selftest</code> is passed), plus C++17 <code>g++</code>, <code>gcov</code>, <code>nm</code>, and <code>cppcheck</code> for C/C++ checks. Transfer the release tarball and its <code>.sha256</code> file together, verify the expected digest obtained over an authenticated channel, unpack the archive into a trusted directory, and run <code>install.sh</code>.</p>
+<pre>sha256sum -c devpack-VERSION.sha256 &amp;&amp;
+tar -xzf devpack-VERSION.tar.gz &amp;&amp;
+cd devpack-VERSION &amp;&amp;
+./install.sh --verify ../devpack-VERSION.sha256
+export PATH="$HOME/.local/bin:$PATH"
+devpack version</pre>
+<p>By default <code>install.sh</code> installs into <samp>$HOME/.local/share/devpack/&lt;version&gt;</samp>, updates the <samp>current</samp> symlink to that version, publishes the <samp>devpack</samp> launcher symlink in <samp>$HOME/.local/bin</samp>, and runs <code>tests/run_all.sh</code> until <code>ALL OK</code>. It never needs network access or elevated privileges.</p>
+<table><thead><tr><th scope="col">Option</th><th scope="col">Behavior</th></tr></thead><tbody>
+<tr><td><code>--prefix DIR</code></td><td>Install into a custom prefix directory outside the extracted source tree instead of <samp>$HOME/.local/share/devpack/&lt;version&gt;</samp>.</td></tr>
+<tr><td><code>--bin-dir DIR</code></td><td>Create the <samp>devpack</samp> launcher symlink in <code>DIR</code> (must be outside the prefix) instead of <samp>$HOME/.local/bin</samp>.</td></tr>
+<tr><td><code>--verify FILE.sha256</code></td><td>Verify the sibling <samp>devpack-&lt;version&gt;.tar.gz</samp> archive against its SHA-256 checksum file before installing.</td></tr>
+<tr><td><code>--no-selftest</code></td><td>Skip running <code>tests/run_all.sh</code> during installation when test tools are unavailable and the release was already verified elsewhere; rerun later with <code>devpack selftest</code>.</td></tr>
+<tr><td><code>--uninstall</code></td><td>Remove the installer-managed files and <code>__pycache__</code> directories at the prefix (passing the same <code>--prefix</code> and <code>--bin-dir</code> if customized), repoint <samp>current</samp> to a remaining sibling version or remove the <samp>devpack</samp> launcher symlink, and preserve non-manifest user files.</td></tr>
+</tbody></table>
+
+<h3>Check prerequisites with <code>devpack doctor</code></h3>
+<p>Run <code>devpack doctor</code> from the project repository (or pass <code>--workdir DIR</code>) before scaffolding and again after editing project configuration. It reports <code>PASS</code>, <code>WARN</code>, or <code>FAIL</code> per check and exits <code>0</code> only when no check reports <code>FAIL</code>.</p>
+<table><thead><tr><th scope="col">Check</th><th scope="col">PASS / WARN / FAIL meaning</th></tr></thead><tbody>
+<tr><td><code>Python</code></td><td><code>PASS</code> with the active Python version (<code>devpack</code> requires 3.10+).</td></tr>
+<tr><td><code>Git</code></td><td><code>PASS</code> if <code>git</code> is on <code>PATH</code>; <code>FAIL</code> if unavailable.</td></tr>
+<tr><td><code>Docker</code></td><td><code>PASS</code> if <code>docker</code> is on <code>PATH</code>; <code>WARN</code> if unavailable (required only when running tasks under default <code>docker</code> isolation).</td></tr>
+<tr><td><code>ShellCheck (selftest)</code></td><td><code>PASS</code> if <code>shellcheck</code> is on <code>PATH</code>; <code>FAIL</code> if unavailable.</td></tr>
+<tr><td><code>Textual</code></td><td><code>PASS</code> if the <code>textual</code> package is importable; <code>WARN</code> if missing (optional; only needed for <code>devpack tui</code>, while <code>devpack dash</code> uses stdlib).</td></tr>
+<tr><td><code>Project config</code></td><td><code>PASS</code> with the path to <samp>.devpack/project.toml</samp>; <code>WARN</code> when absent (run <code>devpack init</code>); <code>FAIL</code> if the workdir is missing, <samp>.devpack/project.toml</samp> is a symlink, or parsing fails.</td></tr>
+<tr><td><code>Gate config</code></td><td>Checked when project config is present: <code>PASS</code> with resolved file path; <code>FAIL</code> if <code>gate_config</code> is unset, missing, or a symlink.</td></tr>
+<tr><td><code>Engine config</code></td><td>Checked when project config is present: <code>PASS</code> if <code>runner/agent_exec.py</code> <code>--check-config</code> validates <samp>engines_config</samp>; <code>FAIL</code> on validation error.</td></tr>
+<tr><td><code>Engine roles</code></td><td>Checked when engine config passes: <code>PASS</code> listing <code>implementer</code> and <code>reviewer</code> engines; <code>FAIL</code> if either required role is unmapped.</td></tr>
+<tr><td><code>Default engine &lt;role&gt;</code></td><td>Checked for each entry in <code>[default_engines]</code>: <code>PASS</code> if it names a defined engine; <code>FAIL</code> if it references an undefined engine.</td></tr>
+<tr><td><code>Engine &lt;name&gt;</code></td><td>Checked for each configured engine: <code>PASS</code> with binary path when the executable is on <code>PATH</code>, project <code>data_class</code> is permitted by <code>max_data_class</code> (<code>secret</code> is always refused), and required environment variables exist for <code>class = "local"</code>; <code>FAIL</code> otherwise.</td></tr>
+<tr><td><code>State directory</code></td><td><code>PASS</code> with the resolved trusted state path when writable outside the worktree; <code>FAIL</code> if the workdir is missing, the state path lies inside the worktree or worker mounts, or it cannot be written.</td></tr>
+</tbody></table>
+
+<h3>Scaffold the project with <code>devpack init</code></h3>
+<p>Run <code>devpack init</code> from the project repository with the approved pipeline mode and data classification:</p>
+<pre>devpack doctor
+devpack init --mode hitl --data-class internal</pre>
+<p>The command creates <samp>.devpack/project.toml</samp>, <samp>.devpack/engines.toml</samp> (copied from <code>runner/engines.example.toml</code>), <samp>.devpack/gate.toml</samp> (copied from <code>enforcement/gate/gate.project.example.toml</code>), and <samp>plans/example/</samp> (copied from <code>workflow/templates/plan.example</code>), and appends <samp>/runs/</samp> to <samp>.gitignore</samp> if not already listed (leaving a symlinked <samp>.gitignore</samp> untouched). Re-running <code>devpack init</code> never overwrites existing files (it prints <code>Exists</code> instead of <code>Created</code>). Pass <code>--install-hooks</code> at a Git repository root to install the pre-commit hook if absent (fails before writing any files if the workdir is not a Git root), and pass <code>--install-skills</code> to copy bundled skills into the project.</p>
+
+<h3>Configure engines and gate</h3>
+<p>Edit <samp>.devpack/engines.toml</samp> for the approved engines in your environment, keep an independent engine mapped to <code>reviewer</code>, and remove unused entries. Native engines use <code>class = "cloud"</code> or <code>class = "local"</code> (with <code>base_url_env</code> and <code>auth_token_env</code> naming environment variables for on-premises endpoints, never literal URLs or tokens). External engines use <code>class = "external"</code> with an argv template <code>command</code> (using <code>{brief}</code>, <code>{workdir}</code>, <code>{role}</code>, <code>{model}</code>, <code>{run_dir}</code>, and <code>{allow_args}</code>), <code>result</code>, <code>reply_from</code>, optional <code>events_from</code>, <code>env_allow</code>, <code>role_map</code>, explicit <code>timeout_s</code>, and <code>max_data_class</code>. Set <code>[workspace]</code> and <code>[[component]]</code> build/test commands in <samp>.devpack/project.toml</samp>, review checks in <samp>.devpack/gate.toml</samp>, and re-run <code>devpack doctor</code> (or <code>devpack skills --check-config .devpack/engines.toml</code>).</p>
+
+<h3>Run, watch, and approve</h3>
+<p>Review and adapt the briefs in <samp>plans/example/briefs/</samp>, commit your project baseline, and run the first ready task. Monitor live runs and inspect checkpoints with either terminal dashboard, then approve or reject checkpoints and resume paused runs:</p>
+<pre>devpack plan run-next plans/example
+devpack tui --workdir .
+devpack dash --once --plain jobs
+devpack approve list --status pending
+devpack approve show &lt;approval-id&gt;
+devpack approve approve &lt;approval-id&gt;
+devpack run --resume &lt;approval-id&gt;</pre>
+<p>Use <code>devpack tui</code> when <code>textual</code> is installed or <code>devpack dash</code> anywhere Python stdlib runs; both accept <code>--workdir DIR</code> outside the project. If a blocking checkpoint pauses with exit code <code>20</code> (<code>AWAITING_APPROVAL</code>), approve or reject (with <code>--note</code>) via <code>devpack approve</code> and resume the task with <code>devpack run --resume &lt;approval-id&gt;</code> or <code>devpack dispatch --resume &lt;approval-id&gt;</code>.</p>
+</section>
+
+<section id="architecture"><h2>3. Architecture</h2>
 <figure>
 <svg viewBox="0 0 760 405" role="img" aria-labelledby="architecture-title architecture-desc">
 <title id="architecture-title">Pack components and data flow</title>
@@ -63,10 +121,10 @@ pre{background:var(--panel);padding:.8rem 1rem;border-left:3px solid var(--accen
 </figure>
 <p><code>orchestrator/</code> provides orchestration instructions and example briefs. <code>workflow/templates/</code> supplies implement, review and fix briefs, a task plan, an ADR and a dependency-plan example. <code>runner/devpack_run.py</code> coordinates a whole task. <code>runner/devpack_dispatch.py</code> routes individual roles and records guarded attempts. <code>runner/devpack_submit.py</code> validates broker submissions. <code>runner/devpack_broker.py</code> services the queue on the trusted host, validates worktree and brief boundaries, and executes through the runner adapter.</p>
 <p><code>runner/agent_exec.py</code> loads engines, checks classification and isolation, constructs argv and mounts, and normalizes execution evidence. Native cloud and local engines share a CLI protocol. An external engine uses operator-supplied argv and a declared result protocol. Worker edits are bounded to allowed brief paths and any active component scope. Keep pack code, grading inputs, trusted Git metadata, approval state, and the gate configuration out of worker control. Scope and test-lock checks compare actual changes to trusted input. Sandbox containment, post-run verification and classification are distinct controls.</p>
-<p><code>runner/workspace_scope.py</code> resolves components, built-in exclusions and selected scans. <code>runner/safe_git.py</code> protects Git operations from untrusted settings. <code>runner/repomap.py</code> generates a budgeted C/C++ index. <code>runner/memory.py</code> recalls scoped, bounded memory and validates proposals. Learning mines evidence and qualifies engine guidance. Dashboards consume recorded artifacts. Eval isolates benchmark fixtures and grades against trusted harness inputs.</p>
+<p><code>runner/workspace_scope.py</code> resolves components, built-in exclusions and selected scans. <code>runner/safe_git.py</code> protects Git operations from untrusted settings. <code>runner/repomap.py</code> generates a budgeted C/C++ index. <code>runner/memory.py</code> recalls scoped, bounded memory and validates proposals. Learning mines evidence and qualifies engine guidance. Dashboards consume recorded artifacts. Eval isolates benchmark fixtures and grades against trusted harness inputs. The installed <code>devpack</code> launcher symlinks to <code>runner/devpack_cli.py</code>, which implements <code>version</code>, <code>doctor</code>, and <code>init</code> directly and forwards all other sub-commands to the pack's existing runner, enforcement, dashboard, and self-test tools.</p>
 </section>
 
-<section id="workflow"><h2>3. Workflow</h2>
+<section id="workflow"><h2>4. Workflow</h2>
 <figure>
 <svg viewBox="0 0 760 390" role="img" aria-labelledby="sequence-title sequence-desc">
 <title id="sequence-title">Task lifecycle sequence</title>
@@ -85,7 +143,7 @@ pre{background:var(--panel);padding:.8rem 1rem;border-left:3px solid var(--accen
 <p>Use log analysis to identify <code>BRIEF</code> (bad input), <code>CONTEXT</code> (missing repository knowledge), <code>SKILL</code> (missing or wrong guidance), <code>TOOL</code> (harness or permissions), <code>MODEL</code> (incorrect result under adequate conditions), or <code>ENV</code> (infrastructure or quota). A primary and optional secondary label support the handoff. Confirm heuristic findings through the logs CLI and use the evidence to fix the brief, routing, tool or environment before trying again.</p>
 </section>
 
-<section id="logs"><h2>4. Runs and logs</h2>
+<section id="logs"><h2>5. Runs and logs</h2>
 <p>Run data is written below the configured runs root. This tree uses placeholders for generated names.</p>
 <pre>runs/&lt;run-id&gt;/
   run.json                       identity, outcome, timing and step index
@@ -102,7 +160,7 @@ pre{background:var(--panel);padding:.8rem 1rem;border-left:3px solid var(--accen
 <p>The CLI and TUI use <code>runner/dash/reader.py</code> to assemble snapshots from run records, step streams, gate receipts, broker queue records, plans and external approval state. <code>runner/dash/files.py</code> handles constrained file reads and <code>runner/dash/events.py</code> normalizes events. The reader refreshes active jobs more often than discovery, bounds history, and reports source health. Use the TUI for interactive views and the CLI for text and JSON snapshots. Keep dashboard configuration in trusted operator space.</p>
 </section>
 
-<section id="config"><h2>5. Configuration reference</h2>
+<section id="config"><h2>6. Configuration reference</h2>
 <h3>Project configuration</h3>
 <p>Install the project example as <samp>.devpack/project.toml</samp> in the target checkout. Configure the gate and engine files with trusted inputs before dispatch. See <code>.devpack/project.example.toml</code>.</p>
 <table><thead><tr><th>Key</th><th>Type, default and interpretation</th></tr></thead><tbody>
@@ -189,7 +247,7 @@ module_bundle_path = "read-only/{app}.pp"
 te = "{app}.te"</pre>
 </section>
 
-<section id="cli"><h2>6. CLI reference</h2>
+<section id="cli"><h2>7. CLI reference</h2>
 <p>Run these examples from the pack checkout. Per-command tables list top-level options and subcommand options separately. Use the relevant subcommand's help for ordering. A successful operation typically returns 0 and argparse misuse returns 2. Gate returns 1 for invalid configuration or a failed required check. The SELinux source and linked-policy gate returns 1 for findings and 3 for incomplete evidence. Other tools document their command-specific result in the surrounding workflow. Task execution returns 1 on escalation or other task failure and 20 on a blocking approval. A terminal approval can be pending after task execution completes. Plan run-next returns 1 when no task is ready and work remains. Dashboard queries can return 1 for unavailable sources and invalid options return 2. Engine timeouts and launch failures can be represented as 124 and 126/127 in step results. Inspect the run outcome and receipt as well as the process status.</p>
 <pre>python3 runner/brief_lint.py orchestrator/briefs/example_implement.md --repo eval/fixture
 python3 runner/devpack_plan.py validate workflow/templates/plan.example
@@ -683,6 +741,48 @@ python3 skilltest/skilltest.py lint knowledge/skills/automotive-cpp</pre>
 <tr><td><code data-entry="runner/devpack_broker.py" data-command="">--allow-unsandboxed-local</code></td><td></td></tr>
 <tr><td><code data-entry="runner/devpack_broker.py" data-command="">--state-dir</code></td><td>Default: &#x27;&#x27;.</td></tr>
 <tr><td><code data-entry="runner/devpack_broker.py" data-command="">--resume</code></td><td>Resume one approved broker checkpoint ID and exit Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h3 id="cli-devpack"><code>runner/devpack_cli.py</code></h3>
+<p>One entry point for the installed devpack tools.</p>
+<pre>python3 runner/devpack_cli.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_cli.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="">-h</code>, <code data-entry="runner/devpack_cli.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: <code>version</code>, <code>doctor</code>, <code>init</code>, <code>run</code>, <code>plan</code>, <code>dispatch</code>, <code>broker</code>, <code>approve</code>, <code>logs</code>, <code>dash</code>, <code>tui</code>, <code>gate</code>, <code>skills</code>, <code>hooks</code>, <code>selftest</code> Required.</td></tr>
+</tbody></table>
+<h4>version<code data-entry="runner/devpack_cli.py" data-command="version"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="version">-h</code>, <code data-entry="runner/devpack_cli.py" data-command="version">--help</code></td><td>show this help message and exit</td></tr>
+</tbody></table>
+<h4>doctor<code data-entry="runner/devpack_cli.py" data-command="doctor"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="doctor">-h</code>, <code data-entry="runner/devpack_cli.py" data-command="doctor">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="doctor">--workdir</code></td><td>Project directory to check (default: current directory).</td></tr>
+</tbody></table>
+<h4>init<code data-entry="runner/devpack_cli.py" data-command="init"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="init">-h</code>, <code data-entry="runner/devpack_cli.py" data-command="init">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="init">--workdir</code></td><td>Target project directory to scaffold (default: current directory).</td></tr>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="init">--mode</code></td><td>Pipeline mode. Choices: hitl, autonomous. Default: &#x27;hitl&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="init">--data-class</code></td><td>Project data classification ceiling. Choices: public, internal, confidential, customer-restricted, secret. Default: &#x27;internal&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="init">--install-hooks</code></td><td>Install the pre-commit hook into the target Git repository root.</td></tr>
+<tr><td><code data-entry="runner/devpack_cli.py" data-command="init">--install-skills</code></td><td>Install bundled skills into the project.</td></tr>
+</tbody></table>
+<h4>Forwarded sub-commands</h4>
+<p>Every other sub-command forwards all remaining arguments unchanged with <code>PYTHONDONTWRITEBYTECODE=1</code> (and prepends the pack root to <code>PYTHONPATH</code> for <code>tui</code>) and returns the target tool's exit code.</p>
+<table><thead><tr><th scope="col">Sub-command</th><th scope="col">Target entry point</th></tr></thead><tbody>
+<tr><td><code>run</code></td><td><code>runner/devpack_run.py</code></td></tr>
+<tr><td><code>plan</code></td><td><code>runner/devpack_plan.py</code></td></tr>
+<tr><td><code>dispatch</code></td><td><code>runner/devpack_dispatch.py</code></td></tr>
+<tr><td><code>broker</code></td><td><code>runner/devpack_broker.py</code></td></tr>
+<tr><td><code>approve</code></td><td><code>runner/devpack_approve.py</code></td></tr>
+<tr><td><code>logs</code></td><td><code>runner/devpack_logs.py</code></td></tr>
+<tr><td><code>dash</code></td><td><code>runner/devpack_dash.py</code></td></tr>
+<tr><td><code>tui</code></td><td><code>runner/dash/tui/__main__.py</code></td></tr>
+<tr><td><code>gate</code></td><td><code>enforcement/gate/gate.py</code></td></tr>
+<tr><td><code>skills</code></td><td><code>runner/agent_exec.py</code></td></tr>
+<tr><td><code>hooks</code></td><td><code>enforcement/hooks/install.sh</code></td></tr>
+<tr><td><code>selftest</code></td><td><code>tests/run_all.sh</code></td></tr>
 </tbody></table>
 <h3><code>runner/devpack_dash.py</code></h3>
 <p>Inspect Pack runs and checkpoint evidence from a read-only terminal dashboard.</p>
@@ -1216,6 +1316,7 @@ python3 skilltest/skilltest.py lint knowledge/skills/automotive-cpp</pre>
 </tbody></table>
 <h3 id="cli-shell">Shell entry points</h3>
 <table><thead><tr><th>Command</th><th>Usage and result</th></tr></thead><tbody>
+<tr><td><code>install.sh</code></td><td>Run with bash from an extracted release. Accepts <code>--prefix DIR</code> (default <samp>$HOME/.local/share/devpack/&lt;version&gt;</samp>, maintaining <samp>current</samp>), <code>--bin-dir DIR</code> (default <samp>$HOME/.local/bin</samp>), <code>--verify FILE.sha256</code>, <code>--no-selftest</code>, <code>--uninstall</code>, and <code>-h</code>/<code>--help</code>. Exit 0 on success, 1 on validation, checksum, self-test, or filesystem errors.</td></tr>
 <tr><td><code>tests/run_all.sh</code></td><td>Run with bash. Accepts <code>-h</code> or <code>--help</code>. Exit 0 on success, 1 on failed verification, 2 on misuse.</td></tr>
 <tr><td><code>tools/make_release.sh</code></td><td>Run with bash and VERSION OUTDIR. Exit 0 when archive and checksum pass verification, 2 on bad usage, 1 on verification or tag errors.</td></tr>
 <tr><td><code>enforcement/hooks/install.sh</code></td><td>Install the pre-commit hook. Use <code>--repo</code> PATH to select the target checkout (default current directory) or <code>-h</code>/<code>--help</code>. Exit 0 on success, 1 for invalid input or failed installation.</td></tr>
@@ -1224,7 +1325,7 @@ python3 skilltest/skilltest.py lint knowledge/skills/automotive-cpp</pre>
 </tbody></table>
 </section>
 
-<section id="skills"><h2>7. Skills</h2>
+<section id="skills"><h2>8. Skills</h2>
 <p>Load applicable skill instructions into the brief or engine context. Give the worker the project rules and file scope alongside the domain guidance. Skills guide decisions and checks verify the output.</p>
 <table><thead><tr><th>Skill</th><th>Use it for</th></tr></thead><tbody>
 <tr><td><code>automotive-cpp</code></td><td>Safety-oriented C++ changes, status handling, bounded behavior, naming and Doxygen.</td></tr>
@@ -1244,14 +1345,14 @@ python3 skilltest/skilltest.py lint knowledge/skills/automotive-cpp</pre>
 <p>Use the schema, review checklist, triage instructions and verification notes under <code>knowledge/skills/telaf-selinux/references/</code>.</p>
 </section>
 
-<section id="quality"><h2>8. Quality gates and eval</h2>
+<section id="quality"><h2>9. Quality gates and eval</h2>
 <p><code>tests/run_all.sh</code> runs unittest discovery across pack subsystems and skill test directories and shellchecks scripts when shellcheck is installed. The full pack gate also checks offline evaluation fixtures, graders, skill lint, example briefs, repomap, log rendering, C/C++ lint and cppcheck. The product gate example runs scoped preflight, cppcheck, test lock, build and tests. Use all components in CI. The receipt records scope coverage and check outcomes. Use verified test completion evidence where required.</p>
 <p><code>enforcement/checks/</code> includes scope, protected-test integrity, secret/PII, traceability, symbol boundaries, deviations and test proof. Protect the expected output, assertion behavior and preprocessing of protected tests. Evidence collection gathers artifacts for later inspection. The pre-commit hook offers early checks and CI retains the trusted gate. Coverity remains the company CI authority where adopted. See <code>policy/static_analysis.md</code>, <code>policy/tool_confidence.md</code>, and <code>workflow/ci/pipeline.md</code>.</p>
 <p><code>eval/run_eval.py</code> supports single-agent, pipeline runner, orchestrator and memory comparisons. <code>eval/tasks/</code> supplies task briefs, fixture patches, checks, hidden tests, reference solutions and selected oracle clarifications. The C++17 fixture models codec, ring buffer, link state and diagnostics behaviors. Validate seeded failure and reference success with the deterministic verifier. Use mutation and negative cases to catch weak graders. Compare minimal, standard and oracle briefs, optional repo context and skill ablations when diagnosing failures. Start with dry-run to check selection and trial volume.</p>
 <p><code>eval/memory_tasks/</code> covers recall, supersession, distractors, stale guidance and scope isolation in multi-step sequences. Compare product outcomes across arms and check recall with the deterministic grader. <code>eval/orchestrator_goals/</code> exercises goal decomposition and worker orchestration. <code>skilltest/skilltest.py</code> validates skill packages and runs fixture-based skill on/off comparisons with graders and reports.</p>
 </section>
 
-<section id="extending"><h2>9. Extending the pack</h2>
+<section id="extending"><h2>10. Extending the pack</h2>
 <h3 id="external">Add an engine or adapter</h3>
 <p>Declare an engine, route the intended role, and set its data ceiling, timeout, context and isolation. Keep credentials in allowed operator environment variables. Run offline contract tests with a fake engine and fixture artifacts before qualifying it. For external adapters, install the executable in the approved execution environment. <code>command</code> is argv with a literal executable. Templates support <code>{brief}</code> (prompt file), <code>{workdir}</code>, <code>{role}</code> (mapped role), <code>{model}</code>, <code>{run_dir}</code> (adapter outputs), and <code>{allow_args}</code> (argv splice occupying an entire argument). The engine identity uses <samp>agent:model</samp>. The adapter example and offline fixture are in <code>runner/engines.example.toml</code> and <code>runner/tests/fixtures/external_job.py</code>.</p>
 <pre>[engines.worker]
@@ -1276,7 +1377,7 @@ implementer = "implement"</pre>
 <p>Build a projection from the shared Reader snapshot, use constrained artifact reads, and reuse the common event normalizer and presentation helpers. Keep commands that mutate approvals in the approval CLI. Test unknown, missing, stale and malformed sources with fixtures before wiring the view into the CLI or TUI.</p>
 </section>
 
-<section id="development"><h2>10. Developing the pack</h2>
+<section id="development"><h2>11. Developing the pack</h2>
 <table><thead><tr><th>Location</th><th>Ownership</th></tr></thead><tbody>
 <tr><td><code>policy/</code>, <code>orchestrator/</code>, <code>workflow/</code></td><td>Operating policy, orchestrator guidance, briefs, design records and CI examples.</td></tr>
 <tr><td><code>runner/</code>, <code>enforcement/</code></td><td>Execution, queue, policy decisions, dashboards and trusted checks.</td></tr>
@@ -1291,7 +1392,7 @@ bash tools/make_release.sh 0.0.0-test /tmp/pack-release</pre>
 <p>Record changes under Unreleased in <code>CHANGELOG.md</code>. For a release, set <code>VERSION</code>, write the release entry, commit and tag the version. <code>tools/make_release.sh</code> archives the committed tag, accepting the version with or without v. The smoke version archives committed HEAD. Generated artifacts are excluded. The tool unpacks the result, checks version and project leaks and runs the offline suite with shellcheck required. It publishes the compressed archive and SHA-256 file after verification. The archive includes this manual under <code>docs/manual/index.html</code>. Follow <code>docs/TRANSFER.md</code> to verify the checksum and unpack at the destination.</p>
 </section>
 
-<section id="operations"><h2>11. Operations and troubleshooting</h2>
+<section id="operations"><h2>12. Operations and troubleshooting</h2>
 <table><thead><tr><th>Symptom</th><th>What to inspect and do</th></tr></thead><tbody>
 <tr><td>Scope violation</td><td>Inspect the actual changed paths, brief globs and active workspace components. Remove unrelated edits or have the human revise and reapprove the scope.</td></tr>
 <tr><td>Test-lock violation</td><td>Compare test files against trusted baseline. Restore protected tests. Request a registered deviation if the test contract legitimately changes.</td></tr>
@@ -1303,7 +1404,7 @@ bash tools/make_release.sh 0.0.0-test /tmp/pack-release</pre>
 </tbody></table>
 </section>
 
-<section id="gaps"><h2>12. Known gaps</h2>
+<section id="gaps"><h2>13. Known gaps</h2>
 <ul>
 <li>The README describes Python 3.10+ support. <code>enforcement/gate/gate.py</code> imports stdlib tomllib directly, so run the full gate with Python 3.11 or newer.</li>
 <li><code>.devpack/project.example.toml</code> says <code>allow_unsandboxed_local</code> permits local isolation. <code>runner/agent_exec.py</code> records that worker-project value as ignored. Use trusted authorization.</li>

@@ -59,9 +59,9 @@ def stop_at_parse(parser, *args, **kwargs):
 
 
 @contextmanager
-def parser_environment(path, temp):
+def parser_environment(path, temp, argv=None):
     with patch.object(sys, "path", [str(path.parent), str(ROOT), *sys.path]), \
-         patch.object(sys, "argv", [str(path)]), \
+         patch.object(sys, "argv", list(argv) if argv is not None else [str(path)]), \
          patch.object(sys, "dont_write_bytecode", True), \
          patch.dict("os.environ", {"DEVPACK_PROJECT_CONFIG": "none", "XDG_STATE_HOME": temp}):
         yield
@@ -74,16 +74,14 @@ def entry_points():
     for path in sorted(candidates):
         if "tests" in path.relative_to(ROOT).parts[:-1] and path.name != "verify_orchestrator_goals.py":
             continue
-        if path.name.startswith("devpack_cli"):
-            continue
         source = path.read_text(encoding="utf-8")
         if "ArgumentParser(" in source and ".parse_args(" in source:
             yield path
     yield ROOT / "runner/dash/tui/__main__.py"
 
 
-def parser_for(path, temp):
-    with parser_environment(path, temp), patch.object(argparse.ArgumentParser, "parse_args", stop_at_parse):
+def parser_for(path, temp, argv=None):
+    with parser_environment(path, temp, argv), patch.object(argparse.ArgumentParser, "parse_args", stop_at_parse):
         try:
             if path == ROOT / "runner/dash/tui/__main__.py":
                 runpy.run_module("runner.dash.tui.__main__", run_name="__main__")
@@ -92,6 +90,39 @@ def parser_for(path, temp):
         except ParserReady as captured:
             return captured.parser
     raise AssertionError(f"No CLI parser reached for {path.relative_to(ROOT)}")
+
+
+def entry_commands(path, temp):
+    if path == ROOT / "runner/devpack_cli.py":
+        top = parser_for(path, temp, [str(path), "version"])
+        yield "", top
+        cmd_action = next(a for a in top._actions if a.dest == "command")
+        orig_parse_args = argparse.ArgumentParser.parse_args
+        with parser_environment(path, temp):
+            from runner import devpack_cli
+            forwarded = set(devpack_cli.COMMANDS)
+        for choice in cmd_action.choices:
+            if choice in forwarded:
+                continue
+            calls = 0
+
+            def stop_on_second(self, args=None, namespace=None):
+                nonlocal calls
+                calls += 1
+                if calls >= 2:
+                    raise ParserReady(self)
+                return orig_parse_args(self, args, namespace)
+
+            with parser_environment(path, temp, [str(path), choice]), \
+                 patch.object(argparse.ArgumentParser, "parse_args", stop_on_second):
+                try:
+                    runpy.run_path(str(path), run_name="__main__")
+                except ParserReady as captured:
+                    yield choice, captured.parser
+                    continue
+            raise AssertionError(f"No CLI parser reached for {path.relative_to(ROOT)} {choice}")
+        return
+    yield from commands(parser_for(path, temp))
 
 
 def commands(parser, command=""):
@@ -134,18 +165,24 @@ class ManualTest(unittest.TestCase):
 
     def test_cli_options_match_parsers(self):
         expected = set()
+        devpack_choices = set()
         with tempfile.TemporaryDirectory() as temp:
             for path in entry_points():
-                for command, parser in commands(parser_for(path, temp)):
+                for command, parser in entry_commands(path, temp):
                     entry = path.relative_to(ROOT).as_posix()
                     expected.add((entry, command, ""))
                     for action in parser._actions:
+                        if entry == "runner/devpack_cli.py" and command == "" and action.dest == "command":
+                            devpack_choices.update(action.choices)
                         for option in action.option_strings:
                             expected.add((entry, command, option))
-        documented = Manual().cli
+        manual = Manual()
+        documented = manual.cli
         self.assertTrue(documented)
         self.assertEqual(len(documented), len(set(documented)))
         self.assertSetEqual(expected, set(documented))
+        self.assertTrue(devpack_choices)
+        self.assertLessEqual(devpack_choices, set(manual.code))
 
     def test_no_project_leaks(self):
         with tempfile.TemporaryDirectory() as temp:
