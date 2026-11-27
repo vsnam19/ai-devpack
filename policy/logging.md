@@ -16,6 +16,7 @@ plus random hex suffix, `yyyymmddThhmmssZ-<6hex>`):
 | `runs/<run-id>/steps/NN-<role>-<engine>.jsonl` | Redacted raw `stream-json` event stream from the agent CLI |
 | `runs/<run-id>/steps/NN-<role>-<engine>.meta.json` | Step execution summary: status, exit code, model, duration, turns, tokens in/out, cost in USD, tool-call counts, `tool_protocol_errors`, and prompt SHA-256 |
 | `runs/<run-id>/steps/NN-gate.txt` | Deterministic gate output when a gate check ran at step `NN` |
+| `runs/<run-id>/steps/NN-gate-receipt.json` | Machine-readable receipt from the pack gate at step `NN`, including each gate attempt after a fix |
 | `runs/<run-id>/transcript.md` | Human-readable Markdown transcript rendered across all steps in order |
 | `runs/<run-id>/index.html` | Self-contained static HTML page (inline CSS, light/dark mode, no JavaScript or external assets) |
 

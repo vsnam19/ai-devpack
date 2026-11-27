@@ -953,6 +953,50 @@ def build_gate_argv(
     return argv
 
 
+def prepare_gate_receipt(receipt: Path, *, clear: bool = True) -> None:
+    """Validate the absolute steps directory and optionally remove the old receipt."""
+    steps_dir = receipt.parent
+    if steps_dir.resolve(strict=True) != steps_dir or not steps_dir.is_dir():
+        raise ValueError("expected a directory without symlinks")
+    if clear:
+        receipt.unlink(missing_ok=True)
+
+
+def set_gate_receipt(
+    command: Sequence[str], workdir: Path, receipt: Path, *, pack_root: Path | str | None = None,
+) -> tuple[list[str], bool]:
+    """Route direct invocations of the pack gate to the current step's receipt."""
+    argv = list(command)
+    root = Path(pack_root) if pack_root is not None else Path(__file__).resolve().parents[1]
+    scripts = {Path(DEFAULT_GATE_CMD[1]).resolve(), (root / "enforcement/gate/gate.py").resolve()}
+    if not argv:
+        return argv, False
+    launcher_index = int(Path(argv[0]).name == "env")
+    script_index = launcher_index
+    if launcher_index < len(argv) and (workdir / argv[launcher_index]).resolve() not in scripts:
+        script_index += 1
+        if re.fullmatch(r"python(?:[23](?:\.\d+)?)?", Path(argv[launcher_index]).name):
+            while script_index < len(argv) and argv[script_index].startswith("-"):
+                option = argv[script_index]
+                if option == "-" or option.startswith(("-c", "-m")):
+                    return argv, False
+                script_index += 2 if option in {"-W", "-X", "--check-hash-based-pycs"} else 1
+                if option == "--":
+                    break
+    if script_index >= len(argv) or (workdir / argv[script_index]).resolve() not in scripts:
+        return argv, False
+
+    result = argv[:script_index + 1]
+    options = iter(argv[script_index + 1:])
+    for arg in options:
+        if arg == "--receipt":
+            next(options, None)
+        elif not arg.startswith("--receipt="):
+            result.append(arg)
+    result[script_index + 1:script_index + 1] = ["--receipt", str(receipt)]
+    return result, True
+
+
 def resolve_project_gate_command(
     workdir: Path,
     gate_config: Path | str | None = None,

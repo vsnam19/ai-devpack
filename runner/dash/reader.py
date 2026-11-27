@@ -32,6 +32,7 @@ FILTER_KEYS = {"backend", "state", "role", "agent", "model"}
 STEM = re.compile(r"(\d{2,})-([A-Za-z0-9_.-]+)\.(meta\.json|prompt\.md|jsonl)")
 GATE = re.compile(r"step_(\d{2,})_gate\.json")
 GATE_TEXT = re.compile(r"(\d{2,})-gate\.txt")
+GATE_RECEIPT = re.compile(r"(\d{2,})-gate-receipt\.json")
 QUEUE = re.compile(r"(.+)\.(request|response)\.json")
 OUTCOMES = {
     "running": "running", "awaiting_approval": "waiting for approval", "rejected": "rejected",
@@ -684,10 +685,14 @@ class Reader:
             flags["command"] = self.text(shlex.join([part for part in raw["command"] if isinstance(part, str)]))
         verdict = raw.get("gate_passed")
         status = flags.get("gate_status") if receipt else None
+        findings = {
+            key: self.findings(raw.get(key))
+            for key in ("lint_findings", "static_findings")
+            if not receipt or key in raw
+        }
         return {
             **flags, "step": step, "status": ("pass" if verdict else "fail") if type(verdict) is bool else status,
-            "lint_findings": self.findings(raw.get("lint_findings")),
-            "static_findings": self.findings(raw.get("static_findings")),
+            **findings,
             "checks": self.findings(raw.get("checks")),
         }
 
@@ -720,12 +725,19 @@ class Reader:
                 step = int(match[1])
                 gate = result.setdefault(step, {"step": step, "status": None})
                 gate["transcript"] = self.excerpt(root / "steps" / name)
-        receipt = root / "steps" / "02-gate-receipt.json"
-        if receipt.name in self.children(receipt.parent):
-            try:
-                result[2] = {**result.get(2, {}), **self.gate_at(receipt, 2, receipt=True)}
-            except READ_ERRORS:
-                notices.append("Gate receipt unreadable for step 2")
+            match = GATE_RECEIPT.fullmatch(name)
+            if match:
+                step = int(match[1])
+                try:
+                    receipt = self.gate_at(root / "steps" / name, step, receipt=True)
+                    gate = result.setdefault(step, {})
+                    if gate.get("status") == "fail" or ("status" in gate and receipt["status"] is None):
+                        del receipt["status"]
+                    gate.update(receipt)
+                    gate.setdefault("lint_findings", [])
+                    gate.setdefault("static_findings", [])
+                except READ_ERRORS:
+                    notices.append(f"Gate receipt unreadable for step {step}")
         return [result[step] for step in sorted(result)], notices
 
     def make_job(self, native, run, approvals, request=None, wrapper=None, response=None, notices=()):

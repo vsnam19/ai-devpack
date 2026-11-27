@@ -205,7 +205,7 @@ def load_task_data(
         "BASE_COMMIT": "HEAD~1",
         "HEAD_COMMIT": "HEAD",
         "BRIEF_FILE": "brief_implement.md",
-        "GATE_RECEIPT": "gate_receipt.json",
+        "GATE_RECEIPT": "",
         "IN_SCOPE": allowed_files or "src/*",
         "MAX_WORDS": "1200",
         "REVIEW_FILE": "review.md",
@@ -546,6 +546,7 @@ def _enforce_step_scope_and_test_lock(
     pack_root: Path,
     control_before: Mapping[str, str],
     ws_scope: Any,
+    pack_artifacts: Mapping[str, str],
     timeout_s: int = 60,
 ) -> tuple[bool, str, str, list[str], str]:
     """Run ``scope_check.py --allow`` and ``test_lock.py --no-deviation`` after an agent step.
@@ -555,7 +556,7 @@ def _enforce_step_scope_and_test_lock(
     if base_ref is None:
         return True, "ok", "skipped", [], ""
 
-    changed_files, changed_err = get_changed_files(worktree, base_ref)
+    changed_files, changed_err = get_changed_files(worktree, base_ref, pack_artifacts=pack_artifacts)
     if changed_files is None:
         detail = changed_err or "failed to enumerate changed files"
         return False, "violation", "fail", [], f"SCOPE_VIOLATION: {detail}"
@@ -632,6 +633,8 @@ def _enforce_step_scope_and_test_lock(
                     scope_cmd.extend(["--components", ",".join(c.name for c in ws_scope.active_components)])
             for extra_gate in trusted_cfg.protected_rel_paths:
                 scope_cmd.extend(["--gate-config-file", extra_gate])
+            for path, digest in pack_artifacts.items():
+                scope_cmd.extend(["--pack-artifact", path, digest])
             s_rc, s_out, s_err, _ = execute_command(scope_cmd, cwd=worktree, timeout_s=timeout_s)
             s_comb = (s_out + ("\n" + s_err if s_err else "")).strip()
             if s_rc != 0:
@@ -850,6 +853,7 @@ def run_task_workflow(
 
     log_dir.mkdir(parents=True, exist_ok=True)
     active_run_dir = run_dir if run_dir is not None else log_dir
+    receipt_dir = active_run_dir.resolve() / "steps"
     (active_run_dir / "steps").mkdir(parents=True, exist_ok=True)
     role_engine_map = {
         "implementer": impl_engine.name,
@@ -1073,6 +1077,7 @@ def run_task_workflow(
     control_before = _control_snapshot(worktree)
     step_index = 0
     step_logs: list[str] = []
+    pack_artifacts: dict[str, str] = {}
     total_cost_usd = 0.0
     local_tokens = 0
     local_wall_s = 0.0
@@ -1134,6 +1139,7 @@ def run_task_workflow(
             pack_root=lint_pack_root,
             control_before=control_before,
             ws_scope=ws_scope,
+            pack_artifacts=pack_artifacts,
         )
         scope_status = s_status
         test_lock_status = tl_status
@@ -1279,11 +1285,29 @@ def run_task_workflow(
             break
         # Step: Gate (configured gate_cmd + preflight lint on changed C/C++ files)
         step_index += 1
+        receipt = receipt_dir / f"{step_index:02d}-gate-receipt.json"
+        step_gate_cmd, writes_receipt = agent_exec.set_gate_receipt(
+            gate_cmd, worktree, receipt, pack_root=lint_pack_root,
+        )
+        try:
+            agent_exec.prepare_gate_receipt(receipt, clear=writes_receipt)
+        except (OSError, RuntimeError, ValueError):
+            escalation_reason = "Cannot safely prepare the gate receipt directory or file."
+            enforcement_failed = True
+            break
         gate_rc, gate_out, gate_err, gate_dur = execute_command(
-            gate_cmd,
+            step_gate_cmd,
             cwd=worktree,
             timeout_s=gate_timeout_s,
         )
+        context = {**context, "GATE_RECEIPT": ""}
+        if writes_receipt and receipt.is_file() and not receipt.is_symlink():
+            if isolation == "local":
+                context["GATE_RECEIPT"] = str(receipt)
+            if receipt.is_relative_to(worktree.resolve()):
+                pack_artifacts[receipt.relative_to(worktree.resolve()).as_posix()] = (
+                    hashlib.sha256(receipt.read_bytes()).hexdigest()
+                )
         gate_passed = gate_rc == 0
         combined_gate_output = (gate_out + ("\n" + gate_err if gate_err else "")).strip()
 
@@ -1292,7 +1316,7 @@ def run_task_workflow(
         static_findings = 0
         static_ok = True
         if base_ref is not None:
-            changed_files, _ = get_changed_files(worktree, base_ref)
+            changed_files, _ = get_changed_files(worktree, base_ref, pack_artifacts=pack_artifacts)
             with tempfile.TemporaryDirectory(prefix="devpack-run-gate-cfg-") as gate_cfg_tmp:
                 trusted_cfg = resolve_trusted_gate_config(
                     worktree,
@@ -1408,7 +1432,7 @@ def run_task_workflow(
                 "step_index": step_index,
                 "step": "gate",
                 "round": fix_rounds_used,
-                "command": gate_cmd,
+                "command": step_gate_cmd,
                 "returncode": gate_rc,
                 "gate_passed": gate_passed,
                 "lint_findings": lint_findings,

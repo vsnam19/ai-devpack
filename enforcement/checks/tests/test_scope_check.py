@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import pathlib
 import subprocess
@@ -71,6 +72,38 @@ class TestScopeCheck(unittest.TestCase):
         with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
             code = scope_check.main(args)
         return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def test_pack_artifact_exclusion_requires_exact_untracked_path_and_content(self) -> None:
+        artifact = self.repo_dir / "runs" / "one" / "steps" / "02-gate-receipt.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"pack receipt")
+        args = [
+            "--repo", str(self.repo_dir), "--base", "HEAD", "--allow", "src/**",
+            "--pack-artifact", artifact.relative_to(self.repo_dir).as_posix(),
+            hashlib.sha256(b"pack receipt").hexdigest(),
+        ]
+        code, out, _ = self._run_scope(args)
+        self.assertEqual(code, 0, out)
+
+        same_name = self.repo_dir / "docs" / artifact.name
+        same_name.write_bytes(b"pack receipt")
+        (self.repo_dir / "gate_receipt.json").write_bytes(b"pack receipt")
+        code, out, _ = self._run_scope(args)
+        self.assertEqual(code, 1)
+        self.assertIn(f"SCOPE_VIOLATION: docs/{artifact.name}", out)
+        self.assertIn("SCOPE_VIOLATION: gate_receipt.json", out)
+        self.assertNotIn("SCOPE_VIOLATION: runs/", out)
+
+        artifact.write_bytes(b"agent edit")
+        code, out, _ = self._run_scope(args)
+        self.assertEqual(code, 1)
+        self.assertIn("SCOPE_VIOLATION: runs/", out)
+
+        artifact.write_bytes(b"pack receipt")
+        subprocess.run(["git", "add", str(artifact)], cwd=self.repo_dir, check=True)
+        code, out, _ = self._run_scope(args)
+        self.assertEqual(code, 1)
+        self.assertIn("SCOPE_VIOLATION: runs/", out)
 
     def test_happy_path_all_changes_within_allowed_globs(self) -> None:
         """Changes matching allowed globs succeed with exit code 0."""

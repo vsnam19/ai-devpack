@@ -80,6 +80,17 @@ class TestGateRunner(unittest.TestCase):
             code = gate.main(args)
         return code, buf.getvalue()
 
+    def test_write_receipt_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            target = root / "target.json"
+            target.write_text("original", encoding="utf-8")
+            receipt = root / "receipt.json"
+            receipt.symlink_to(target)
+            with self.assertRaises(OSError):
+                gate.write_receipt(receipt, "GATE_OK", None, root, [])
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+
     def test_happy_path_runs_ordered_checks_and_writes_receipt(self) -> None:
         """All checks pass in order inside repo root, printing GATE_OK and writing full JSON receipt."""
         head_sha = _init_git_repo(self.repo_dir)
