@@ -1,9 +1,12 @@
-"""Keyboard-first dashboard backed by the demo snapshot."""
+"""Keyboard-first dashboard for pack runs and demo fixtures."""
+
+import time
 
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Input, Markdown, OptionList, RichLog, Static, Tabs, Tab
@@ -11,6 +14,7 @@ from textual.widgets.option_list import Option
 from rich.text import Text
 
 from .fixtures import LIVE_MESSAGES, demo_snapshot, event
+from .source import current_step, empty_snapshot, find, selection
 
 PANELS = ("plans", "tasks", "agents", "approvals")
 TABS = {"brief": "Brief", "log": "Log", "gate": "Gate", "graph": "Plan graph", "meta": "Meta"}
@@ -20,6 +24,7 @@ STATES = {
     "failed": ("✗", "error", "Failed"),
     "awaiting_approval": ("⏸", "warning", "Awaiting approval"),
     "blocked": ("⏸", "foreground", "Blocked"),
+    "unknown": ("?", "foreground", "Unknown"),
     "queued": ("○", "foreground", "Queued"),
     "retrying": ("↻", "warning", "Retried"),
 }
@@ -43,7 +48,7 @@ KEYMAP = (
 def elapsed(seconds):
     if seconds is None:
         return "–"
-    minutes, seconds = divmod(seconds, 60)
+    minutes, seconds = divmod(int(seconds), 60)
     return f"{minutes}m{seconds:02d}" if minutes else f"{seconds}s"
 
 
@@ -73,6 +78,14 @@ class Panel(OptionList):
         self.focus()
 
 
+class Polled(Message):
+    def __init__(self, keys, snapshot, delay):
+        super().__init__()
+        self.keys = keys
+        self.snapshot = snapshot
+        self.delay = delay
+
+
 class Dashboard(App):
     TITLE = "Work dashboard"
     CSS_PATH = "dashboard.tcss"
@@ -86,6 +99,8 @@ class Dashboard(App):
         Binding("k", "move_row(-1)", "Up"),
         Binding("left_square_bracket", "change_tab(-1)", "Previous tab"),
         Binding("right_square_bracket", "change_tab(1)", "Next tab"),
+        Binding("left", "attempt(-1)", show=False),
+        Binding("right", "attempt(1)", show=False),
         Binding("f", "follow", "Follow"),
         Binding("slash", "filter", "Filter"),
         Binding("escape", "clear_filter", "Clear filter"),
@@ -95,13 +110,19 @@ class Dashboard(App):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, *, live=True):
+    def __init__(self, *, live=True, source=None):
         super().__init__()
-        self.snapshot = demo_snapshot()
-        self.plan = self.snapshot["plans"][0]
-        self.selected_task = self.plan["jobs"][0]
-        self.step = self.selected_task["steps"][0]
-        self.approval = self.snapshot["approvals"][0]
+        self.source = source
+        self.snapshot = empty_snapshot() if source else demo_snapshot()
+        self.plan = self.snapshot["plans"][0] if not source else None
+        self.selected_task = self.plan["jobs"][0] if self.plan else None
+        self.step = self.selected_task["steps"][0] if self.selected_task else None
+        self.approval = self.snapshot["approvals"][0] if not source else None
+        self.attempt_id = None
+        self.pending_poll = False
+        self.next_poll = 0
+        self.next_age = 0
+        self.log_sequence = 0
         self.panel = "plans"
         self.detail_source = "plans"
         self.filters = dict.fromkeys(PANELS, "")
@@ -135,7 +156,7 @@ class Dashboard(App):
                             yield Static(id=f"{panel}-title", classes="panel-title")
                         yield Panel(id=panel)
             with Vertical(id="main"):
-                yield Static(id="context")
+                yield Static(id="context", markup=False)
                 yield Tabs(*(Tab(label, id=key) for key, label in TABS.items()), id="tabs")
                 yield Static(id="detail-status", markup=False)
                 with VerticalScroll(id="reading"):
@@ -153,8 +174,60 @@ class Dashboard(App):
         self.action_panel("plans")
         self.update_top()
         self.show_detail()
-        if self.live:
+        if self.source:
+            self.poll_if_due()
+            self.set_interval(min(0.2, self.source.interval), self.poll_if_due)
+        elif self.live:
             self.set_interval(1, self.tick)
+
+    def selection_keys(self):
+        return (self.plan["id"] if self.plan else None,
+                self.selected_task["id"] if self.selected_task else None,
+                self.attempt_id, self.step["id"] if self.step else None)
+
+    def poll_if_due(self):
+        if not self.is_running:
+            return
+        now = time.monotonic()
+        if now >= self.next_age:
+            self.next_age = now + 1
+            self.update_top()
+        if not self.pending_poll and now >= self.next_poll:
+            self.pending_poll = True
+            keys = self.selection_keys()
+
+            def read():
+                try:
+                    snapshot, delay = self.source.poll(keys)
+                except (OSError, ValueError, RecursionError):
+                    snapshot, delay = None, self.source.interval
+                self.post_message(Polled(keys, snapshot, delay))
+
+            self.run_worker(read, thread=True)
+
+    @on(Polled)
+    def apply_poll(self, message):
+        self.pending_poll = False
+        if not self.is_running:
+            return
+        if message.keys != self.selection_keys():
+            self.next_poll = 0
+            return
+        self.next_poll = time.monotonic() + message.delay
+        if message.snapshot is None:
+            self.snapshot = {**self.snapshot, "health": "unavailable"}
+            self.update_top()
+            return
+        approval_id = self.approval["id"] if self.approval else None
+        self.plan, self.selected_task, self.step = selection(message.snapshot, message.keys)
+        self.attempt_id = self.selected_task["run_id"] if self.selected_task else None
+        self.snapshot = message.snapshot
+        approvals = self.snapshot["approvals"]
+        self.approval = find(approvals, approval_id, approvals[0] if approvals else None)
+        for panel in PANELS:
+            self.populate(panel, choose_first=False)
+        self.update_top()
+        self.show_detail(preserve_scroll=True)
 
     def on_resize(self, event):
         screen = self.default_screen
@@ -191,8 +264,8 @@ class Dashboard(App):
     def rows(self, panel):
         return {
             "plans": self.snapshot["plans"],
-            "tasks": self.plan["jobs"],
-            "agents": self.selected_task["steps"],
+            "tasks": self.plan["jobs"] if self.plan else [],
+            "agents": self.selected_task["steps"] if self.selected_task else [],
             "approvals": self.snapshot["approvals"],
         }[panel]
 
@@ -220,7 +293,11 @@ class Dashboard(App):
             text = self.state_text(row["state"])
             text.append(f" {row['task_id']} ", style="bold")
             text.append(title)
-            if not small:
+            if self.source:
+                attempt = row["attempt"]
+                total = row["attempts"]
+                text.append(f"  ↻{attempt}/{total}" if total > 1 else "  ↻1", style="dim")
+            if not small and not self.source:
                 text.append(f"{' ' * (20 - len(title))}{row['attempts']}× {elapsed(row['age_s']):>5}",
                             style="dim")
                 if row["depends_on"]:
@@ -232,15 +309,26 @@ class Dashboard(App):
             model = f"{row['engine']}:{row['model']}"
             if small:
                 text.append(f"\n   {model}")
+                if self.source:
+                    duration = elapsed(row["duration_s"]) if row["duration_s"] is not None else "?"
+                    tokens_in, tokens_out = (row[key] if row[key] is not None else "?"
+                                             for key in ("tokens_in", "tokens_out"))
+                    text.append(f"\n   {duration}  {tokens_in}/{tokens_out}  {amount(row['cost_usd'])}", style="dim")
                 return text
             text.append(model, style=self.color("secondary"))
-            text.append(f" {elapsed(row['duration_s']):>5}", style="dim")
+            duration = "?" if self.source and row["duration_s"] is None else elapsed(row["duration_s"])
+            text.append(f" {duration:>5}", style="dim")
             tokens = row["tokens_in"]
             text.append(f"\n   Attempt {row['attempt']}   {tokens if tokens is not None else '?'} in"
-                        f" / {row['tokens_out'] if tokens is not None else '?'} out"
+                        f" / {row['tokens_out'] if row['tokens_out'] is not None else '?'} out"
                         f"   {amount(row['cost_usd'])}", style="dim")
             return text
-        text = Text("⏸ ", style=self.color("warning"))
+        if self.source:
+            status = {"approved": "done", "rejected": "failed"}.get(row["status"], "awaiting_approval")
+            text = self.state_text(status)
+            text.append(" ")
+        else:
+            text = Text("⏸ ", style=self.color("warning"))
         text.append(f"{row['id']}  {row['task_id']}", style="bold")
         text.append(f"  {row['checkpoint']}" if not small else f"\n   {row['checkpoint']}")
         return text
@@ -255,19 +343,49 @@ class Dashboard(App):
         self.visible_rows[panel] = {row["id"]: row for row in rows}
         selected = self.selection(panel)
         index = next((i for i, row in enumerate(rows) if row is selected), None)
-        widget.clear_options()
-        widget.add_options(Option(self.row_text(panel, row), id=row["id"]) for row in rows)
-        if not rows:
-            widget.add_option(Option("No matches", disabled=True))
-        elif index is None and choose_first:
+        if index is None and rows and choose_first:
             index = 0
-        widget.highlighted = index
+        options = [Option(self.row_text(panel, row), id=row["id"]) for row in rows]
+        if not rows:
+            message = "No matches"
+            if not query:
+                message = {
+                    "plans": self.snapshot.get("message", "No plans."),
+                    "tasks": "No tasks.", "agents": "No agent steps.", "approvals": "No approvals.",
+                }[panel]
+            options.append(Option(message, disabled=True))
+        if self.source and not choose_first:
+            old_options = widget.options
+            with widget.prevent(OptionList.OptionHighlighted):
+                if [option.id for option in old_options] != [option.id for option in options]:
+                    widget.set_options(options)
+                else:
+                    for i, (old, new) in enumerate(zip(old_options, options)):
+                        if old.prompt != new.prompt:
+                            widget.replace_option_prompt_at_index(i, new.prompt)
+                widget.highlighted = index
+        else:
+            widget.clear_options()
+            widget.add_options(options)
+            widget.highlighted = index
         suffix = f"  ·  {self.snapshot['pending_approvals']} pending" if panel == "approvals" else ""
         if self.filters[panel]:
             suffix += f"  /{self.filters[panel]}"
         self.query_one(f"#{panel}-title", Static).update(panel.title() + suffix)
 
     def update_top(self):
+        if self.source:
+            data = self.snapshot
+            observed = data["observed"]
+            age = "?" if observed is None else f"{int(time.monotonic() - observed)}s"
+            text = Text("LIVE", style=f"bold {self.color('accent')}")
+            text.append(f"   ● {data['running']} run", style=self.color("primary"))
+            text.append(f"   ✗ {data['failed']} fail", style=self.color("error"))
+            text.append(f"   ⏸ {data['awaiting']} wait", style=self.color("warning"))
+            text.append(f"   Today {amount(data['cost_today'])}")
+            text.append(f"   Source {data['health']}   Age {age}", style="dim")
+            self.query_one("#top", Static).update(text)
+            return
         jobs = self.snapshot["jobs"]
         running = sum(job["state"] == "running" for job in jobs)
         failed = sum(step["status"] == "failed" for job in jobs for step in job["steps"])
@@ -300,24 +418,40 @@ class Dashboard(App):
     @on(OptionList.OptionHighlighted)
     def highlight(self, message):
         panel = message.option_list.id
-        row = self.visible_rows[panel].get(message.option.id)
+        row = self.visible_rows.get(panel, {}).get(message.option.id)
         if row is None or row is self.selection(panel):
             return
         if panel == "plans":
             self.plan = row
-            self.selected_task = row["jobs"][0]
-            self.step = self.selected_task["steps"][0]
+            self.selected_task = row["jobs"][0] if row["jobs"] else None
+            if self.selected_task:
+                self.step = current_step(self.selected_task) if self.source else self.selected_task["steps"][0]
+            else:
+                self.step = None
+            self.attempt_id = None
             self.populate("tasks")
             self.populate("agents")
         elif panel == "tasks":
             self.selected_task = row
-            self.step = row["steps"][(row["current_step"] or 1) - 1]
+            self.step = current_step(row)
+            self.attempt_id = None
             self.populate("agents")
         elif panel == "agents":
             self.step = row
         else:
             self.approval = row
         self.show_detail()
+        if self.source:
+            self.next_poll = 0
+
+    def action_attempt(self, direction):
+        task = self.selected_task
+        if not self.source or self.panel != "tasks" or not task:
+            return
+        index = task["attempt"] - 1 + direction
+        if 0 <= index < len(task["runs"]):
+            self.attempt_id = task["runs"][index]
+            self.next_poll = 0
 
     @on(OptionList.OptionSelected)
     def drill(self, message):
@@ -384,6 +518,8 @@ class Dashboard(App):
             self.show_detail()
 
     def check_action(self, action, parameters):
+        if action == "attempt" and (not self.source or self.focused is not self.query_one("#tasks")):
+            return False
         if isinstance(self.screen, Help):
             return False
         return super().check_action(action, parameters)
@@ -411,7 +547,12 @@ class Dashboard(App):
             self.action_panel("main")
 
     def plan_brief(self):
+        if not self.plan:
+            return self.snapshot["message"]
         finished = sum(job["state"] == "done" for job in self.plan["jobs"])
+        if self.source:
+            return (f"{self.plan['title']}\n\n{started(self.plan)}/{len(self.plan['jobs'])} started"
+                    f" · {finished} complete\n\n{self.selected_task['brief']}")
         return (
             f"## {self.plan['title']}\n\n"
             f"**{started(self.plan)}/{len(self.plan['jobs'])} started** · {finished} complete\n\n"
@@ -424,7 +565,7 @@ class Dashboard(App):
         status = {
             "brief": {"plans": "PLAN BRIEF", "approvals": "APPROVAL BRIEF",
                       "agents": "STEP BRIEF", "tasks": "TASK BRIEF"}[source],
-            "log": f"{'LIVE' if self.step['status'] == 'running' else 'EVENT STREAM'}"
+            "log": f"{'LIVE' if self.step and self.step['status'] == 'running' else 'EVENT STREAM'}"
                    f"    ·    Follow {'ON' if self.follow else 'OFF'}  [f]",
             "gate": "GATE RESULTS",
             "graph": "TASK DEPENDENCIES",
@@ -437,20 +578,24 @@ class Dashboard(App):
             keymap += "   ? help   q quit\n f follow   / filter   a approvals"
         else:
             keymap += "   f follow   / filter   a approvals   ? help   q quit"
+        if self.source and self.panel == "tasks" and self.selected_task and self.selected_task["attempts"] > 1:
+            keymap += "   ←/→ attempts"
         self.query_one("#keys", Static).update(Text(keymap))
 
-    def show_detail(self):
+    def show_detail(self, *, preserve_scroll=False):
         tab = self.query_one("#tabs", Tabs).active or "brief"
         source = self.detail_source
         if source == "plans":
-            context = f"{self.plan['id']}  /  {self.plan['title']}"
+            context = f"{self.plan['id']}  /  {self.plan['title']}" if self.plan else "Runs"
         elif source == "approvals":
-            context = f"{self.approval['id']}  /  {self.approval['checkpoint']}"
-        elif source == "agents":
-            context = f"{self.selected_task['task_id']}  /  {self.selected_task['title']}  /  {self.step['role']}"
-        else:
+            context = f"{self.approval['id']}  /  {self.approval['checkpoint']}" if self.approval else "Approvals"
+        elif self.selected_task:
             context = f"{self.selected_task['task_id']}  /  {self.selected_task['title']}"
-        self.query_one("#context", Static).update(context)
+            if source == "agents" and self.step:
+                context += f"  /  {self.step['role']}"
+        else:
+            context = "Runs"
+        self.query_one("#context", Static).update(Text(context) if self.source else context)
         self.update_status()
         reading = self.query_one("#reading", VerticalScroll)
         brief = self.query_one("#brief", Markdown)
@@ -458,11 +603,15 @@ class Dashboard(App):
         log = self.query_one("#log", RichLog)
         reading.display = tab != "log"
         log.display = tab == "log"
-        brief.display = tab == "brief"
-        detail.display = tab in ("gate", "graph", "meta")
-        reading.scroll_home(animate=False)
+        brief.display = tab == "brief" and not self.source
+        detail.display = tab in ("gate", "graph", "meta") or (tab == "brief" and self.source is not None)
+        if not preserve_scroll:
+            reading.scroll_home(animate=False)
         if tab == "brief":
-            brief.update(self.brief_body())
+            if self.source:
+                detail.update(Text(self.brief_body()))
+            else:
+                brief.update(self.brief_body())
         elif tab == "log":
             self.render_log()
         else:
@@ -472,13 +621,28 @@ class Dashboard(App):
         if self.detail_source == "plans":
             return self.plan_brief()
         if self.detail_source == "approvals":
-            return self.approval["brief"]
+            return self.approval["brief"] if self.approval else "No approvals."
         if self.detail_source == "agents":
-            return self.step["brief"]
-        return self.selected_task["brief"]
+            return self.step["brief"] if self.step else "No agent steps."
+        return self.selected_task["brief"] if self.selected_task else self.snapshot["message"]
 
     def render_log(self):
         log = self.query_one("#log", RichLog)
+        if self.source:
+            records = self.step["events"] if self.step else []
+            key = self.step.get("stream_key") if self.step else None
+            key = key or (*self.selection_keys(), "empty")
+            if self.log_step != key or (records and not self.log_sequence):
+                log.clear()
+                self.log_step, self.log_sequence = key, 0
+                if not records:
+                    log.write(Text("Waiting for the first event." if self.step else "No agent steps.", style="dim"),
+                              scroll_end=False)
+            for record in records:
+                if record["sequence"] > self.log_sequence:
+                    self.write_event(record)
+                    self.log_sequence = record["sequence"]
+            return
         if self.log_step is self.step:
             return
         self.log_step = self.step
@@ -491,19 +655,36 @@ class Dashboard(App):
     def write_event(self, record):
         line = Text(f"{record['sequence']:03d}  ", style="dim", overflow="fold")
         if record["kind"] == "tool":
-            code = record["exit_code"]
+            code = record.get("exit_code")
             line.append(f"$ {record['text']} ", style=self.color("primary"))
-            line.append(f"[exit {code}]", style=self.color("error" if code else "success"))
+            if code is not None:
+                line.append(f"[exit {code}]", style=self.color("error" if code else "success"))
         else:
             line.append(f"> {record['text']}", style=self.color("accent"))
         self.query_one("#log", RichLog).write(line, scroll_end=self.follow)
 
     def gates(self):
-        gates = self.step["gates"] or self.selected_task["gates"]
+        task_gates = self.selected_task["gates"] if self.selected_task else []
+        gates = (self.step["gates"] if self.step else []) or task_gates
         if not gates:
             return Text("No gate results yet.", style="dim")
         text = Text()
         for gate in gates:
+            if self.source:
+                status = str(gate.get("status") or "unknown")
+                text.append(f"Step {gate['step']:02}  {status.upper()}\n", style="bold")
+                if command := gate.get("command"):
+                    text.append(f"$ {command}\n", style=self.color("primary"))
+                if gate.get("returncode") is not None:
+                    text.append(f"Exit {gate['returncode']}\n")
+                for field in ("stdout", "stderr", "transcript", "error", "artifact_notice"):
+                    if gate.get(field):
+                        text.append(f"{gate[field]}\n")
+                for field in ("checks", "lint_findings", "static_findings"):
+                    for finding in gate.get(field, []):
+                        text.append("  ".join(str(value) for value in finding.values()) + "\n")
+                text.append("\n")
+                continue
             failed = gate["status"] == "fail"
             text.append(f"{'✗ FAIL' if failed else '✓ PASS'}  {gate['name']}  ·  Attempt {gate['attempt']}\n",
                         style=f"bold {self.color('error' if failed else 'success')}")
@@ -513,6 +694,8 @@ class Dashboard(App):
         return text
 
     def graph(self):
+        if not self.plan:
+            return Text(self.snapshot["message"])
         text = Text(self.plan["title"] + "\n\n", style="bold")
         jobs = self.plan["jobs"]
 
@@ -533,16 +716,34 @@ class Dashboard(App):
         return text
 
     def meta(self):
+        if not self.selected_task:
+            return Text(self.snapshot["message"])
         text = Text()
-        fields = {
-            "Job ID": self.selected_task["id"], "Kind": self.selected_task["kind"], "Task": self.selected_task["task_id"],
-            "Health": self.selected_task["health"], "Step ID": self.step["id"],
-            "Engine": f"{self.step['engine']}:{self.step['model']}",
-            "Started": self.step["started"], "Finished": self.step["finished"],
-            "Elapsed": elapsed(self.step["duration_s"]), "Tokens in": self.step["tokens_in"],
-            "Tokens out": self.step["tokens_out"], "Cost": amount(self.step["cost_usd"]),
-            **self.step["files"],
-        }
+        if self.source:
+            task = self.selected_task
+            fields = {
+                "Run ID": task["run_id"], "Kind": task["kind"], "Task": task["task_id"],
+                "Health": task["health"], "Attempt": f"{task['attempt']}/{task['attempts']}",
+                "Attempts": ", ".join(task["runs"]), "Started": task["started"], "Finished": task["finished"],
+            }
+            if self.step:
+                step = self.step
+                fields.update({
+                    "Step ID": step["id"], "Engine": f"{step['engine']}:{step['model']}",
+                    "Elapsed": elapsed(step["duration_s"]) if step["duration_s"] is not None else None,
+                    "Tokens in": step["tokens_in"], "Tokens out": step["tokens_out"],
+                    "Cost": amount(step["cost_usd"]), **step["files"],
+                })
+        else:
+            fields = {
+                "Job ID": self.selected_task["id"], "Kind": self.selected_task["kind"], "Task": self.selected_task["task_id"],
+                "Health": self.selected_task["health"], "Step ID": self.step["id"],
+                "Engine": f"{self.step['engine']}:{self.step['model']}",
+                "Started": self.step["started"], "Finished": self.step["finished"],
+                "Elapsed": elapsed(self.step["duration_s"]), "Tokens in": self.step["tokens_in"],
+                "Tokens out": self.step["tokens_out"], "Cost": amount(self.step["cost_usd"]),
+                **self.step["files"],
+            }
         for label, value in fields.items():
             text.append(f"{label:<13}", style=self.color("secondary"))
             text.append(f"{value if value is not None else '?'}\n")

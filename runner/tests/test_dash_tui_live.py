@@ -1,0 +1,181 @@
+"""Headless checks for the read-only terminal dashboard."""
+
+from contextlib import ExitStack
+from datetime import datetime, timezone
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from runner.dash.reader import Reader, Settings
+from runner.tests.test_dashboard_reader import write
+
+
+class LiveDashboardTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        try:
+            from runner.dash.tui.app import Dashboard
+        except ModuleNotFoundError as error:
+            if error.name == "textual":
+                self.skipTest("Textual is optional and is not installed")
+            raise
+        from runner.dash.tui.source import RunSource
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.settings = Settings(self.root, self.root / "runs", self.root / "state")
+        self.reader = Reader(self.settings)
+        self.app = Dashboard(source=RunSource(self.reader, interval=0.05))
+
+    def run_record(self, name, **fields):
+        path = self.settings.runs / name
+        write(path / "run.json", {"kind": "task", "outcome": "running", **fields})
+        write(path / "steps" / "01-build-engine.meta.json", {"status": "running"})
+        return path
+
+    async def wait_for(self, pilot, condition):
+        for _ in range(100):
+            await pilot.pause(0.04)
+            if condition():
+                return
+        self.assertTrue(condition(), "Dashboard did not show the expected update")
+
+    async def test_groups_attempts_and_propagates_selection_in_compact_layout(self):
+        self.run_record("first", plan_id="p01", task_id="build", started="2026-01-01T01:00:00Z")
+        self.run_record("second", plan_id="p01", task_id="build", started="2026-01-01T02:00:00Z")
+        self.run_record("loose", task="review")
+        async with self.app.run_test(size=(80, 24)) as pilot:
+            await self.wait_for(pilot, lambda: len(self.app.snapshot["plans"]) == 2)
+            groups = {plan["title"]: plan["jobs"] for plan in self.app.snapshot["plans"]}
+            self.assertEqual(set(groups), {"p01", "Ad-hoc runs"})
+            self.assertEqual(groups["p01"][0]["attempts"], 2)
+            self.assertEqual(groups["Ad-hoc runs"][0]["task_id"], "review")
+            if self.app.plan["title"] != "p01":
+                await pilot.press("j")
+            self.assertEqual(self.app.plan["title"], "p01")
+            await pilot.press("enter")
+            expected = self.app.plan["jobs"][0]["task_id"]
+            self.assertEqual(self.app.selected_task["task_id"], expected)
+            self.assertEqual(self.app.step["role"], "build")
+            self.assertEqual(self.app.focused.id, "tasks")
+            self.assertGreaterEqual(self.app.query_one("#main").region.width, 48)
+            self.assertIn(expected, self.app.query_one("#context").content.plain)
+            self.assertEqual(self.app.selected_task["run_id"], "second")
+            await pilot.press("left")
+            await self.wait_for(pilot, lambda: self.app.selected_task["run_id"] == "first")
+            await pilot.press("enter")
+            self.assertEqual(self.app.focused.id, "agents")
+
+    async def test_selected_stream_redaction_and_follow(self):
+        run = self.run_record("active", task="build")
+        path = run / "steps" / "01-build-engine.jsonl"
+        secret = "fake-secret-123456789"
+        (run / "steps" / "01-build-engine.prompt.md").write_text(f"token={secret}\n", encoding="utf-8")
+        write(run / "steps" / "02-review-engine.meta.json", {"status": "running", "duration_s": 1.5})
+        (run / "steps" / "02-review-engine.jsonl").write_text(
+            '{"type":"message","content":"other stream"}\n', encoding="utf-8",
+        )
+
+        def append(*messages):
+            with path.open("a", encoding="utf-8") as output:
+                for message in messages:
+                    output.write(json.dumps({"type": "message", "content": message}) + "\n")
+
+        append(f"token={secret}", *(f"record {i}" for i in range(55)))
+        async with self.app.run_test(size=(120, 35)) as pilot:
+            await self.wait_for(pilot, lambda: bool(self.app.plan))
+            detail = self.app.query_one("#detail")
+            self.assertIn("token=[REDACTED]", detail.content.plain)
+            self.assertNotIn(secret, detail.content.plain)
+            await pilot.press("3", "k", "]")
+            log = self.app.query_one("#log")
+
+            def log_text():
+                return "\n".join(line.text for line in log.lines)
+
+            await self.wait_for(pilot, lambda: "record 54" in log_text())
+            self.assertEqual(self.app.step["index"], 1)
+            self.assertIn("token=[REDACTED]", log_text())
+            self.assertNotIn(secret, log_text())
+            self.assertNotIn("other stream", log_text())
+            self.assertGreater(log.max_scroll_y, 0)
+            self.assertEqual(log.scroll_y, log.max_scroll_y)
+            append("new followed event")
+            await self.wait_for(pilot, lambda: "new followed event" in log_text())
+            self.assertEqual(log.scroll_y, log.max_scroll_y)
+            await pilot.press("f")
+            log.scroll_home(animate=False, immediate=True)
+            await pilot.pause()
+            position = log.scroll_y
+            self.assertLess(position, log.max_scroll_y)
+            append("new unfollowed event")
+            await self.wait_for(pilot, lambda: "new unfollowed event" in log_text())
+            self.assertEqual(log.scroll_y, position)
+            self.assertEqual(self.app.step["index"], 1)
+            await pilot.press("j")
+            await self.wait_for(pilot, lambda: "other stream" in log_text())
+            self.assertNotIn("new unfollowed event", log_text())
+            self.assertEqual(self.app.step["index"], 2)
+
+    async def test_gate_and_approval_commands_are_display_only(self):
+        started = datetime.now(timezone.utc).isoformat()
+        run = self.run_record("pause", task="review", outcome="awaiting_approval",
+                              approval_id="vote", checkpoint_id="brief", started=started)
+        write(run / "step_01_gate.json", {"gate_passed": False, "command": ["check"], "returncode": 1,
+                                        "stderr": "check failed"})
+        write(run / "steps" / "01-build-engine.meta.json", {"status": "running", "cost_usd": 0.25})
+        pending = write(self.settings.state / "approvals" / "pending" / "vote.json",
+                        {"id": "vote", "checkpoint": "brief", "status": "pending", "summary": "Review brief"})
+        before = pending.read_bytes()
+        commands = self.reader.commands("vote")
+
+        def forbidden(*args, **kwargs):
+            self.fail("Dashboard attempted an external action or filesystem mutation")
+
+        original_os_open, original_io_open = os.open, io.open
+
+        def read_only_fd(path, flags, *args, **kwargs):
+            if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
+                forbidden()
+            return original_os_open(path, flags, *args, **kwargs)
+
+        def read_only_file(file, mode="r", *args, **kwargs):
+            if any(flag in mode for flag in "wax+"):
+                forbidden()
+            return original_io_open(file, mode, *args, **kwargs)
+
+        with ExitStack() as guard:
+            for target in ("subprocess.Popen", "os.system", "os.kill", "os.mkdir",
+                           "os.unlink", "os.rename", "os.replace", "socket.create_connection"):
+                guard.enter_context(patch(target, side_effect=forbidden))
+            guard.enter_context(patch("os.open", side_effect=read_only_fd))
+            guard.enter_context(patch("io.open", side_effect=read_only_file))
+            guard.enter_context(patch("builtins.open", side_effect=read_only_file))
+            async with self.app.run_test(size=(120, 35)) as pilot:
+                await self.wait_for(pilot, lambda: bool(self.app.approval))
+                self.assertIn("1 wait", self.app.query_one("#top").content.plain)
+                self.assertIn("Today $0.250", self.app.query_one("#top").content.plain)
+                await pilot.press("]", "]")
+                self.assertIn("check failed", self.app.query_one("#detail").content.plain)
+                await pilot.press("a", "enter")
+                detail = self.app.query_one("#detail").content.plain
+                self.assertIn(commands["approve"], detail.splitlines())
+                self.assertIn(commands["reject"], detail.splitlines())
+        self.assertEqual(pending.read_bytes(), before)
+
+    async def test_empty_states(self):
+        async with self.app.run_test(size=(80, 24)) as pilot:
+            await self.wait_for(pilot, lambda: self.app.snapshot["health"] == "missing")
+            detail = self.app.query_one("#detail")
+            self.assertIn("Runs root missing", detail.content.plain)
+            await pilot.press("a")
+            self.assertEqual(detail.content.plain, "No approvals.")
+            self.settings.runs.mkdir()
+            self.app.next_poll = 0
+            await self.wait_for(pilot, lambda: self.app.snapshot["health"] == "current")
+            await pilot.press("1")
+            self.assertEqual(detail.content.plain, "No runs found.")
