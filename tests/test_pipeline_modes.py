@@ -117,6 +117,63 @@ def _write_engines_v2(path: Path, *, gate_cmd: str = '["true"]', max_fix_rounds:
 class PipelineModesTests(unittest.TestCase):
     """Test suite for operating modes, checkpoints, approvals, resume, and tamper boundaries."""
 
+    def test_project_gate_receipts_stay_in_run_directory_across_fixer_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _make_sample_repo(wt)
+            (wt / ".gitignore").write_text("/briefs/\n", encoding="utf-8")
+            (wt / "gate.toml").write_text(
+                '[[check]]\nname = "unit"\n'
+                'cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "tests"]\n',
+                encoding="utf-8",
+            )
+            (wt / "tests" / "test_unit.py").write_text(
+                "import unittest\nfrom pathlib import Path\n"
+                "class UnitTest(unittest.TestCase):\n"
+                "    def test_output(self):\n"
+                "        self.assertTrue(Path('src/output.txt').read_text().strip())\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
+            subprocess.run(["git", "commit", "-qm", "Configure unit gate"], cwd=wt, check=True)
+            cfg = devpack_run.load_engine_config(_write_engines_v2(base / "engines.toml"))
+            ctx = devpack_run.load_task_data(None, "receipt", "Write output", "Write output", "src/**")
+            run_dir = base / "run"
+            roles = []
+
+            def stub(request):
+                roles.append(request.role)
+                if request.role in {"reviewer", "fixer"}:
+                    index = 5 if roles.count("reviewer") == 2 else 2
+                    receipt = run_dir / "steps" / f"{index:02d}-gate-receipt.json"
+                    self.assertIn(str(receipt), request.prompt)
+                if request.role in {"implementer", "fixer"}:
+                    (wt / "src" / "output.txt").write_text(request.role, encoding="utf-8")
+                    result = "done"
+                else:
+                    result = "VERDICT: REQUEST_CHANGES" if roles.count("reviewer") == 1 else "VERDICT: APPROVE"
+                return agent_exec.AgentResult(status="ok", exit_code=0, final_text=result)
+
+            with mock.patch.object(devpack_run, "run_agent", side_effect=stub), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc, summary = devpack_run.run_task_workflow(
+                    cfg, ctx, wt, run_dir, REPO_ROOT, gate_config=wt / "gate.toml",
+                    plan_brief=_valid_brief_text().replace(
+                        "- `src/mod.cpp`", "- `src/**`\n- `tests/**`"
+                    ),
+                    isolation="local", allow_unsandboxed_local=True,
+                    brief_approved=True, state_dir=base / "state",
+                )
+
+            self.assertEqual(0, rc, summary)
+            self.assertEqual("ok", summary["scope"])
+            self.assertEqual(["implementer", "reviewer", "fixer", "reviewer"], roles)
+            self.assertFalse(list(wt.rglob("gate_receipt.json")))
+            for index in (2, 5):
+                receipt = run_dir / "steps" / f"{index:02d}-gate-receipt.json"
+                self.assertEqual("GATE_OK", json.loads(receipt.read_text())["gate_status"])
+
     def test_default_mode_is_hitl_and_blocking_vs_terminal_semantics(self) -> None:
         """Missing [pipeline] defaults to hitl; brief stops (exit 20) and terminal checkpoints keep exit code."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -60,6 +60,12 @@ deviation (`deviations.md`), never a default (LSN-014).
 8. **No host dependence.** The pack must not rely on user-level agent memory, plugins or
    global instruction files. The agent configuration comes from the repository.
 9. **Logging.** Tool calls and commands are logged to the task evidence directory.
+   The pack gate writes receipts under the run directory at `steps/NN-gate-receipt.json`.
+   If the run directory is under the working copy, the host scope checker accepts an
+   exact list of generated receipt paths and their SHA-256 digests. This exclusion
+   applies only to unchanged, untracked receipts at the recorded paths. Staged
+   changes, changed contents, symlinks and same-named files elsewhere are subject
+   to ordinary scope rules.
 
 ## Why
 

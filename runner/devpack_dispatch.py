@@ -615,14 +615,16 @@ def _resolve_gate_command(
     Raises ``ValueError`` when no gate can be resolved (for example, ``gate_config`` is unset).
     """
     timeout_s = engines_cfg.gate_timeout_s if engines_cfg is not None else 300
+    receipt = run_dir.absolute() / "steps" / "02-gate-receipt.json"
     if explicit_gate_cmd.strip():
-        return shlex.split(explicit_gate_cmd), timeout_s
+        command, _ = agent_exec.set_gate_receipt(shlex.split(explicit_gate_cmd), workdir, receipt, pack_root=pack_root)
+        return command, timeout_s
 
     if trusted_gate_toml is not None and trusted_gate_toml.is_file():
         return agent_exec.build_gate_argv(
             trusted_gate_toml,
             workdir,
-            receipt=run_dir / "steps" / "02-gate-receipt.json",
+            receipt=receipt,
             all_components=all_components,
             components=components,
             project_config_path=project_config_path,
@@ -630,9 +632,11 @@ def _resolve_gate_command(
         ), timeout_s
 
     if engines_cfg is not None and list(engines_cfg.gate_cmd) != list(agent_exec.DEFAULT_GATE_CMD):
-        return list(engines_cfg.gate_cmd), timeout_s
+        command, _ = agent_exec.set_gate_receipt(engines_cfg.gate_cmd, workdir, receipt, pack_root=pack_root)
+        return command, timeout_s
     return agent_exec.resolve_project_gate_command(
         workdir,
+        receipt=receipt,
         project_config_path=project_config_path,
         all_components=all_components,
         components=components,

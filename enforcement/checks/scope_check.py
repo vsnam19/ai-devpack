@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import fnmatch
+import hashlib
 import pathlib
 import re
 import subprocess
@@ -303,12 +305,15 @@ def _is_untracked_ignored(
     return ignored
 
 
-def get_changed_files(repo_root: pathlib.Path, base_ref: str) -> tuple[list[str] | None, str | None]:
+def get_changed_files(
+    repo_root: pathlib.Path, base_ref: str, *, pack_artifacts: Mapping[str, str] | None = None,
+) -> tuple[list[str] | None, str | None]:
     """Return sorted list of files changed since ``base_ref`` (committed, staged, working tree, or untracked).
 
     Untracked files are enumerated via ``git ls-files --others`` WITHOUT ``--exclude-standard``
     and filtered solely against trusted ``.gitignore`` snapshots from ``base_ref``, pack-owned
-    harness entries in ``.git/info/exclude``, and standard build-output directories.
+    harness entries in ``.git/info/exclude``, standard build-output directories, and
+    exact artifact paths with content hashes supplied by the host runner.
     """
     try:
         verify = run_git(
@@ -345,6 +350,14 @@ def get_changed_files(repo_root: pathlib.Path, base_ref: str) -> tuple[list[str]
             cleaned = entry.strip()
             if not cleaned:
                 continue
+            if pack_artifacts and entry in pack_artifacts:
+                artifact = repo_root.resolve() / entry
+                try:
+                    if artifact.resolve() == artifact and artifact.is_file():
+                        if hashlib.sha256(artifact.read_bytes()).hexdigest() == pack_artifacts[entry]:
+                            continue
+                except (OSError, RuntimeError):
+                    pass  # Keep unreadable or redirected artifacts subject to scope checks.
             if not _is_untracked_ignored(cleaned, base_rules, pack_excludes):
                 changed.add(cleaned)
     except GitSecurityError as exc:
@@ -397,6 +410,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Additional repository-relative gate/lint config path protected from worker edits.",
     )
+    parser.add_argument(
+        "--pack-artifact", action="append", nargs=2, default=[], metavar=("PATH", "SHA256"),
+        help="Host-recorded untracked pack artifact with exact repository-relative path and digest.",
+    )
     return parser
 
 
@@ -411,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.list_changed:
-        changed_files, err = get_changed_files(repo_root, args.base)
+        changed_files, err = get_changed_files(repo_root, args.base, pack_artifacts=dict(args.pack_artifact))
         if changed_files is None:
             print(f"SCOPE_ERROR: {err}", file=sys.stderr)
             return 1
@@ -449,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
                 effective_patterns.append(f"{ws_scope.workspace_root_rel}/{norm_pat}")
 
     compiled_globs = [glob_to_regex(pat) for pat in effective_patterns]
-    changed_files, err = get_changed_files(repo_root, args.base)
+    changed_files, err = get_changed_files(repo_root, args.base, pack_artifacts=dict(args.pack_artifact))
     if changed_files is None:
         print(f"SCOPE_ERROR: {err}", file=sys.stderr)
         return 1

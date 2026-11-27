@@ -385,6 +385,16 @@ class ReaderTest(unittest.TestCase):
         write(unreadable / "step_01_gate.json", {}).write_text("{")
         self.assertTrue(self.reader.snapshot(job_id="unreadable")["jobs"][0]["read_failed"])
 
+    def test_gate_receipts_are_read_for_each_numbered_attempt(self):
+        run = self.run_record("retry", outcome="pass")
+        write(run / "steps" / "02-gate-receipt.json", {"gate_status": "GATE_FAIL"})
+        write(run / "steps" / "05-gate-receipt.json", {"gate_status": "GATE_OK"})
+        (run / "steps" / "05-gate.txt").write_text("passed after fix")
+        gates = self.reader.snapshot(job_id="retry")["jobs"][0]["gates"]
+        self.assertEqual([(item["step"], item["status"]) for item in gates],
+                         [(2, "GATE_FAIL"), (5, "GATE_OK")])
+        self.assertEqual(gates[1]["transcript"], "passed after fix")
+
     def test_interactive_broker_selection_refreshes_native_runs(self):
         from unittest.mock import patch
 

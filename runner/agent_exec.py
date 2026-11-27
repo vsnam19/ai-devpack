@@ -949,6 +949,31 @@ def build_gate_argv(
     return argv
 
 
+def set_gate_receipt(
+    command: Sequence[str], workdir: Path, receipt: Path, *, pack_root: Path | str | None = None,
+) -> tuple[list[str], bool]:
+    """Route direct invocations of the pack gate to the current step's receipt."""
+    argv = list(command)
+    root = Path(pack_root) if pack_root is not None else Path(__file__).resolve().parents[1]
+    scripts = {Path(DEFAULT_GATE_CMD[1]).resolve(), (root / "enforcement/gate/gate.py").resolve()}
+    script_index = next(
+        (index for index, arg in enumerate(argv[:2]) if (workdir / arg).resolve() in scripts),
+        None,
+    )
+    if script_index is None:
+        return argv, False
+
+    result = argv[:script_index + 1]
+    options = iter(argv[script_index + 1:])
+    for arg in options:
+        if arg == "--receipt":
+            next(options, None)
+        elif not arg.startswith("--receipt="):
+            result.append(arg)
+    result[script_index + 1:script_index + 1] = ["--receipt", str(receipt)]
+    return result, True
+
+
 def resolve_project_gate_command(
     workdir: Path,
     gate_config: Path | str | None = None,
