@@ -13,6 +13,8 @@ exhaustive pass with a fixed taxonomy; at most 2 fix rounds; escalation ends at 
 **human**; agents never merge; sandbox by default; provenance and transcripts recorded
 internally.
 
+Open the [offline developer and operator manual](docs/manual/index.html) in a browser.
+
 ## Layout
 
 | Path | Content |
