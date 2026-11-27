@@ -9,7 +9,7 @@ from .files import Controls, RECORD_LIMIT, TICK_LIMIT, array, clean, mapping, re
 KNOWN = {
     "system", "assistant", "user", "result", "message", "tool_use", "tool_result",
     "thread.started", "turn.started", "turn.completed", "turn.failed",
-    "item.started", "item.updated", "item.completed",
+    "item.started", "item.updated", "item.completed", "notice",
 }
 
 
@@ -113,6 +113,8 @@ class Stream:
                         self.emit("message", self.excerpt(content), timestamp=timestamp)
                     for block in array(content):
                         self.block(mapping(block), timestamp)
+                elif kind == "notice":
+                    self.emit("notice", self.excerpt(event.get("message")) or kind, timestamp=timestamp)
                 elif kind.startswith("item."):
                     item = dict(mapping(event.get("item")))
                     if kind != "item.updated":

@@ -162,6 +162,12 @@ may use an absolute path inside that directory as seen by the job. A reviewer
 supplies a final `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES` line, or the
 equivalent JSON `verdict` value.
 
+Set `events_from` to a JSONL file under the private `{run_dir}` to show progress
+in the dashboard while the job runs. Append one JSON object per line and flush
+the file as the job progresses. The runner redacts events before writing them
+to the step transcript, reads any remaining events at exit, and records a
+truncation notice if the source exceeds 4 MiB.
+
 The commented external job runner example shows how a wrapper can send a brief
 to another agent and write a reply and an optional event stream. Package the
 executable in the sandbox image selected with `--image-tag`. Select an independent reviewer

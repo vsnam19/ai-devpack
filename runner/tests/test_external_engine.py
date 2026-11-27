@@ -1,9 +1,12 @@
 """External engine contract tests."""
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+import time
 import unittest
 from unittest.mock import patch
 
@@ -72,6 +75,7 @@ implementer = "implement"
                 event, = [json.loads(line) for line in events.splitlines()]
                 if mode in ("quiet", "timeout"):
                     self.assertEqual(event["type"], "result")
+                    self.assertFalse(metadata["events_streamed"])
                 else:
                     self.assertEqual(event["item"]["type"], "agent_message")
                 if mode != "timeout":
@@ -225,13 +229,14 @@ print(json.dumps({"status": "ok", "exit_code": 0, "reply_path": "reply.md"}))
         events = self.root / "run" / "steps" / "01-implementer-external.jsonl"
         self.assertEqual(json.loads(events.read_text()), {"type": "engine_event"})
 
-    def run_artifact_job(self, script):
+    def run_artifact_job(self, script, events_from="{run_dir}/events"):
         config = self.configuration()
         original = config.read_text()
         job = self.root / "artifact_job.py"
         job.write_text(script, encoding="utf-8")
         command = [sys.executable, str(job), "{run_dir}"]
-        config.write_text(original.replace(
+        config.write_text(original.replace('events_from = "{run_dir}/events"',
+                                           f"events_from = {json.dumps(events_from)}").replace(
             next(line for line in original.splitlines() if line.startswith("command = ")),
             f"command = {json.dumps(command)}",
         ))
@@ -240,6 +245,79 @@ print(json.dumps({"status": "ok", "exit_code": 0, "reply_path": "reply.md"}))
             workdir=self.root, run_dir=self.root / "run", isolation="local",
             allow_unsandboxed_local=True, role="implementer",
         ))
+
+    def test_events_stream_before_exit_and_match_batch(self):
+        def run(mode):
+            engine = load_engines(self.configuration(mode)).engines["external"]
+            return run_agent(AgentRequest(
+                engine=engine, prompt="Check live events.", workdir=self.root,
+                run_dir=self.root / mode, isolation="local", allow_unsandboxed_local=True,
+                role="implementer", allow_globs=["literal;touch marker"], timeout=10,
+                env_overrides={"FIXTURE_TOKEN": "external-test-secret"},
+            ))
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 3
+            while not predicate():
+                if time.monotonic() >= deadline:
+                    self.fail("Timed out waiting for the fixture or its transcript")
+                time.sleep(0.01)
+
+        step = Path("steps/01-implementer-external.jsonl")
+        live = self.root / "live" / step
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            job = executor.submit(run, "live")
+            try:
+                wait_for((self.root / "ready").exists)
+                self.assertEqual(live.read_text() if live.exists() else None, "")
+                (self.root / "start-events").touch()
+                wait_for(lambda: live.exists() and live.stat().st_size > 0)
+                self.assertFalse(job.done())
+                streamed = live.read_text()
+                self.assertNotIn("external-test-secret", streamed)
+                self.assertNotIn("\\u001b", streamed)
+                self.assertEqual(json.loads(streamed)["type"], "progress")
+            finally:
+                (self.root / "start-events").touch()
+                (self.root / "finish-events").touch()
+            result = job.result()
+        self.assertEqual(result.status, "ok", result.error)
+        self.assertTrue(json.loads(live.with_suffix(".meta.json").read_text())["events_streamed"])
+        with patch("runner.agent_exec._ExternalEvents.follow", return_value=nullcontext()):
+            batch = run("batch")
+        self.assertEqual(batch.status, "ok", batch.error)
+        self.assertFalse(json.loads(batch.transcript_path.with_suffix(".meta.json").read_text())
+                         ["events_streamed"])
+        self.assertEqual(live.read_bytes(), (self.root / "batch" / step).read_bytes())
+        first, last = map(json.loads, live.read_text().splitlines())
+        self.assertEqual(first, json.loads(streamed))
+        self.assertEqual(last, {"type": "done", "text": "finished ☃"})
+
+    def test_unsafe_event_paths_are_refused(self):
+        for path, write in (
+            ("../events", '(output.parent / "events").write_text(event)'),
+            ("events", '(output / "events").symlink_to(reply)'),
+            ("events", '(output / "events").symlink_to(output / "../brief.md")'),
+            ("nested/events", '(output / "nested").symlink_to(output, target_is_directory=True)\n'
+                              '(output / "events").write_text(event)'),
+        ):
+            with self.subTest(path=path, write=write):
+                result = self.run_artifact_job(f"""
+import json
+from pathlib import Path
+import sys
+
+output = Path(sys.argv[1])
+event = '{{"type": "unsafe"}}'
+reply = output / "reply.md"
+reply.write_text(event)
+{write}
+print(json.dumps(dict(status="ok", exit_code=0, reply_path=str(reply))))
+""", events_from=path)
+                self.assertEqual(result.status, "harness_error", result.error)
+                self.assertEqual(json.loads(result.transcript_path.read_text())["type"], "result")
+                meta = json.loads(result.transcript_path.with_suffix(".meta.json").read_text())
+                self.assertFalse(meta["events_streamed"])
 
     def test_json_stdout_normalizes_failure_status(self):
         for reported, expected, attribution, exit_code in (
@@ -258,7 +336,7 @@ print(json.dumps({"status": "ok", "exit_code": 0, "reply_path": "reply.md"}))
             ("stdout", "sys.stdout.write(large)"),
             ("stderr", "sys.stderr.write(large)"),
             ("reply", 'reply.write_text(large)'),
-            ("events", '(output / "events").write_text(large)'),
+            ("events", '(output / "events").write_text(\'{"type":"message","content":"Progress"}\\n\' + large)'),
         ):
             with self.subTest(name=name):
                 result = self.run_artifact_job(f"""
@@ -275,6 +353,17 @@ print(json.dumps(dict(status="ok", exit_code=0, reply_path=str(reply))))
 """)
                 self.assertEqual(result.status, "harness_error", result.error)
                 self.assertIn(f"external {name} exceeds", result.error)
+                if name == "events":
+                    progress, notice = map(json.loads, result.transcript_path.read_text().splitlines())
+                    self.assertEqual(progress, {"type": "message", "content": "Progress"})
+                    self.assertEqual(notice["type"], "notice")
+                    self.assertIn("truncated", notice["message"])
+                    from runner.dash.events import Stream
+
+                    stream = Stream(devpack_logs.Redactor(), lambda: 0)
+                    stream.poll(result.transcript_path)
+                    self.assertEqual([event["kind"] for event in stream.events], ["message", "notice"])
+                    self.assertEqual(stream.events[-1]["text"], notice["message"])
 
     def test_external_events_preserve_unicode_line_separator(self):
         message = "first\u2028second"

@@ -82,11 +82,15 @@ To share an agent run with the project owner or a colleague who has repository a
 ### External engine steps
 
 The standard step files contain the redacted effective brief, JSONL evidence,
-and result metadata. The transcript copies JSON object events from the optional
-`events_from` path after the job exits. Jobs that buffer their output are
-supported. When no events are available, one synthetic result event records
-the reply. Keep reply and event files under the private step output directory
-and use the pack step files for persistent evidence. The pack records unknown
+and result metadata. The transcript starts empty and flushes complete, redacted
+JSON object events from the optional `events_from` file while the job runs.
+The final read includes buffered events and accepts a valid last event without
+a trailing newline. Event files must be regular files under the private step
+output directory, with no symbolic links in the path. If the file exceeds 4 MiB,
+the transcript retains complete events within the limit and records one truncation
+notice, and the step reports a harness error. When no events are available, one
+synthetic result event records the reply. The `events_streamed` metadata flag
+reports whether the live tailer flushed any records. The pack records unknown
 token counts and cost as JSON null. Quota and exhaustion map to
 `engine_unavailable` with an ENV/TOOL attribution hint. An external job's gate
 status is execution evidence. The pack records its own gate outcome separately.
