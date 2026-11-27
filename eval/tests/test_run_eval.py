@@ -726,6 +726,29 @@ class HarnessErrorTests(unittest.TestCase):
             self.assertIn("450/120", md)
             self.assertNotIn("0.1974", md)
 
+    def test_summary_usage_coverage_appears_in_matching_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, tasks_dir = _create_mini_fixture_and_task(Path(tmp))
+            task = run_eval.load_and_validate_tasks(tasks_dir, "all")[0]
+            trial = run_eval.TrialResult(
+                task_id=task.task_id, category=task.category, model="haiku:sonnet",
+                run_index=1, passed=True, agent_returncode=0, check_returncode=0,
+                cost_usd=0.015, turns=1, duration_s=1.0, mode="runner",
+                tokens_in=100, tokens_out=42,
+                usage_coverage={
+                    "cost_usd": {"known": 3, "eligible": 4},
+                    "tokens_out": {"known": 2, "eligible": 4},
+                },
+            )
+            tasks, categories = run_eval.aggregate_results([task], [trial.model], 1, [trial])
+            md = run_eval.render_summary_markdown(
+                "r", "2026-11-23", "local", 1, [trial.model], tasks, categories, mode="runner",
+            )
+            for section in ("Per-Category Summary", "Per-Task Summary", "Per-Trial Runs"):
+                with self.subTest(section=section):
+                    table = md.split(f"## {section}\n", 1)[1].split("\n## ", 1)[0]
+                    self.assertIn("| 0.0150 (cost_usd 3/4) | 100/42 (tokens_out 2/4) |", table)
+
     def test_nullable_usage_reports_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

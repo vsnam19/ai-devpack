@@ -293,11 +293,20 @@ def _incomplete_usage(coverage: dict[str, dict[str, int]]) -> dict[str, dict[str
     return coverage if any(c["known"] < c["eligible"] for c in coverage.values()) else {}
 
 
-def _usage_note(coverage: dict[str, dict[str, int]]) -> str:
-    return ", ".join(
+def _annotate_usage_columns(
+    cost: str, tokens: str, coverage: dict[str, dict[str, int]],
+) -> tuple[str, str]:
+    cost_counts = coverage.get("cost_usd")
+    if cost_counts and cost_counts["known"] < cost_counts["eligible"]:
+        cost += f" (cost_usd {cost_counts['known']}/{cost_counts['eligible']})"
+    token_note = ", ".join(
         f"{name} {counts['known']}/{counts['eligible']}"
-        for name, counts in coverage.items() if counts["known"] < counts["eligible"]
+        for name, counts in coverage.items()
+        if name != "cost_usd" and counts["known"] < counts["eligible"]
     )
+    if token_note:
+        tokens += f" ({token_note})"
+    return cost, tokens
 
 
 @dataclass
@@ -3532,9 +3541,7 @@ def render_summary_markdown(
             else "n/a"
         )
         tok_str = _fmt_tokens(cat.get("mean_tokens_in"), cat.get("mean_tokens_out"))
-        coverage = _usage_note(cat.get("usage_coverage", {}))
-        if coverage:
-            tok_str += f" ({coverage})"
+        cost_str, tok_str = _annotate_usage_columns(cost_str, tok_str, cat.get("usage_coverage", {}))
         under_k = bool(cat.get("any_under_k", False))
         lint_val = (
             cat.get("mean_lint_findings_final")
@@ -3566,9 +3573,7 @@ def render_summary_markdown(
             f"{ts.mean_cost_usd:.4f}" if ts.mean_cost_usd is not None else "n/a"
         )
         tok_str = _fmt_tokens(ts.mean_tokens_in, ts.mean_tokens_out)
-        coverage = _usage_note(_usage_coverage(ts.runs))
-        if coverage:
-            tok_str += f" ({coverage})"
+        cost_str, tok_str = _annotate_usage_columns(cost_str, tok_str, _usage_coverage(ts.runs))
         under_k = ts.valid_runs < ts.k
         lint_val = (
             ts.mean_lint_findings_final
@@ -3677,9 +3682,7 @@ def render_summary_markdown(
         for run in ts.runs:
             run_cost = f"{run.cost_usd:.4f}" if run.cost_usd is not None else "n/a"
             tok_str = _fmt_tokens(run.tokens_in, run.tokens_out)
-            coverage = _usage_note(_trial_usage_coverage(run))
-            if coverage:
-                tok_str += f" ({coverage})"
+            run_cost, tok_str = _annotate_usage_columns(run_cost, tok_str, _trial_usage_coverage(run))
             pass_str = f"skipped ({run.skip_reason})" if run.skipped else ("yes" if run.passed else "no")
             cause_str = (
                 run.ablation_cause or run.suspected_cause or "-"

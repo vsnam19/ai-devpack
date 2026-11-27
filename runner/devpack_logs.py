@@ -243,6 +243,8 @@ def parse_stream_jsonl(
     jsonl_path: pathlib.Path,
     redactor: Redactor,
     step: StepRecord,
+    *,
+    allow_stream_cost: bool = True,
 ) -> None:
     """Parse a stream-json or session ``.jsonl`` file into ``step`` with redaction applied."""
     try:
@@ -447,7 +449,12 @@ def parse_stream_jsonl(
             if isinstance(res_text, str) and res_text:
                 step.final_result = redactor.redact(res_text)
             cost_val = event.get("total_cost_usd")
-            if isinstance(cost_val, (int, float)) and step.cost_usd is None:
+            if (
+                allow_stream_cost
+                and step.cost_usd is None
+                and type(cost_val) in (int, float)
+                and 0 <= cost_val <= sys.float_info.max
+            ):
                 step.cost_usd = float(cost_val)
             turns_val = event.get("num_turns")
             if isinstance(turns_val, int) and step.num_turns == 0:
@@ -717,6 +724,7 @@ def load_run_dir(run_dir: pathlib.Path, redactor: Redactor) -> RunRecord:
                 except OSError:
                     pass
 
+            allow_stream_cost = True
             meta_path = steps_dir / f"{stem}.meta.json"
             if meta_path.is_file():
                 try:
@@ -725,12 +733,21 @@ def load_run_dir(run_dir: pathlib.Path, redactor: Redactor) -> RunRecord:
                     )
                     if isinstance(meta_obj, dict):
                         _apply_step_meta(step, meta_obj, redactor)
+                        schema_version = meta_obj.get("schema_version")
+                        if (
+                            type(schema_version) is int
+                            and schema_version >= 1
+                            and meta_obj.get("usage_provenance") == "unknown"
+                            and "cost_usd" in meta_obj
+                            and meta_obj["cost_usd"] is None
+                        ):
+                            allow_stream_cost = False
                 except (OSError, json.JSONDecodeError):
                     pass
 
             jsonl_path = steps_dir / f"{stem}.jsonl"
             if jsonl_path.is_file():
-                parse_stream_jsonl(jsonl_path, redactor, step)
+                parse_stream_jsonl(jsonl_path, redactor, step, allow_stream_cost=allow_stream_cost)
 
             if step.model in ("-", "") and step.engine not in ("-", ""):
                 step.model = step.engine

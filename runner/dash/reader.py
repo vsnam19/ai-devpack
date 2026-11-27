@@ -832,13 +832,13 @@ class Reader:
         process_health = None
         last_event = self.activity.get(native)
         if state == "running" and status == "current" and native:
-            now = self.clock()
             try:
                 record = self.optional(source / native / "heartbeat.json")
             except (DeferredRead, *READ_ERRORS):
                 process_health = "unknown"
             else:
                 if record:
+                    now = self.clock()
                     process_health = heartbeat.process_health(record, native, now)
                     event_time = number(record.get("last_event_at"))
                     if event_time is not None and event_time <= now:

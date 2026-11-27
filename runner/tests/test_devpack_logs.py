@@ -80,6 +80,37 @@ def _build_synthetic_run_dir(
 class DevpackLogsTests(unittest.TestCase):
     """Test suite for devpack_logs.py subcommands, rendering, truncation, escaping, and redaction."""
 
+    def test_versioned_unknown_cost_overrides_stream_cost(self) -> None:
+        for cost in (0.1974, 0.0):
+            with self.subTest(cost=cost), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                steps = run_dir / "steps"
+                steps.mkdir()
+                (steps / "01-implementer-local.meta.json").write_text(
+                    json.dumps({"schema_version": 1, "usage_provenance": "unknown", "cost_usd": None}),
+                    encoding="utf-8",
+                )
+                (steps / "01-implementer-local.jsonl").write_text(
+                    json.dumps({"type": "result", "total_cost_usd": cost}) + "\n",
+                    encoding="utf-8",
+                )
+                record = devpack_logs.load_run_dir(run_dir, devpack_logs.Redactor())
+                self.assertIsNone(record.cost_usd)
+                self.assertIsNone(json.loads(devpack_logs.format_runs_json([record]))["totals"]["cost_usd"])
+
+    def test_invalid_stream_cost_is_ignored(self) -> None:
+        for cost in (True, -1, float("nan"), float("inf"), 10**400):
+            with self.subTest(cost=cost), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                steps = run_dir / "steps"
+                steps.mkdir()
+                (steps / "01-implementer-haiku.jsonl").write_text(
+                    json.dumps({"type": "result", "total_cost_usd": cost}) + "\n",
+                    encoding="utf-8",
+                )
+                record = devpack_logs.load_run_dir(run_dir, devpack_logs.Redactor())
+                self.assertIsNone(record.cost_usd)
+
     def test_nullable_usage_in_run_totals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

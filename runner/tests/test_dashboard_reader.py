@@ -98,6 +98,34 @@ class ReaderTest(unittest.TestCase):
                 self.assertIsNone(job["process_health"])
             probe.assert_called_once_with(123)
 
+    def test_heartbeat_written_during_read_is_current(self):
+        run = self.run_record("active", outcome="running")
+        path = run / "heartbeat.json"
+        now = 1000
+        reader = Reader(self.settings, clock=lambda: now)
+        read_optional = reader.optional
+
+        def optional_with_heartbeat_update(candidate):
+            nonlocal now
+            if candidate == path:
+                now = 1001
+                write(path, {
+                    "schema_version": 1, "run_id": "active", "pid": 123, "host_id": "host",
+                    "boot_id": "boot", "pid_namespace": "ns", "pid_start_identity": "start",
+                    "heartbeat_at": now, "last_event_at": now,
+                })
+            return read_optional(candidate)
+
+        with (
+            patch.object(reader, "optional", side_effect=optional_with_heartbeat_update),
+            patch.object(heartbeat, "host_id", return_value="host"),
+            patch.object(heartbeat, "boot_id", return_value="boot"),
+            patch.object(heartbeat, "pid_identity", return_value=("start", "ns")),
+        ):
+            job = reader.snapshot(job_id="active")["jobs"][0]
+        self.assertEqual(job["process_health"], "alive")
+        self.assertEqual(job["last_event_time"], 1001)
+
     def test_mixed_usage_and_versioned_zero(self):
         run = self.run_record("mixed", outcome="pass")
         write(run / "steps" / "01-build-engine.meta.json",
