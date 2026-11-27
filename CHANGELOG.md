@@ -5,6 +5,9 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Added
+- Offline HTML developer and operator manual with parser, path, anchor, and leak checks.
+
 ## [0.4.0] - 2026-11-27
 
 ### Changed

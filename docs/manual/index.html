@@ -1,0 +1,1318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-devpack developer reference</title>
+<style>
+:root{color-scheme:light dark;--bg:#faf9f5;--panel:#f0eee7;--ink:#202820;--muted:#4c594e;--line:#c5ccc1;--accent:#155d47}
+@media(prefers-color-scheme:dark){:root{--bg:#141b18;--panel:#202c26;--ink:#edf2ec;--muted:#b5c5b9;--line:#485a50;--accent:#8ce0bb}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:1rem/1.58 system-ui,sans-serif;display:grid;grid-template-columns:16rem minmax(0,1fr)}
+nav{position:sticky;top:0;height:100vh;overflow:auto;background:var(--panel);padding:1.5rem;border-right:1px solid var(--line)}
+nav a{display:block;padding:.35rem 0}a{color:var(--accent)}a:focus-visible{outline:2px solid currentColor;outline-offset:3px}
+main{width:100%;max-width:76rem;padding:clamp(1rem,4vw,4rem)}header{border-bottom:3px solid var(--accent);padding-bottom:1.5rem}h1,h2,h3,h4{line-height:1.2}h1{font:700 clamp(2.25rem,5vw,4.5rem)/1.05 Georgia,serif;margin:.45rem 0}h2{font:700 2rem/1.15 Georgia,serif;border-top:1px solid var(--line);padding-top:1.3rem}section{margin-top:3rem;scroll-margin-top:1rem}p,li,dd{max-width:80ch}dt{font-weight:700}dd{margin:0 0 .8rem}
+pre{background:var(--panel);padding:.8rem 1rem;border-left:3px solid var(--accent);white-space:pre-wrap;overflow-wrap:anywhere}code{font-size:.92em;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse;margin-bottom:1rem;table-layout:fixed}th,td{padding:.45rem .6rem;text-align:left;vertical-align:top;border-bottom:1px solid var(--line);overflow-wrap:anywhere}th{background:var(--panel)}th:first-child{width:33%}figure{margin:1rem 0}figcaption{color:var(--muted)}svg{width:100%;height:auto;color:var(--ink);background:var(--panel);border:1px solid var(--line)}svg rect{fill:var(--bg);stroke:var(--accent)}svg text{fill:currentColor;font:16px system-ui,sans-serif}svg line,svg path{stroke:var(--accent);fill:none;stroke-width:2}
+@media(max-width:730px){body{display:block}nav{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)}nav ol{columns:2;padding-left:1rem}}
+@media print{:root{color-scheme:light;--bg:white;--panel:#f4f4f4;--ink:black;--muted:#333;--line:#bbb;--accent:#235045}body{display:block;font-size:10pt}nav{position:static;height:auto;border:0}nav ol{columns:3}main{max-width:none;padding:0}h2,h3,h4{break-after:avoid}tr,figure{break-inside:avoid}thead{display:table-header-group}}
+</style>
+</head>
+<body>
+<nav aria-label="Manual contents">
+<strong>ai-devpack</strong>
+<ol>
+<li><a href="#overview">Overview</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#workflow">Workflow</a></li>
+<li><a href="#logs">Runs and logs</a></li>
+<li><a href="#config">Configuration</a></li>
+<li><a href="#cli">CLI reference</a></li>
+<li><a href="#skills">Skills</a></li>
+<li><a href="#quality">Quality gates and eval</a></li>
+<li><a href="#extending">Extending</a></li>
+<li><a href="#development">Developing the pack</a></li>
+<li><a href="#operations">Operations and troubleshooting</a></li>
+<li><a href="#gaps">Known gaps</a></li>
+</ol>
+</nav>
+<main>
+<header><p>Developer and operator manual</p><h1>ai-devpack reference</h1><p>Run, inspect, extend, and release the automotive C/C++ development harness.</p></header>
+
+<section id="overview"><h2>1. Overview</h2>
+<p>The pack gives small and on-premises agents bounded tasks backed by deterministic checks. The orchestrator can prepare work and request execution. Trusted gate commands and independent review authorize progress. Missing or invalid evidence fails closed. Fix attempts are bounded and unresolved work goes to a human. Merge and safety decisions remain human responsibilities.</p>
+<p>Obtain data-owner sign-off before use. Classifications in increasing order are <code>public</code>, <code>internal</code>, <code>confidential</code>, <code>customer-restricted</code>, and <code>secret</code>. Engine routing checks the configured ceiling and refuses secret data. Retention, customer permission, and approved service decisions remain operator obligations. Treat run artifacts at the source classification. See <code>policy/data_governance.md</code> and <code>policy/asil_boundaries.md</code>.</p>
+<dl><dt>Brief</dt><dd>A bounded task with goals, inputs, outputs, scope and verification commands.</dd><dt>Engine</dt><dd>A configured model and invocation protocol.</dd><dt>Gate</dt><dd>A trusted set of checks whose receipt records individual outcomes.</dd><dt>Checkpoint</dt><dd>A recorded policy or human decision tied to a subject and evidence.</dd><dt>Oracle</dt><dd>A human-authored clarification for an eval task. Hidden graders check the result independently.</dd><dt>Component</dt><dd>A named subtree selected within the configured source workspace.</dd></dl>
+</section>
+
+<section id="architecture"><h2>2. Architecture</h2>
+<figure>
+<svg viewBox="0 0 760 405" role="img" aria-labelledby="architecture-title architecture-desc">
+<title id="architecture-title">Pack components and data flow</title>
+<desc id="architecture-desc">Briefs enter the runner, which invokes engines and enforcement. Approvals authorize workflow progression. Run files feed dashboards, learning and evaluation.</desc>
+<defs><marker id="arch-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6"/></marker></defs>
+<g marker-end="url(#arch-arrow)"><line x1="380" y1="71" x2="380" y2="105"/><line x1="255" y1="144" x2="217" y2="144"/><line x1="505" y1="144" x2="543" y2="144"/><line x1="380" y1="179" x2="380" y2="220"/><line x1="380" y1="280" x2="380" y2="315"/><path d="M290 179V249H220"/><path d="M470 179V249H540"/></g>
+<rect x="255" y="20" width="250" height="51" rx="8"/><text x="380" y="51" text-anchor="middle">Orchestrator · briefs · plans</text>
+<rect x="255" y="105" width="250" height="74" rx="8"/><text x="380" y="135" text-anchor="middle">Task runner · dispatch · broker<tspan x="380" dy="23">Trusted host controls</tspan></text>
+<rect x="15" y="105" width="202" height="74" rx="8"/><text x="116" y="134" text-anchor="middle">Native · local · external<tspan x="116" dy="23">Worker sandbox + skills</tspan></text>
+<rect x="543" y="105" width="202" height="74" rx="8"/><text x="644" y="134" text-anchor="middle">Scope · test lock · gate<tspan x="644" dy="23">Lint · cppcheck · tests</tspan></text>
+<rect x="15" y="220" width="205" height="60" rx="8"/><text x="117" y="255" text-anchor="middle">Checkpoints · approvals</text>
+<rect x="255" y="220" width="250" height="60" rx="8"/><text x="380" y="255" text-anchor="middle">Run artifacts and evidence</text>
+<rect x="540" y="220" width="205" height="60" rx="8"/><text x="642" y="255" text-anchor="middle">Memory · learning · eval</text>
+<rect x="255" y="315" width="250" height="60" rx="8"/><text x="380" y="350" text-anchor="middle">CLI and terminal dashboards</text>
+</svg>
+<figcaption>Worker products return to the host for verification. Decision records live in separate trusted state.</figcaption>
+</figure>
+<p><code>orchestrator/</code> provides orchestration instructions and example briefs. <code>workflow/templates/</code> supplies implement, review and fix briefs, a task plan, an ADR and a dependency-plan example. <code>runner/devpack_run.py</code> coordinates a whole task. <code>runner/devpack_dispatch.py</code> routes individual roles and records guarded attempts. <code>runner/devpack_submit.py</code> validates broker submissions. <code>runner/devpack_broker.py</code> services the queue on the trusted host, validates worktree and brief boundaries, and executes through the runner adapter.</p>
+<p><code>runner/agent_exec.py</code> loads engines, checks classification and isolation, constructs argv and mounts, and normalizes execution evidence. Native cloud and local engines share a CLI protocol. An external engine uses operator-supplied argv and a declared result protocol. Worker edits are bounded to allowed brief paths and any active component scope. Keep pack code, grading inputs, trusted Git metadata, approval state, and the gate configuration out of worker control. Scope and test-lock checks compare actual changes to trusted input. Sandbox containment, post-run verification and classification are distinct controls.</p>
+<p><code>runner/workspace_scope.py</code> resolves components, built-in exclusions and selected scans. <code>runner/safe_git.py</code> protects Git operations from untrusted settings. <code>runner/repomap.py</code> generates a budgeted C/C++ index. <code>runner/memory.py</code> recalls scoped, bounded memory and validates proposals. Learning mines evidence and qualifies engine guidance. Dashboards consume recorded artifacts. Eval isolates benchmark fixtures and grades against trusted harness inputs.</p>
+</section>
+
+<section id="workflow"><h2>3. Workflow</h2>
+<figure>
+<svg viewBox="0 0 760 390" role="img" aria-labelledby="sequence-title sequence-desc">
+<title id="sequence-title">Task lifecycle sequence</title>
+<desc id="sequence-desc">The host lints the brief, dispatches implementation, checks scope and test lock, runs the gate and requests review. Fix rounds repeat checks and review at most twice before escalation.</desc>
+<defs><marker id="seq-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6"/></marker></defs>
+<text x="126" y="31" text-anchor="middle">Host</text><text x="380" y="31" text-anchor="middle">Worker / reviewer</text><text x="634" y="31" text-anchor="middle">Human</text>
+<path stroke-dasharray="4 5" d="M126 44V368 M380 44V368 M634 44V368"/>
+<g marker-end="url(#seq-arrow)"><path d="M126 76H205V100H126"/><line x1="126" y1="145" x2="380" y2="145"/><path d="M126 170H205V195H126"/><line x1="126" y1="246" x2="380" y2="246"/><line x1="380" y1="284" x2="126" y2="284"/><line x1="126" y1="320" x2="380" y2="320"/><line x1="126" y1="361" x2="634" y2="361"/></g>
+<text x="220" y="88">Brief lint and checkpoint</text><text x="160" y="137">Implement</text><text x="220" y="191">Scope and test lock</text><text x="146" y="218">Run gate</text><text x="151" y="238">Review after pass</text><text x="147" y="275">Verdict and findings</text><text x="151" y="312">Fix ≤ 2, then recheck</text><text x="400" y="353">Escalate on hard failure or exhaustion</text>
+</svg>
+</figure>
+<p>Lint the brief against the repository and engine budget. The broker treats structural findings in orchestrator briefs as errors. Human-authored brief findings are advisory at lint time. Parse the allowed files, baseline protected tests and run the implementer with a bounded prompt. The host checks changes, runs the gate, and sends evidence and the diff to the reviewer after a pass. The reviewer supplies exhaustive findings and a final verdict. Retry eligible failures with a fix brief and rerun checks. Scope, test integrity, broken harness prerequisites and human-owned decisions can stop progress early. The configured maximum is capped at two fix rounds unless a registered deviation applies.</p>
+<p>In <code>hitl</code> mode, requested checkpoints require a human decision. In <code>autonomous</code> mode, eligible checkpoints can be auto-approved under policy and evidence validation. Blocking checkpoints cover plan, brief, deviation and SELinux manifest decisions. Their callers can pause before advancing. A paused task returns 20 and records <code>AWAITING_APPROVAL</code> and an approval ID. Terminal checkpoints such as pre-merge, escalation and decision memory record the decision boundary after work. A pending terminal decision does not provide a worker continuation. Protected or unknown merge targets, escalation, decision/fact memory, safety- or security-relevant deviations, high/unknown ASIL deviations and release SELinux manifests require human approval as applicable to the checkpoint.</p>
+<p>Inspect the approval record and evidence using <code>runner/devpack_approve.py</code>. Approve or reject with an operator note where required. Resume the same runner or dispatch with the recorded ID and matching workdir/state directory. Resume verifies saved inputs and consumes an approved continuation once. A changed brief requires a fresh approval. Provenance goes to trusted JSONL and, where applicable, Git notes. See <code>runner/checkpoints.py</code> and <code>policy/operating_modes.md</code>.</p>
+<p>Plans declare a DAG of task IDs and Markdown briefs. <code>runner/devpack_plan.py</code> validates schema, reads briefs and checks dependencies. Its <code>run-next</code> selects one ready task from recorded attempts and delegates to the task runner. Inspect plan status before retrying a failed prerequisite. A separate human decision handles merge.</p>
+<p>Use log analysis to identify <code>BRIEF</code> (bad input), <code>CONTEXT</code> (missing repository knowledge), <code>SKILL</code> (missing or wrong guidance), <code>TOOL</code> (harness or permissions), <code>MODEL</code> (incorrect result under adequate conditions), or <code>ENV</code> (infrastructure or quota). A primary and optional secondary label support the handoff. Confirm heuristic findings through the logs CLI and use the evidence to fix the brief, routing, tool or environment before trying again.</p>
+</section>
+
+<section id="logs"><h2>4. Runs and logs</h2>
+<p>Run data is written below the configured runs root. This tree uses placeholders for generated names.</p>
+<pre>runs/&lt;run-id&gt;/
+  run.json                       identity, outcome, timing and step index
+  heartbeat.json                 liveness and current phase for active work
+  steps/
+    NN-role-engine.prompt.md     prepared prompt
+    NN-role-engine.jsonl         normalized or provider stream events
+    NN-role-engine.meta.json     step status, timing and measured usage
+    NN-gate.txt                  captured gate output
+    NN-gate-receipt.json         structured receipt when supported
+  run_summary.json               task runner result and checkpoint summary
+  attribution.json               optional heuristic and confirmed causes</pre>
+<p>Artifact names vary by entry point and protocol. A legacy log directory can also receive summaries. The logs CLI renders a Markdown transcript and standalone HTML, or analyzes failure signals. <code>runner/redaction.py</code> masks configured secrets and sensitive values before logging and rendering. Redaction complements storage and access controls. The runner heartbeat is a liveness claim with timestamps and phase, distinct from a test receipt or a terminal outcome.</p>
+<p>The CLI and TUI use <code>runner/dash/reader.py</code> to assemble snapshots from run records, step streams, gate receipts, broker queue records, plans and external approval state. <code>runner/dash/files.py</code> handles constrained file reads and <code>runner/dash/events.py</code> normalizes events. The reader refreshes active jobs more often than discovery, bounds history, and reports source health. Use the TUI for interactive views and the CLI for text and JSON snapshots. Keep dashboard configuration in trusted operator space.</p>
+</section>
+
+<section id="config"><h2>5. Configuration reference</h2>
+<h3>Project configuration</h3>
+<p>Install the project example as <samp>.devpack/project.toml</samp> in the target checkout. Configure the gate and engine files with trusted inputs before dispatch. See <code>.devpack/project.example.toml</code>.</p>
+<table><thead><tr><th>Key</th><th>Type, default and interpretation</th></tr></thead><tbody>
+<tr><td><code>data_class</code></td><td>String, <code>internal</code>. See <a href="#overview">data classes</a>.</td></tr>
+<tr><td><code>engines_config</code>, <code>gate_config</code></td><td>Paths. Relative paths try the project file directory, then an existing match under the pack. Without overrides the runner uses its engine and gate discovery chains.</td></tr>
+<tr><td><code>runs_root</code>, <code>plans_root</code></td><td>Paths. Default <samp>runs</samp> and <samp>plans</samp>. The dashboard reads its own runs root setting.</td></tr>
+<tr><td><code>default_engines</code></td><td>Table mapping role to engine name. Empty project override by default. Example routes implementer and fixer to haiku, reviewer and orchestrator to sonnet.</td></tr>
+<tr><td><code>allow_unsandboxed_local</code>, <code>require_qualification</code></td><td>Booleans, false. The former is ignored as worker-project authorization. Enable local execution via trusted operator policy or an authorized invocation. Qualification enables engine checks against trusted qualification configuration.</td></tr>
+<tr><td><code>protected_test_globs</code></td><td>String array, empty additional rules by default. Adds repo-relative patterns to built-in test protections.</td></tr>
+<tr><td><code>pipeline.mode</code>, <code>pipeline.state_dir</code></td><td>Strings. Mode defaults to <code>hitl</code>. State defaults to a project-specific directory under the platform state home. Use a host path outside the agent worktree and writable mounts.</td></tr>
+<tr><td><code>pipeline.target_branch</code>, <code>pipeline.protected_branches</code></td><td>String and nonempty string array. Defaults use main and protect main, master, release/* and hotfix/*. A customized protection list can affect the default target.</td></tr>
+<tr><td><code>pipeline.checkpoints</code></td><td>Table of checkpoint IDs to <code>human</code> or <code>auto</code>, empty by default. IDs are plan, brief, deviation, selinux-manifest, pre-merge, escalation and memory-decision. Hard stops override automatic decisions.</td></tr>
+<tr><td><code>workspace.root</code>, <code>workspace.exclude</code></td><td>Required workspace root relative to repo when the table is present. Additional exclusion patterns are a string array, empty by default. Standalone checks can use the implicit repo-wide scope when the table is absent.</td></tr>
+<tr><td><code>workspace.discover</code>, <code>workspace.discovery_depth</code></td><td>Boolean true and positive integer 4. Discovery recognizes build markers and stops descending at component boundaries.</td></tr>
+<tr><td><code>component</code></td><td>Array of tables. Each requires unique string <code>name</code> and workspace-relative <code>path</code>. Optional repo-relative strings <code>preflight_config</code> and <code>compile_commands</code> default to unset. <code>test_globs</code> is a component-relative string array. <code>include_dirs</code> is a string array for analysis. Both arrays default to empty. <code>build_cmd</code> and <code>test_cmd</code> are shell command strings, empty until configured.</td></tr>
+<tr><td><code>scan.default</code>, <code>scan.selected</code></td><td>String <code>all</code> or <code>selected</code>, and component name array. Defaults to selected if names were supplied, all otherwise. Explicit CLI selection takes precedence over environment and config.</td></tr>
+<tr><td><code>cppcheck</code></td><td>Analysis options can come from the applicable lint or project config. <code>enable</code>, <code>include_dirs</code>, <code>extra_args</code> and <code>fail_on</code> are string arrays. <code>std</code> and <code>suppressions_file</code> are strings. Defaults enable warning, style, performance and portability, select C++17 and include the include directory, leave the suppression path and extra args empty, and fail on error and warning. <code>enable</code> and <code>fail_on</code> also accept comma-separated strings. <code>max_memory_mb</code> is an integer of at least 64, default 2048. <code>timeout_s</code> is a positive integer when set. The example explicitly supplies an inline-suppression argument.</td></tr>
+</tbody></table>
+<pre>data_class = "internal"
+engines_config = "engines.toml"
+gate_config = "gate.toml"
+runs_root = "runs"
+[pipeline]
+mode = "hitl"
+[workspace]
+root = "src"
+discover = false
+[[component]]
+name = "control"
+path = "control"
+build_cmd = "cmake --build build"
+test_cmd = "ctest --test-dir build --output-on-failure"</pre>
+
+<h3>Preflight settings</h3>
+<p>Use the applicable component preflight file or a trusted default. The broker can copy supported general, naming and Doxygen tables from the project configuration into its trusted sandbox configuration. See <code>enforcement/lint/README.md</code> and <code>eval/fixture/preflight.toml</code> for rule descriptions and examples.</p>
+<table><thead><tr><th>Keys</th><th>Types and defaults</th></tr></thead><tbody>
+<tr><td><code>general.std</code>, <code>general.c_std</code>, <code>general.max_params</code>, <code>general.subprocess_timeout_s</code>, <code>general.max_memory_mb</code></td><td>Strings C++17 and C11, then integers 5, 30 seconds and 2048 MiB. A configured memory limit must be at least 64 MiB.</td></tr>
+<tr><td><code>general.allow_missing_tools</code>, <code>general.skip_clang_tidy</code>, <code>general.allow_new_in_init</code>, <code>general.no_exceptions</code>, <code>general.no_rtti</code>, <code>general.no_impl_in_header</code></td><td>Boolean. The first three default false and the last three default true.</td></tr>
+<tr><td><code>general.allowed_heap_paths</code>, <code>general.skip_dirs</code>, <code>general.exclude_globs</code>, <code>general.disabled_rules</code>, <code>general.exempt_param_prefixes</code></td><td>String arrays. Defaults are empty except for the built-in directory skip list. Disabled rules require trusted deviation handling.</td></tr>
+<tr><td><code>doxygen.require_file_doxygen</code>, <code>doxygen.require_param_direction</code></td><td>Booleans defaulting true. The linter also accepts these keys as general settings.</td></tr>
+<tr><td><code>naming.check_meaningful</code>, <code>naming.disallowed_names</code>, <code>naming.allowed_loop_indices</code></td><td>Boolean true, and two string arrays with built-in sets.</td></tr>
+<tr><td><code>naming.class_regex</code>, <code>naming.function_regex</code>, <code>naming.variable_regex</code>, <code>naming.parameter_regex</code>, <code>naming.member_regex</code>, <code>naming.private_member_regex</code>, <code>naming.constant_regex</code>, <code>naming.namespace_regex</code></td><td>Regex strings. Built-in checks cover PascalCase classes, camelCase functions, members and variables, m_ private members, k-prefixed constants and lowercase namespaces. See defaults in <code>enforcement/lint/preflight_lint.py</code>.</td></tr>
+<tr><td><code>plugins.paths</code></td><td>String array, empty by default. The standalone linter requires explicit permission to load code from config plugins.</td></tr>
+</tbody></table>
+
+<h3>Engine configuration</h3>
+<p>Use <code>runner/engines.example.toml</code> as the starting point. <code>version</code> is integer 2 for named engines. <code>roles</code> maps role to engine name. Legacy inline role definitions support model, cmd and timeout_s. <code>gate_cmd</code> is an argv array and <code>gate_timeout_s</code> is an integer defaulting to 300. Both can appear under <code>limits</code> as fallback. Brief lint also reads <code>limits.brief_tokens_max</code> as an integer fallback budget. <code>limits.max_fix_rounds</code> defaults to 2, also accepted at top level as a fallback. A value above 2 requires a valid deviation. <code>memory.enabled</code> defaults true, <code>top_k</code> to 5, <code>budget_tokens</code> to 800, <code>reviewer_sees_handoffs</code> to false, and <code>role_scopes</code> permits per-role string arrays of visible scopes.</p>
+<table><thead><tr><th>Key in engines.NAME</th><th>Type and behavior</th></tr></thead><tbody>
+<tr><td><code>class</code> / <code>engine_class</code></td><td>String, cloud by default. Cloud and local use the native CLI. Use explicit <code>class = "external"</code> for the external schema.</td></tr>
+<tr><td><code>model</code>, <code>max_data_class</code></td><td>Model string required for named engines. Classification ceiling defaults to internal for native engines and is required for external engines.</td></tr>
+<tr><td><code>timeout_s</code>, <code>min_context_tokens</code></td><td>Integers. Native timeout defaults to 900 seconds. External timeout must be positive and explicit. Minimum context defaults to zero unless set by a built-in engine definition.</td></tr>
+<tr><td><code>context_tokens</code>, <code>brief_tokens_max</code></td><td>Positive token budgets where specified. Brief lint uses the explicit brief limit or derives a budget from configured context.</td></tr>
+<tr><td><code>cmd</code>, <code>base_url_env</code>, <code>auth_token_env</code></td><td>Native command override as argv array, otherwise use the standard CLI. Endpoint and token fields are environment variable names, empty when unset. The local example sets both names.</td></tr>
+<tr><td><code>command</code>, <code>result</code>, <code>reply_from</code>, <code>events_from</code>, <code>env_allow</code>, <code>role_map</code></td><td>External-only configuration. Command and env_allow are string arrays. Result and reply are strings. Role map is a table of strings. Events path template is optional. See <a href="#external">external engine contract</a> for accepted values and an example.</td></tr>
+</tbody></table>
+
+<h3>Gate, plan and dashboard</h3>
+<p>Gate TOML requires at least one <code>[[check]]</code> table. Each has a unique nonempty string <code>name</code>, nonempty string array <code>cmd</code>, positive numeric <code>timeout_s</code> (300 by default), and boolean <code>required</code> (true by default). Commands run in the selected gate directory and support <code>{pack_root}</code>. Required command failure stops the gate. Optional failures are recorded. See <code>enforcement/gate/gate.project.example.toml</code> and <code>enforcement/gate/gate.example.toml</code>.</p>
+<pre>[[check]]
+name = "build"
+cmd = ["cmake", "--build", "build"]
+timeout_s = 600
+required = true</pre>
+<p>The plan file requires string <code>id</code>, <code>title</code>, <code>goal</code>, ISO date or timestamp <code>created</code>, and <code>[[tasks]]</code> entries. Optional string <code>owner_role</code> renders as Unassigned when absent. Each task needs unique string <code>id</code>, string <code>title</code>, contained Markdown path <code>brief</code> and string array <code>depends_on</code> (use [] for roots). Optional string <code>role</code>, positive integer <code>size_limit</code>, and string array <code>requirement_ids</code> provide task metadata. See <code>workflow/templates/plan.example/plan.toml</code>.</p>
+<p>Dashboard settings are supplied via an explicit operator TOML outside the workdir and artifact roots. <code>runs_root</code>, <code>plans_root</code>, and <code>engines_config</code> are paths. Runs defaults to runs. Plans falls back to the project setting or plans. Engine settings use the project engine configuration, a conventional project file or the pack example. <code>log_roots</code> and <code>evidence_roots</code> are path arrays defaulting to empty. Relative paths resolve under workdir. The remaining settings are positive integers.</p>
+<pre>[dashboard]
+runs_root = "runs"
+plans_root = "plans"
+history_limit = 100
+stream_poll_s = 1
+active_poll_s = 3
+discovery_poll_s = 5
+quiet_threshold_s = 300</pre>
+<p>The sample shows CLI defaults. The TUI uses an active poll default of two seconds. Command-line root settings override operator defaults.</p>
+
+<h3>TelAF SELinux platform profile</h3>
+<p>The extractor reads the project’s <code>selinux</code> table independently of component selection. Its workspace-relative strings are <code>platform_profile</code>, <code>platform_root</code>, <code>sdk_policy_include</code>, and <code>linked_policy</code>, unset until supplied. <code>manifest_name</code> defaults to <samp>access-manifest.yaml</samp>. <code>app_globs</code> is a string array defaulting to <samp>**/apps/*.adef</samp>. <code>api_search_paths</code>, <code>sdef_globs</code>, <code>exclude</code>, and <code>sim_macros</code> are optional string arrays, empty by default. Simulation macros must be identifiers. The skill’s <code>module_dir</code> template is guidance for choosing a policy output location.</p>
+<p>Supply verified platform values as TOML. The fictional <code>knowledge/skills/telaf-selinux/references/example-platform-profile.toml</code> shows syntax. Required unknown or invalid values become <code>unknown</code> and block dependent work. <code>prefix</code> and <code>admin_source_domain</code> are identifiers. <code>domain_pattern</code>, <code>exec_type_pattern</code> and <code>data_type_pattern</code> are strings with an app or executable placeholder. <code>transition_check</code> is a template string and <code>module_bundle_path</code> a relative path template. <code>base_inherited_grants</code> and <code>banned</code> are arrays of strings.</p>
+<p><code>module_files</code> contains filename templates <code>te</code>, <code>fc</code>, <code>if</code>, <code>makefile</code> and <code>component</code>. <code>build.include_variables</code> is a nonempty array of identifiers. The example's <code>build.makefile</code> and <code>contexts.installed</code>/<code>contexts.writable</code> communicate platform conventions. <code>interfaces</code> maps interface names to nonempty templates. Optional <code>skeleton_generator</code> and <code>file_contexts_tool</code> are templates. The profile validator checks placeholders and values. Tooling leaves platform-specific build and linked-policy verification to the operator.</p>
+<pre>prefix = "acme_"
+domain_pattern = "{prefix}{executable}_t"
+module_bundle_path = "read-only/{app}.pp"
+[module_files]
+te = "{app}.te"</pre>
+</section>
+
+<section id="cli"><h2>6. CLI reference</h2>
+<p>Run these examples from the pack checkout. Per-command tables list top-level options and subcommand options separately. Use the relevant subcommand's help for ordering. A successful operation typically returns 0 and argparse misuse returns 2. Gate returns 1 for invalid configuration or a failed required check. The SELinux source and linked-policy gate returns 1 for findings and 3 for incomplete evidence. Other tools document their command-specific result in the surrounding workflow. Task execution returns 1 on escalation or other task failure and 20 on a blocking approval. A terminal approval can be pending after task execution completes. Plan run-next returns 1 when no task is ready and work remains. Dashboard queries can return 1 for unavailable sources and invalid options return 2. Engine timeouts and launch failures can be represented as 124 and 126/127 in step results. Inspect the run outcome and receipt as well as the process status.</p>
+<pre>python3 runner/brief_lint.py orchestrator/briefs/example_implement.md --repo eval/fixture
+python3 runner/devpack_plan.py validate workflow/templates/plan.example
+python3 runner/devpack_dash.py --once --plain jobs
+python3 -m runner.dash.tui --demo
+python3 eval/run_eval.py --dry-run --tasks all --models haiku --k 1
+python3 skilltest/skilltest.py lint knowledge/skills/automotive-cpp</pre>
+<p>Jump to <a href="#cli-enforcement">enforcement and evidence</a>, <a href="#cli-eval">evaluation</a>, <a href="#cli-selinux">SELinux tools</a>, <a href="#cli-learning">learning</a>, <a href="#cli-runner">runner and operations</a>, <a href="#cli-skilltest">skill testing</a>, <a href="#cli-tui">terminal dashboard</a>, or <a href="#cli-shell">shell entry points</a>.</p>
+<h3 id="cli-enforcement"><code>enforcement/checks/scope_check.py</code></h3>
+<p>Fail if files changed since --base are outside the --allow glob patterns.</p>
+<pre>python3 enforcement/checks/scope_check.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/checks/scope_check.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">-h</code>, <code data-entry="enforcement/checks/scope_check.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--repo</code></td><td>Path to the git repository root (default: current directory). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--base</code></td><td>Base git reference to compare against (e.g. main, HEAD~1). Required.</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--allow</code></td><td>Allowed POSIX path glob pattern(s) (e.g. &#x27;src/**&#x27;, &#x27;tests/*.cpp&#x27;). Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--list-changed</code></td><td>Print changed/untracked files using trusted base .gitignore rules and exit 0.</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--components</code></td><td>Comma-separated active component names.</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--all-components</code></td><td>Check scope against every workspace component.</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--project-config</code></td><td>Optional path to project.toml for workspace-root boundary checks. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--gate-config-file</code></td><td>Additional repository-relative gate/lint config path protected from worker edits. Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/scope_check.py" data-command="">--pack-artifact</code></td><td>Host-recorded untracked pack artifact with exact repository-relative path and digest. Default: [].</td></tr>
+</tbody></table>
+<h3><code>enforcement/checks/secret_pii_check.py</code></h3>
+<p>Scan staged files (--staged) or explicit paths for secrets and custom PII patterns. Reports file:line without echoing the secret.</p>
+<pre>python3 enforcement/checks/secret_pii_check.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/checks/secret_pii_check.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/checks/secret_pii_check.py" data-command="">-h</code>, <code data-entry="enforcement/checks/secret_pii_check.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/checks/secret_pii_check.py" data-command="">--repo</code></td><td>Path to the repository root (default: current directory). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/secret_pii_check.py" data-command="">--staged</code></td><td>Scan staged git files, reading the staged index blob (git show :&lt;path&gt;).</td></tr>
+<tr><td><code data-entry="enforcement/checks/secret_pii_check.py" data-command="">--patterns</code></td><td>Optional path to an external file of forbidden regex patterns (one per line).</td></tr>
+<tr><td><code>paths</code></td><td>Files or directories to scan when --staged is not set.</td></tr>
+</tbody></table>
+<h3><code>enforcement/checks/symbol_check.py</code></h3>
+<p>Check worker C/C++ object files with nm for framework overrides and denied symbols.</p>
+<pre>python3 enforcement/checks/symbol_check.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/checks/symbol_check.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">-h</code>, <code data-entry="enforcement/checks/symbol_check.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--worker-obj</code></td><td>Worker object (.o) file Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--worker-test-obj</code></td><td>Worker-authored test object (.o) file under tests/ Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--framework-obj</code></td><td>Framework/harness object (.o) file whose symbols worker objects may not define Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--worker-src</code></td><td>Worker C/C++ source file to compile into a temporary object and check Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--worker-test-src</code></td><td>Worker test C/C++ source file to compile into a temporary object and check Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--framework-src</code></td><td>Framework C/C++ source file to compile into a temporary object for collision checking Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">-I</code>, <code data-entry="enforcement/checks/symbol_check.py" data-command="">--include-dir</code></td><td>Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--compile-commands</code></td><td>Optional compile_commands.json</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--force-include-framework</code></td><td>Optional test_framework.hpp to force-include for test sources</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--std</code></td><td>C++ standard when compiling --*-src Default: &#x27;c++17&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--c-std</code></td><td>C standard when compiling --*-src Default: &#x27;c11&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--framework-namespace</code></td><td>Framework namespace(s) forbidden in worker objects (default: can_fixture_test) Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--import-profile</code></td><td>Undefined-symbol policy profile: &#x27;production&#x27; (denylist + optional TOML allowlist) or &#x27;eval&#x27; (strict eval allowlist) Choices: production, eval. Default: &#x27;production&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--import-allowlist</code></td><td>Optional newline-delimited regex file for undefined symbols</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--nm-bin</code></td><td>nm executable name or path Default: &#x27;nm&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--label</code></td><td>Human-readable label for diagnostics Default: &#x27;worker_objects&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/symbol_check.py" data-command="">--json</code></td><td>Emit JSON result</td></tr>
+<tr><td><code>objects</code></td><td>Additional worker object (.o) files</td></tr>
+</tbody></table>
+<h3><code>enforcement/checks/test_lock.py</code></h3>
+<p>Fail if protected test code lines are changed/removed, files deleted/renamed, or assertion count decreases compared to --base, unless HEAD commit message contains &#x27;Deviation: &lt;ID&gt;&#x27;.</p>
+<pre>python3 enforcement/checks/test_lock.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/checks/test_lock.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/checks/test_lock.py" data-command="">-h</code>, <code data-entry="enforcement/checks/test_lock.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_lock.py" data-command="">--repo</code></td><td>Path to the git repository root (default: current directory). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_lock.py" data-command="">--base</code></td><td>Base git reference to compare against (e.g. main, HEAD~1). Required.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_lock.py" data-command="">--protected</code></td><td>Glob pattern(s) identifying protected test files. Required.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_lock.py" data-command="">--assert-regex</code>, <code data-entry="enforcement/checks/test_lock.py" data-command="">--assertion-regex</code>, <code data-entry="enforcement/checks/test_lock.py" data-command="">--regex</code></td><td>Regular expression for assertion tokens (default: &#x27;\\b(ASSERT|EXPECT|CHECK|REQUIRE)\\w*\\(|\\bassert\\b&#x27;). Default: &#x27;\\b(ASSERT|EXPECT|CHECK|REQUIRE)\\w*\\(|\\bassert\\b&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_lock.py" data-command="">--no-deviation</code></td><td>Ignore &#x27;Deviation: &lt;ID&gt;&#x27; trailers in git commit messages (required for agent-produced commits).</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_lock.py" data-command="">--deviation</code></td><td>Explicit human deviation ID verified against the external DEVPACK_DEVIATIONS registry. Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h3><code>enforcement/checks/test_proof.py</code></h3>
+<p>Out-of-process gcov coverage proof runner and verifier for test binaries.</p>
+<pre>python3 enforcement/checks/test_proof.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/checks/test_proof.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="">-h</code>, <code data-entry="enforcement/checks/test_proof.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>subcommand</code></td><td>Subcommands: run, verify Required.</td></tr>
+</tbody></table>
+<h4>run<code data-entry="enforcement/checks/test_proof.py" data-command="run"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">-h</code>, <code data-entry="enforcement/checks/test_proof.py" data-command="run">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">--test-src</code></td><td>Pristine test source file Required.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">--obj-dir</code></td><td>Directory holding .gcno/.gcda files Required.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">--gcov-bin</code></td><td>gcov binary path or name Default: &#x27;gcov&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">--assert-regex</code></td><td>Regex matching assertion lines Default: &#x27;(?&lt;![A-Za-z0-9_])CHECK(?:_EQ|_TRUE|_FALSE|_NEAR)?\\s*\\(&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">--allow-zero-checks</code></td><td>Allow 0 matched CHECK lines</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">--label</code></td><td>Human-readable label for diagnostics Default: &#x27;test_binary&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">--cwd</code></td><td>Working directory for test command</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="run">--timeout-s</code></td><td>Subprocess timeout in seconds Default: 300.</td></tr>
+<tr><td><code>cmd</code></td><td>Command to execute after &#x27;--&#x27;</td></tr>
+</tbody></table>
+<h4>verify<code data-entry="enforcement/checks/test_proof.py" data-command="verify"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">-h</code>, <code data-entry="enforcement/checks/test_proof.py" data-command="verify">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--test-src</code></td><td>Pristine test source file Required.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--obj-dir</code></td><td>Directory holding .gcno/.gcda files Required.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--gcov-bin</code></td><td>gcov binary path or name Default: &#x27;gcov&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--assert-regex</code></td><td>Regex matching assertion lines Default: &#x27;(?&lt;![A-Za-z0-9_])CHECK(?:_EQ|_TRUE|_FALSE|_NEAR)?\\s*\\(&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--allow-zero-checks</code></td><td>Allow 0 matched CHECK lines</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--label</code></td><td>Human-readable label for diagnostics Default: &#x27;test_binary&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--stdout-file</code></td><td>Captured output file</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--returncode</code></td><td>Process return code</td></tr>
+<tr><td><code data-entry="enforcement/checks/test_proof.py" data-command="verify">--start-time</code></td><td>Epoch timestamp before run started</td></tr>
+</tbody></table>
+<h3><code>enforcement/checks/trace_check.py</code></h3>
+<p>Check requirement-to-test traceability: report untested requirements and unknown @req tags; exit 1 on either.</p>
+<pre>python3 enforcement/checks/trace_check.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/checks/trace_check.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/checks/trace_check.py" data-command="">-h</code>, <code data-entry="enforcement/checks/trace_check.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/checks/trace_check.py" data-command="">--repo</code></td><td>Base repository directory for resolving test globs (default: current directory). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/checks/trace_check.py" data-command="">--requirements</code></td><td>Path to the requirements file with &#x27;REQ-ID: text&#x27; lines. Required.</td></tr>
+<tr><td><code data-entry="enforcement/checks/trace_check.py" data-command="">--tests</code></td><td>Test file paths or glob patterns to scan for &#x27;@req REQ-ID&#x27; tags. Required.</td></tr>
+</tbody></table>
+<h3><code>enforcement/evidence/collect.py</code></h3>
+<p>Bundle gate receipt, review last-line VERDICT, git diff stat, and ai-provenance git note into evidence/&lt;change-id&gt;.json.</p>
+<pre>python3 enforcement/evidence/collect.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/evidence/collect.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/evidence/collect.py" data-command="">-h</code>, <code data-entry="enforcement/evidence/collect.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/evidence/collect.py" data-command="">--change-id</code></td><td>Unique change identifier used for the output filename evidence/&lt;change-id&gt;.json. Required.</td></tr>
+<tr><td><code data-entry="enforcement/evidence/collect.py" data-command="">--receipt</code></td><td>Path to the gate receipt JSON file. Required.</td></tr>
+<tr><td><code data-entry="enforcement/evidence/collect.py" data-command="">--review</code></td><td>Path to the review output file whose last line contains &#x27;VERDICT: ...&#x27;. Required.</td></tr>
+<tr><td><code data-entry="enforcement/evidence/collect.py" data-command="">--base</code></td><td>Base git reference for computing diff statistics. Required.</td></tr>
+<tr><td><code data-entry="enforcement/evidence/collect.py" data-command="">--repo</code></td><td>Path to the git repository root (default: current directory). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/evidence/collect.py" data-command="">--out-dir</code></td><td>Output directory for evidence JSON (default: &lt;repo&gt;/evidence).</td></tr>
+</tbody></table>
+<h3><code>enforcement/gate/gate.py</code></h3>
+<p>Fail-closed quality gate runner. Executes ordered [[check]] entries from a TOML configuration, writes a JSON receipt, and exits 0 only on GATE_OK.</p>
+<pre>python3 enforcement/gate/gate.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/gate/gate.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">-h</code>, <code data-entry="enforcement/gate/gate.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--config</code></td><td>Path to the TOML gate configuration file (default: gate.toml). Default: &#x27;gate.toml&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--repo</code></td><td>Path to the repository root directory used as cwd for checks (default: current directory). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--receipt</code></td><td>Path to write the JSON gate receipt (default: gate_receipt.json). Default: &#x27;gate_receipt.json&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--skip</code></td><td>Skip the named check (may be specified multiple times; requires --deviation &lt;ID&gt;). Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--deviation</code></td><td>Deviation identifier authorizing --skip &lt;NAME&gt;.</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--components</code></td><td>Comma-separated workspace component names forwarded via DEVPACK_COMPONENTS.</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--all-components</code></td><td>Run workspace-aware checks across all components (sets DEVPACK_COMPONENTS=all).</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--allow-unowned</code></td><td>Allow changed workspace files outside all components in project checks.</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--allow-empty</code></td><td>Allow an explicitly empty C/C++ change set.</td></tr>
+<tr><td><code data-entry="enforcement/gate/gate.py" data-command="">--project-config</code></td><td>Optional path to project.toml (default: &lt;repo&gt;/.devpack/project.toml). Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h3><code>enforcement/gate/project_checks.py</code></h3>
+<p>Run changed-file quality checks and active component build/test commands.</p>
+<pre>python3 enforcement/gate/project_checks.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/gate/project_checks.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">-h</code>, <code data-entry="enforcement/gate/project_checks.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--check</code></td><td>Choices: lint, cppcheck, test_lock, build, tests. Required.</td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--repo</code></td><td>Target project root, never the pack root. Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--base</code></td><td>Trusted base commit (default: DEVPACK_BASE or HEAD).</td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--project-config</code></td><td></td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--components</code></td><td></td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--all-components</code></td><td></td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--allow-empty</code></td><td>Explicitly allow no C/C++ changes.</td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--allow-unowned</code></td><td>Allow changed workspace files outside every component.</td></tr>
+<tr><td><code data-entry="enforcement/gate/project_checks.py" data-command="">--dry-run</code></td><td>Print resolved commands without executing them.</td></tr>
+</tbody></table>
+<h3><code>enforcement/lint/preflight_lint.py</code></h3>
+<p>Generic C/C++ preflight linter (MISRA-style lexical/AST rules, Doxygen, configurable naming regexes, parameter limits, optional clang-tidy, and baseline fingerprints). DOXYGEN-FILE-BLOCK requires @file in Doxygen comments; DOXYGEN-PARAM-DIR-MISMATCH checks parameter types against directions.</p>
+<pre>python3 enforcement/lint/preflight_lint.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/lint/preflight_lint.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">-h</code>, <code data-entry="enforcement/lint/preflight_lint.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--version</code></td><td>show program&#x27;s version number and exit</td></tr>
+<tr><td><code>targets</code></td><td>C/C++ files or directories to check</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--allow-empty</code></td><td>Allow an intentionally empty scan</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--config</code></td><td>Path to preflight.toml configuration file</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--repo-root</code></td><td>Repository root directory for path-relative normalization and fingerprints</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--compile-commands</code></td><td>Path to compile_commands.json</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--clang-tidy-config</code></td><td>Path to .clang-tidy configuration file</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--std</code></td><td>C++ standard (default: c++17) Choices: c++14, c++17, c++20.</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--c-std</code></td><td>C standard (default: c11) Choices: c99, c11, c17.</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--allow-new-in-init</code></td><td>Allow dynamic memory allocation (new/delete/malloc/free) in *init* files</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--allow-new-paths</code></td><td>Glob pattern(s) where dynamic heap allocation is allowed (repeatable or comma-separated)</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--allow-missing-tools</code></td><td>Do not fail non-zero on TOOL-MISSING when compiler/AST/compile info is unavailable</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--max-params</code></td><td>Maximum function parameters per HIS-PAR (default: 5)</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--naming-class-regex</code></td><td>Regex for class/struct/enum/type-alias names</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--naming-function-regex</code></td><td>Regex for function and method names</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--naming-variable-regex</code></td><td>Regex for local and global variable names</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--naming-parameter-regex</code></td><td>Regex for function parameter names</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--naming-member-regex</code></td><td>Regex for public struct/class member field names</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--naming-private-member-regex</code></td><td>Regex for private/protected class member field names</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--naming-constant-regex</code></td><td>Regex for constexpr constant names</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--naming-namespace-regex</code></td><td>Regex for namespace names</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--disable-rule</code></td><td>Disable specific rule ID(s) (repeatable)</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--plugin</code></td><td>Path to a Python plugin file implementing the preflight hook interface (repeatable)</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--allow-config-plugins</code></td><td>Allow loading Python plugin modules declared in [plugins].paths in preflight.toml</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--baseline</code></td><td>Path to JSON baseline manifest or legacy .txt count file</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--baseline-scope</code></td><td>Scope name for baseline comparison or update (default: default)</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--baseline-profile</code></td><td>Baseline profile name (default: release) Default: &#x27;release&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--baseline-update</code></td><td>Create or update the baseline manifest entry for the checked targets</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--jobs</code></td><td>Number of parallel worker threads (default: PREFLIGHT_JOBS or min(4, CPU count))</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--cache-dir</code></td><td>Directory for content-hash lint cache</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--no-cache</code></td><td>Disable lint cache reads and writes</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--changed-files</code></td><td>JSON array of repository-relative files whose diagnostic paths are in scope</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--finding-export</code></td><td>Write normalized diagnostic multiset JSON</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--skip-clang-tidy</code></td><td>Skip clang-tidy checks on C++ files</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--components</code></td><td>Comma-separated workspace component names to check (overrides [scan] defaults)</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--all-components</code></td><td>Check all configured/discovered workspace components</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--project-config</code></td><td>Optional path to project.toml (default: &lt;repo-root&gt;/.devpack/project.toml)</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--deviation</code></td><td>Human deviation ID verified against DEVPACK_DEVIATIONS (e.g. for PROCESS-TERMINATION) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--base</code></td><td>Base git ref for detecting worker-added suppressions and changed test files Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--subprocess-timeout-s</code></td><td>Timeout in seconds for compiler/preprocessor subprocesses (default: 30)</td></tr>
+<tr><td><code data-entry="enforcement/lint/preflight_lint.py" data-command="">--max-memory-mb</code></td><td>Address-space limit (RLIMIT_AS) in MiB for compiler/preprocessor subprocesses (default: 2048)</td></tr>
+</tbody></table>
+<h3><code>enforcement/static/cppcheck_check.py</code></h3>
+<p>Run cppcheck static analysis on C/C++ targets or changed files vs --base.</p>
+<pre>python3 enforcement/static/cppcheck_check.py --help</pre>
+<h4>Top-level arguments<code data-entry="enforcement/static/cppcheck_check.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">-h</code>, <code data-entry="enforcement/static/cppcheck_check.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--allow-empty</code></td><td>Allow an intentionally empty scan</td></tr>
+<tr><td><code>targets</code></td><td>Target C/C++ file(s) or directory(ies) to analyze</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--repo-root</code>, <code data-entry="enforcement/static/cppcheck_check.py" data-command="">--repo</code></td><td>Analysed repository root: relative include paths resolve here, paths are normalized against it, and preflight.toml is loaded from it when --config is absent (default: cwd)</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--config</code></td><td>Path to preflight.toml containing [cppcheck] table</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--base</code></td><td>Git base ref to discover changed C/C++ files against Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--baseline</code></td><td>Optional JSON baseline file suppressing pre-existing findings</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--baseline-update</code></td><td>Write or update --baseline with the current findings</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--json</code></td><td>Emit normalized JSON output</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--cppcheck-bin</code></td><td>cppcheck executable name or path (default: cppcheck) Default: &#x27;cppcheck&#x27;.</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--fail-on</code></td><td>Comma-separated severities that fail the check (default: error,warning)</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--std</code></td><td>Language standard passed to cppcheck (e.g. c++17)</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--enable</code></td><td>Comma-separated cppcheck --enable checks</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">-I</code>, <code data-entry="enforcement/static/cppcheck_check.py" data-command="">--include-dir</code></td><td>Additional include directory passed to cppcheck (repeatable) Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--suppressions-file</code></td><td>Optional cppcheck suppressions file</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--trusted-suppressions-dir</code></td><td>Trusted snapshot directory: relative suppressions_file is resolved only inside it (never from the working tree)</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--extra-arg</code></td><td>Extra argument forwarded to cppcheck (repeatable) Default: [].</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--timeout-s</code></td><td>Timeout in seconds for cppcheck subprocess (default: 300) Default: 300.</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--max-memory-mb</code></td><td>Address-space limit (RLIMIT_AS) in MiB for cppcheck subprocess (default: 2048)</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--components</code></td><td>Comma-separated workspace component names to analyze (overrides [scan] defaults)</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--all-components</code></td><td>Analyze all configured/discovered workspace components</td></tr>
+<tr><td><code data-entry="enforcement/static/cppcheck_check.py" data-command="">--project-config</code></td><td>Optional path to project.toml (default: &lt;repo-root&gt;/.devpack/project.toml)</td></tr>
+</tbody></table>
+<h3 id="cli-eval"><code>eval/lib/check_memory_scope.py</code></h3>
+<p>Check a memory task&#x27;s cumulative allowed files against its external baseline.</p>
+<pre>python3 eval/lib/check_memory_scope.py --help</pre>
+<h4>Top-level arguments<code data-entry="eval/lib/check_memory_scope.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="eval/lib/check_memory_scope.py" data-command="">-h</code>, <code data-entry="eval/lib/check_memory_scope.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="eval/lib/check_memory_scope.py" data-command="">--workdir</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="eval/lib/check_memory_scope.py" data-command="">--sequence</code></td><td>Required.</td></tr>
+</tbody></table>
+<h3><code>eval/lib/mutate_cpp.py</code></h3>
+<p>Isolated C++ mutation runner for worker-authored test files.</p>
+<pre>python3 eval/lib/mutate_cpp.py --help</pre>
+<h4>Top-level arguments<code data-entry="eval/lib/mutate_cpp.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="eval/lib/mutate_cpp.py" data-command="">-h</code>, <code data-entry="eval/lib/mutate_cpp.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="eval/lib/mutate_cpp.py" data-command="">--workdir</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="eval/lib/mutate_cpp.py" data-command="">--test-file</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="eval/lib/mutate_cpp.py" data-command="">--spec-file</code></td><td></td></tr>
+<tr><td><code data-entry="eval/lib/mutate_cpp.py" data-command="">--spec-stdin</code></td><td></td></tr>
+</tbody></table>
+<h3><code>eval/run_eval.py</code></h3>
+<p>Run ai-devpack evaluation tasks across engines in single, runner, or orchestrator mode and compute pass@1, pass^k, lint, and reviewer metrics.</p>
+<pre>python3 eval/run_eval.py --help</pre>
+<h4>Top-level arguments<code data-entry="eval/run_eval.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">-h</code>, <code data-entry="eval/run_eval.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--mode</code></td><td>Evaluation topology mode: single, runner, orchestrator, or memory (default: single) Choices: single, runner, orchestrator, memory. Default: &#x27;single&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--engines</code>, <code data-entry="eval/run_eval.py" data-command="">--models</code></td><td>Comma-separated engine/model names to evaluate (default: sonnet,haiku) Default: &#x27;sonnet,haiku&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--pairs</code></td><td>Comma-separated implementer:reviewer pairs for --mode runner (default: haiku:sonnet) Default: &#x27;haiku:sonnet&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--orchestrator</code></td><td>Orchestrator engine name for --mode orchestrator (default: sonnet) Default: &#x27;sonnet&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--workers</code></td><td>Comma-separated worker engine(s) for --mode orchestrator (default: haiku) Default: &#x27;haiku&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--tier</code></td><td>Task tier filter: smoke, v2, or all (default: all) Choices: smoke, v2, all. Default: &#x27;all&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--k</code></td><td>Number of trials per (task, engine) pair (default: 5) Default: 5.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--tasks</code></td><td>Task or goal selection: &#x27;all&#x27; or comma-separated IDs (default: all) Default: &#x27;all&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--goals-dir</code></td><td>Path to orchestrator goals directory for --mode orchestrator Default: &#x27;eval/orchestrator_goals&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--memory-tasks-dir</code></td><td>Path to memory sequences directory for --mode memory Default: &#x27;eval/memory_tasks&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--no-memory-ab</code></td><td>Run only the with_memory arm in --mode memory (skip without_memory A/B arm)</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--max-fix-rounds</code></td><td>Maximum fix rounds for --mode runner (default: 2) Default: 2.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--isolation</code></td><td>Isolation mode: &#x27;docker&#x27; or &#x27;local&#x27; (default: docker) Choices: docker, local. Default: &#x27;docker&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--allow-unsandboxed-local</code></td><td>Explicitly authorize unsandboxed --isolation local (sandbox deviation)</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--out</code></td><td>Output directory for summary.md and results.json (default: eval/results) Default: &#x27;eval/results&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--runs-root</code></td><td>Directory for per-trial run directories (default: &lt;out&gt;/&lt;date&gt;/runs) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--engines-config</code></td><td>Path to engines.toml configuration (default: runner/engines.example.toml) Default: &#x27;runner/engines.example.toml&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--dry-run</code></td><td>Validate tasks and print the execution plan without calling any model</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--timeout-s</code></td><td>Per-trial timeout in seconds (default: 900) Default: 900.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--max-parallel</code></td><td>Maximum number of parallel trials (default: 1) Default: 1.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--credentials</code></td><td>Path to Claude credentials file (or set DEVPACK_CLAUDE_CREDENTIALS) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--work-root</code></td><td>Root directory for isolated per-run workspaces (default: /tmp/devpack-eval) Default: &#x27;/tmp/devpack-eval&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--fixture-dir</code></td><td>Path to the C++ evaluation fixture directory Default: &#x27;eval/fixture&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--tasks-dir</code></td><td>Path to the evaluation tasks directory Default: &#x27;eval/tasks&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--dockerfile</code></td><td>Path to eval/Dockerfile for docker isolation mode Default: &#x27;eval/Dockerfile&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--agent-bin</code></td><td>Agent CLI executable name or path (default: claude) Default: &#x27;claude&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--claude-version</code></td><td>Claude Code version baked into the docker image via --build-arg (default: 2.1.330) Default: &#x27;2.1.330&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--allow-harness-errors</code></td><td>Exit 0 even when some runs were harness errors (default: exit 1)</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--max-harness-error-rate</code></td><td>Fraction of trials (0-1) that may be harness errors before the run is marked INVALID_RUN and pass metrics are withheld (default: 0.1) Default: 0.1.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--record-qualification</code></td><td>Evaluate SPEC 5.3 criteria and write .devpack/qualification.json when met</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--qualification-file</code></td><td>Path to qualification.json (default: &lt;repo_root&gt;/.devpack/qualification.json) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--profile-override</code></td><td>Override engine profile path for an engine during evaluation (repeatable) Default: [].</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--context</code></td><td>Code context injection mode: none or repomap (default: none) Choices: none, repomap. Default: &#x27;none&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--brief-variant</code></td><td>Task brief variant: standard, minimal, or oracle (default: standard) Choices: standard, minimal, oracle. Default: &#x27;standard&#x27;.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--repomap-budget</code></td><td>Estimated token budget for --context repomap (default: 1500) Default: 1500.</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--skills</code></td><td>Install pack skills into isolated workspaces and enable skills in agent invocations</td></tr>
+<tr><td><code data-entry="eval/run_eval.py" data-command="">--ablate</code></td><td>Rerun failing base-arm tasks across oracle-brief, repomap, and toggled-skill arms</td></tr>
+</tbody></table>
+<h3 id="cli-selinux"><code>knowledge/skills/telaf-selinux/scripts/avc_triage.py</code></h3>
+<p>Classify AVC evidence without changing policy or the input manifest.</p>
+<pre>python3 knowledge/skills/telaf-selinux/scripts/avc_triage.py --help</pre>
+<h4>Top-level arguments<code data-entry="knowledge/skills/telaf-selinux/scripts/avc_triage.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/avc_triage.py" data-command="">-h</code>, <code data-entry="knowledge/skills/telaf-selinux/scripts/avc_triage.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/avc_triage.py" data-command="">--log</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/avc_triage.py" data-command="">--manifest</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/avc_triage.py" data-command="">--profile</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/avc_triage.py" data-command="">--patch-out</code></td><td></td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/avc_triage.py" data-command="">--report-out</code></td><td></td></tr>
+</tbody></table>
+<h3><code>knowledge/skills/telaf-selinux/scripts/extract_manifest.py</code></h3>
+<p>Conservative Legato evidence extractor. No policy generation or approval. Output is JSON, a YAML 1.2 subset, so no YAML dependency is necessary. Definition parsing is lexical, not a replacement for the Legato build parser.</p>
+<pre>python3 knowledge/skills/telaf-selinux/scripts/extract_manifest.py --help</pre>
+<h4>Top-level arguments<code data-entry="knowledge/skills/telaf-selinux/scripts/extract_manifest.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/extract_manifest.py" data-command="">-h</code>, <code data-entry="knowledge/skills/telaf-selinux/scripts/extract_manifest.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>adef</code></td><td></td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/extract_manifest.py" data-command="">--app-name</code></td><td></td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/extract_manifest.py" data-command="">--workspace</code></td><td>Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/extract_manifest.py" data-command="">--config</code></td><td>TOML or JSON project config Default: &#x27;.devpack/project.toml&#x27;.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/extract_manifest.py" data-command="">--output</code></td><td>Workspace-relative output directory; must not contain an existing manifest Required.</td></tr>
+</tbody></table>
+<h3><code>knowledge/skills/telaf-selinux/scripts/gen_policy.py</code></h3>
+<p>Generate reviewable policy from approved JSON-flow YAML and project TOML.</p>
+<pre>python3 knowledge/skills/telaf-selinux/scripts/gen_policy.py --help</pre>
+<h4>Top-level arguments<code data-entry="knowledge/skills/telaf-selinux/scripts/gen_policy.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/gen_policy.py" data-command="">-h</code>, <code data-entry="knowledge/skills/telaf-selinux/scripts/gen_policy.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/gen_policy.py" data-command="">--manifest</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/gen_policy.py" data-command="">--profile</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/gen_policy.py" data-command="">--out</code></td><td>Required.</td></tr>
+</tbody></table>
+<h3><code>knowledge/skills/telaf-selinux/scripts/sel_gate.py</code></h3>
+<p>Supplementary source gate plus authoritative linked-policy baseline checks.</p>
+<pre>python3 knowledge/skills/telaf-selinux/scripts/sel_gate.py --help</pre>
+<h4>Top-level arguments<code data-entry="knowledge/skills/telaf-selinux/scripts/sel_gate.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/sel_gate.py" data-command="">-h</code>, <code data-entry="knowledge/skills/telaf-selinux/scripts/sel_gate.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/sel_gate.py" data-command="">--module</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/sel_gate.py" data-command="">--manifest</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/sel_gate.py" data-command="">--profile</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/sel_gate.py" data-command="">--linked-policy</code></td><td></td></tr>
+<tr><td><code data-entry="knowledge/skills/telaf-selinux/scripts/sel_gate.py" data-command="">--release</code></td><td></td></tr>
+</tbody></table>
+<h3 id="cli-learning"><code>learning/harvest.py</code></h3>
+<p>Aggregate recurring failures from run directories by (engine, rule/category).</p>
+<pre>python3 learning/harvest.py --help</pre>
+<h4>Top-level arguments<code data-entry="learning/harvest.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="learning/harvest.py" data-command="">-h</code>, <code data-entry="learning/harvest.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>runs_root</code></td><td>Root directory containing run directories (runs/&lt;run-id&gt;/) Required.</td></tr>
+<tr><td><code data-entry="learning/harvest.py" data-command="">--since</code></td><td>Include only runs on or after DATE (YYYY-MM-DD or ISO-8601) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="learning/harvest.py" data-command="">--out-dir</code></td><td>Directory to write &lt;date&gt;.md and &lt;date&gt;.json (default: learning/reports) Default: &#x27;learning/reports&#x27;.</td></tr>
+<tr><td><code data-entry="learning/harvest.py" data-command="">--date</code></td><td>Report date stem for &lt;out-dir&gt;/&lt;date&gt;.{md,json} (default: today UTC) Default: &#x27;2026-11-27&#x27;.</td></tr>
+<tr><td><code data-entry="learning/harvest.py" data-command="">--max-examples</code></td><td>Maximum redacted example snippets stored per (engine, rule) (default: 5) Default: 5.</td></tr>
+</tbody></table>
+<h3><code>learning/propose.py</code></h3>
+<p>Draft a &lt;=40 line candidate engine profile from a harvest JSON report.</p>
+<pre>python3 learning/propose.py --help</pre>
+<h4>Top-level arguments<code data-entry="learning/propose.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="learning/propose.py" data-command="">-h</code>, <code data-entry="learning/propose.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="learning/propose.py" data-command="">--harvest</code></td><td>Path to harvest JSON report Required.</td></tr>
+<tr><td><code data-entry="learning/propose.py" data-command="">--engine</code></td><td>Target engine name (e.g. local, haiku) Required.</td></tr>
+<tr><td><code data-entry="learning/propose.py" data-command="">--active-profile</code></td><td>Optional path to current active profile (default: knowledge/engine_profiles/&lt;engine&gt;.md) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="learning/propose.py" data-command="">--out</code></td><td>Output path for candidate profile (default: learning/reports/candidate-&lt;engine&gt;-v&lt;N&gt;.md) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="learning/propose.py" data-command="">--min-count</code></td><td>Minimum failure occurrences required to include a rule (default: 3) Default: 3.</td></tr>
+<tr><td><code data-entry="learning/propose.py" data-command="">--top-n</code></td><td>Maximum number of top recurring rules to include (default: 15) Default: 15.</td></tr>
+<tr><td><code data-entry="learning/propose.py" data-command="">--max-lines</code></td><td>Maximum total lines allowed in candidate profile (default: 40) Default: 40.</td></tr>
+</tbody></table>
+<h3><code>learning/validate.py</code></h3>
+<p>A/B validate a candidate engine profile against the active profile.</p>
+<pre>python3 learning/validate.py --help</pre>
+<h4>Top-level arguments<code data-entry="learning/validate.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="learning/validate.py" data-command="">-h</code>, <code data-entry="learning/validate.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--engine</code></td><td>Engine name (e.g. local, haiku) Required.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--candidate</code></td><td>Path to candidate profile markdown Required.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--active</code></td><td>Optional active profile path (default: knowledge/engine_profiles/&lt;engine&gt;.md) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--tasks</code></td><td>Task selection: &#x27;all&#x27; or comma-separated IDs Default: &#x27;all&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--tier</code></td><td>Task tier (default: smoke) Choices: smoke, v2, all. Default: &#x27;smoke&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--k</code></td><td>Trials per task per arm (default: 3) Default: 3.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--harvest</code></td><td>Optional harvest JSON to also include finding tasks Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--results-json-pair</code></td><td>Evaluate pre-recorded A/B results JSON files offline without running agents</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--isolation</code></td><td>Isolation mode (default: docker) Choices: docker, local. Default: &#x27;docker&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--allow-unsandboxed-local</code></td><td>Authorize --isolation local</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--engines-config</code></td><td>Path to engines.toml Default: &#x27;runner/engines.example.toml&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--credentials</code></td><td>Optional Claude credentials file path Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--agent-bin</code></td><td>Agent CLI executable (default: claude) Default: &#x27;claude&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--timeout-s</code></td><td>Per-trial timeout seconds (default: 900) Default: 900.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--fixture-dir</code></td><td>Path to C++ evaluation fixture directory Default: &#x27;eval/fixture&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--tasks-dir</code></td><td>Path to evaluation tasks directory Default: &#x27;eval/tasks&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--out-dir</code></td><td>Directory for decision reports (default: learning/reports) Default: &#x27;learning/reports&#x27;.</td></tr>
+<tr><td><code data-entry="learning/validate.py" data-command="">--dry-run</code></td><td>Print A/B validation plan without running agents</td></tr>
+</tbody></table>
+<h3 id="cli-runner"><code>runner/agent_exec.py</code></h3>
+<p>Single isolated agent executor, v2/v0.1 engine configuration loader, and stream-json transcript parser.</p>
+<pre>python3 runner/agent_exec.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/agent_exec.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/agent_exec.py" data-command="">-h</code>, <code data-entry="runner/agent_exec.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/agent_exec.py" data-command="">--install-skills</code></td><td>Copy bundled skills into PROJECT/.claude/skills before committing the task baseline Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/agent_exec.py" data-command="">--check-config</code></td><td>Validate and print a summary of an engines.toml file Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/agent_exec.py" data-command="">--parse-stream</code></td><td>Parse a stream-json .jsonl transcript and print the resulting AgentResult JSON Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h3><code>runner/brief_lint.py</code></h3>
+<p>Lint a worker brief before dispatch and emit JSON findings.</p>
+<pre>python3 runner/brief_lint.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/brief_lint.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/brief_lint.py" data-command="">-h</code>, <code data-entry="runner/brief_lint.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>brief</code></td><td>Path to the Markdown brief file. Required.</td></tr>
+<tr><td><code data-entry="runner/brief_lint.py" data-command="">--repo</code></td><td>Repository root directory for path, line-range, and symbol checks (default: .). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/brief_lint.py" data-command="">--engine</code></td><td>Target engine name for brief size budget lookup (e.g. haiku, sonnet, local). Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/brief_lint.py" data-command="">--engines-config</code></td><td>Optional path to engines.toml (default: runner/engines.example.toml). Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/brief_lint.py" data-command="">--author</code></td><td>Brief author role: orchestrator emits errors; human downgrades findings to warnings. Choices: orchestrator, human. Default: &#x27;orchestrator&#x27;.</td></tr>
+</tbody></table>
+<h3><code>runner/devpack_approve.py</code></h3>
+<p>Human/CI-only CLI to list, inspect, approve, and reject pipeline checkpoints. Never callable by agents inside a sandbox.</p>
+<pre>python3 runner/devpack_approve.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_approve.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="">-h</code>, <code data-entry="runner/devpack_approve.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="">--workdir</code></td><td>Project workdir (default: .) Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="">--state-dir</code></td><td>Explicit checkpoint state directory Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="">--project-config</code></td><td>Optional project.toml path Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: list, show, approve, reject Required.</td></tr>
+</tbody></table>
+<h4>list<code data-entry="runner/devpack_approve.py" data-command="list"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="list">-h</code>, <code data-entry="runner/devpack_approve.py" data-command="list">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="list">--workdir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="list">--state-dir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="list">--project-config</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="list">--json</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="list">--status</code></td><td>Filter by approval status (default: all) Choices: pending, decided, all. Default: &#x27;all&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="list">--checkpoint</code></td><td>Filter by checkpoint ID Choices: , brief, deviation, escalation, memory-decision, plan, pre-merge, selinux-manifest. Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h4>show<code data-entry="runner/devpack_approve.py" data-command="show"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="show">-h</code>, <code data-entry="runner/devpack_approve.py" data-command="show">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="show">--workdir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="show">--state-dir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="show">--project-config</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="show">--json</code></td><td></td></tr>
+<tr><td><code>id</code></td><td>Approval ID Required.</td></tr>
+</tbody></table>
+<h4>approve<code data-entry="runner/devpack_approve.py" data-command="approve"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="approve">-h</code>, <code data-entry="runner/devpack_approve.py" data-command="approve">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="approve">--workdir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="approve">--state-dir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="approve">--project-config</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="approve">--json</code></td><td></td></tr>
+<tr><td><code>id</code></td><td>Pending approval ID Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="approve">--note</code></td><td>Optional approval note Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h4>reject<code data-entry="runner/devpack_approve.py" data-command="reject"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="reject">-h</code>, <code data-entry="runner/devpack_approve.py" data-command="reject">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="reject">--workdir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="reject">--state-dir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="reject">--project-config</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="reject">--json</code></td><td></td></tr>
+<tr><td><code>id</code></td><td>Pending approval ID Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_approve.py" data-command="reject">--note</code></td><td>Required rejection reason note Required.</td></tr>
+</tbody></table>
+<h3><code>runner/devpack_broker.py</code></h3>
+<p>Serialize validated queue requests using the host installation and its credentials.</p>
+<pre>python3 runner/devpack_broker.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_broker.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">-h</code>, <code data-entry="runner/devpack_broker.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--workdir</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--runs-root</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--credentials</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--engines</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--workers</code></td><td>Comma-separated permitted engine names</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--gate-cmd</code></td><td>Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--agent-bin</code></td><td>Default: &#x27;claude&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--docker-bin</code></td><td>Default: &#x27;docker&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--image-tag</code></td><td>Default: &#x27;devpack-eval:2.1.330&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--isolation</code></td><td>Choices: docker, local. Default: &#x27;docker&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--allow-unsandboxed-local</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--state-dir</code></td><td>Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_broker.py" data-command="">--resume</code></td><td>Resume one approved broker checkpoint ID and exit Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h3><code>runner/devpack_dash.py</code></h3>
+<p>Inspect Pack runs and checkpoint evidence from a read-only terminal dashboard.</p>
+<pre>python3 runner/devpack_dash.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_dash.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">-h</code>, <code data-entry="runner/devpack_dash.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--workdir</code></td><td>Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--dashboard-config</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--project-config</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--runs-root</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--plans-root</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--state-dir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--plain</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--json</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="">--once</code></td><td>Read one snapshot or initial tail page</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: jobs, show, gate, tail, plans, plan, approvals</td></tr>
+</tbody></table>
+<h4>jobs<code data-entry="runner/devpack_dash.py" data-command="jobs"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="jobs">-h</code>, <code data-entry="runner/devpack_dash.py" data-command="jobs">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="jobs">--filter</code></td><td>Filter with space-separated AND terms. Keys are backend, state, role, agent, model. Use key=value or a bare literal matched against id, role, agent and model case-insensitively. Use double quotes for values with spaces. Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h4>show<code data-entry="runner/devpack_dash.py" data-command="show"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="show">-h</code>, <code data-entry="runner/devpack_dash.py" data-command="show">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>job</code></td><td>Required.</td></tr>
+</tbody></table>
+<h4>gate<code data-entry="runner/devpack_dash.py" data-command="gate"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="gate">-h</code>, <code data-entry="runner/devpack_dash.py" data-command="gate">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>job</code></td><td>Required.</td></tr>
+</tbody></table>
+<h4>tail<code data-entry="runner/devpack_dash.py" data-command="tail"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="tail">-h</code>, <code data-entry="runner/devpack_dash.py" data-command="tail">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>job</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="tail">--kind</code></td><td>Choices: all, tool, message. Default: &#x27;all&#x27;.</td></tr>
+</tbody></table>
+<h4>plans<code data-entry="runner/devpack_dash.py" data-command="plans"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="plans">-h</code>, <code data-entry="runner/devpack_dash.py" data-command="plans">--help</code></td><td>show this help message and exit</td></tr>
+</tbody></table>
+<h4>plan<code data-entry="runner/devpack_dash.py" data-command="plan"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="plan">-h</code>, <code data-entry="runner/devpack_dash.py" data-command="plan">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>plan_id</code></td><td>Required.</td></tr>
+</tbody></table>
+<h4>approvals<code data-entry="runner/devpack_dash.py" data-command="approvals"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="approvals">-h</code>, <code data-entry="runner/devpack_dash.py" data-command="approvals">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="approvals">--status</code></td><td>Choices: pending, decided, all. Default: &#x27;all&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dash.py" data-command="approvals">--plain</code></td><td></td></tr>
+</tbody></table>
+<h3><code>runner/devpack_dispatch.py</code></h3>
+<p>Dispatch one worker job through agent_exec with data-class refusal, sandbox enforcement, deterministic gate, preflight lint, scope_check, and test_lock.</p>
+<pre>python3 runner/devpack_dispatch.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_dispatch.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">-h</code>, <code data-entry="runner/devpack_dispatch.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--plan-id</code></td><td>Optional machine-readable plan ID</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--plan-dir</code></td><td>Plan directory (default: plans/&lt;plan-id&gt; under the workdir)</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--task-id</code></td><td>Task ID (default: brief filename stem) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--submit</code></td><td>Submit through the host broker</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--engine</code></td><td>Engine name from engines.toml (e.g. haiku, sonnet, local) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--brief</code></td><td>Path to the worker brief markdown file Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--workdir</code></td><td>Path to the target git worktree Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--allow</code></td><td>Allowed file glob(s) checked via scope_check.py Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--protected</code></td><td>Additional protected test globs (nested-test and project defaults always apply) Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--base</code></td><td>Base git ref for scope_check/test_lock (default: pre-run workdir HEAD) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--gate-cmd</code></td><td>Override gate command to run in workdir after the agent completes Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--no-gate</code></td><td>Skip gate execution (note: gate=&#x27;skipped&#x27; causes non-zero exit per SPEC)</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--runs-root</code></td><td>Root directory for runs/&lt;run-id&gt;/ logs (default: from .devpack/project.toml or runs) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--engines</code></td><td>Path to engines.toml (default: from .devpack/project.toml or runner/engines.example.toml) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--project-config</code></td><td>Optional path to project.toml (default: &lt;workdir&gt;/.devpack/project.toml) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--image-tag</code></td><td>Operator-selected sandbox image</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--isolation</code></td><td>Agent isolation mode (default: docker) Choices: docker, local. Default: &#x27;docker&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--allow-unsandboxed-local</code></td><td>Explicitly authorize unsandboxed --isolation local (sandbox deviation)</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--credentials</code></td><td>Optional path to Claude credentials file for cloud engines Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--agent-bin</code></td><td>Agent CLI binary name or path (default: claude) Default: &#x27;claude&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--role</code></td><td>Step role label in run directory (default: worker) Default: &#x27;worker&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--no-checklist</code></td><td>Do not inject runner/quality_checklist.md into the worker prompt</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--profile</code></td><td>Optional engine profile markdown path (default: knowledge/engine_profiles/&lt;engine&gt;.md) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--qualification-file</code></td><td>Optional qualification JSON path (default: &lt;workdir&gt;/.devpack/qualification.json) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--require-qualification</code></td><td>Refuse engines without a valid qualified entry even if qualification.json is absent</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--allow-unqualified</code></td><td>Permit running an unqualified engine (requires --deviation &lt;ID&gt;)</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--deviation</code></td><td>Deviation ID (e.g. DEV-001) authorizing --allow-unqualified Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--dry-run</code></td><td>Validate configuration, data-class, and sandbox policy without running an agent</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--no-memory</code></td><td>Disable project memory retrieval and injection for this dispatch</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--components</code></td><td>Comma-separated workspace component names to scope checks to</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--all-components</code></td><td>Run workspace-scoped checks across all configured/discovered components</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--mode</code></td><td>Override pipeline mode (may only tighten autonomous -&gt; hitl) Choices: hitl, autonomous.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--state-dir</code></td><td>Explicit checkpoint state directory (must be outside agent worktree) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_dispatch.py" data-command="">--resume</code></td><td>Resume a paused dispatch job from an approved checkpoint ID Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h3><code>runner/devpack_logs.py</code></h3>
+<p>Render, list, show, and build static HTML indexes for agent run directories and Claude Code session JSONL transcripts.</p>
+<pre>python3 runner/devpack_logs.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_logs.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="">-h</code>, <code data-entry="runner/devpack_logs.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="">--redact-env</code></td><td>Environment variable name whose value must be redacted (repeatable). Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="">--patterns</code></td><td>Optional path to external secret/PII regex pattern file. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="">--full</code></td><td>Do not truncate tool inputs or tool results at 4 KB.</td></tr>
+<tr><td><code>subcommand</code></td><td>Subcommands: render, list, show, site, analyze, attribute</td></tr>
+</tbody></table>
+<h4>render<code data-entry="runner/devpack_logs.py" data-command="render"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="render">-h</code>, <code data-entry="runner/devpack_logs.py" data-command="render">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="render">--redact-env</code></td><td>Environment variable name whose value must be redacted (repeatable). Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="render">--patterns</code></td><td>Optional path to external secret/PII regex pattern file. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="render">--full</code></td><td>Do not truncate tool inputs or tool results at 4 KB.</td></tr>
+<tr><td><code>run_dir</code></td><td>Path to the run directory (omit when using --session). Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="render">--session</code></td><td>Path to a standalone Claude Code session or stream-json .jsonl file. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="render">--out</code></td><td>Output directory for transcript.md and index.html (required with --session). Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h4>list<code data-entry="runner/devpack_logs.py" data-command="list"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="list">-h</code>, <code data-entry="runner/devpack_logs.py" data-command="list">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="list">--redact-env</code></td><td>Environment variable name whose value must be redacted (repeatable). Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="list">--patterns</code></td><td>Optional path to external secret/PII regex pattern file. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="list">--full</code></td><td>Do not truncate tool inputs or tool results at 4 KB.</td></tr>
+<tr><td><code>runs_root</code></td><td>Root directory containing run subdirectories. Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="list">--json</code></td><td>Output run list and totals as JSON.</td></tr>
+</tbody></table>
+<h4>show<code data-entry="runner/devpack_logs.py" data-command="show"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="show">-h</code>, <code data-entry="runner/devpack_logs.py" data-command="show">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="show">--redact-env</code></td><td>Environment variable name whose value must be redacted (repeatable). Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="show">--patterns</code></td><td>Optional path to external secret/PII regex pattern file. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="show">--full</code></td><td>Do not truncate tool inputs or tool results at 4 KB.</td></tr>
+<tr><td><code>run_dir</code></td><td>Path to the run directory. Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="show">--step</code></td><td>Optional step number or prefix to display (e.g. 01 or 1). Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h4>site<code data-entry="runner/devpack_logs.py" data-command="site"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="site">-h</code>, <code data-entry="runner/devpack_logs.py" data-command="site">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="site">--redact-env</code></td><td>Environment variable name whose value must be redacted (repeatable). Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="site">--patterns</code></td><td>Optional path to external secret/PII regex pattern file. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="site">--full</code></td><td>Do not truncate tool inputs or tool results at 4 KB.</td></tr>
+<tr><td><code>runs_root</code></td><td>Root directory containing run subdirectories. Required.</td></tr>
+</tbody></table>
+<h4>analyze<code data-entry="runner/devpack_logs.py" data-command="analyze"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="analyze">-h</code>, <code data-entry="runner/devpack_logs.py" data-command="analyze">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="analyze">--redact-env</code></td><td>Environment variable name whose value must be redacted (repeatable). Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="analyze">--patterns</code></td><td>Optional path to external secret/PII regex pattern file. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="analyze">--full</code></td><td>Do not truncate tool inputs or tool results at 4 KB.</td></tr>
+<tr><td><code>run_dir</code></td><td>Path to the run directory. Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="analyze">--repo</code></td><td>Optional repository root for path and C/C++ symbol existence checks. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="analyze">--engines</code></td><td>Optional path to engines.toml for context_tokens lookup. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="analyze">--json</code></td><td>Print attribution JSON to stdout.</td></tr>
+</tbody></table>
+<h4>attribute<code data-entry="runner/devpack_logs.py" data-command="attribute"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="attribute">-h</code>, <code data-entry="runner/devpack_logs.py" data-command="attribute">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="attribute">--redact-env</code></td><td>Environment variable name whose value must be redacted (repeatable). Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="attribute">--patterns</code></td><td>Optional path to external secret/PII regex pattern file. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="attribute">--full</code></td><td>Do not truncate tool inputs or tool results at 4 KB.</td></tr>
+<tr><td><code>run_dir</code></td><td>Path to the run directory. Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="attribute">--cause</code></td><td>Primary cause (BRIEF, CONTEXT, SKILL, TOOL, MODEL, ENV). Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="attribute">--secondary</code></td><td>Optional secondary cause (BRIEF, CONTEXT, SKILL, TOOL, MODEL, ENV). Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="attribute">--note</code></td><td>Explanation note for confirmation. Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_logs.py" data-command="attribute">--by</code></td><td>Name or role of the confirming human. Required.</td></tr>
+</tbody></table>
+<h3><code>runner/devpack_memory.py</code></h3>
+<p>Manage and query bounded project memory (.devpack/memory).</p>
+<pre>python3 runner/devpack_memory.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_memory.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="">-h</code>, <code data-entry="runner/devpack_memory.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="">--workdir</code></td><td>Repository workdir (default: current directory) Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="">--memory-dir</code></td><td>Explicit path to .devpack/memory directory Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="">--state-dir</code></td><td>Explicit checkpoint state directory Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="">--patterns</code></td><td>Optional secret/PII patterns file Default: &#x27;&#x27;.</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: list, show, add, approve, supersede, expire, query Required.</td></tr>
+</tbody></table>
+<h4>list<code data-entry="runner/devpack_memory.py" data-command="list"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">-h</code>, <code data-entry="runner/devpack_memory.py" data-command="list">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">--workdir</code></td><td>Repository workdir (default: current directory)</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">--memory-dir</code></td><td>Explicit path to .devpack/memory directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">--state-dir</code></td><td>Explicit checkpoint state directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">--patterns</code></td><td>Optional secret/PII patterns file</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">--scope</code></td><td>Filter by scope Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">--type</code></td><td>Filter by type Choices: , decision, fact, handoff, known-gap. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="list">--status</code></td><td>Filter by status Choices: , active, pending, superseded, expired. Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h4>show<code data-entry="runner/devpack_memory.py" data-command="show"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="show">-h</code>, <code data-entry="runner/devpack_memory.py" data-command="show">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="show">--workdir</code></td><td>Repository workdir (default: current directory)</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="show">--memory-dir</code></td><td>Explicit path to .devpack/memory directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="show">--state-dir</code></td><td>Explicit checkpoint state directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="show">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="show">--patterns</code></td><td>Optional secret/PII patterns file</td></tr>
+<tr><td><code>id</code></td><td>Memory entry ID Required.</td></tr>
+</tbody></table>
+<h4>add<code data-entry="runner/devpack_memory.py" data-command="add"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">-h</code>, <code data-entry="runner/devpack_memory.py" data-command="add">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--workdir</code></td><td>Repository workdir (default: current directory)</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--memory-dir</code></td><td>Explicit path to .devpack/memory directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--state-dir</code></td><td>Explicit checkpoint state directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--patterns</code></td><td>Optional secret/PII patterns file</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--type</code></td><td>Entry type Choices: decision, fact, handoff, known-gap. Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--scope</code></td><td>Entry scope (default: project) Default: &#x27;project&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--tags</code></td><td>Comma-separated or repeatable tags Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--body</code></td><td>Entry body text Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--body-file</code></td><td>Read entry body from file Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--title</code></td><td>Optional short title Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--id</code></td><td>Optional explicit entry ID Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--source</code></td><td>Source attribution (default: human) Default: &#x27;human&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--supersedes</code></td><td>Entry ID(s) superseded by this entry Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--expires</code></td><td>Optional expiry date/timestamp (ISO-8601) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="add">--status</code></td><td>Initial status (default: active) Choices: active, pending. Default: &#x27;active&#x27;.</td></tr>
+</tbody></table>
+<h4>approve<code data-entry="runner/devpack_memory.py" data-command="approve"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="approve">-h</code>, <code data-entry="runner/devpack_memory.py" data-command="approve">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="approve">--workdir</code></td><td>Repository workdir (default: current directory)</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="approve">--memory-dir</code></td><td>Explicit path to .devpack/memory directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="approve">--state-dir</code></td><td>Explicit checkpoint state directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="approve">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="approve">--patterns</code></td><td>Optional secret/PII patterns file</td></tr>
+<tr><td><code>id</code></td><td>Pending entry ID to approve Required.</td></tr>
+</tbody></table>
+<h4>supersede<code data-entry="runner/devpack_memory.py" data-command="supersede"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="supersede">-h</code>, <code data-entry="runner/devpack_memory.py" data-command="supersede">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="supersede">--workdir</code></td><td>Repository workdir (default: current directory)</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="supersede">--memory-dir</code></td><td>Explicit path to .devpack/memory directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="supersede">--state-dir</code></td><td>Explicit checkpoint state directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="supersede">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="supersede">--patterns</code></td><td>Optional secret/PII patterns file</td></tr>
+<tr><td><code>id</code></td><td>Entry ID to mark superseded Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="supersede">--by</code></td><td>Optional superseding entry ID Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h4>expire<code data-entry="runner/devpack_memory.py" data-command="expire"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="expire">-h</code>, <code data-entry="runner/devpack_memory.py" data-command="expire">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="expire">--workdir</code></td><td>Repository workdir (default: current directory)</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="expire">--memory-dir</code></td><td>Explicit path to .devpack/memory directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="expire">--state-dir</code></td><td>Explicit checkpoint state directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="expire">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="expire">--patterns</code></td><td>Optional secret/PII patterns file</td></tr>
+<tr><td><code>id</code></td><td>Entry ID to expire Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="expire">--expired</code></td><td>Expire all active entries past their expires timestamp</td></tr>
+</tbody></table>
+<h4>query<code data-entry="runner/devpack_memory.py" data-command="query"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">-h</code>, <code data-entry="runner/devpack_memory.py" data-command="query">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--workdir</code></td><td>Repository workdir (default: current directory)</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--memory-dir</code></td><td>Explicit path to .devpack/memory directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--state-dir</code></td><td>Explicit checkpoint state directory</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--json</code></td><td>Emit JSON output</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--patterns</code></td><td>Optional secret/PII patterns file</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--task</code></td><td>Task brief text Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--task-file</code></td><td>Path to task brief file Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--role</code></td><td>Role scope (e.g. implementer, reviewer, fixer) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--engine</code></td><td>Engine scope (e.g. haiku, sonnet, local) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--top-k</code></td><td>Max entries (default: 5) Default: 5.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--budget-tokens</code></td><td>Token budget (default: 800) Default: 800.</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--reviewer-sees-handoffs</code></td><td>Allow reviewer role to see non-reviewer handoff entries</td></tr>
+<tr><td><code data-entry="runner/devpack_memory.py" data-command="query">--explain</code></td><td>Print match reasons and token counts</td></tr>
+</tbody></table>
+<h3><code>runner/devpack_plan.py</code></h3>
+<p>Validate, render, inspect, and run machine-readable task plans.</p>
+<pre>python3 runner/devpack_plan.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_plan.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="">-h</code>, <code data-entry="runner/devpack_plan.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: validate, render-md, status, run-next Required.</td></tr>
+</tbody></table>
+<h4>validate<code data-entry="runner/devpack_plan.py" data-command="validate"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="validate">-h</code>, <code data-entry="runner/devpack_plan.py" data-command="validate">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>plan_dir</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="validate">--workdir</code></td><td>Default: current directory.</td></tr>
+</tbody></table>
+<h4>render-md<code data-entry="runner/devpack_plan.py" data-command="render-md"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="render-md">-h</code>, <code data-entry="runner/devpack_plan.py" data-command="render-md">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>plan_dir</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="render-md">--workdir</code></td><td>Default: current directory.</td></tr>
+</tbody></table>
+<h4>status<code data-entry="runner/devpack_plan.py" data-command="status"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="status">-h</code>, <code data-entry="runner/devpack_plan.py" data-command="status">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>plan_dir</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="status">--workdir</code></td><td>Default: current directory.</td></tr>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="status">--runs-root</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="status">--json</code></td><td></td></tr>
+</tbody></table>
+<h4>run-next<code data-entry="runner/devpack_plan.py" data-command="run-next"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_plan.py" data-command="run-next">-h</code>, <code data-entry="runner/devpack_plan.py" data-command="run-next">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>plan_dir</code></td><td>Required.</td></tr>
+<tr><td><code>runner_args</code></td><td></td></tr>
+</tbody></table>
+<h3><code>runner/devpack_run.py</code></h3>
+<p>Run one task through implement -&gt; gate -&gt; review -&gt; fix (max 2 rounds, then ESCALATE_TO_HUMAN).</p>
+<pre>python3 runner/devpack_run.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_run.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">-h</code>, <code data-entry="runner/devpack_run.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--config</code></td><td>Path to engines TOML configuration (default: runner/engines.example.toml) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--gate-config</code></td><td>Project gate TOML override (otherwise project gate_config is required). Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--task-file</code></td><td>Optional path to task brief/JSON file Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--plan-id</code></td><td>Optional machine-readable plan ID</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--plan-dir</code></td><td>Plan directory (default: plans/&lt;plan-id&gt; under the worktree)</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--task-id</code></td><td>Task identifier (default: task-001) Default: &#x27;task-001&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--title</code></td><td>Short task title Default: &#x27;Task Implementation&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--goal</code></td><td>One-paragraph task goal Default: &#x27;Implement the task according to specifications.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--allowed-files</code></td><td>Allowed file glob(s) for the task (default: active components or src/*) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--worktree</code></td><td>Path to the git worktree where the task runs (default: current directory) Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--log-dir</code></td><td>Directory to write per-step logs and run artifacts Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--runs-root</code></td><td>Root directory for creating a timestamped runs/&lt;run-id&gt;/ directory Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--repo-root</code></td><td>Path to ai-devpack repository root for locating workflow/templates Default: pack installation root.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--max-fix-rounds</code></td><td>Override max_fix_rounds from config (hard-capped at 2 unless --deviation &lt;ID&gt;)</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--deviation</code></td><td>Human deviation ID verified against DEVPACK_DEVIATIONS (for --max-fix-rounds &gt; 2) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--image-tag</code></td><td>Operator-selected sandbox image</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--isolation</code></td><td>Agent isolation mode (default: docker) Choices: docker, local. Default: &#x27;docker&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--allow-unsandboxed-local</code></td><td>Explicitly authorize unsandboxed --isolation local (sandbox deviation)</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--credentials</code></td><td>Optional path to Claude credentials file for cloud engines Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--agent-bin</code></td><td>Agent CLI executable name or path (default: claude) Default: &#x27;claude&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--skills</code></td><td>Enable slash commands/skills in agent invocations (default: off, passes --disable-slash-commands)</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--protected</code></td><td>Additional protected test globs (nested-test and project defaults always apply) Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--dry-run</code></td><td>Print the step plan and template resolution without running commands</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--components</code></td><td>Comma-separated workspace component names to scope checks to</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--all-components</code></td><td>Run workspace-scoped checks across all configured/discovered components</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--mode</code></td><td>Override pipeline mode (may only tighten autonomous -&gt; hitl) Choices: hitl, autonomous.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--state-dir</code></td><td>Explicit checkpoint state directory (must be outside agent worktree) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--resume</code></td><td>Resume a paused run from a checkpoint approval ID Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--brief-author</code></td><td>Author mode passed to brief_lint (default: human) Choices: human, orchestrator. Default: &#x27;human&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_run.py" data-command="">--target-branch</code></td><td>Merge target branch for pre-merge protection check (default: [pipeline].target_branch or main)</td></tr>
+</tbody></table>
+<h3><code>runner/devpack_submit.py</code></h3>
+<p>Submit a bounded worker request without importing host execution code.</p>
+<pre>python3 runner/devpack_submit.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/devpack_submit.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">-h</code>, <code data-entry="runner/devpack_submit.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--submit</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--engine</code></td><td>Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--brief</code></td><td>Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--workdir</code></td><td>Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--allow</code></td><td>Default: [].</td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--gate-cmd</code></td><td>Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--components</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--all-components</code></td><td></td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--mode</code></td><td>Choices: hitl, autonomous.</td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--resume</code></td><td>Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/devpack_submit.py" data-command="">--timeout</code></td><td>Default: 900.</td></tr>
+</tbody></table>
+<h3><code>runner/memory.py</code></h3>
+<p>Bounded memory library module; use runner/devpack_memory.py for CLI commands.</p>
+<pre>python3 runner/memory.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/memory.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/memory.py" data-command="">-h</code>, <code data-entry="runner/memory.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+</tbody></table>
+<h3><code>runner/precommit_scan.py</code></h3>
+<p>Scan staged files for high-confidence secrets without echoing matched values.</p>
+<pre>python3 runner/precommit_scan.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/precommit_scan.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/precommit_scan.py" data-command="">-h</code>, <code data-entry="runner/precommit_scan.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/precommit_scan.py" data-command="">--repo</code></td><td>Repository root (default: current directory). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/precommit_scan.py" data-command="">--staged</code></td><td>Scan staged index blobs.</td></tr>
+<tr><td><code data-entry="runner/precommit_scan.py" data-command="">--vendor-dir</code></td><td>Vendored pack directory excluded from the scan (default: devpack or DEVPACK_VENDOR_DIR). Default: &#x27;devpack&#x27;.</td></tr>
+<tr><td><code data-entry="runner/precommit_scan.py" data-command="">--patterns</code></td><td>Optional extra regex patterns, one per line.</td></tr>
+<tr><td><code>paths</code></td><td>Explicit files to scan when --staged is not set.</td></tr>
+</tbody></table>
+<h3><code>runner/repomap.py</code></h3>
+<p>Build a deterministic, ranked, token-budgeted C/C++ Markdown code map.</p>
+<pre>python3 runner/repomap.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/repomap.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/repomap.py" data-command="">-h</code>, <code data-entry="runner/repomap.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/repomap.py" data-command="">--repo</code></td><td>Path to repository root directory (default: .). Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/repomap.py" data-command="">--task</code></td><td>Optional path to task or brief Markdown file for relevance ranking. Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/repomap.py" data-command="">--budget</code></td><td>Maximum estimated token budget (default: 1500). Default: 1500.</td></tr>
+<tr><td><code data-entry="runner/repomap.py" data-command="">--ctags</code></td><td>Optionally supplement stdlib regex parsing with ctags if installed.</td></tr>
+<tr><td><code data-entry="runner/repomap.py" data-command="">--components</code></td><td>Comma-separated workspace component names to index (overrides [scan] defaults).</td></tr>
+<tr><td><code data-entry="runner/repomap.py" data-command="">--all-components</code></td><td>Index all configured/discovered workspace components.</td></tr>
+<tr><td><code data-entry="runner/repomap.py" data-command="">--project-config</code></td><td>Optional path to project.toml (default: &lt;repo&gt;/.devpack/project.toml). Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h3><code>runner/safe_git.py</code></h3>
+<p>Verify repository git metadata and config against the safe_git denylist.</p>
+<pre>python3 runner/safe_git.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/safe_git.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/safe_git.py" data-command="">-h</code>, <code data-entry="runner/safe_git.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: verify Required.</td></tr>
+</tbody></table>
+<h4>verify<code data-entry="runner/safe_git.py" data-command="verify"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/safe_git.py" data-command="verify">-h</code>, <code data-entry="runner/safe_git.py" data-command="verify">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>repo</code></td><td>Path to git repository or worktree. Required.</td></tr>
+</tbody></table>
+<h3><code>runner/workspace_scope.py</code></h3>
+<p>Inspect, resolve, and filter Yocto workspace component scopes.</p>
+<pre>python3 runner/workspace_scope.py --help</pre>
+<h4>Top-level arguments<code data-entry="runner/workspace_scope.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="">-h</code>, <code data-entry="runner/workspace_scope.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: list, resolve, filter Required.</td></tr>
+</tbody></table>
+<h4>list<code data-entry="runner/workspace_scope.py" data-command="list"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="list">-h</code>, <code data-entry="runner/workspace_scope.py" data-command="list">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="list">--repo</code></td><td>Path to repository root (default: .) Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="list">--project-config</code></td><td>Optional path to project.toml (default: &lt;repo&gt;/.devpack/project.toml) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="list">--json</code></td><td>Emit JSON output</td></tr>
+</tbody></table>
+<h4>resolve<code data-entry="runner/workspace_scope.py" data-command="resolve"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="resolve">-h</code>, <code data-entry="runner/workspace_scope.py" data-command="resolve">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="resolve">--repo</code></td><td>Path to repository root (default: .) Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="resolve">--project-config</code></td><td>Optional path to project.toml (default: &lt;repo&gt;/.devpack/project.toml) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="resolve">--components</code></td><td>Comma-separated component names to activate</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="resolve">--all-components</code></td><td>Activate all configured/discovered components</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="resolve">--json</code></td><td>Emit JSON output</td></tr>
+</tbody></table>
+<h4>filter<code data-entry="runner/workspace_scope.py" data-command="filter"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="filter">-h</code>, <code data-entry="runner/workspace_scope.py" data-command="filter">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="filter">--repo</code></td><td>Path to repository root (default: .) Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="filter">--project-config</code></td><td>Optional path to project.toml (default: &lt;repo&gt;/.devpack/project.toml) Default: &#x27;&#x27;.</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="filter">--components</code></td><td>Comma-separated component names to activate</td></tr>
+<tr><td><code data-entry="runner/workspace_scope.py" data-command="filter">--all-components</code></td><td>Activate all configured/discovered components</td></tr>
+<tr><td><code>paths</code></td><td>Paths to filter (reads newline-delimited paths from stdin when omitted)</td></tr>
+</tbody></table>
+<h3 id="cli-skilltest"><code>skilltest/skilltest.py</code></h3>
+<p>Deterministic skill linting and offline-capable A/B experiment harness.</p>
+<pre>python3 skilltest/skilltest.py --help</pre>
+<h4>Top-level arguments<code data-entry="skilltest/skilltest.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="">-h</code>, <code data-entry="skilltest/skilltest.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: lint, run, report Required.</td></tr>
+</tbody></table>
+<h4>lint<code data-entry="skilltest/skilltest.py" data-command="lint"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="lint">-h</code>, <code data-entry="skilltest/skilltest.py" data-command="lint">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>skill_dir</code></td><td>Required.</td></tr>
+</tbody></table>
+<h4>run<code data-entry="skilltest/skilltest.py" data-command="run"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">-h</code>, <code data-entry="skilltest/skilltest.py" data-command="run">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>skill_dir</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">--engines</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">--engines-config</code></td><td>Default: &#x27;runner/engines.example.toml&#x27;.</td></tr>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">--k</code></td><td>Default: 3.</td></tr>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">--isolation</code></td><td>Choices: local, docker. Default: &#x27;docker&#x27;.</td></tr>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">--allow-unsandboxed-local</code></td><td></td></tr>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">--dry-run</code></td><td></td></tr>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">--agent-bin</code></td><td>Default: &#x27;claude&#x27;.</td></tr>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="run">--results-root</code></td><td>Default: &#x27;skilltest/results&#x27;.</td></tr>
+</tbody></table>
+<h4>report<code data-entry="skilltest/skilltest.py" data-command="report"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="skilltest/skilltest.py" data-command="report">-h</code>, <code data-entry="skilltest/skilltest.py" data-command="report">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>summary_json</code></td><td>Required.</td></tr>
+</tbody></table>
+<h3><code>tests/verify_orchestrator_goals.py</code></h3>
+<p>Verify all orchestrator goals under eval/orchestrator_goals/ offline.</p>
+<pre>python3 tests/verify_orchestrator_goals.py --help</pre>
+<h4>Top-level arguments<code data-entry="tests/verify_orchestrator_goals.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="tests/verify_orchestrator_goals.py" data-command="">-h</code>, <code data-entry="tests/verify_orchestrator_goals.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+</tbody></table>
+<h3 id="cli-tui"><code>runner/dash/tui/__main__.py</code></h3>
+<p>Browse pack runs in the terminal or capture dashboard screenshots.</p>
+<pre>python3 -m runner.dash.tui --help</pre>
+<h4>Top-level arguments<code data-entry="runner/dash/tui/__main__.py" data-command=""></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">-h</code>, <code data-entry="runner/dash/tui/__main__.py" data-command="">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--workdir</code></td><td>Default: &#x27;.&#x27;.</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--dashboard-config</code></td><td></td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--project-config</code></td><td></td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--runs-root</code></td><td></td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--plans-root</code></td><td></td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--state-dir</code></td><td></td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--plain</code></td><td></td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--json</code></td><td></td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--once</code></td><td>Read one snapshot or initial tail page</td></tr>
+<tr><td><code>command</code></td><td>Subcommands: jobs, show, gate, tail, plans, plan, approvals</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--demo</code></td><td>Show fixture runs</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--poll-interval</code></td><td>Active refresh interval (default 2 seconds)</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="">--screenshots</code></td><td></td></tr>
+</tbody></table>
+<h4>jobs<code data-entry="runner/dash/tui/__main__.py" data-command="jobs"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="jobs">-h</code>, <code data-entry="runner/dash/tui/__main__.py" data-command="jobs">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="jobs">--filter</code></td><td>Filter with space-separated AND terms. Keys are backend, state, role, agent, model. Use key=value or a bare literal matched against id, role, agent and model case-insensitively. Use double quotes for values with spaces. Default: &#x27;&#x27;.</td></tr>
+</tbody></table>
+<h4>show<code data-entry="runner/dash/tui/__main__.py" data-command="show"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="show">-h</code>, <code data-entry="runner/dash/tui/__main__.py" data-command="show">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>job</code></td><td>Required.</td></tr>
+</tbody></table>
+<h4>gate<code data-entry="runner/dash/tui/__main__.py" data-command="gate"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="gate">-h</code>, <code data-entry="runner/dash/tui/__main__.py" data-command="gate">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>job</code></td><td>Required.</td></tr>
+</tbody></table>
+<h4>tail<code data-entry="runner/dash/tui/__main__.py" data-command="tail"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="tail">-h</code>, <code data-entry="runner/dash/tui/__main__.py" data-command="tail">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>job</code></td><td>Required.</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="tail">--kind</code></td><td>Choices: all, tool, message. Default: &#x27;all&#x27;.</td></tr>
+</tbody></table>
+<h4>plans<code data-entry="runner/dash/tui/__main__.py" data-command="plans"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="plans">-h</code>, <code data-entry="runner/dash/tui/__main__.py" data-command="plans">--help</code></td><td>show this help message and exit</td></tr>
+</tbody></table>
+<h4>plan<code data-entry="runner/dash/tui/__main__.py" data-command="plan"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="plan">-h</code>, <code data-entry="runner/dash/tui/__main__.py" data-command="plan">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code>plan_id</code></td><td>Required.</td></tr>
+</tbody></table>
+<h4>approvals<code data-entry="runner/dash/tui/__main__.py" data-command="approvals"></code></h4>
+<table><thead><tr><th scope="col">Argument</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="approvals">-h</code>, <code data-entry="runner/dash/tui/__main__.py" data-command="approvals">--help</code></td><td>show this help message and exit</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="approvals">--status</code></td><td>Choices: pending, decided, all. Default: &#x27;all&#x27;.</td></tr>
+<tr><td><code data-entry="runner/dash/tui/__main__.py" data-command="approvals">--plain</code></td><td></td></tr>
+</tbody></table>
+<h3 id="cli-shell">Shell entry points</h3>
+<table><thead><tr><th>Command</th><th>Usage and result</th></tr></thead><tbody>
+<tr><td><code>tests/run_all.sh</code></td><td>Run with bash. Accepts <code>-h</code> or <code>--help</code>. Exit 0 on success, 1 on failed verification, 2 on misuse.</td></tr>
+<tr><td><code>tools/make_release.sh</code></td><td>Run with bash and VERSION OUTDIR. Exit 0 when archive and checksum pass verification, 2 on bad usage, 1 on verification or tag errors.</td></tr>
+<tr><td><code>enforcement/hooks/install.sh</code></td><td>Install the pre-commit hook. Use <code>--repo</code> PATH to select the target checkout (default current directory) or <code>-h</code>/<code>--help</code>. Exit 0 on success, 1 for invalid input or failed installation.</td></tr>
+<tr><td><code>eval/fixture/build_and_test.sh</code></td><td>Build and test the C++ fixture. Use the task verifiers for seeded and hidden cases.</td></tr>
+<tr><td><code>eval/tasks/verify_tasks.sh</code>, <code>eval/memory_tasks/verify_memory_tasks.sh</code></td><td>Verify benchmark grading against positive and negative patch cases.</td></tr>
+</tbody></table>
+</section>
+
+<section id="skills"><h2>7. Skills</h2>
+<p>Load applicable skill instructions into the brief or engine context. Give the worker the project rules and file scope alongside the domain guidance. Skills guide decisions and checks verify the output.</p>
+<table><thead><tr><th>Skill</th><th>Use it for</th></tr></thead><tbody>
+<tr><td><code>automotive-cpp</code></td><td>Safety-oriented C++ changes, status handling, bounded behavior, naming and Doxygen.</td></tr>
+<tr><td><code>review-taxonomy</code></td><td>Review findings with evidence, blocking severity and a final verdict.</td></tr>
+<tr><td><code>requirements-analysis</code></td><td>Ambiguous or untestable requirements, traceability and observable behavior.</td></tr>
+<tr><td><code>skill-authoring</code></td><td>Authoring a focused skill and providing fixtures, graders and expected outputs.</td></tr>
+<tr><td><code>misra-cpp-2023</code>, <code>doxygen-naming</code></td><td>Legacy focused guidance. Prefer the consolidated automotive C++ skill for new work.</td></tr>
+<tr><td><code>telaf-selinux</code></td><td>Planning and validating TelAF application policy under verified platform conventions.</td></tr>
+</tbody></table>
+<h3>TelAF policy workflow</h3>
+<ol>
+<li>Use the manifest extractor with the application definition, source evidence and platform profile. Resolve unknowns with the platform owner.</li>
+<li>Review the proposed manifest and gate evidence. Use the selinux-manifest checkpoint for the approval boundary. Release decisions require a human.</li>
+<li>Generate candidate policy from the reviewed manifest using the supported templates. Build and inspect the linked result in the actual platform environment and confirm image labels, transitions and inherited grants.</li>
+<li>Run the SELinux gate on the manifest and generated artifacts. Treat a missing platform verification as unfinished work. Use recorded AVCs to check labels, process domain and grant intent. Correct the manifest or deployment based on the evidence.</li>
+</ol>
+<p>Use the schema, review checklist, triage instructions and verification notes under <code>knowledge/skills/telaf-selinux/references/</code>.</p>
+</section>
+
+<section id="quality"><h2>8. Quality gates and eval</h2>
+<p><code>tests/run_all.sh</code> runs unittest discovery across pack subsystems and skill test directories and shellchecks scripts when shellcheck is installed. The full pack gate also checks offline evaluation fixtures, graders, skill lint, example briefs, repomap, log rendering, C/C++ lint and cppcheck. The product gate example runs scoped preflight, cppcheck, test lock, build and tests. Use all components in CI. The receipt records scope coverage and check outcomes. Use verified test completion evidence where required.</p>
+<p><code>enforcement/checks/</code> includes scope, protected-test integrity, secret/PII, traceability, symbol boundaries, deviations and test proof. Protect the expected output, assertion behavior and preprocessing of protected tests. Evidence collection gathers artifacts for later inspection. The pre-commit hook offers early checks and CI retains the trusted gate. Coverity remains the company CI authority where adopted. See <code>policy/static_analysis.md</code>, <code>policy/tool_confidence.md</code>, and <code>workflow/ci/pipeline.md</code>.</p>
+<p><code>eval/run_eval.py</code> supports single-agent, pipeline runner, orchestrator and memory comparisons. <code>eval/tasks/</code> supplies task briefs, fixture patches, checks, hidden tests, reference solutions and selected oracle clarifications. The C++17 fixture models codec, ring buffer, link state and diagnostics behaviors. Validate seeded failure and reference success with the deterministic verifier. Use mutation and negative cases to catch weak graders. Compare minimal, standard and oracle briefs, optional repo context and skill ablations when diagnosing failures. Start with dry-run to check selection and trial volume.</p>
+<p><code>eval/memory_tasks/</code> covers recall, supersession, distractors, stale guidance and scope isolation in multi-step sequences. Compare product outcomes across arms and check recall with the deterministic grader. <code>eval/orchestrator_goals/</code> exercises goal decomposition and worker orchestration. <code>skilltest/skilltest.py</code> validates skill packages and runs fixture-based skill on/off comparisons with graders and reports.</p>
+</section>
+
+<section id="extending"><h2>9. Extending the pack</h2>
+<h3 id="external">Add an engine or adapter</h3>
+<p>Declare an engine, route the intended role, and set its data ceiling, timeout, context and isolation. Keep credentials in allowed operator environment variables. Run offline contract tests with a fake engine and fixture artifacts before qualifying it. For external adapters, install the executable in the approved execution environment. <code>command</code> is argv with a literal executable. Templates support <code>{brief}</code> (prompt file), <code>{workdir}</code>, <code>{role}</code> (mapped role), <code>{model}</code>, <code>{run_dir}</code> (adapter outputs), and <code>{allow_args}</code> (argv splice occupying an entire argument). The engine identity uses <samp>agent:model</samp>. The adapter example and offline fixture are in <code>runner/engines.example.toml</code> and <code>runner/tests/fixtures/external_job.py</code>.</p>
+<pre>[engines.worker]
+class = "external"
+model = "worker:standard"
+command = ["job-runner", "{brief}", "{workdir}", "{role}", "{run_dir}", "{allow_args}"]
+result = "json-stdout"
+reply_from = "json:reply_path"
+events_from = "{run_dir}/events.jsonl"
+env_allow = ["JOB_RUNNER_TOKEN"]
+max_data_class = "internal"
+timeout_s = 900
+[engines.worker.role_map]
+implementer = "implement"</pre>
+<p>For <code>json-stdout</code>, emit one JSON object with string <code>status</code> and integer <code>exit_code</code>. Optional agent/model identity must match configuration. Supply a relative <code>reply_path</code> for <code>json:reply_path</code>. The executor consumes optional <code>usage.input_tokens</code>, <code>usage.output_tokens</code>, measured cost (<code>total_cost_usd</code>, <code>cost_usd</code> or <code>cost</code>) and reviewer <code>verdict</code>. Recognized external statuses are ok, failed, timeout, gate-failed, exhausted, quota, quota-exhausted and engine-unavailable. Other values classify as a harness error. Use <code>APPROVE</code> or <code>REQUEST_CHANGES</code> for a successful reviewer response. A status of ok with a nonzero process or reported exit fails. <code>exit-code</code> mode uses process status. Reply sources also include <code>stdout</code> and <samp>file:relative-path</samp> under the adapter output root. The optional events file is tailed through the executor, which bounds and redacts input. Keep it and reply files within the declared output boundary.</p>
+<pre>{"status":"ok","exit_code":0,"agent":"worker","model":"standard","reply_path":"reply.md","usage":{"input_tokens":104,"output_tokens":32}}</pre>
+<h3>Add a gate check</h3>
+<p>Add a deterministic command with a unique name to trusted gate TOML. Keep operator check code and its configuration outside worker write scope. Provide a timeout and verify both pass and failure receipts. For component checks, obtain active scope through the existing workspace APIs.</p>
+<h3>Add a skill or eval task</h3>
+<p>Write trigger and contract in a skill's SKILL.md and keep detailed reference material next to it. Add isolated skill fixtures, expected outputs and graders. Run skill lint before model trials. For an eval task, provide task.md, seeded and solution patches, and check.sh, with hidden cases and an oracle where appropriate. Add negative controls and verify them offline. Follow <code>eval/README.md</code> and <code>skilltest/README.md</code>.</p>
+<h3>Add a dashboard view</h3>
+<p>Build a projection from the shared Reader snapshot, use constrained artifact reads, and reuse the common event normalizer and presentation helpers. Keep commands that mutate approvals in the approval CLI. Test unknown, missing, stale and malformed sources with fixtures before wiring the view into the CLI or TUI.</p>
+</section>
+
+<section id="development"><h2>10. Developing the pack</h2>
+<table><thead><tr><th>Location</th><th>Ownership</th></tr></thead><tbody>
+<tr><td><code>policy/</code>, <code>orchestrator/</code>, <code>workflow/</code></td><td>Operating policy, orchestrator guidance, briefs, design records and CI examples.</td></tr>
+<tr><td><code>runner/</code>, <code>enforcement/</code></td><td>Execution, queue, policy decisions, dashboards and trusted checks.</td></tr>
+<tr><td><code>learning/</code>, <code>knowledge/</code></td><td>Harvest run signals, propose bounded improvements, validate qualification and keep versioned skills and lessons.</td></tr>
+<tr><td><code>eval/</code>, <code>skilltest/</code>, <code>tests/</code></td><td>Benchmark fixtures, skill experiments and pack regression tests.</td></tr>
+<tr><td><code>docs/</code>, <code>tools/</code></td><td>Handoff and design documents, and packaging tools.</td></tr>
+</tbody></table>
+<p>Use explicit trusted inputs, fail-closed return paths and bounded run budgets. Follow the local style of each subsystem. Use isolated temporary directories and mock agents in tests, preserve assertions and protect gate inputs. Run the launcher and the full pack gate when changing release-bound work. Use <code>tests/test_no_project_leaks.py</code> to detect forbidden project strings, personal identifiers and host paths. Keep fixtures and documentation generic.</p>
+<pre>bash tests/run_all.sh
+python3 enforcement/gate/gate.py --config enforcement/gate/gate.example.toml --receipt /tmp/pack-gate.json
+bash tools/make_release.sh 0.0.0-test /tmp/pack-release</pre>
+<p>Record changes under Unreleased in <code>CHANGELOG.md</code>. For a release, set <code>VERSION</code>, write the release entry, commit and tag the version. <code>tools/make_release.sh</code> archives the committed tag, accepting the version with or without v. The smoke version archives committed HEAD. Generated artifacts are excluded. The tool unpacks the result, checks version and project leaks and runs the offline suite with shellcheck required. It publishes the compressed archive and SHA-256 file after verification. The archive includes this manual under <code>docs/manual/index.html</code>. Follow <code>docs/TRANSFER.md</code> to verify the checksum and unpack at the destination.</p>
+</section>
+
+<section id="operations"><h2>11. Operations and troubleshooting</h2>
+<table><thead><tr><th>Symptom</th><th>What to inspect and do</th></tr></thead><tbody>
+<tr><td>Scope violation</td><td>Inspect the actual changed paths, brief globs and active workspace components. Remove unrelated edits or have the human revise and reapprove the scope.</td></tr>
+<tr><td>Test-lock violation</td><td>Compare test files against trusted baseline. Restore protected tests. Request a registered deviation if the test contract legitimately changes.</td></tr>
+<tr><td>Gate failed</td><td>Open the first failed required check in the receipt. Reproduce that command using the same trusted config, baseline and component set. Fix the product or repair missing proof before rerunning review.</td></tr>
+<tr><td>Quota or engine unavailable</td><td>Check the step status and sanitized stderr. Verify credentials presence, configured executable, budget, context and classification. Treat infrastructure failure separately from output quality.</td></tr>
+<tr><td><code>AWAITING_APPROVAL</code></td><td>Read the approval evidence and inspect the checkpoint ID. Decide in the approval CLI using trusted state. Resume only a blocking continuation using its recorded ID.</td></tr>
+<tr><td>Quiet or stale heartbeat</td><td>Compare its timestamp and phase with the actual runner or broker process. Check for timeout or worker loss before retrying. A quiet run can still have a live process.</td></tr>
+<tr><td>Dashboard missing artifacts</td><td>Verify roots and coverage, then check symlinks, permissions and source health. Use CLI output if Textual is unavailable.</td></tr>
+</tbody></table>
+</section>
+
+<section id="gaps"><h2>12. Known gaps</h2>
+<ul>
+<li>The README describes Python 3.10+ support. <code>enforcement/gate/gate.py</code> imports stdlib tomllib directly, so run the full gate with Python 3.11 or newer.</li>
+<li><code>.devpack/project.example.toml</code> says <code>allow_unsandboxed_local</code> permits local isolation. <code>runner/agent_exec.py</code> records that worker-project value as ignored. Use trusted authorization.</li>
+<li>The future adapter and accounting sections in <code>docs/design/dashboard.md</code> are design material. The shipped reader joins pack-shaped artifacts. It has no general external job discovery or accounting integration.</li>
+<li><code>runner/devpack_dash.py</code> defaults to runs even if the project has a different runs root. Set the dashboard root explicitly when runner output is redirected.</li>
+<li><code>knowledge/skills/telaf-selinux/references/example-platform-profile.toml</code> includes contexts and build makefile conventions. <code>knowledge/skills/telaf-selinux/scripts/platform_profile.py</code> validates the required profile subset and does not retain these fields in its normalized profile.</li>
+</ul>
+<p><a href="#overview">Back to overview</a></p>
+</section>
+</main>
+</body>
+</html>
