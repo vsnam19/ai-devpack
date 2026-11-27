@@ -6,6 +6,7 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 ## [Unreleased]
 
 ### Added
+- Verified transfer archives with SHA-256 checksums, offline installation guidance, and expanded project leak detection.
 - Live external engine events in step transcripts and the dashboard, with redaction, bounded reads, and truncation notices.
 - Machine-readable plans with brief validation, dependency-aware sequential execution, linked run history, and dashboard views.
 - Read-only Pack run dashboard with terminal navigation, filtered Jobs, incremental event tailing, gate diagnostics and checkpoint evidence.

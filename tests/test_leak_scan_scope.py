@@ -89,6 +89,26 @@ class CommittableScopeTest(unittest.TestCase):
         self.assertEqual(1, len(leaks))
         self.assertTrue(leaks[0].startswith("word.txt:1:"), leaks)
 
+    def test_proxy_spellings_in_text_and_file_names(self):
+        """All proxy spellings and camel case match in file contents and file names."""
+        variants = ["tls" + separator + "proxy" for separator in ("", "_", "-")]
+        variants.append("Tls" + "Proxy")
+        for word in variants:
+            with self.subTest(word=word), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _write(root, "notes.txt", f"see {word} here\n")
+                _write(root, f"{word}.txt", "clean\n")
+                self.assertCountEqual(
+                    [f"notes.txt:1: {word}", f"{word}.txt: (file name) {word}"],
+                    leak.find_leaks(root),
+                )
+
+    def test_words_containing_only_one_proxy_fragment_are_ignored(self):
+        """Unrelated words containing only one proxy fragment are not flagged."""
+        _write(self.root, "dtls-handshake.txt", "Use dtls and proxypass.\n")
+        _write(self.root, "proxypass.txt", "The proxy supports tls.\n")
+        self.assertEqual([], leak.find_leaks(self.root))
+
     def test_host_path_is_substring_match(self):
         """The host-path pattern matches without word boundaries."""
         self.assertIsNotNone(leak.PATTERN.search("prefix" + HOME_PATH))

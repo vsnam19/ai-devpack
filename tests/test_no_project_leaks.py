@@ -26,6 +26,9 @@ _FRAGMENTS = [
     ("qual", "comm"),
     ("shoulder", "tap"),
     ("nam", "vs"),
+    ("tls", "proxy"),
+    ("tls_", "proxy"),
+    ("tls-", "proxy"),
 ]
 FORBIDDEN = [a + b for a, b in _FRAGMENTS]
 SKIP_DIRS = {".git", "__pycache__", ".worktrees"}

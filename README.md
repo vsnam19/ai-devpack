@@ -247,6 +247,9 @@ qualified engine fails re-qualification.
 
 ## Install into a project
 
+For offline installation from a verified release archive, follow the
+[transfer guide](docs/TRANSFER.md).
+
 1. **Day 0:** complete the data-owner sign-off in `policy/data_governance.md` and
    obtain safety approval for `policy/asil_boundaries.md`.
 2. Choose one installation topology and pin the pack version:
