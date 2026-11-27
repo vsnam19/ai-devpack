@@ -5,7 +5,7 @@ import math
 import time
 
 from runner.dash.events import Stream
-from runner.dash.files import DeferredRead, identifier
+from runner.dash.files import TICK_LIMIT, DeferredRead, identifier
 from runner.dash.reader import READ_ERRORS, TERMINAL, number, timestamp
 from runner.dash.ui import poll_delay
 
@@ -123,6 +123,8 @@ class RunSource:
     def poll(self, keys):
         reader = self.reader
         raw = reader.snapshot(interactive=True, include_gates=False)
+        # Discovery has its own budget. Reserve half of the adapter's budget for details.
+        reader.files.remaining = TICK_LIMIT // 2
         jobs = raw["jobs"]
         groups = {}
         task_names = {}
@@ -194,12 +196,13 @@ class RunSource:
             "approvals": [approval_row(approval, task_names) for approval in raw["approvals"]],
             "pending_approvals": raw["pending_approvals"],
             "running": sum(job["state"] == "running" for job in jobs),
-            "failed": sum(job["state"] == "failed" for job in jobs),
+            "failed": sum(RUN_STATES.get(job["state"]) == "failed" for job in jobs),
             "awaiting": sum(job["state"] == "waiting for approval" for job in jobs),
             "cost_today": cost,
         }
         _, task, step = selection(snapshot, keys)
         if task:
+            reader.files.remaining += TICK_LIMIT // 2
             self.details(task, step, raw)
         else:
             self.stream_key, self.stream = None, None
@@ -218,9 +221,12 @@ class RunSource:
                              if step["index"] == 1 and "prompt.md" in step["files"]), None)
         try:
             task["brief"] = (reader.excerpt(base / "steps" / first_prompt) if first_prompt else None) or UNAVAILABLE
+        except DeferredRead:
+            pass
+        try:
             self.gates, _ = reader.gates(native)
             self.gate_key = native
-        except DeferredRead:
+        except ARTIFACT_ERRORS:
             pass
         task["gates"] = self.gates if self.gate_key == native else []
         if not selected:

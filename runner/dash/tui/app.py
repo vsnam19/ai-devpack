@@ -11,6 +11,7 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Input, Markdown, OptionList, RichLog, Static, Tabs, Tab
 from textual.widgets.option_list import Option
+from rich.cells import cell_len
 from rich.text import Text
 
 from .fixtures import LIVE_MESSAGES, demo_snapshot, event
@@ -153,7 +154,7 @@ class Dashboard(App):
                     with Vertical(id=f"{panel}-panel", classes="panel"):
                         with Horizontal(classes="panel-heading"):
                             yield Static(f"[{index}]", classes="panel-number")
-                            yield Static(id=f"{panel}-title", classes="panel-title")
+                            yield Static(id=f"{panel}-title", classes="panel-title", markup=False)
                         yield Panel(id=panel)
             with Vertical(id="main"):
                 yield Static(id="context", markup=False)
@@ -200,6 +201,9 @@ class Dashboard(App):
                 try:
                     snapshot, delay = self.source.poll(keys)
                 except (OSError, ValueError, RecursionError):
+                    snapshot, delay = None, self.source.interval
+                except Exception as error:
+                    self.log.error("Dashboard poll failed", error)
                     snapshot, delay = None, self.source.interval
                 self.post_message(Polled(keys, snapshot, delay))
 
@@ -289,16 +293,27 @@ class Dashboard(App):
                 text.append(f"  {STATES[row['state']][2]}", style="dim")
             return text
         if panel == "tasks":
-            title = row["title"][:14] if small else row["title"]
+            task_id = row["task_id"]
+            title = Text(row["title"] if row["title"] != task_id else "")
             text = self.state_text(row["state"])
-            text.append(f" {row['task_id']} ", style="bold")
-            text.append(title)
+            attempt_text = ""
             if self.source:
                 attempt = row["attempt"]
                 total = row["attempts"]
-                text.append(f"  ↻{attempt}/{total}" if total > 1 else "  ↻1", style="dim")
+                attempt_text = f"  ↻{attempt}/{total}" if total > 1 else "  ↻1"
+            if small:
+                task_id = task_id[-9:]
+                while cell_len(task_id) > 9:
+                    task_id = task_id[1:]
+                # 28 columns minus panel borders, padding, and scrollbar.
+                title.truncate(min(14, max(0, 23 - text.cell_len - cell_len(task_id + attempt_text) - 2)))
+            text.append(f" {task_id}", style="bold")
+            if title:
+                text.append(" ")
+                text.append(title)
+            text.append(attempt_text, style="dim")
             if not small and not self.source:
-                text.append(f"{' ' * (20 - len(title))}{row['attempts']}× {elapsed(row['age_s']):>5}",
+                text.append(f"{' ' * (21 - len(title))}{row['attempts']}× {elapsed(row['age_s']):>5}",
                             style="dim")
                 if row["depends_on"]:
                     text.append(f"  ‹ {','.join(row['depends_on'])}", style=self.color("secondary"))

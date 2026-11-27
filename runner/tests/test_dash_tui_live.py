@@ -179,3 +179,76 @@ class LiveDashboardTests(unittest.IsolatedAsyncioTestCase):
             await self.wait_for(pilot, lambda: self.app.snapshot["health"] == "current")
             await pilot.press("1")
             self.assertEqual(detail.content.plain, "No runs found.")
+
+    async def test_unreadable_selected_gates_leave_dashboard_current(self):
+        self.run_record("active", task="build")
+        with patch.object(self.reader, "gates", side_effect=PermissionError("steps unavailable")):
+            async with self.app.run_test() as pilot:
+                await self.wait_for(pilot, lambda: self.app.snapshot["observed"] is not None)
+                self.assertEqual(self.app.snapshot["health"], "current")
+                self.assertEqual(self.app.selected_task["task_id"], "build")
+                self.assertEqual(self.app.selected_task["gates"], [])
+
+    async def test_discovery_budget_does_not_starve_identity_or_details(self):
+        run = self.run_record("active", plan_id="p01", task_id="build")
+        (run / "steps" / "01-build-engine.prompt.md").write_text("Build brief", encoding="utf-8")
+        write(run / "step_01_gate.json", {"gate_passed": True, "returncode": 0})
+        snapshot = self.reader.snapshot
+
+        def depleted_snapshot(**kwargs):
+            result = snapshot(**kwargs)
+            self.reader.files.remaining = 0
+            return result
+
+        with patch.object(self.reader, "snapshot", side_effect=depleted_snapshot):
+            async with self.app.run_test() as pilot:
+                await self.wait_for(pilot, lambda: bool(self.app.plan))
+                self.assertEqual(self.app.plan["id"], "plan:p01")
+                self.assertEqual(self.app.selected_task["brief"], "Build brief")
+                self.assertTrue(self.app.selected_task["gates"])
+
+    async def test_filter_title_displays_rich_tags_literally(self):
+        async with self.app.run_test() as pilot:
+            await pilot.press("slash", "[", "b", "]", "x")
+            self.assertIn("/[b]x", str(self.app.query_one("#plans-title").render()))
+
+    async def test_poll_retries_after_unexpected_exception(self):
+        self.run_record("active", task="build")
+        poll = self.app.source.poll
+
+        def fail_once(keys):
+            self.app.source.poll = poll
+            raise KeyError("unexpected artifact field")
+
+        with patch.object(self.app.source, "poll", side_effect=fail_once):
+            async with self.app.run_test() as pilot:
+                await self.wait_for(pilot, lambda: bool(self.app.selected_task))
+                self.assertIn("Source current", self.app.query_one("#top").content.plain)
+                self.assertEqual(self.app.selected_task["task_id"], "build")
+
+    async def test_failed_summary_includes_rejected_and_refused_runs(self):
+        for outcome in ("fail", "rejected", "refused"):
+            self.run_record(outcome, task=outcome, outcome=outcome)
+        async with self.app.run_test(size=(120, 35)) as pilot:
+            await self.wait_for(pilot, lambda: bool(self.app.plan))
+            self.assertEqual([task["state"] for task in self.app.plan["jobs"]], ["failed"] * 3)
+            self.assertIn("3 fail", self.app.query_one("#top").content.plain)
+
+    async def test_compact_row_fits_task_id_title_and_attempt(self):
+        self.run_record("active", task_id="20261127-long-task-ending", task="Build")
+        async with self.app.run_test(size=(80, 24)) as pilot:
+            await self.wait_for(pilot, lambda: bool(self.app.selected_task))
+            await pilot.press("2")
+            panel = self.app.query_one("#tasks")
+            prompt = panel.get_option_at_index(0).prompt
+            self.assertIn("ending", prompt.plain)
+            self.assertIn("Build", prompt.plain)
+            self.assertTrue(prompt.plain.endswith("↻1"))
+            self.assertLessEqual(prompt.cell_len, panel.content_region.width - 1)
+
+    async def test_task_row_shows_id_once_when_title_matches(self):
+        self.run_record("build")
+        async with self.app.run_test(size=(120, 35)) as pilot:
+            await self.wait_for(pilot, lambda: bool(self.app.selected_task))
+            prompt = self.app.query_one("#tasks").get_option_at_index(0).prompt
+            self.assertEqual(prompt.plain.count("build"), 1)
