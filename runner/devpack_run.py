@@ -872,6 +872,8 @@ def run_task_workflow(
     else:
         update_run_json(
             active_run_dir,
+            outcome="running",
+            finished=None,
             **(plan_link or {}),
             components=active_component_names,
             scan_mode=ws_scope.scan_mode,
@@ -2041,39 +2043,39 @@ def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    cfg_path_str = str(args.config).strip() or str(saved.get("engines_config_path", "")).strip()
-    if cfg_path_str and Path(cfg_path_str).is_file():
-        resumed_cfg: EnginesConfig | dict[str, Any] = load_engine_config(Path(cfg_path_str).resolve())
-        resumed_cfg_path: Path | None = Path(cfg_path_str).resolve()
-    elif isinstance(saved.get("roles"), dict):
-        resumed_cfg = {
-            "roles": dict(saved["roles"]),
-            "gate_cmd": list(saved.get("gate_cmd", list(agent_exec.DEFAULT_GATE_CMD))),
-            "gate_timeout_s": int(saved.get("gate_timeout_s", 300)),
-            "limits": {"max_fix_rounds": int(saved.get("max_fix_rounds", 2))},
-        }
-        resumed_cfg_path = None
-    else:
-        proj_cfg = agent_exec.load_project_config(resumed_worktree)
-        resumed_cfg_path = Path(proj_cfg["engines_config"])
-        resumed_cfg = load_engine_config(resumed_cfg_path)
-
-    credentials_path = (
-        Path(args.credentials).resolve()
-        if args.credentials
-        else (Path(saved["credentials_path"]).resolve() if saved.get("credentials_path") else None)
-    )
-    gate_cfg = (
-        Path(args.gate_config).resolve()
-        if args.gate_config
-        else (Path(saved["gate_config"]).resolve() if saved.get("gate_config") else None)
-    )
-    resumed_isolation = args.isolation if args.isolation != "docker" else str(saved.get("isolation", "docker"))
-    resumed_allow_local = bool(args.allow_unsandboxed_local or saved.get("allow_unsandboxed_local", False))
-    resumed_agent_bin = args.agent_bin if args.agent_bin != "claude" else str(saved.get("agent_bin", "claude"))
-    resumed_target_branch = args.target_branch if args.target_branch is not None else saved.get("target_branch")
-
     try:
+        cfg_path_str = str(args.config).strip() or str(saved.get("engines_config_path", "")).strip()
+        if cfg_path_str and Path(cfg_path_str).is_file():
+            resumed_cfg: EnginesConfig | dict[str, Any] = load_engine_config(Path(cfg_path_str).resolve())
+            resumed_cfg_path: Path | None = Path(cfg_path_str).resolve()
+        elif isinstance(saved.get("roles"), dict):
+            resumed_cfg = {
+                "roles": dict(saved["roles"]),
+                "gate_cmd": list(saved.get("gate_cmd", list(agent_exec.DEFAULT_GATE_CMD))),
+                "gate_timeout_s": int(saved.get("gate_timeout_s", 300)),
+                "limits": {"max_fix_rounds": int(saved.get("max_fix_rounds", 2))},
+            }
+            resumed_cfg_path = None
+        else:
+            proj_cfg = agent_exec.load_project_config(resumed_worktree)
+            resumed_cfg_path = Path(proj_cfg["engines_config"])
+            resumed_cfg = load_engine_config(resumed_cfg_path)
+
+        credentials_path = (
+            Path(args.credentials).resolve()
+            if args.credentials
+            else (Path(saved["credentials_path"]).resolve() if saved.get("credentials_path") else None)
+        )
+        gate_cfg = (
+            Path(args.gate_config).resolve()
+            if args.gate_config
+            else (Path(saved["gate_config"]).resolve() if saved.get("gate_config") else None)
+        )
+        resumed_isolation = args.isolation if args.isolation != "docker" else str(saved.get("isolation", "docker"))
+        resumed_allow_local = bool(args.allow_unsandboxed_local or saved.get("allow_unsandboxed_local", False))
+        resumed_agent_bin = args.agent_bin if args.agent_bin != "claude" else str(saved.get("agent_bin", "claude"))
+        resumed_target_branch = args.target_branch if args.target_branch is not None else saved.get("target_branch")
+
         rc, _summary = run_task_workflow(
             config=resumed_cfg,
             context=dict(saved["context"]),
@@ -2104,7 +2106,9 @@ def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
             plan_link=saved.get("plan_link"),
             plan_brief=saved.get("plan_brief"),
         )
-    except ValueError as exc:
+    except (OSError, ValueError, GitSecurityError) as exc:
+        if (resumed_run_dir / "run.json").is_file():
+            update_run_json(resumed_run_dir, outcome="fail", finished=datetime.now(timezone.utc).isoformat())
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return rc
@@ -2119,7 +2123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo_root = Path(args.repo_root).resolve()
     task_file = None
     if args.task_file:
-        task_file = Path(args.task_file).absolute() if args.plan_id else Path(args.task_file).resolve()
+        task_file = Path(os.path.abspath(args.task_file)) if args.plan_id else Path(args.task_file).resolve()
     credentials_path = Path(args.credentials).resolve() if args.credentials else None
 
     if not worktree.is_dir():
@@ -2144,7 +2148,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         plan_link = run_link(worktree, args.plan_id, args.plan_dir, args.task_id)
         plan_brief = None
         if plan_link and task_file is not None and task_file.suffix.lower() == ".md":
-            plan_brief = Files().read(task_file, TEXT_LIMIT).decode("utf-8")
+            plan_dir = Path(os.path.abspath(Path(args.worktree) / (args.plan_dir or Path("plans") / args.plan_id)))
+            task_file.relative_to(plan_dir)
+            plan_brief = Files(plan_dir).read(task_file, TEXT_LIMIT).decode("utf-8")
         context = load_task_data(
             task_file=None if plan_brief is not None else task_file,
             task_id=args.task_id,

@@ -74,10 +74,10 @@ def _check_dependencies(tasks):
         raise ValueError("plan contains a dependency cycle")
 
 
-def load_plan(directory, *, workdir=None, files=None):
+def load_plan(directory, *, workdir=None, files=None, check_references=True):
     """Read a plan and its briefs. Supply workdir to lint briefs against the project."""
     directory = Path(os.path.abspath(directory))
-    files = files if files is not None else Files()
+    files = files if files is not None else Files(directory)
     plan = parse_toml_with_arrays(files.read(directory / "plan.toml", JSON_LIMIT).decode("utf-8"))
     _fields(plan, {"id", "title", "goal", "created", "tasks"}, {"owner_role"}, "plan")
     created = plan["created"]
@@ -117,17 +117,30 @@ def load_plan(directory, *, workdir=None, files=None):
         tasks[task_id] = task
     _check_dependencies(tasks)
 
-    briefs = {}
-    for task_id, task in tasks.items():
-        text = files.read(directory / task["brief"], TEXT_LIMIT).decode("utf-8")
-        if workdir is not None:
-            findings = lint_brief_text(text, repo_root=workdir)
-            errors = [f'{item["rule"]}: {item["message"]}' for item in findings if item["severity"] == "error"]
-            if errors:
-                raise ValueError(f"invalid brief for {task_id}: " + "; ".join(errors))
-            brief_allowed_files(text)
-        briefs[task_id] = text
+    briefs = {
+        task_id: files.read(directory / task["brief"], TEXT_LIMIT).decode("utf-8")
+        for task_id, task in tasks.items()
+    }
+    if workdir is not None:
+        for task_id, text in briefs.items():
+            dependencies = set()
+            pending = list(tasks[task_id]["depends_on"]) if check_references else []
+            while pending:
+                dependency = pending.pop()
+                if dependency not in dependencies:
+                    dependencies.add(dependency)
+                    pending.extend(tasks[dependency]["depends_on"])
+            _lint_plan_brief(task_id, text, workdir, check_references=check_references,
+                             prerequisite_briefs=[briefs[key] for key in sorted(dependencies)])
     return plan, briefs
+
+
+def _lint_plan_brief(task_id, text, workdir, **lint_options):
+    findings = lint_brief_text(text, repo_root=workdir, **lint_options)
+    errors = [f'{item["rule"]}: {item["message"]}' for item in findings if item["severity"] == "error"]
+    if errors:
+        raise ValueError(f"invalid brief for {task_id}: " + "; ".join(errors))
+    brief_allowed_files(text)
 
 
 def _started(value):
@@ -170,7 +183,8 @@ def progress(plan, runs):
 
 
 def read_runs(root):
-    files = Files()
+    root = Path(os.path.abspath(root))
+    files = Files(root)
     try:
         names = files.names(root, folders=True)
     except FileNotFoundError:
@@ -180,7 +194,7 @@ def read_runs(root):
             continue
         try:
             record = files.json(root / name / "run.json")
-        except FileNotFoundError:
+        except READ_ERRORS:
             continue
         if record.get("run_id") not in (None, "", name):
             continue
@@ -230,18 +244,25 @@ def run_next(directory, forwarded):
         forwarded = forwarded[1:]
     if forwarded[-1:] == ["--"]:
         forwarded = forwarded[:-1]
+    owned = ("--plan-id", "--plan-dir", "--task-id", "--task-file", "--title", "--brief-author")
+    for token in forwarded:
+        option = token.partition("=")[0]
+        # argparse also accepts unambiguous long-option prefixes.
+        if token == "--" or (option.startswith("--") and any(flag.startswith(option) for flag in owned)):
+            raise ValueError(f"run-next does not accept forwarded argument {option}")
     args = devpack_run.build_arg_parser().parse_args(forwarded)
     if args.resume or args.log_dir:
         raise ValueError("run-next requires a new attempt under the runs root")
     workdir = Path(args.worktree).resolve(strict=True)
-    runs_root = Path(args.runs_root).resolve() if args.runs_root else workdir / "runs"
+    runs_root = Path(os.path.abspath(args.runs_root)) if args.runs_root else workdir / "runs"
     # Serialize run-next invocations for this plan even before a run record exists.
-    with regular(directory / "plan.toml") as (fd, _):
+    directory = Path(os.path.abspath(directory))
+    with regular(directory / "plan.toml", root=directory) as (fd, _):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("a run-next invocation already holds this plan") from None
-        plan, _ = load_plan(directory, workdir=workdir)
+        plan, briefs = load_plan(directory, workdir=workdir, check_references=False)
         tasks = progress(plan, read_runs(runs_root))["tasks"]
         if any(task["state"] == "in_progress" for task in tasks):
             print("Plan already has a running or paused task.")
@@ -250,10 +271,11 @@ def run_next(directory, forwarded):
         if task is None:
             print("No ready tasks.")
             return 0 if all(task["state"] == "done" for task in tasks) else 1
+        _lint_plan_brief(task["id"], briefs[task["id"]], workdir)
         return devpack_run.main([
-            *forwarded, "--plan-id", plan["id"], "--plan-dir", str(directory), "--task-id", task["id"],
-            "--task-file", str(directory / task["brief"]), "--title", task["title"],
-            "--runs-root", str(runs_root), "--brief-author", "orchestrator",
+            *forwarded, f"--plan-id={plan['id']}", f"--plan-dir={directory}", f"--task-id={task['id']}",
+            f"--task-file={directory / task['brief']}", f"--title={task['title']}",
+            f"--runs-root={runs_root}", "--brief-author=orchestrator",
         ])
 
 
@@ -271,11 +293,12 @@ def main(argv=None):
             command.add_argument("--runs-root", type=Path)
             command.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    directory = args.plan_dir.absolute()
+    directory = Path(os.path.abspath(args.plan_dir))
     try:
         if args.command == "run-next":
             return run_next(directory, args.runner_args)
-        plan, _ = load_plan(directory, workdir=args.workdir)
+        plan, _ = load_plan(directory, workdir=args.workdir,
+                            check_references=args.command == "validate")
         if args.command == "render-md":
             print(render_markdown(plan), end="")
         elif args.command == "status":
