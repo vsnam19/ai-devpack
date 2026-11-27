@@ -103,6 +103,7 @@ from runner.safe_git import (  # noqa: E402
     run_git,
     snapshot_git_metadata,
 )
+from runner.devpack_plan import run_link  # noqa: E402
 from runner.workspace_scope import WorkspaceScope, parse_toml_with_arrays, resolve_workspace_scope  # noqa: E402
 
 CPP_SUFFIXES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh")
@@ -800,6 +801,8 @@ def dispatch_job(
     components: str | Sequence[str] | None = None,
     all_components: bool = False,
     task_id: str = "",
+    plan_id: str | None = None,
+    plan_dir: Path | str | None = None,
     trusted_git_dir: Path | None = None,
     mode: str | None = None,
     state_dir: Path | str | None = None,
@@ -814,6 +817,7 @@ def dispatch_job(
 
     Returns ``(exit_code, result_payload)``.
     """
+    plan_link = run_link(workdir, plan_id, plan_dir, task_id or brief_path.stem)
     cleaned_deviation = deviation_id.strip()
     if allow_unqualified and not cleaned_deviation:
         raise ValueError("--allow-unqualified requires --deviation <ID>")
@@ -953,6 +957,7 @@ def dispatch_job(
             effective_base=effective_base,
             brief_path=brief_path,
             task_id=(task_id or brief_path.stem),
+            plan_link=plan_link,
             brief_raw=brief_raw,
             effective_brief_lint=effective_brief_lint,
             prompt_text=prompt_text,
@@ -1033,6 +1038,7 @@ def dispatch_job(
                 "components": list(components) if isinstance(components, (list, tuple)) else components,
                 "all_components": bool(all_components),
                 "task_id": task_id or brief_path.stem,
+                **plan_link,
                 "trusted_git_dir": str(trusted_git_dir.resolve()) if trusted_git_dir else "",
                 "pipeline_mode": pipeline_cfg.mode,
                 "state_dir": pipeline_cfg.state_dir,
@@ -1054,6 +1060,7 @@ def _dispatch_job_with_trusted_cfg(
     effective_base: str,
     brief_path: Path,
     task_id: str,
+    plan_link: dict[str, str],
     brief_raw: str,
     effective_brief_lint: list[dict[str, Any]],
     prompt_text: str,
@@ -1166,9 +1173,10 @@ def _dispatch_job_with_trusted_cfg(
     run_dir = new_run_dir(
         effective_runs_root,
         kind="dispatch",
-        task=brief_path.stem,
+        task=task_id if plan_link else brief_path.stem,
         engines=[engine.name],
         outcome="running",
+        plan_link=plan_link,
     )
 
     update_run_json(
@@ -1782,7 +1790,7 @@ def _dispatch_job_with_trusted_cfg(
         run_extra["gate_touched"] = gate_touched
     update_run_json(
         run_dir,
-        task=brief_path.stem,
+        task=task_id if plan_link else brief_path.stem,
         outcome=outcome,
         pipeline_mode=pipeline_cfg.mode,
         approval_id=brief_approval_id,
@@ -1870,6 +1878,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "and test_lock."
         ),
     )
+    parser.add_argument("--plan-id", help="Optional machine-readable plan ID")
+    parser.add_argument("--plan-dir", help="Plan directory (default: plans/<plan-id> under the workdir)")
+    parser.add_argument("--task-id", default="", help="Task ID (default: brief filename stem)")
     parser.add_argument("--submit", action="store_true", help="Submit through the host broker")
     parser.add_argument(
         "--engine",
@@ -2217,6 +2228,8 @@ def _resume_dispatch_from_approval(
             components=saved.get("components"),
             all_components=bool(saved.get("all_components", False)),
             task_id=str(saved.get("task_id", "")),
+            plan_id=saved.get("plan_id"),
+            plan_dir=saved.get("plan_dir"),
             trusted_git_dir=resumed_trusted_git,
             mode=resumed_mode,
             state_dir=pipeline_cfg.state_dir,
@@ -2325,6 +2338,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             memory_enabled=False if args.no_memory else None,
             components=args.components,
             all_components=bool(args.all_components),
+            task_id=args.task_id,
+            plan_id=args.plan_id,
+            plan_dir=args.plan_dir,
             mode=cli_pipeline_cfg.mode,
             state_dir=cli_pipeline_cfg.state_dir if cli_pipeline_cfg.state_dir_explicit else None,
         )

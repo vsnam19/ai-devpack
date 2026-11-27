@@ -4,6 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
+from shutil import copytree
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -11,6 +12,30 @@ from runner.devpack_dash import main
 
 
 class CLITest(unittest.TestCase):
+    def test_plan_list_and_detail(self):
+        with TemporaryDirectory() as directory:
+            workdir = Path(directory) / "target"
+            example = Path(__file__).resolve().parents[2] / "workflow/templates/plan.example"
+            copytree(example, workdir / "plans/example")
+            args = ["--workdir", str(workdir), "--state-dir", str(workdir.parent / "state")]
+
+            listing = io.StringIO()
+            with redirect_stdout(listing):
+                self.assertEqual(main([*args, "--plain", "plans"]), 0)
+            self.assertIn("example  0/3 done", listing.getvalue())
+
+            detail = io.StringIO()
+            with redirect_stdout(detail):
+                self.assertEqual(main([*args, "--json", "plan", "example"]), 0)
+            selected = json.loads(detail.getvalue())["plans"]
+            self.assertEqual([plan["id"] for plan in selected], ["example"])
+            self.assertEqual(selected[0]["tasks"][1]["blocked_by"], ["T1"])
+
+            missing = io.StringIO()
+            with redirect_stdout(missing):
+                self.assertEqual(main([*args, "--plain", "plan", "missing"]), 1)
+            self.assertIn("Plan unavailable", missing.getvalue())
+
     def test_snapshot_and_exit_codes(self):
         with TemporaryDirectory() as directory:
             root = Path(directory) / "target"

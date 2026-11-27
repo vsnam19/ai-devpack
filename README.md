@@ -109,6 +109,36 @@ python3 runner/devpack_run.py --resume <approval-id>
 python3 runner/devpack_dispatch.py --resume <approval-id>
 ```
 
+## Plans
+
+Put a plan in `plans/<plan-id>/plan.toml` and keep its Markdown briefs inside the
+same directory. See [the three-task example](workflow/templates/plan.example/plan.toml).
+The manifest records `id`, `title`, `goal`, `created` (an ISO date or timestamp),
+and optional `owner_role`. Each `[[tasks]]` entry supplies `id`, `title`,
+`depends_on`, and a relative Markdown `brief` path. Optional task metadata
+includes `role`, `size_limit` (changed lines), and `requirement_ids`.
+
+```bash
+python3 runner/devpack_plan.py validate plans/<plan-id>
+python3 runner/devpack_plan.py render-md plans/<plan-id>
+python3 runner/devpack_plan.py status plans/<plan-id>
+python3 runner/devpack_plan.py run-next plans/<plan-id>
+python3 runner/devpack_dash.py --plain plans
+python3 runner/devpack_dash.py --json plan <plan-id>
+```
+
+`render-md` writes to standard output. The first ready task in manifest order
+runs through the normal task workflow with its brief and scope. Status uses the
+latest attempt for each task. Add `--json` to `status` for structured output. A successful outcome satisfies dependencies, a failed
+attempt can be retried, and a running or paused attempt holds the plan. Resume a
+paused task with `devpack_run.py --resume <approval-id>`.
+
+Plan commands use `runs/` under the workdir by default. Use the same `--runs-root`
+for `run-next`, `status`, and the dashboard when storing attempts elsewhere.
+The dashboard accepts `--plans-root` or `[dashboard].plans_root` for an alternate
+plan directory. For direct task runs and dispatch jobs, pass `--plan-id` and
+`--task-id` to record the link. Use `--plan-dir` for a nonstandard plan location.
+
 ## Engines
 
 Use `runner/engines.example.toml` as the starting point. Select a configured engine

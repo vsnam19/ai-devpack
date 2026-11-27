@@ -49,6 +49,12 @@ Each checkpoint is classified along two axes:
 | `escalation` | Escalation | `terminal` | Action after 2 failed fix rounds or STOP condition | Tech lead (TL) | Always writes `PENDING` approval record; keeps `ESCALATE_TO_HUMAN` (exit `1`) | Hard-stop |
 | `memory-decision` | Memory | `terminal` | Promotion of `decision` / `fact` memory proposals | Human reviewer (`policy/memory.md`) | Always writes `PENDING` approval record; keeps existing exit code | Hard-stop |
 
+The plan checkpoint applies during planning before briefs are drafted. When
+`devpack_plan.py run-next` starts a task from an existing plan, it delegates to the
+task runner and applies its brief and terminal checkpoints. A blocking pause
+returns exit code 20 and holds the plan until the attempt is resumed or rejected.
+Plan validation checks structure and brief lint before task selection.
+
 ## 2. Configuration and tightening rules
 
 Configure mode and state location in trusted `.devpack/project.toml`:

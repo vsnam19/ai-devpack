@@ -466,6 +466,15 @@ def _extract_scope_entries(sections: Sequence[dict[str, Any]], lines: Sequence[s
     return has_scope, scope_line, [entry for _, entry in items]
 
 
+def brief_allowed_files(text: str) -> list[str]:
+    """Extract allowed file globs using the same syntax the linter validates."""
+    lines = text.splitlines()
+    globs = _extract_scope_entries(_parse_sections(lines), lines)[2]
+    if any(glob.startswith("-") or "\x00" in glob for glob in globs):
+        raise ValueError("invalid allowed-files glob")
+    return globs
+
+
 def _extract_contradiction_targets(text: str) -> set[str]:
     """Extract normalized file paths or test-target keywords from a line or phrase."""
     targets: set[str] = set()

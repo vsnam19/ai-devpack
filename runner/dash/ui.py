@@ -143,7 +143,21 @@ def event_line(event):
 
 
 def plain(snapshot, command):
-    if command == "approvals":
+    if command in ("plans", "plan"):
+        if not snapshot["plans"]:
+            yield "No plans found" if command == "plans" else "Plan unavailable"
+        for plan in snapshot["plans"]:
+            yield f"{plan['id']}  {plan['done']}/{plan['total']} done  {plan['title']}"
+            if command == "plan":
+                yield plan["goal"]
+                for task in plan["tasks"]:
+                    dependencies = ", ".join(task["depends_on"]) or "—"
+                    outcome = task["latest_outcome"] or "—"
+                    yield (f"  {task['id']}  {task['state']}  attempts={task['attempts']}  "
+                           f"outcome={outcome}  depends on {dependencies}  {task['title']}")
+                    if task["brief_excerpt"]:
+                        yield from (f"    {line}" for line in task["brief_excerpt"].splitlines())
+    elif command == "approvals":
         for approval in snapshot["approvals"]:
             yield from approval_lines(approval)
         if not snapshot["approvals"]:

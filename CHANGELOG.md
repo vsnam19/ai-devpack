@@ -6,6 +6,7 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 ## [Unreleased]
 
 ### Added
+- Machine-readable plans with brief validation, dependency-aware sequential execution, linked run history, and dashboard views.
 - Read-only Pack run dashboard with terminal navigation, filtered Jobs, incremental event tailing, gate diagnostics and checkpoint evidence.
 
 ## [0.3.0] - 2026-11-27
