@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from time import monotonic
 import unittest
 from unittest.mock import patch
 
@@ -38,10 +39,11 @@ class LiveDashboardTests(unittest.IsolatedAsyncioTestCase):
         return path
 
     async def wait_for(self, pilot, condition):
-        for _ in range(100):
-            await pilot.pause(0.04)
+        deadline = monotonic() + 4
+        while monotonic() < deadline:
             if condition():
                 return
+            await pilot.pause()
         self.assertTrue(condition(), "Dashboard did not show the expected update")
 
     async def test_groups_attempts_and_propagates_selection_in_compact_layout(self):
@@ -97,15 +99,22 @@ class LiveDashboardTests(unittest.IsolatedAsyncioTestCase):
             def log_text():
                 return "\n".join(line.text for line in log.lines)
 
-            await self.wait_for(pilot, lambda: "record 54" in log_text())
+            def followed(message):
+                # RichLog adds the line before its after-refresh scroll runs.
+                return message in log_text() and 0 < log.scroll_y == log.max_scroll_y
+
+            await self.wait_for(pilot, lambda: followed("record 54"))
             self.assertEqual(self.app.step["index"], 1)
             self.assertIn("token=[REDACTED]", log_text())
             self.assertNotIn(secret, log_text())
             self.assertNotIn("other stream", log_text())
             self.assertGreater(log.max_scroll_y, 0)
             self.assertEqual(log.scroll_y, log.max_scroll_y)
+            previous_end = log.max_scroll_y
             append("new followed event")
-            await self.wait_for(pilot, lambda: "new followed event" in log_text())
+            await self.wait_for(
+                pilot, lambda: followed("new followed event") and log.max_scroll_y > previous_end,
+            )
             self.assertEqual(log.scroll_y, log.max_scroll_y)
             await pilot.press("f")
             log.scroll_home(animate=False, immediate=True)
