@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import copy
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import getpass
@@ -41,7 +43,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence, TextIO
 import uuid
 
 try:
@@ -61,6 +63,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 
 try:
     from runner import memory as devpack_memory  # type: ignore[import-not-found]
+    from runner.dash.files import Controls, regular  # type: ignore[import-not-found]
     from runner.redaction import (  # type: ignore[import-not-found]
         NO_OS_IDENTITIES as _NO_OS_IDENTITIES,
         collect_env_auth_secrets as _collect_env_auth_secrets,
@@ -74,6 +77,7 @@ try:
     )
 except ModuleNotFoundError:  # pragma: no cover
     import memory as devpack_memory  # type: ignore[no-redef]
+    from dash.files import Controls, regular  # type: ignore[no-redef]
     from redaction import (  # type: ignore[no-redef]
         NO_OS_IDENTITIES as _NO_OS_IDENTITIES,
         collect_env_auth_secrets as _collect_env_auth_secrets,
@@ -1456,6 +1460,7 @@ class AgentResult:
     memory_tokens: int = 0
     memory_enabled: bool = True
     failure_attribution: str = ""
+    events_streamed: bool | None = None
 
     def __post_init__(self) -> None:
         """Synchronize token field aliases and coerce transcript_path to Path."""
@@ -1498,6 +1503,8 @@ class AgentResult:
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dictionary with stringified paths."""
         payload = asdict(self)
+        if self.events_streamed is None:
+            payload.pop("events_streamed")
         payload["transcript_path"] = str(self.transcript_path) if str(self.transcript_path) != "." else ""
         return payload
 
@@ -2498,21 +2505,132 @@ def _read_external_text(handle: BinaryIO, label: str) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _read_external_artifact(value: str, output: Path, visible_output: Path, *, label: str) -> str:
-    """Read only regular files inside this step's private output directory."""
+@contextmanager
+def _open_external_artifact(value: str, output: Path, visible_output: Path) -> Iterator[BinaryIO]:
+    """Open a regular file beneath the private output directory without following links."""
     path = Path(value)
     if path.is_absolute():
         path = path.relative_to(visible_output)
-    if ".." in path.parts:
+    if not path.parts or ".." in path.parts:
         raise ValueError("external artifact path escapes {run_dir}")
-    path = (output / path).resolve()
-    if not path.is_relative_to(output):
-        raise ValueError("external artifact path escapes {run_dir}")
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise ValueError("external artifact must be a regular file")
+    with regular(output / path, output) as (fd, _), os.fdopen(fd, "rb", closefd=False) as handle:
+        yield handle
+
+
+def _read_external_artifact(value: str, output: Path, visible_output: Path, *, label: str) -> str:
+    with _open_external_artifact(value, output, visible_output) as handle:
         return _read_external_text(handle, label)
+
+
+class _ExternalEvents:
+    def __init__(
+        self, path: str, output: Path, visible_output: Path, transcript: TextIO,
+        redact: Callable[[str], str],
+    ) -> None:
+        self.path = path
+        self.output = output
+        self.visible_output = visible_output
+        self.transcript = transcript
+        self.redact = redact
+        self.raw = bytearray()
+        self.line_start = 0
+        self.wrote_event = False
+        self.streamed = False
+        self.capped = False
+        self.identity: tuple[int, int] | None = None
+
+    def write(self, event: dict[str, Any]) -> None:
+        self.transcript.write(self.redact(json.dumps(event)).rstrip("\n") + "\n")
+        self.transcript.flush()
+        self.wrote_event = True
+
+    def _consume(self, data: bytes, *, final: bool = False) -> None:
+        remaining = _EXTERNAL_READ_LIMIT - len(self.raw)
+        self.capped = len(data) > remaining
+        # Search only the new bytes so a long unterminated line is not rescanned on each poll.
+        chunk = data[:remaining]
+        newline = chunk.rfind(b"\n")
+        end = len(self.raw) + newline + 1 if newline >= 0 else self.line_start
+        self.raw.extend(chunk)
+        if final and not self.capped:
+            end = len(self.raw)
+        if end > self.line_start:
+            for line in self.raw[self.line_start:end].split(b"\n"):
+                try:
+                    event = json.loads(line.decode("utf-8", errors="replace"))
+                    if isinstance(event, dict):
+                        self.write(event)
+                except (ValueError, RecursionError):
+                    continue
+            self.line_start = end
+        if self.capped:
+            self.write({"type": "notice", "message": "External events truncated at the size limit"})
+
+    def _poll(self, stop: threading.Event) -> None:
+        while not stop.is_set() and not self.capped:
+            try:
+                with _open_external_artifact(self.path, self.output, self.visible_output) as handle:
+                    info = os.fstat(handle.fileno())
+                    identity = (info.st_dev, info.st_ino)
+                    if self.identity is not None and (
+                        identity != self.identity or info.st_size < len(self.raw)
+                    ):
+                        # Reconcile a rewritten file after the process stops.
+                        return
+                    self.identity = identity
+                    data = b""
+                    if info.st_size > len(self.raw):
+                        handle.seek(len(self.raw))
+                        data = handle.read(_EXTERNAL_READ_LIMIT - len(self.raw) + 1)
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError):
+                # The final read validates the artifact again once the writer has exited.
+                return
+            else:
+                self._consume(data)
+                self.streamed = self.wrote_event
+            stop.wait(0.1)
+
+    @contextmanager
+    def follow(self) -> Iterator[None]:
+        if not self.path:
+            yield
+            return
+        stop = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            worker = executor.submit(self._poll, stop)
+            try:
+                yield
+            finally:
+                stop.set()
+                worker.result()
+
+    def reset(self) -> None:
+        self.transcript.seek(0)
+        self.transcript.truncate()
+        self.wrote_event = False
+        self.raw.clear()
+        self.line_start = 0
+
+    def finish(self) -> None:
+        if not self.path:
+            return
+        if not self.capped:
+            try:
+                with _open_external_artifact(self.path, self.output, self.visible_output) as handle:
+                    data = handle.read(_EXTERNAL_READ_LIMIT + 1)
+            except FileNotFoundError:
+                self.reset()
+                return
+            except (OSError, ValueError):
+                self.reset()
+                raise
+            if not data.startswith(self.raw):
+                self.reset()
+            self._consume(data[len(self.raw):], final=True)
+        if self.capped:
+            raise ValueError(f"external events exceeds the {_EXTERNAL_READ_LIMIT}-byte limit")
 
 
 def _run_external(
@@ -2528,10 +2646,11 @@ def _run_external(
     res = AgentResult(
         tokens_in=None, tokens_out=None, input_tokens=None, output_tokens=None, cost_usd=None,
     )
-    stream = ""
+    events = None
+    finalized_events = False
     staging = None
     try:
-        with tempfile.TemporaryDirectory(
+        with jsonl_path.open("w", encoding="utf-8") as transcript, tempfile.TemporaryDirectory(
             prefix="devpack-external-", ignore_cleanup_errors=True,
         ) as staging:
             root = Path(staging).resolve()
@@ -2601,6 +2720,8 @@ def _run_external(
             def expand(template: str) -> str:
                 return _EXTERNAL_PLACEHOLDER.sub(lambda match: values[match[1]], template)
 
+            events = _ExternalEvents(expand(config.events_from), output, visible_output,
+                                     transcript, redact_event)
             argv = list(docker_prefix) if docker_prefix else [config.command[0]]
             for arg in config.command[1:]:
                 if arg == "{allow_args}":
@@ -2614,7 +2735,7 @@ def _run_external(
                 with subprocess.Popen(
                     argv, cwd=workdir, env=process_env, stdin=subprocess.DEVNULL,
                     stdout=stdout, stderr=stderr, start_new_session=True,
-                ) as proc:
+                ) as proc, events.follow():
                     try:
                         proc.wait(timeout=request.timeout)
                     except subprocess.TimeoutExpired:
@@ -2700,13 +2821,8 @@ def _run_external(
                     if last_line != verdict_line:
                         res.final_text = f"{res.final_text}\n\n{verdict_line}".lstrip()
 
-            if config.events_from:
-                try:
-                    stream = _read_external_artifact(
-                        expand(config.events_from), output, visible_output, label="events",
-                    )
-                except FileNotFoundError:
-                    pass
+            finalized_events = True
+            events.finish()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         res.status = "harness_error"
         res.exit_code = res.exit_code or 126
@@ -2716,17 +2832,10 @@ def _run_external(
         if staging is not None and os.path.lexists(staging):
             logging.getLogger(__name__).warning("External engine staging remains at %r", staging)
 
-    with jsonl_path.open("w", encoding="utf-8") as transcript:
-        wrote_event = False
-        for line in stream.split("\n"):
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(event, dict):
-                transcript.write(redact_event(json.dumps(event)).rstrip("\n") + "\n")
-                wrote_event = True
-        if not wrote_event:
+    if events is not None:
+        res.events_streamed = events.streamed
+    if events is None or not events.wrote_event or not (finalized_events or events.capped):
+        with jsonl_path.open("w", encoding="utf-8") as transcript:
             event = json.dumps({"type": "result", "result": res.final_text})
             transcript.write(redact_event(event).rstrip("\n") + "\n")
     res.duration_s = round(time.monotonic() - started, 4)
@@ -2880,6 +2989,8 @@ def run_agent(request: AgentRequest) -> AgentResult:
             res.cost_usd = None
             res.tokens_in = res.input_tokens = None
             res.tokens_out = res.output_tokens = None
+        if request.engine.engine_class == "external" and res.events_streamed is None:
+            res.events_streamed = False
         res.transcript_path = jsonl_path
         res.model = res.model or request.engine.model
         res.engine = request.engine.name
@@ -2958,8 +3069,10 @@ def run_agent(request: AgentRequest) -> AgentResult:
 
     if request.engine.external is not None:
         def redact_external_event(line: str) -> str:
+            clean_event = redact_value(json.loads(line), _text_fn=lambda text: Controls().strip(text))
             return redact_stream_line(
-                line, extra_secrets=secrets_list, path_replacements=request.path_replacements,
+                json.dumps(clean_event), extra_secrets=secrets_list,
+                path_replacements=request.path_replacements,
                 home_placeholder=request.home_placeholder, identities=os_identities,
                 credentials_path=cred_path,
             )
