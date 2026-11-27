@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 import io
 import json
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 from time import monotonic
@@ -13,6 +16,23 @@ from unittest.mock import patch
 
 from runner.dash.reader import Reader, Settings
 from runner.tests.test_dashboard_reader import write
+
+
+class DashboardParserTests(unittest.TestCase):
+    def test_accepts_dashboard_options(self):
+        from runner.dash.tui.__main__ import parser
+        from runner.devpack_dash import parser as dashboard_parser
+
+        shared = ["--workdir", "work", "--runs-root", "runs", "--plans-root", "plans",
+                  "--state-dir", "state", "--project-config", "project.toml",
+                  "--dashboard-config", "dashboard.toml", "--once"]
+        for args in (["--json", "jobs", "--filter", "task:T1"], ["--plain", "show", "run"],
+                     ["gate", "run"], ["tail", "run", "--kind", "tool"], ["plans"],
+                     ["plan", "example"], ["approvals", "--status", "pending", "--plain"]):
+            with self.subTest(args=args):
+                expected = vars(dashboard_parser().parse_args(shared + args))
+                actual = vars(parser().parse_args(shared + args))
+                self.assertEqual({key: actual[key] for key in expected}, expected)
 
 
 class LiveDashboardTests(unittest.IsolatedAsyncioTestCase):
@@ -45,6 +65,54 @@ class LiveDashboardTests(unittest.IsolatedAsyncioTestCase):
                 return
             await pilot.pause()
         self.assertTrue(condition(), "Dashboard did not show the expected update")
+
+    async def test_machine_readable_plan(self):
+        from textual.widgets import Tabs
+
+        repo = Path(__file__).resolve().parents[2]
+        plan = self.root / "plans" / "example"
+        shutil.copytree(repo / "workflow" / "templates" / "plan.example", plan)
+        secret = "fake-plan-secret-123456789"
+        with (plan / "briefs" / "T3.md").open("a", encoding="utf-8") as brief:
+            brief.write(f"\ntoken={secret}\n")
+        first = self.run_record("draft", plan_id="example", task_id="T1", outcome="pass")
+        (first / "steps" / "01-build-engine.prompt.md").write_text("Run prompt", encoding="utf-8")
+        self.run_record("example", plan_id="example", task_id="T2")
+        self.run_record("loose", task="review")
+
+        async with self.app.run_test(size=(120, 35)) as pilot:
+            await self.wait_for(pilot, lambda: bool(self.app.plan))
+            plans = self.app.query_one("#plans")
+            self.assertIn("1/3", plans.get_option_at_index(0).prompt.plain)
+            self.assertIn("Running", plans.get_option_at_index(0).prompt.plain)
+            self.assertEqual(self.app.plan["title"], "Document a command-line workflow")
+            self.assertEqual([task["id"] for task in self.app.plan["jobs"]], ["T1", "T2", "T3"])
+            self.assertEqual(self.app.selected_task["runs"], ["draft"])
+            detail = self.app.query_one("#detail")
+            self.assertNotIn("Run prompt", detail.content.plain)
+            await pilot.press("2", "j", "j")
+            self.assertEqual(self.app.selected_task["state"], "blocked")
+            self.assertEqual(self.app.selected_task["runs"], [])
+            self.assertIn("Blocked by T2", detail.content.plain)
+            self.assertIn("Follow the documented workflow", detail.content.plain)
+            self.assertIn("token=[REDACTED]", detail.content.plain)
+            self.assertNotIn(secret, detail.content.plain)
+            self.app.query_one("#tabs", Tabs).active = "graph"
+            await pilot.pause()
+            self.assertIn("   └─ ●  T2", detail.content.plain)
+            self.assertIn("      └─ ⏸  T3", detail.content.plain)
+            self.assertEqual(self.app.snapshot["plans"][1]["title"], "Ad-hoc runs")
+            self.assertEqual(self.app.snapshot["plans"][1]["jobs"][0]["runs"], ["loose"])
+
+        result = subprocess.run(
+            [sys.executable, "-m", "runner.dash.tui", "--workdir", str(self.root),
+             "--runs-root", str(self.settings.runs), "--screenshots", str(self.root / "screenshots")],
+            cwd=self.root, env={**os.environ, "PYTHONPATH": str(repo)}, capture_output=True,
+            text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        overview = self.root / "screenshots" / "01-overview.svg"
+        self.assertIn("1/3", overview.read_text(encoding="utf-8"))
 
     async def test_groups_attempts_and_propagates_selection_in_compact_layout(self):
         self.run_record("first", plan_id="p01", task_id="build", started="2026-01-01T01:00:00Z")

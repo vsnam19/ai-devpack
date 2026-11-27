@@ -1,5 +1,6 @@
 """Keyboard-first dashboard for pack runs and demo fixtures."""
 
+from collections import defaultdict
 import time
 
 from textual import events, on
@@ -288,8 +289,8 @@ class Dashboard(App):
         # Sidebar width minus panel borders, padding, and scrollbar.
         width = 23 if small else 46
         if panel == "plans":
-            count, total = started(row), len(row["jobs"])
-            filled = round(7 * count / total)
+            count, total = (row["done"], row["total"]) if "done" in row else (started(row), len(row["jobs"]))
+            filled = round(7 * count / total) if total else 0
             text = self.state_text(row["state"])
             progress = f" {count}/{total}"
             label = "" if small else f"  {STATES[row['state']][2]}"
@@ -309,27 +310,38 @@ class Dashboard(App):
                 title = ""
             text = self.state_text(row["state"])
             attempt_text = ""
-            if self.source:
+            if self.source and row["attempts"]:
                 attempt = row["attempt"]
                 total = row["attempts"]
                 attempt_text = f"  ↻{attempt}/{total}" if total > 1 else "  ↻1"
-            summary = ""
-            if not small and not self.source:
-                summary = f"{row['attempts']}× {elapsed(row['age_s']):>5}"
-            available = width - text.cell_len - cell_len(attempt_text + summary) - 3
             if small:
                 task_id = task_id[-9:]
                 while cell_len(task_id) > 9:
                     task_id = task_id[1:]
             else:
-                task_id = row_field(task_id, min(20, available))
+                task_id = row_field(task_id, 20)
+            blockers = row.get("blocked_by")
+            summary = ""
+            if blockers:
+                label = "‹ " if small else "Blocked by "
+                space = width - text.cell_len - cell_len(task_id + attempt_text) - 5
+                summary = row_field(label + ", ".join(blockers), space)
+                summary = "  " + summary if summary else ""
+            elif self.source and not row["attempts"]:
+                summary = "  Queued"
+            elif not small and not self.source:
+                summary = f"{row['attempts']}× {elapsed(row['age_s']):>5}"
+            available = width - text.cell_len - cell_len(attempt_text + summary) - 3
+            task_id = row_field(task_id, available)
             title_width = available - cell_len(task_id)
             title = row_field(title, min(14, title_width) if small else title_width)
             text.append(f" {task_id}", style="bold")
             if title:
                 text.append(f" {title}")
             text.append(attempt_text, style="dim")
-            if summary:
+            if self.source:
+                text.append(summary, style=self.color("secondary") if blockers else "dim")
+            elif summary:
                 padding = min(max(1, 21 - cell_len(title)), width - text.cell_len - cell_len(summary))
                 text.append(f"{' ' * padding}{summary}", style="dim")
                 if row["depends_on"] and width - text.cell_len > 4:
@@ -596,8 +608,11 @@ class Dashboard(App):
             return self.snapshot["message"]
         finished = sum(job["state"] == "done" for job in self.plan["jobs"])
         if self.source:
+            brief = self.task_brief()
+            if "done" in self.plan:
+                return f"{self.plan['title']}\n\n{self.plan['done']}/{self.plan['total']} complete\n\n{brief}"
             return (f"{self.plan['title']}\n\n{started(self.plan)}/{len(self.plan['jobs'])} started"
-                    f" · {finished} complete\n\n{self.selected_task['brief']}")
+                    f" · {finished} complete\n\n{brief}")
         return (
             f"## {self.plan['title']}\n\n"
             f"**{started(self.plan)}/{len(self.plan['jobs'])} started** · {finished} complete\n\n"
@@ -669,7 +684,15 @@ class Dashboard(App):
             return self.approval["brief"] if self.approval else "No approvals."
         if self.detail_source == "agents":
             return self.step["brief"] if self.step else "No agent steps."
-        return self.selected_task["brief"] if self.selected_task else self.snapshot["message"]
+        return self.task_brief()
+
+    def task_brief(self):
+        task = self.selected_task
+        if not task:
+            return self.snapshot["message"]
+        if blockers := task.get("blocked_by"):
+            return f"Blocked by {', '.join(blockers)}\n\n{task['brief']}"
+        return task["brief"]
 
     def render_log(self):
         log = self.query_one("#log", RichLog)
@@ -742,22 +765,31 @@ class Dashboard(App):
         if not self.plan:
             return Text(self.snapshot["message"])
         text = Text(self.plan["title"] + "\n\n", style="bold")
-        jobs = self.plan["jobs"]
+        children = defaultdict(list)
+        for job in self.plan["jobs"]:
+            parent = job["depends_on"][0] if job["depends_on"] else None
+            children[parent].append(job)
 
-        def branch(parent, indent):
-            children = [job for job in jobs if (job["depends_on"] or (None,))[0] == parent]
-            for index, job in enumerate(children, 1):
-                last = index == len(children)
-                text.append(indent + ("└─ " if last else "├─ "), style="dim")
-                text.append_text(self.state_text(job["state"]))
-                text.append(f"  {job['task_id']}  {job['title']}", style="bold")
-                text.append(f"  ·  {STATES[job['state']][2]}\n", style="dim")
-                for extra in job["depends_on"][1:]:
-                    text.append(indent + ("   " if last else "│  ") + f"   also needs {extra}\n",
-                                style="dim")
-                branch(job["task_id"], indent + ("   " if last else "│  "))
-
-        branch(None, "")
+        # Follow the first dependency for the tree and label the remaining edges.
+        roots = children.pop(None, [])
+        stack = [(iter(roots), "", len(roots))]
+        while stack:
+            siblings, indent, remaining = stack.pop()
+            job = next(siblings, None)
+            if job is None:
+                continue
+            remaining -= 1
+            last = remaining == 0
+            stack.append((siblings, indent, remaining))
+            text.append(indent + ("└─ " if last else "├─ "), style="dim")
+            text.append_text(self.state_text(job["state"]))
+            text.append(f"  {job['task_id']}  {job['title']}", style="bold")
+            text.append(f"  ·  {STATES[job['state']][2]}\n", style="dim")
+            next_indent = indent + ("   " if last else "│  ")
+            for extra in job["depends_on"][1:]:
+                text.append(next_indent + f"   also needs {extra}\n", style="dim")
+            descendants = children.pop(job["task_id"], [])
+            stack.append((iter(descendants), next_indent, len(descendants)))
         return text
 
     def meta(self):
@@ -766,6 +798,8 @@ class Dashboard(App):
         text = Text()
         if self.source:
             task = self.selected_task
+            if not task["attempts"]:
+                return Text(f"{task['task_id']}  ·  No attempts yet.")
             fields = {
                 "Run ID": task["run_id"], "Kind": task["kind"], "Task": task["task_id"],
                 "Health": task["health"], "Attempt": f"{task['attempt']}/{task['attempts']}",

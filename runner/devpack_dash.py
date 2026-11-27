@@ -25,8 +25,8 @@ INTERVALS = {"stream_poll_s", "active_poll_s", "discovery_poll_s", "quiet_thresh
 ROOTS = {"log_roots", "evidence_roots"}
 
 
-def parser():
-    result = argparse.ArgumentParser(description=__doc__, epilog=FILTER_HELP)
+def parser(*, description=__doc__):
+    result = argparse.ArgumentParser(description=description, epilog=FILTER_HELP)
     result.add_argument("--workdir", default=".")
     result.add_argument("--dashboard-config")
     result.add_argument("--project-config")
@@ -52,7 +52,7 @@ def parser():
     return result
 
 
-def config(args):
+def config(args, *, active_poll_default=None):
     files = Files()
     workdir = Path(args.workdir).resolve(strict=True)
     if not workdir.is_dir():
@@ -140,6 +140,8 @@ def config(args):
     engines = parse_toml_with_arrays(engine_bytes.decode("utf-8"))
     models = tuple((key, spec["model"]) for key, spec in mapping(engines.get("engines")).items()
                    if isinstance(spec, dict) and isinstance(spec.get("model"), str))
+    if active_poll_default is not None:
+        options.setdefault("active_poll_s", active_poll_default)
     return Settings(workdir, runs, state, project_config, plans=plans, models=models, **options)
 
 
