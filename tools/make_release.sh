@@ -70,6 +70,10 @@ tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
         printf 'Archived VERSION does not match requested version %s.\n' "$version" >&2
         exit 1
     fi
+    if [[ ! -f install.sh || -L install.sh || ! -x install.sh ]]; then
+        printf 'Archive must contain an executable install.sh at its root.\n' >&2
+        exit 1
+    fi
     python3 "$root/tests/test_no_project_leaks.py" --scan-tree "$tmp/$name"
 
     python3 - <<'PY'

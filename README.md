@@ -249,8 +249,21 @@ qualified engine fails re-qualification.
 
 ## Install into a project
 
-For offline installation from a verified release archive, follow the
-[transfer guide](docs/TRANSFER.md).
+For an offline release, verify and unpack the archive as described in the
+[transfer guide](docs/TRANSFER.md), then run `./install.sh` from the extracted
+directory. Add `$HOME/.local/bin` to your PATH and run these commands in the
+project repository:
+
+```bash
+devpack doctor
+devpack init
+```
+
+Edit the scaffolded engine and gate configuration before running a plan.
+Use `devpack --help` to list tools. Each tool accepts its existing arguments,
+for example `devpack plan status plans/example` or `devpack dash --workdir .`.
+
+For a source checkout or vendored pack, use the manual setup below.
 
 1. **Day 0:** complete the data-owner sign-off in `policy/data_governance.md` and
    obtain safety approval for `policy/asil_boundaries.md`.
