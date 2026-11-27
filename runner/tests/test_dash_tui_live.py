@@ -261,3 +261,92 @@ class LiveDashboardTests(unittest.IsolatedAsyncioTestCase):
             await self.wait_for(pilot, lambda: bool(self.app.selected_task))
             prompt = self.app.query_one("#tasks").get_option_at_index(0).prompt
             self.assertEqual(prompt.plain.count("build"), 1)
+
+    async def test_repopulate_preserves_historical_attempt_and_step(self):
+        from textual.widgets import OptionList
+
+        first = self.run_record("first", plan_id="p02", task_id="build",
+                                started="2026-01-01T01:00:00Z")
+        write(first / "steps" / "02-review-engine.meta.json", {"status": "running"})
+        self.run_record("second", plan_id="p02", task_id="build", started="2026-01-01T02:00:00Z")
+        self.run_record("setup", plan_id="p02", task_id="setup", started="2026-01-01T03:00:00Z")
+        self.run_record("other", plan_id="p01", task_id="other", started="2026-01-01T04:00:00Z")
+        highlights = []
+
+        def record_highlights(message):
+            if isinstance(message, OptionList.OptionHighlighted):
+                highlights.append(message.option.id)
+
+        async with self.app.run_test(size=(120, 35), message_hook=record_highlights) as pilot:
+            await self.wait_for(pilot, lambda: len(self.app.snapshot["plans"]) == 2)
+            self.assertEqual(self.app.plan["id"], "plan:p01")
+            await pilot.press("1", "j")
+            self.assertEqual(self.app.plan["id"], "plan:p02")
+            await pilot.press("2", "j")
+            self.assertEqual(self.app.selected_task["task_id"], "build")
+            await pilot.press("left")
+            await self.wait_for(pilot, lambda: self.app.selected_task["run_id"] == "first")
+            await pilot.press("3", "j")
+            self.assertEqual(self.app.step["index"], 2)
+
+            def assert_selection():
+                self.assertEqual(self.app.plan["id"], "plan:p02")
+                self.assertEqual(self.app.selected_task["task_id"], "build")
+                self.assertEqual(self.app.attempt_id, "first")
+                self.assertEqual(self.app.step["index"], 2)
+                self.assertEqual(highlights, [])
+
+            highlights.clear()
+            await pilot.press("ctrl+t")
+            assert_selection()
+            await pilot.resize_terminal(80, 24)
+            await pilot.pause()
+            self.assertTrue(self.app.compact())
+            assert_selection()
+
+            await pilot.press("1", "slash", "p", "0", "2")
+            plans = self.app.query_one("#plans")
+            self.assertEqual([option.id for option in plans.options], ["plan:p02"])
+            assert_selection()
+            await pilot.press("escape")
+            self.assertEqual(plans.highlighted_option.id, "plan:p02")
+            assert_selection()
+
+            await pilot.press("slash", "z")
+            self.assertIsNone(plans.highlighted)
+            await pilot.press("ctrl+t")
+            await pilot.resize_terminal(120, 35)
+            await pilot.pause()
+            self.assertFalse(self.app.compact())
+            self.assertIsNone(plans.highlighted)
+            assert_selection()
+            await pilot.press("escape")
+            self.assertEqual(plans.highlighted_option.id, "plan:p02")
+            assert_selection()
+
+    async def test_sidebar_rows_bound_multiline_reader_text(self):
+        from rich.cells import cell_len
+
+        self.run_record("active", plan_id="p01", task_id="task\n" + "界" * 80,
+                        task="Build\twide " + "界" * 80)
+        write(self.settings.state / "approvals" / "pending" / "vote.json",
+              {"id": "vote", "status": "pending", "checkpoint": "brief", "run_dir": "active"})
+        with patch.object(self.app.source, "plan_title", return_value="Plan\n" + "界" * 80):
+            async with self.app.run_test(size=(120, 35)) as pilot:
+                await self.wait_for(pilot, lambda: bool(self.app.approval and self.app.plan))
+
+                def assert_rows(compact):
+                    for key, lines in (("plans", 1), ("tasks", 1), ("approvals", 2 if compact else 1)):
+                        panel = self.app.query_one(f"#{key}")
+                        prompt = panel.get_option_at_index(0).prompt.plain
+                        self.assertEqual(len(prompt.splitlines()), lines, prompt)
+                        self.assertNotIn("\t", prompt)
+                        for line in prompt.splitlines():
+                            self.assertLessEqual(cell_len(line), panel.content_region.width - 1)
+
+                assert_rows(False)
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause()
+                assert_rows(True)
+                plan = self.app.query_one("#plans").get_option_at_index(0).prompt
+                self.assertLessEqual(cell_len(plan.plain.split(" 1/1")[0].strip("● ")), 15)

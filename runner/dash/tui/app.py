@@ -61,6 +61,12 @@ def started(plan):
     return sum(job["attempts"] > 0 for job in plan["jobs"])
 
 
+def row_field(value, width):
+    text = Text(" ".join(value.split()))
+    text.truncate(max(0, width))
+    return text.plain
+
+
 class Help(ModalScreen):
     BINDINGS = [("escape,question_mark,q", "dismiss", "Close")]
 
@@ -239,7 +245,7 @@ class Dashboard(App):
         self.resize_layout(event.size)
         if self.visible_rows and previous != screen.has_class("compact"):
             for panel in PANELS:
-                self.populate(panel)
+                self.populate(panel, choose_first=False)
             self.update_top()
             self.log_step = None
             self.show_detail()
@@ -279,59 +285,73 @@ class Dashboard(App):
 
     def row_text(self, panel, row):
         small = self.compact()
+        # Sidebar width minus panel borders, padding, and scrollbar.
+        width = 23 if small else 46
         if panel == "plans":
             count, total = started(row), len(row["jobs"])
             filled = round(7 * count / total)
-            title = row["title"][:15] if small else row["title"]
             text = self.state_text(row["state"])
-            text.append(f" {title:<15} ", style="bold")
+            progress = f" {count}/{total}"
+            label = "" if small else f"  {STATES[row['state']][2]}"
+            available = width - text.cell_len - cell_len(progress + label) - (2 if small else 9)
+            title = row_field(row["title"], min(15, available) if small else available)
+            text.append(f" {title}" + " " * (1 + max(0, min(15, available) - cell_len(title))), style="bold")
             if not small:
                 text.append("━" * filled, style=self.color("accent"))
                 text.append("─" * (7 - filled), style="dim")
-            text.append(f" {count}/{total}")
-            if not small:
-                text.append(f"  {STATES[row['state']][2]}", style="dim")
+            text.append(progress)
+            text.append(label, style="dim")
             return text
         if panel == "tasks":
-            task_id = row["task_id"]
-            title = Text(row["title"] if row["title"] != task_id else "")
+            task_id = " ".join(row["task_id"].split())
+            title = " ".join(row["title"].split())
+            if title == task_id:
+                title = ""
             text = self.state_text(row["state"])
             attempt_text = ""
             if self.source:
                 attempt = row["attempt"]
                 total = row["attempts"]
                 attempt_text = f"  ↻{attempt}/{total}" if total > 1 else "  ↻1"
+            summary = ""
+            if not small and not self.source:
+                summary = f"{row['attempts']}× {elapsed(row['age_s']):>5}"
+            available = width - text.cell_len - cell_len(attempt_text + summary) - 3
             if small:
                 task_id = task_id[-9:]
                 while cell_len(task_id) > 9:
                     task_id = task_id[1:]
-                # 28 columns minus panel borders, padding, and scrollbar.
-                title.truncate(min(14, max(0, 23 - text.cell_len - cell_len(task_id + attempt_text) - 2)))
+            else:
+                task_id = row_field(task_id, min(20, available))
+            title_width = available - cell_len(task_id)
+            title = row_field(title, min(14, title_width) if small else title_width)
             text.append(f" {task_id}", style="bold")
             if title:
-                text.append(" ")
-                text.append(title)
+                text.append(f" {title}")
             text.append(attempt_text, style="dim")
-            if not small and not self.source:
-                text.append(f"{' ' * (21 - len(title))}{row['attempts']}× {elapsed(row['age_s']):>5}",
-                            style="dim")
-                if row["depends_on"]:
-                    text.append(f"  ‹ {','.join(row['depends_on'])}", style=self.color("secondary"))
+            if summary:
+                padding = min(max(1, 21 - cell_len(title)), width - text.cell_len - cell_len(summary))
+                text.append(f"{' ' * padding}{summary}", style="dim")
+                if row["depends_on"] and width - text.cell_len > 4:
+                    dependency = row_field(",".join(row["depends_on"]), width - text.cell_len - 4)
+                    text.append(f"  ‹ {dependency}", style=self.color("secondary"))
             return text
         if panel == "agents":
             text = self.state_text(row["status"])
-            text.append(f" {row['index']:02} {row['role']:<11}", style="bold")
+            role = row_field(row["role"], 11)
+            text.append(f" {row['index']:02} {role}" + " " * (11 - cell_len(role)), style="bold")
             model = f"{row['engine']}:{row['model']}"
             if small:
-                text.append(f"\n   {model}")
+                text.append(f"\n   {row_field(model, width - 3)}")
                 if self.source:
                     duration = elapsed(row["duration_s"]) if row["duration_s"] is not None else "?"
                     tokens_in, tokens_out = (row[key] if row[key] is not None else "?"
                                              for key in ("tokens_in", "tokens_out"))
                     text.append(f"\n   {duration}  {tokens_in}/{tokens_out}  {amount(row['cost_usd'])}", style="dim")
                 return text
-            text.append(model, style=self.color("secondary"))
             duration = "?" if self.source and row["duration_s"] is None else elapsed(row["duration_s"])
+            model = row_field(model, width - text.cell_len - max(5, cell_len(duration)) - 1)
+            text.append(model, style=self.color("secondary"))
             text.append(f" {duration:>5}", style="dim")
             tokens = row["tokens_in"]
             text.append(f"\n   Attempt {row['attempt']}   {tokens if tokens is not None else '?'} in"
@@ -344,23 +364,30 @@ class Dashboard(App):
             text.append(" ")
         else:
             text = Text("⏸ ", style=self.color("warning"))
-        text.append(f"{row['id']}  {row['task_id']}", style="bold")
-        text.append(f"  {row['checkpoint']}" if not small else f"\n   {row['checkpoint']}")
+        available = width - text.cell_len - (2 if small else 14)
+        approval_id = row_field(row["id"], min(12 if small else 16, available))
+        task_id = row_field(row["task_id"], available - cell_len(approval_id))
+        text.append(f"{approval_id}  {task_id}", style="bold")
+        if small:
+            text.append(f"\n   {row_field(row['checkpoint'], width - 3)}")
+        else:
+            text.append(f"  {row_field(row['checkpoint'], width - text.cell_len - 2)}")
         return text
 
     def populate(self, panel, *, choose_first=True):
         widget = self.query_one(f"#{panel}", Panel)
         query = self.filters[panel].casefold()
-        rows = [
-            row for row in self.rows(panel)
-            if query in f"{row['id']} {self.row_text(panel, row).plain}".casefold()
-        ]
+        rows, options = [], []
+        for row in self.rows(panel):
+            prompt = self.row_text(panel, row)
+            fields = ("title", "task_id", "checkpoint", "role", "engine", "model")
+            full_text = " ".join(row.get(field) or "" for field in fields)
+            if query in f"{row['id']} {prompt.plain} {' '.join(full_text.split())}".casefold():
+                rows.append(row)
+                options.append(Option(prompt, id=row["id"]))
         self.visible_rows[panel] = {row["id"]: row for row in rows}
         selected = self.selection(panel)
-        index = next((i for i, row in enumerate(rows) if row is selected), None)
-        if index is None and rows and choose_first:
-            index = 0
-        options = [Option(self.row_text(panel, row), id=row["id"]) for row in rows]
+        index = next((i for i, row in enumerate(rows) if selected and row["id"] == selected["id"]), None)
         if not rows:
             message = "No matches"
             if not query:
@@ -369,24 +396,27 @@ class Dashboard(App):
                     "tasks": "No tasks.", "agents": "No agent steps.", "approvals": "No approvals.",
                 }[panel]
             options.append(Option(message, disabled=True))
-        if self.source and not choose_first:
-            old_options = widget.options
-            with widget.prevent(OptionList.OptionHighlighted):
-                if [option.id for option in old_options] != [option.id for option in options]:
-                    widget.set_options(options)
-                else:
-                    for i, (old, new) in enumerate(zip(old_options, options)):
-                        if old.prompt != new.prompt:
-                            widget.replace_option_prompt_at_index(i, new.prompt)
-                widget.highlighted = index
+        if index is None and rows and choose_first:
+            # A filter or parent selection can require a genuine selection change.
+            widget.set_options(options)
+            widget.highlighted = 0
         else:
-            widget.clear_options()
-            widget.add_options(options)
-            widget.highlighted = index
+            self.replace_rows(widget, options, index)
         suffix = f"  ·  {self.snapshot['pending_approvals']} pending" if panel == "approvals" else ""
         if self.filters[panel]:
             suffix += f"  /{self.filters[panel]}"
         self.query_one(f"#{panel}-title", Static).update(panel.title() + suffix)
+
+    def replace_rows(self, widget, options, index):
+        old_options = widget.options
+        with widget.prevent(OptionList.OptionHighlighted):
+            if [option.id for option in old_options] != [option.id for option in options]:
+                widget.set_options(options)
+            else:
+                for i, (old, new) in enumerate(zip(old_options, options)):
+                    if old.prompt != new.prompt:
+                        widget.replace_option_prompt_at_index(i, new.prompt)
+            widget.highlighted = index
 
     def update_top(self):
         if self.source:
@@ -550,7 +580,7 @@ class Dashboard(App):
         self.theme = "pack-light" if self.current_theme.dark else "pack-dark"
         if not isinstance(self.screen, Help):
             for panel in PANELS:
-                self.populate(panel)
+                self.populate(panel, choose_first=False)
             self.log_step = None
             self.update_top()
             self.show_detail()
