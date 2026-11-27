@@ -137,6 +137,21 @@ class TrustedGateArgvTests(unittest.TestCase):
                     )
                     self.assertNotIn("--receipt=gate_receipt.json", argv)
 
+    def test_receipt_routing_handles_wrapped_python_and_custom_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = "enforcement/gate/gate.py"
+            receipt = root / "run" / "steps" / "02-gate-receipt.json"
+            for prefix in (["python3", "-B"], ["/usr/bin/env", "python3", "-B"]):
+                with self.subTest(prefix=prefix):
+                    command = [*prefix, script, "--config", "gate.toml", "--receipt=old.json"]
+                    argv, routed = agent_exec.set_gate_receipt(command, root, receipt, pack_root=root)
+                    self.assertTrue(routed)
+                    self.assertEqual(argv, [*prefix, script, "--receipt", str(receipt), "--config", "gate.toml"])
+
+            command = ["python3", "custom.py", "--input", script]
+            self.assertEqual(agent_exec.set_gate_receipt(command, root, receipt, pack_root=root), (command, False))
+
     def test_trusted_gate_forwards_all_components(self) -> None:
         """With all_components=True the trusted gate argv contains --all-components."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -395,6 +395,21 @@ class ReaderTest(unittest.TestCase):
                          [(2, "GATE_FAIL"), (5, "GATE_OK")])
         self.assertEqual(gates[1]["transcript"], "passed after fix")
 
+    def test_gate_receipt_preserves_combined_verdict_and_findings(self):
+        run = self.run_record("combined", outcome="fail")
+        lint = [{"message": "lint failure"}]
+        static = [{"message": "static failure"}]
+        checks = [{"name": "unit", "status": "PASS"}]
+        write(run / "step_02_gate.json", {
+            "gate_passed": False, "lint_findings": lint, "static_findings": static,
+        })
+        write(run / "steps" / "02-gate-receipt.json", {"gate_status": "GATE_OK", "checks": checks})
+        gate, = self.reader.snapshot(job_id="combined")["jobs"][0]["gates"]
+        self.assertEqual(gate["status"], "fail")
+        self.assertEqual(gate["lint_findings"], lint)
+        self.assertEqual(gate["static_findings"], static)
+        self.assertEqual(gate["checks"], checks)
+
     def test_interactive_broker_selection_refreshes_native_runs(self):
         from unittest.mock import patch
 

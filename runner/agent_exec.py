@@ -956,11 +956,21 @@ def set_gate_receipt(
     argv = list(command)
     root = Path(pack_root) if pack_root is not None else Path(__file__).resolve().parents[1]
     scripts = {Path(DEFAULT_GATE_CMD[1]).resolve(), (root / "enforcement/gate/gate.py").resolve()}
-    script_index = next(
-        (index for index, arg in enumerate(argv[:2]) if (workdir / arg).resolve() in scripts),
-        None,
-    )
-    if script_index is None:
+    if not argv:
+        return argv, False
+    launcher_index = int(Path(argv[0]).name == "env")
+    script_index = launcher_index
+    if launcher_index < len(argv) and (workdir / argv[launcher_index]).resolve() not in scripts:
+        script_index += 1
+        if re.fullmatch(r"python(?:[23](?:\.\d+)?)?", Path(argv[launcher_index]).name):
+            while script_index < len(argv) and argv[script_index].startswith("-"):
+                option = argv[script_index]
+                if option == "-" or option.startswith(("-c", "-m")):
+                    return argv, False
+                script_index += 2 if option in {"-W", "-X", "--check-hash-based-pycs"} else 1
+                if option == "--":
+                    break
+    if script_index >= len(argv) or (workdir / argv[script_index]).resolve() not in scripts:
         return argv, False
 
     result = argv[:script_index + 1]

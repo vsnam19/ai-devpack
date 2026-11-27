@@ -67,6 +67,9 @@ deviation (`deviations.md`), never a default (LSN-014).
    changes, changed contents, symlinks and same-named files elsewhere are subject
    to ordinary scope rules.
 
+   Docker-isolated review and fix briefs leave the gate receipt path blank.
+   The receipt remains available in the run logs.
+
 ## Why
 
 Prompt injection through repository content can make an agent run malicious commands.

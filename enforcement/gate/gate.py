@@ -90,7 +90,9 @@ def write_receipt(
     if error is not None:
         payload["error"] = error
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o666)
+    with os.fdopen(fd, "w", encoding="utf-8") as receipt:
+        receipt.write(json.dumps(payload, indent=2) + "\n")
 
 
 def parse_checks_config(config_path: pathlib.Path) -> tuple[list[dict[str, Any]] | None, str | None, str | None]:

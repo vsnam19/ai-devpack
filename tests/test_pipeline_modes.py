@@ -118,11 +118,28 @@ class PipelineModesTests(unittest.TestCase):
     """Test suite for operating modes, checkpoints, approvals, resume, and tamper boundaries."""
 
     def test_project_gate_receipts_stay_in_run_directory_across_fixer_round(self) -> None:
+        self._run_receipt_workflow()
+
+    def test_docker_briefs_omit_host_receipt_path(self) -> None:
+        self._run_receipt_workflow(isolation="docker")
+
+    def test_project_gate_replaces_stale_receipt_symlink(self) -> None:
+        self._run_receipt_workflow(symlink="receipt")
+
+    def test_project_gate_rejects_replaced_receipt_directory(self) -> None:
+        self._run_receipt_workflow(symlink="steps")
+
+    def test_configured_gate_routes_receipts_from_custom_pack(self) -> None:
+        self._run_receipt_workflow(custom_pack=True)
+
+    def _run_receipt_workflow(
+        self, *, isolation: str = "local", symlink: str = "", custom_pack: bool = False,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             wt = base / "wt"
             _make_sample_repo(wt)
-            (wt / ".gitignore").write_text("/briefs/\n", encoding="utf-8")
+            (wt / ".gitignore").write_text("/briefs/\n/runs/\n", encoding="utf-8")
             (wt / "gate.toml").write_text(
                 '[[check]]\nname = "unit"\n'
                 'cmd = ["python3", "-B", "-m", "unittest", "discover", "-s", "tests"]\n',
@@ -138,8 +155,32 @@ class PipelineModesTests(unittest.TestCase):
             subprocess.run(["git", "add", "-A"], cwd=wt, check=True)
             subprocess.run(["git", "commit", "-qm", "Configure unit gate"], cwd=wt, check=True)
             cfg = devpack_run.load_engine_config(_write_engines_v2(base / "engines.toml"))
+            pack_root = REPO_ROOT
+            gate_config = wt / "gate.toml"
+            if custom_pack:
+                pack_root = base / "pack"
+                script = pack_root / "enforcement" / "gate" / "gate.py"
+                script.parent.mkdir(parents=True)
+                script.write_text(
+                    "import sys\n"
+                    f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+                    "from enforcement.gate.gate import main\n"
+                    "raise SystemExit(main())\n",
+                    encoding="utf-8",
+                )
+                for name in ("checks", "lint"):
+                    (pack_root / "enforcement" / name).symlink_to(
+                        REPO_ROOT / "enforcement" / name, target_is_directory=True,
+                    )
+                (pack_root / "workflow").symlink_to(REPO_ROOT / "workflow", target_is_directory=True)
+                cfg.gate_cmd = ["/usr/bin/env", "python3", "-B", str(script), "--config", str(gate_config)]
+                gate_config = None
             ctx = devpack_run.load_task_data(None, "receipt", "Write output", "Write output", "src/**")
-            run_dir = base / "run"
+            run_dir = wt / "runs" / "run" if symlink else base / "run"
+            protected_dir = base / "protected"
+            protected_dir.mkdir()
+            protected_receipt = protected_dir / "02-gate-receipt.json"
+            protected_receipt.write_text("original", encoding="utf-8")
             roles = []
 
             def stub(request):
@@ -147,7 +188,17 @@ class PipelineModesTests(unittest.TestCase):
                 if request.role in {"reviewer", "fixer"}:
                     index = 5 if roles.count("reviewer") == 2 else 2
                     receipt = run_dir / "steps" / f"{index:02d}-gate-receipt.json"
-                    self.assertIn(str(receipt), request.prompt)
+                    if isolation == "docker":
+                        self.assertNotIn(str(receipt), request.prompt)
+                    else:
+                        self.assertIn(str(receipt), request.prompt)
+                if request.role == "implementer":
+                    steps = run_dir / "steps"
+                    if symlink == "receipt":
+                        (steps / protected_receipt.name).symlink_to(protected_receipt)
+                    elif symlink == "steps":
+                        steps.rename(run_dir / "original-steps")
+                        steps.symlink_to(protected_dir, target_is_directory=True)
                 if request.role in {"implementer", "fixer"}:
                     (wt / "src" / "output.txt").write_text(request.role, encoding="utf-8")
                     result = "done"
@@ -158,13 +209,20 @@ class PipelineModesTests(unittest.TestCase):
             with mock.patch.object(devpack_run, "run_agent", side_effect=stub), \
                     contextlib.redirect_stdout(io.StringIO()):
                 rc, summary = devpack_run.run_task_workflow(
-                    cfg, ctx, wt, run_dir, REPO_ROOT, gate_config=wt / "gate.toml",
+                    cfg, ctx, wt, run_dir, pack_root, gate_config=gate_config,
                     plan_brief=_valid_brief_text().replace(
                         "- `src/mod.cpp`", "- `src/**`\n- `tests/**`"
                     ),
-                    isolation="local", allow_unsandboxed_local=True,
+                    isolation=isolation, allow_unsandboxed_local=isolation == "local",
                     brief_approved=True, state_dir=base / "state",
                 )
+
+            self.assertEqual(protected_receipt.read_text(encoding="utf-8"), "original")
+            if symlink == "steps":
+                self.assertNotEqual(0, rc, summary)
+                self.assertEqual(["implementer"], roles)
+                self.assertIn("receipt directory", summary["escalation_reason"])
+                return
 
             self.assertEqual(0, rc, summary)
             self.assertEqual("ok", summary["scope"])
@@ -172,6 +230,7 @@ class PipelineModesTests(unittest.TestCase):
             self.assertFalse(list(wt.rglob("gate_receipt.json")))
             for index in (2, 5):
                 receipt = run_dir / "steps" / f"{index:02d}-gate-receipt.json"
+                self.assertFalse(receipt.is_symlink())
                 self.assertEqual("GATE_OK", json.loads(receipt.read_text())["gate_status"])
 
     def test_default_mode_is_hitl_and_blocking_vs_terminal_semantics(self) -> None:

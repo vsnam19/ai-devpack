@@ -685,10 +685,14 @@ class Reader:
             flags["command"] = self.text(shlex.join([part for part in raw["command"] if isinstance(part, str)]))
         verdict = raw.get("gate_passed")
         status = flags.get("gate_status") if receipt else None
+        findings = {
+            key: self.findings(raw.get(key))
+            for key in ("lint_findings", "static_findings")
+            if not receipt or key in raw
+        }
         return {
             **flags, "step": step, "status": ("pass" if verdict else "fail") if type(verdict) is bool else status,
-            "lint_findings": self.findings(raw.get("lint_findings")),
-            "static_findings": self.findings(raw.get("static_findings")),
+            **findings,
             "checks": self.findings(raw.get("checks")),
         }
 
@@ -725,10 +729,13 @@ class Reader:
             if match:
                 step = int(match[1])
                 try:
-                    result[step] = {
-                        **result.get(step, {}),
-                        **self.gate_at(root / "steps" / name, step, receipt=True),
-                    }
+                    receipt = self.gate_at(root / "steps" / name, step, receipt=True)
+                    gate = result.setdefault(step, {})
+                    if gate.get("status") == "fail" or ("status" in gate and receipt["status"] is None):
+                        del receipt["status"]
+                    gate.update(receipt)
+                    gate.setdefault("lint_findings", [])
+                    gate.setdefault("static_findings", [])
                 except READ_ERRORS:
                     notices.append(f"Gate receipt unreadable for step {step}")
         return [result[step] for step in sorted(result)], notices

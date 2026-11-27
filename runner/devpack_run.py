@@ -1286,7 +1286,18 @@ def run_task_workflow(
         # Step: Gate (configured gate_cmd + preflight lint on changed C/C++ files)
         step_index += 1
         receipt = receipt_dir / f"{step_index:02d}-gate-receipt.json"
-        step_gate_cmd, writes_receipt = agent_exec.set_gate_receipt(gate_cmd, worktree, receipt)
+        step_gate_cmd, writes_receipt = agent_exec.set_gate_receipt(
+            gate_cmd, worktree, receipt, pack_root=lint_pack_root,
+        )
+        try:
+            if receipt_dir.resolve(strict=True) != receipt_dir or not receipt_dir.is_dir():
+                raise ValueError("expected a directory without symlinks")
+            if writes_receipt:
+                receipt.unlink(missing_ok=True)
+        except (OSError, RuntimeError, ValueError):
+            escalation_reason = "Cannot safely prepare the gate receipt directory or file."
+            enforcement_failed = True
+            break
         gate_rc, gate_out, gate_err, gate_dur = execute_command(
             step_gate_cmd,
             cwd=worktree,
@@ -1294,7 +1305,8 @@ def run_task_workflow(
         )
         context = {**context, "GATE_RECEIPT": ""}
         if writes_receipt and receipt.is_file() and not receipt.is_symlink():
-            context["GATE_RECEIPT"] = str(receipt)
+            if isolation == "local":
+                context["GATE_RECEIPT"] = str(receipt)
             if receipt.is_relative_to(worktree.resolve()):
                 pack_artifacts[receipt.relative_to(worktree.resolve()).as_posix()] = (
                     hashlib.sha256(receipt.read_bytes()).hexdigest()
