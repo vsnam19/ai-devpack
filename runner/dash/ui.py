@@ -101,7 +101,10 @@ def job_lines(job, view):
         )})
         yield f"Process health {display(job['process_health'])}"
         yield f"Wall duration {elapsed(job['duration_s'])}  Invocation time {elapsed(job['invocation_duration_s'])}"
-        yield f"Cost {cost(job['cost_usd'])}  Tokens in/out {display(job['tokens_in'])}/{display(job['tokens_out'])}"
+        coverage = job.get("cost_usd_coverage", {})
+        partial = coverage.get("known") is not None and 0 < coverage["known"] < coverage["eligible"]
+        suffix = " + ?" if partial else ""
+        yield f"Cost {cost(job['cost_usd'])}{suffix}  Tokens in/out {display(job['tokens_in'])}/{display(job['tokens_out'])}"
         yield f"Last event {event_time(job['last_event_time'])}  Age {elapsed(job['last_event_age_s'])}"
         yield f"Gate {display(job['gate'])}"
         if job["activity"]:

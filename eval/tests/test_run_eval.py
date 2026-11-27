@@ -726,6 +726,48 @@ class HarnessErrorTests(unittest.TestCase):
             self.assertIn("450/120", md)
             self.assertNotIn("0.1974", md)
 
+    def test_nullable_usage_reports_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fixture_dir, tasks_dir = _create_mini_fixture_and_task(base)
+            agent = _write_agent(
+                base,
+                "(cwd / 'src' / 'sample.cpp').write_text('int value() { return 42; }\\n')\n"
+                "print(json.dumps({'type': 'result', 'result': 'done', 'total_cost_usd': 0.1974, "
+                "'num_turns': 2, 'duration_ms': 1234, 'usage': {'input_tokens': 450, 'output_tokens': None}}))\n",
+            )
+            out = base / "out"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DEVPACK_LOCAL_BASE_URL": "http://127.0.0.1:11434",
+                    "DEVPACK_LOCAL_AUTH_TOKEN": "LOCAL_TOK",
+                },
+                clear=False,
+            ):
+                rc = run_eval.main(
+                    [
+                        "--isolation", "local", "--allow-unsandboxed-local",
+                        "--engines", "local", "--k", "1",
+                        "--tasks", "01-mini-bugfix",
+                        "--work-root", str(base / "wr"), "--fixture-dir", str(fixture_dir),
+                        "--tasks-dir", str(tasks_dir), "--agent-bin", str(agent),
+                        "--out", str(out),
+                    ]
+                )
+            self.assertEqual(0, rc)
+            results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+            ts = results["tasks"][0]
+            self.assertIsNone(ts["mean_cost_usd"])
+            self.assertIsNone(ts["runs"][0]["cost_usd"])
+            self.assertEqual(450, ts["runs"][0]["tokens_in"])
+            self.assertIsNone(ts["runs"][0]["tokens_out"])
+            self.assertEqual({"known": 0, "eligible": 1}, ts["usage_coverage"]["tokens_out"])
+            md = (out / "summary.md").read_text(encoding="utf-8")
+            self.assertIn("n/a", md)
+            self.assertIn("450/n/a", md)
+            self.assertNotIn("0.1974", md)
+
     def test_devpack_root_set_in_check_env_and_bare_exit_2_is_fail_not_harness_error(self) -> None:
         """check.sh receives DEVPACK_ROOT; a bare exit 2 without a marker is a fail, not a harness error."""
         with tempfile.TemporaryDirectory() as tmp:

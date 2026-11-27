@@ -29,6 +29,7 @@ import getpass
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import platform
@@ -62,6 +63,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     tomllib = None  # type: ignore[assignment]
 
 try:
+    from runner import heartbeat
     from runner import memory as devpack_memory  # type: ignore[import-not-found]
     from runner.dash.files import Controls, regular  # type: ignore[import-not-found]
     from runner.redaction import (  # type: ignore[import-not-found]
@@ -76,6 +78,7 @@ try:
         redact_value,
     )
 except ModuleNotFoundError:  # pragma: no cover
+    import heartbeat
     import memory as devpack_memory  # type: ignore[no-redef]
     from dash.files import Controls, regular  # type: ignore[no-redef]
     from redaction import (  # type: ignore[no-redef]
@@ -1476,16 +1479,16 @@ class AgentResult:
     status: str = "ok"
     exit_code: int = 0
     final_text: str = ""
-    cost_usd: float | None = 0.0
-    tokens_in: int | None = 0
-    tokens_out: int | None = 0
+    cost_usd: float | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
     duration_s: float = 0.0
     num_turns: int = 0
     tool_calls: dict[str, int] = field(default_factory=dict)
     transcript_path: Path = field(default_factory=Path)
     tool_protocol_errors: int = 0
-    input_tokens: int | None = 0
-    output_tokens: int | None = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     error: str = ""
     stderr: str = ""
     permission_denials: list[Any] = field(default_factory=list)
@@ -1508,13 +1511,13 @@ class AgentResult:
 
     def __post_init__(self) -> None:
         """Synchronize token field aliases and coerce transcript_path to Path."""
-        if self.tokens_in and not self.input_tokens:
+        if self.input_tokens is None:
             self.input_tokens = self.tokens_in
-        elif self.input_tokens and not self.tokens_in:
+        elif self.tokens_in is None:
             self.tokens_in = self.input_tokens
-        if self.tokens_out and not self.output_tokens:
+        if self.output_tokens is None:
             self.output_tokens = self.tokens_out
-        elif self.output_tokens and not self.tokens_out:
+        elif self.tokens_out is None:
             self.tokens_out = self.output_tokens
         if isinstance(self.transcript_path, str):
             self.transcript_path = Path(self.transcript_path) if self.transcript_path else Path()
@@ -2153,6 +2156,19 @@ def _looks_like_json_tool_call(text: str) -> bool:
     return False
 
 
+def _measured_cost(record: Mapping[str, Any]) -> float | None:
+    for key in ("total_cost_usd", "cost_usd", "cost"):
+        value = record.get(key)
+        if type(value) in (int, float) and 0 <= value < math.inf:
+            return float(value)
+    return None
+
+
+def _measured_tokens(record: object, key: str) -> int | None:
+    value = record.get(key) if isinstance(record, dict) else None
+    return value if type(value) is int and value >= 0 else None
+
+
 def parse_stream(path_or_text: Path | str) -> AgentResult:
     """Parse a Claude ``stream-json`` transcript file (or raw string) into an ``AgentResult``.
 
@@ -2181,8 +2197,8 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
     detected_model = ""
     init_model = ""
     init_digest = ""
-    summed_in_tokens = 0
-    summed_out_tokens = 0
+    summed_in_tokens = None
+    summed_out_tokens = None
     permission_denials: list[Any] = []
 
     result_event: dict[str, Any] | None = None
@@ -2218,11 +2234,12 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
             if isinstance(msg.get("model"), str) and msg["model"]:
                 detected_model = msg["model"]
             usage = msg.get("usage")
-            if isinstance(usage, dict):
-                if isinstance(usage.get("input_tokens"), int):
-                    summed_in_tokens += usage["input_tokens"]
-                if isinstance(usage.get("output_tokens"), int):
-                    summed_out_tokens += usage["output_tokens"]
+            input_count = _measured_tokens(usage, "input_tokens")
+            output_count = _measured_tokens(usage, "output_tokens")
+            if input_count is not None:
+                summed_in_tokens = (summed_in_tokens or 0) + input_count
+            if output_count is not None:
+                summed_out_tokens = (summed_out_tokens or 0) + output_count
 
             content = msg.get("content")
             has_tool_use = False
@@ -2254,7 +2271,7 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
 
         elif ev_type == "result" or (
             ev_type is None
-            and any(k in event for k in ("result", "total_cost_usd", "cost_usd", "num_turns"))
+            and any(k in event for k in ("result", "total_cost_usd", "cost_usd", "cost", "num_turns"))
         ):
             result_event = event
 
@@ -2263,9 +2280,6 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
             status="harness_error",
             exit_code=1,
             final_text=last_assistant_text,
-            cost_usd=0.0,
-            tokens_in=summed_in_tokens,
-            tokens_out=summed_out_tokens,
             duration_s=0.0,
             num_turns=0,
             tool_calls=tool_calls,
@@ -2286,12 +2300,7 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
     if assistant_messages_seen == 0 and not tool_calls and _looks_like_json_tool_call(final_text):
         tool_protocol_errors += 1
 
-    cost_usd = 0.0
-    for cost_key in ("total_cost_usd", "cost_usd", "cost"):
-        val = result_event.get(cost_key)
-        if isinstance(val, (int, float)):
-            cost_usd = float(val)
-            break
+    cost_usd = _measured_cost(result_event)
 
     num_turns = 0
     for turns_key in ("num_turns", "turns"):
@@ -2306,14 +2315,13 @@ def parse_stream(path_or_text: Path | str) -> AgentResult:
     elif isinstance(result_event.get("duration_ms"), (int, float)):
         duration_s = float(result_event["duration_ms"]) / 1000.0
 
-    tokens_in = summed_in_tokens
-    tokens_out = summed_out_tokens
     usage = result_event.get("usage")
-    if isinstance(usage, dict):
-        if isinstance(usage.get("input_tokens"), int):
-            tokens_in = int(usage["input_tokens"])
-        if isinstance(usage.get("output_tokens"), int):
-            tokens_out = int(usage["output_tokens"])
+    tokens_in = _measured_tokens(usage, "input_tokens")
+    tokens_out = _measured_tokens(usage, "output_tokens")
+    if tokens_in is None:
+        tokens_in = summed_in_tokens
+    if tokens_out is None:
+        tokens_out = summed_out_tokens
 
     model_usage = result_event.get("modelUsage")
     if isinstance(model_usage, dict) and model_usage and not detected_model:
@@ -2368,7 +2376,7 @@ def extract_agent_json_object(stdout_text: str) -> dict[str, Any] | None:
             continue
         if isinstance(obj, dict):
             if obj.get("type") == "result" or any(
-                k in obj for k in ("result", "total_cost_usd", "cost_usd", "num_turns")
+                k in obj for k in ("result", "total_cost_usd", "cost_usd", "cost", "num_turns")
             ):
                 return obj
             if fallback is None:
@@ -2387,11 +2395,7 @@ def parse_agent_json_output(stdout_text: str) -> dict[str, Any]:
     if not parsed:
         return metrics
 
-    for cost_key in ("total_cost_usd", "cost_usd", "cost"):
-        val = parsed.get(cost_key)
-        if isinstance(val, (int, float)):
-            metrics["cost_usd"] = float(val)
-            break
+    metrics["cost_usd"] = _measured_cost(parsed)
 
     for turns_key in ("num_turns", "turns"):
         val = parsed.get(turns_key)
@@ -2434,7 +2438,7 @@ def detect_harness_error(
     result_obj = extract_agent_json_object(stdout_text)
     if result_obj is None or (
         result_obj.get("type") != "result"
-        and not any(k in result_obj for k in ("result", "total_cost_usd", "cost_usd", "num_turns"))
+        and not any(k in result_obj for k in ("result", "total_cost_usd", "cost_usd", "cost", "num_turns"))
     ):
         return "no result event in stream: agent output JSON is missing or unparsable"
     return ""
@@ -2479,6 +2483,8 @@ def new_run_dir(
         json.dumps(run_payload, indent=2) + "\n",
         encoding="utf-8",
     )
+    if outcome == "running":
+        heartbeat.start(run_dir, run_id)
     return run_dir
 
 
@@ -2505,7 +2511,11 @@ def update_run_json(run_dir: Path | str, **updates: Any) -> dict[str, Any]:
     if "outcome" in updates and updates["outcome"] != "running" and not payload.get("finished"):
         payload["finished"] = datetime.now(timezone.utc).isoformat()
     rdir.mkdir(parents=True, exist_ok=True)
+    if "outcome" in updates and updates["outcome"] != "running":
+        heartbeat.finish(rdir)
     run_json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    if updates.get("outcome") == "running":
+        heartbeat.start(rdir, payload.get("run_id") or rdir.name)
     return payload
 
 
@@ -2569,13 +2579,14 @@ def _read_external_artifact(value: str, output: Path, visible_output: Path, *, l
 class _ExternalEvents:
     def __init__(
         self, path: str, output: Path, visible_output: Path, transcript: TextIO,
-        redact: Callable[[str], str],
+        redact: Callable[[str], str], owner: heartbeat.Heartbeat | None = None,
     ) -> None:
         self.path = path
         self.output = output
         self.visible_output = visible_output
         self.transcript = transcript
         self.redact = redact
+        self.owner = owner
         self.raw = bytearray()
         self.line_start = 0
         self.wrote_event = False
@@ -2587,6 +2598,8 @@ class _ExternalEvents:
         self.transcript.write(self.redact(json.dumps(event)).rstrip("\n") + "\n")
         self.transcript.flush()
         self.wrote_event = True
+        if self.owner is not None:
+            self.owner.event()
 
     def _consume(self, data: bytes, *, final: bool = False) -> None:
         remaining = _EXTERNAL_READ_LIMIT - len(self.raw)
@@ -2687,9 +2700,7 @@ def _run_external(
     config = engine.external
     assert config is not None
     started = time.monotonic()
-    res = AgentResult(
-        tokens_in=None, tokens_out=None, input_tokens=None, output_tokens=None, cost_usd=None,
-    )
+    res = AgentResult()
     events = None
     finalized_events = False
     staging = None
@@ -2765,7 +2776,7 @@ def _run_external(
                 return _EXTERNAL_PLACEHOLDER.sub(lambda match: values[match[1]], template)
 
             events = _ExternalEvents(expand(config.events_from), output, visible_output,
-                                     transcript, redact_event)
+                                     transcript, redact_event, heartbeat.current(request.run_dir))
             argv = list(docker_prefix) if docker_prefix else [config.command[0]]
             for arg in config.command[1:]:
                 if arg == "{allow_args}":
@@ -2867,6 +2878,9 @@ def _run_external(
 
             finalized_events = True
             events.finish()
+            res.cost_usd = _measured_cost(payload)
+            res.tokens_in = res.input_tokens = _measured_tokens(payload.get("usage"), "input_tokens")
+            res.tokens_out = res.output_tokens = _measured_tokens(payload.get("usage"), "output_tokens")
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         res.status = "harness_error"
         res.exit_code = res.exit_code or 126
@@ -3027,12 +3041,12 @@ def run_agent(request: AgentRequest) -> AgentResult:
 
     prompt_path.write_text(_redact(effective_prompt), encoding="utf-8")
 
+    owner = heartbeat.current(request.run_dir)
+
     def _write_meta_and_return(res: AgentResult) -> AgentResult:
         """Populate metadata fields, write .meta.json, and return the result."""
-        if request.engine.external is not None:
+        if request.engine.is_local:
             res.cost_usd = None
-            res.tokens_in = res.input_tokens = None
-            res.tokens_out = res.output_tokens = None
         if request.engine.engine_class == "external" and res.events_streamed is None:
             res.events_streamed = False
         res.transcript_path = jsonl_path
@@ -3067,7 +3081,13 @@ def run_agent(request: AgentRequest) -> AgentResult:
             identities=os_identities,
             credentials_path=cred_path,
         )
+        meta_payload.update(
+            schema_version=1,
+            usage_provenance="measured" if res.cost_usd is not None else "unknown",
+        )
         meta_path.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
+        if owner is not None:
+            owner.event()
         return res
 
     iso_allowed, iso_msg = check_local_isolation_allowed(
@@ -3250,6 +3270,8 @@ def run_agent(request: AgentRequest) -> AgentResult:
                         if not redacted_line.endswith("\n"):
                             jsonl_fh.write("\n")
                         jsonl_fh.flush()
+                        if owner is not None:
+                            owner.event()
 
                 def _read_stderr() -> None:
                     """Read subprocess stderr into memory."""

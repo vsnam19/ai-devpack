@@ -1,7 +1,5 @@
 """Adapt bounded reader snapshots and the selected step stream for the TUI."""
 
-from datetime import datetime, timedelta
-import math
 import time
 
 from runner.dash.events import Stream
@@ -49,7 +47,7 @@ def empty_snapshot(message="Reading runs…"):
     return {
         "project": "Dashboard", "mode": "live", "plans": [], "jobs": [], "approvals": [],
         "pending_approvals": 0, "message": message, "health": "loading", "observed": None,
-        "running": 0, "failed": 0, "awaiting": 0, "cost_today": None,
+        "running": 0, "failed": 0, "awaiting": 0, "cost_today": None, "cost_today_incomplete": False,
     }
 
 
@@ -144,7 +142,7 @@ class RunSource:
 
     def poll(self, keys):
         reader = self.reader
-        raw = reader.snapshot(interactive=True, include_gates=False)
+        raw = reader.snapshot(interactive=True, include_gates=False, include_daily_cost=True)
         # Discovery has its own budget. Reserve half of the adapter's budget for details.
         reader.files.remaining = TICK_LIMIT // 2
         jobs = raw["jobs"]
@@ -206,23 +204,6 @@ class RunSource:
             health = "scanning"
             message = "Scanning runs…"
 
-        now = datetime.fromtimestamp(raw["observed_epoch"])
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        start, end = midnight.timestamp(), (midnight + timedelta(days=1)).timestamp()
-        dates = [(job, timestamp(job["started"])) for job in jobs if job["native_id"]]
-        today = [job for job, date in dates if date is not None and start <= date < end]
-        incomplete = any(
-            job["cost_usd"] is None or (
-                (coverage := job["cost_usd_coverage"])["source"] == "steps"
-                and coverage["known"] < coverage["eligible"]
-            )
-            for job in today
-        )
-        cost = None
-        if (not incomplete and raw["scan"]["complete"] and all(date is not None for _, date in dates)
-                and raw["scan"]["returned"] == raw["scan"]["matched"]):
-            total = sum(job["cost_usd"] for job in today)
-            cost = total if math.isfinite(total) else None
         snapshot = {
             **empty_snapshot(message), "plans": plans, "jobs": jobs, "health": health,
             "approvals": [approval_row(approval, task_names) for approval in raw["approvals"]],
@@ -230,7 +211,8 @@ class RunSource:
             "running": sum(job["state"] == "running" for job in jobs),
             "failed": sum(RUN_STATES.get(job["state"]) == "failed" for job in jobs),
             "awaiting": sum(job["state"] == "waiting for approval" for job in jobs),
-            "cost_today": cost,
+            "cost_today": raw["cost_today"],
+            "cost_today_incomplete": raw["cost_today_incomplete"],
         }
         plan, task, step = selection(snapshot, keys)
         if task and task["native_id"]:

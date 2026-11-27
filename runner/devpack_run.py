@@ -420,6 +420,9 @@ def write_gate_step_file(
     if redacted and not redacted.endswith("\n"):
         redacted += "\n"
     gate_path.write_text(redacted, encoding="utf-8")
+    owner = agent_exec.heartbeat.current(run_dir)
+    if owner is not None:
+        owner.event()
     return gate_path
 
 
@@ -664,6 +667,7 @@ def _enforce_step_scope_and_test_lock(
     return ok, scope_status, test_lock_status, gate_touched, "\n\n".join(details)
 
 
+@agent_exec.heartbeat.owns_runs
 def run_task_workflow(
     config: EnginesConfig | dict[str, Any],
     context: dict[str, str],
@@ -909,7 +913,9 @@ def run_task_workflow(
             "fix_rounds_used": 0,
             "max_fix_rounds": max_fix_rounds,
             "escalation_reason": iso_msg,
-            "cost_usd": 0.0,
+            "cost_usd": None,
+            "tokens_in": None,
+            "tokens_out": None,
             "run_dir": str(active_run_dir),
             "step_logs": [],
             "harness_error": True,
@@ -1057,7 +1063,9 @@ def run_task_workflow(
                 "verdict": "",
                 "fix_rounds_used": 0,
                 "max_fix_rounds": max_fix_rounds,
-                "cost_usd": 0.0,
+                "cost_usd": None,
+                "tokens_in": None,
+                "tokens_out": None,
                 "run_dir": str(active_run_dir),
                 "step_logs": [],
             }
@@ -1078,11 +1086,10 @@ def run_task_workflow(
     step_index = 0
     step_logs: list[str] = []
     pack_artifacts: dict[str, str] = {}
-    total_cost_usd = 0.0
-    local_tokens = 0
+    usage_values: dict[str, list[int | float | None]] = {
+        "cost_usd": [], "tokens_in": [], "tokens_out": [], "local_tokens": [],
+    }
     local_wall_s = 0.0
-    total_tokens_in = 0
-    total_tokens_out = 0
     total_duration_s = 0.0
     total_tool_protocol_errors = 0
     any_timeout = False
@@ -1160,8 +1167,8 @@ def run_task_workflow(
 
     def _invoke_role(role_name: str, engine: EngineConfig, prompt_text: str) -> agent_exec.AgentResult:
         """Run a role via agent_exec.run_agent and accumulate telemetry."""
-        nonlocal local_tokens, local_wall_s
-        nonlocal total_cost_usd, total_tokens_in, total_tokens_out, total_duration_s
+        nonlocal local_wall_s
+        nonlocal total_duration_s
         nonlocal total_tool_protocol_errors, any_timeout, any_harness_error, first_harness_error
         nonlocal total_memory_tokens, git_tampered, git_tamper_reason
         step_stem = f"{step_index:02d}-{role_name}-{engine.name}"
@@ -1214,13 +1221,12 @@ def run_task_workflow(
             if mid not in all_memory_ids:
                 all_memory_ids.append(mid)
         total_memory_tokens += int(res.memory_tokens or 0)
-        if engine.is_cloud:
-            total_cost_usd += float(res.cost_usd or 0.0)
-        else:
-            local_tokens += int(res.tokens_in or 0) + int(res.tokens_out or 0)
+        usage_values["cost_usd"].append(res.cost_usd if not engine.is_local else None)
+        usage_values["tokens_in"].append(res.tokens_in)
+        usage_values["tokens_out"].append(res.tokens_out)
+        if not engine.is_cloud:
+            usage_values["local_tokens"].extend((res.tokens_in, res.tokens_out))
             local_wall_s += float(res.duration_s or 0.0)
-        total_tokens_in += int(res.tokens_in or 0)
-        total_tokens_out += int(res.tokens_out or 0)
         total_duration_s += float(res.duration_s or 0.0)
         total_tool_protocol_errors += int(res.tool_protocol_errors or 0)
         if res.status == "timeout":
@@ -1753,6 +1759,13 @@ def run_task_workflow(
         **run_json_extra,
     )
 
+    usage_totals = {}
+    usage_coverage = {}
+    for field, values in usage_values.items():
+        known = [value for value in values if value is not None]
+        total = sum(known) if known else None
+        usage_totals[field] = round(total, 6) if field == "cost_usd" and total is not None else total
+        usage_coverage[field] = {"known": len(known), "eligible": len(values)}
     summary = {
         "task_id": context["TASK_ID"],
         "task_title": context["TASK_TITLE"],
@@ -1768,11 +1781,11 @@ def run_task_workflow(
         "fix_rounds_used": fix_rounds_used,
         "max_fix_rounds": max_fix_rounds,
         "escalation_reason": escalation_reason,
-        "cost_usd": round(total_cost_usd, 6),
-        "local_tokens": local_tokens,
+        "schema_version": 1,
+        "usage_provenance": "measured" if usage_totals["cost_usd"] is not None else "unknown",
+        "usage_coverage": usage_coverage,
+        **usage_totals,
         "local_wall_s": round(local_wall_s, 4),
-        "tokens_in": total_tokens_in,
-        "tokens_out": total_tokens_out,
         "duration_s": round(total_duration_s, 4),
         "tool_protocol_errors": total_tool_protocol_errors,
         "lint_findings_first_attempt": lint_findings_first_attempt,
@@ -2138,6 +2151,7 @@ def _resume_from_approval(args: argparse.Namespace, worktree: Path) -> int:
     return rc
 
 
+@agent_exec.heartbeat.owns_runs
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for ``runner/devpack_run.py``."""
     parser = build_arg_parser()

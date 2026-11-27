@@ -127,12 +127,12 @@ class StepRecord:
     status: str = "ok"
     duration_s: float = 0.0
     num_turns: int = 0
-    tokens_in: int = 0
-    tokens_out: int = 0
+    tokens_in: int | None = None
+    tokens_out: int | None = None
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     max_request_tokens_in: int = 0
-    cost_usd: float = 0.0
+    cost_usd: float | None = None
     prompt_text: str = ""
     prompt_sha256: str = ""
     is_gate: bool = False
@@ -157,15 +157,16 @@ class RunRecord:
     engines_label: str = "-"
     task_label: str = "-"
     outcome: str = "-"
-    cost_usd: float = 0.0
+    cost_usd: float | None = None
     duration_s: float = 0.0
     total_turns: int = 0
-    total_tokens_in: int = 0
-    total_tokens_out: int = 0
+    total_tokens_in: int | None = None
+    total_tokens_out: int | None = None
     total_unknown_events: int = 0
     total_protocol_errors: int = 0
     verdict_line: str = ""
     steps: list[StepRecord] = field(default_factory=list)
+    usage_coverage: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def truncate_text(text: str, full: bool = False, limit: int = TRUNCATE_LIMIT_BYTES) -> str:
@@ -254,8 +255,8 @@ def parse_stream_jsonl(
     tool_id_to_name: dict[str, str] = {}
     saw_tool_use = False
     assistant_turns = 0
-    sum_in_tokens = 0
-    sum_out_tokens = 0
+    assistant_in_tokens: list[int] = []
+    assistant_out_tokens: list[int] = []
     sum_cache_read = 0
     sum_cache_create = 0
     max_request_in = 0
@@ -335,8 +336,10 @@ def parse_stream_jsonl(
 
             usage = msg.get("usage")
             if isinstance(usage, dict):
-                sum_in_tokens += int(usage.get("input_tokens", 0) or 0)
-                sum_out_tokens += int(usage.get("output_tokens", 0) or 0)
+                if isinstance(count := usage.get("input_tokens"), int):
+                    assistant_in_tokens.append(count)
+                if isinstance(count := usage.get("output_tokens"), int):
+                    assistant_out_tokens.append(count)
                 sum_cache_read += int(usage.get("cache_read_input_tokens", 0) or 0)
                 sum_cache_create += int(usage.get("cache_creation_input_tokens", 0) or 0)
                 # Context pressure is per request: one request's full input (fresh + cached).
@@ -444,7 +447,7 @@ def parse_stream_jsonl(
             if isinstance(res_text, str) and res_text:
                 step.final_result = redactor.redact(res_text)
             cost_val = event.get("total_cost_usd")
-            if isinstance(cost_val, (int, float)) and step.cost_usd == 0.0:
+            if isinstance(cost_val, (int, float)) and step.cost_usd is None:
                 step.cost_usd = float(cost_val)
             turns_val = event.get("num_turns")
             if isinstance(turns_val, int) and step.num_turns == 0:
@@ -461,10 +464,10 @@ def parse_stream_jsonl(
             usage = event.get("usage")
             if isinstance(usage, dict):
                 saw_result_usage = True
-                if step.tokens_in == 0:
-                    step.tokens_in = int(usage.get("input_tokens", 0) or 0)
-                if step.tokens_out == 0:
-                    step.tokens_out = int(usage.get("output_tokens", 0) or 0)
+                if step.tokens_in is None and isinstance(count := usage.get("input_tokens"), int):
+                    step.tokens_in = count
+                if step.tokens_out is None and isinstance(count := usage.get("output_tokens"), int):
+                    step.tokens_out = count
                 if step.cache_read_tokens == 0:
                     step.cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
                 if step.cache_creation_tokens == 0:
@@ -491,10 +494,10 @@ def parse_stream_jsonl(
     step.max_request_tokens_in = max(step.max_request_tokens_in, max_request_in)
 
     if not saw_result_usage:
-        if step.tokens_in == 0:
-            step.tokens_in = sum_in_tokens
-        if step.tokens_out == 0:
-            step.tokens_out = sum_out_tokens
+        if step.tokens_in is None and assistant_in_tokens:
+            step.tokens_in = sum(assistant_in_tokens)
+        if step.tokens_out is None and assistant_out_tokens:
+            step.tokens_out = sum(assistant_out_tokens)
         if step.cache_read_tokens == 0:
             step.cache_read_tokens = sum_cache_read
         if step.cache_creation_tokens == 0:
@@ -548,9 +551,9 @@ def _apply_step_meta(step: StepRecord, meta: dict[str, Any], redactor: Redactor)
 
     tokens_dict = meta.get("tokens")
     if isinstance(tokens_dict, dict):
-        if isinstance(tokens_dict.get("in"), int) and step.tokens_in == 0:
+        if isinstance(tokens_dict.get("in"), int) and step.tokens_in is None:
             step.tokens_in = int(tokens_dict["in"])
-        if isinstance(tokens_dict.get("out"), int) and step.tokens_out == 0:
+        if isinstance(tokens_dict.get("out"), int) and step.tokens_out is None:
             step.tokens_out = int(tokens_dict["out"])
 
     for cost_key in ("cost_usd", "total_cost_usd", "cost"):
@@ -769,6 +772,16 @@ def load_run_dir(run_dir: pathlib.Path, redactor: Redactor) -> RunRecord:
     step_entries.sort(key=lambda item: (item[0], item[1], item[2]))
     record.steps = [item[3] for item in step_entries]
 
+    summary_path = run_dir / "run_summary.json"
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(summary, dict) and isinstance(summary.get("usage_coverage"), dict):
+                run_meta.update({name: summary.get(name) for name in (
+                    "usage_coverage", "cost_usd", "tokens_in", "tokens_out",
+                )})
+        except (OSError, ValueError):
+            pass
     _finalize_run_record(record, run_meta)
     return record
 
@@ -810,19 +823,32 @@ def load_session_jsonl(
 
 def _finalize_run_record(record: RunRecord, run_meta: dict[str, Any]) -> None:
     """Compute aggregate totals, inferred engines, and final verdict on ``record``."""
-    sum_cost = sum(s.cost_usd for s in record.steps)
     sum_dur = sum(s.duration_s for s in record.steps)
     record.total_turns = sum(s.num_turns for s in record.steps)
-    record.total_tokens_in = sum(s.tokens_in for s in record.steps)
-    record.total_tokens_out = sum(s.tokens_out for s in record.steps)
     record.total_unknown_events = sum(s.unknown_events for s in record.steps)
     record.total_protocol_errors = sum(s.tool_protocol_errors for s in record.steps)
 
-    meta_cost = run_meta.get("cost_usd") or run_meta.get("total_cost_usd")
-    if isinstance(meta_cost, (int, float)) and float(meta_cost) > 0:
-        record.cost_usd = float(meta_cost)
-    else:
-        record.cost_usd = round(sum_cost, 8)
+    agent_steps = [step for step in record.steps if not step.is_gate]
+    stored_coverage = run_meta.get("usage_coverage")
+    for name, target in (("cost_usd", "cost_usd"), ("tokens_in", "total_tokens_in"),
+                         ("tokens_out", "total_tokens_out")):
+        known = [value for step in agent_steps if (value := getattr(step, name)) is not None]
+        coverage = {"known": len(known), "eligible": len(agent_steps)}
+        stored_value = run_meta.get(name)
+        if name == "cost_usd" and name not in run_meta:
+            stored_value = run_meta.get("total_cost_usd")
+        if isinstance(stored_coverage, dict) and isinstance(stored_coverage.get(name), dict):
+            coverage = stored_coverage[name]
+            total = stored_value
+        elif name in run_meta or (name == "cost_usd" and "total_cost_usd" in run_meta):
+            total = stored_value if isinstance(stored_value, (int, float)) else None
+            coverage = {"known": int(total is not None), "eligible": 1}
+        else:
+            total = sum(known) if known else None
+        if name == "cost_usd" and total is not None:
+            total = round(total, 8)
+        setattr(record, target, total)
+        record.usage_coverage[name] = coverage
 
     meta_dur = run_meta.get("duration_s")
     meta_dur_ms = run_meta.get("duration_ms")
@@ -882,8 +908,32 @@ def filter_run_steps(record: RunRecord, step_selector: str) -> list[StepRecord]:
     return matched
 
 
-def format_cost(cost_usd: float) -> str:
+def _coverage_suffix(counts: dict[str, int]) -> str:
+    if counts and counts["known"] < counts["eligible"]:
+        return f" ({counts['known']}/{counts['eligible']} measured)"
+    return ""
+
+
+def _format_token_count(count: int | None) -> str:
+    return str(count) if count is not None else "n/a"
+
+
+def _format_run_cost(record: RunRecord) -> str:
+    return format_cost(record.cost_usd) + _coverage_suffix(record.usage_coverage.get("cost_usd", {}))
+
+
+def _format_run_tokens(record: RunRecord) -> str:
+    token_counts = []
+    for side, value in (("in", record.total_tokens_in), ("out", record.total_tokens_out)):
+        coverage = _coverage_suffix(record.usage_coverage.get(f"tokens_{side}", {}))
+        token_counts.append(f"{_format_token_count(value)}{coverage} {side}")
+    return " / ".join(token_counts)
+
+
+def format_cost(cost_usd: float | None) -> str:
     """Format a USD cost float for human display."""
+    if cost_usd is None:
+        return "n/a"
     return f"${cost_usd:.6f}" if 0 < cost_usd < 0.01 else f"${cost_usd:.4f}"
 
 
@@ -910,11 +960,11 @@ def render_markdown(
     lines.append(
         f"- **Started:** `{record.started}` | **Finished:** `{record.finished}` | "
         f"**Duration:** `{format_duration(record.duration_s)}` | "
-        f"**Total Cost:** `{format_cost(record.cost_usd)}`"
+        f"**Total Cost:** `{_format_run_cost(record)}`"
     )
     lines.append(
         f"- **Turns:** `{record.total_turns}` | "
-        f"**Tokens:** `{record.total_tokens_in} in / {record.total_tokens_out} out`"
+        f"**Tokens:** `{_format_run_tokens(record)}`"
     )
     if record.total_protocol_errors > 0:
         lines.append(f"- **Tool Protocol Errors:** `{record.total_protocol_errors}`")
@@ -940,7 +990,7 @@ def render_markdown(
             f"## Step {step.step_num}: role=`{step.role}` | engine=`{step.engine}` | "
             f"model=`{step.model}` | status=`{step.status}` | "
             f"duration=`{format_duration(step.duration_s)}` | turns=`{step.num_turns}` | "
-            f"tokens=`{step.tokens_in} in / {step.tokens_out} out` | "
+            f"tokens=`{_format_token_count(step.tokens_in)} in / {_format_token_count(step.tokens_out)} out` | "
             f"cost=`{format_cost(step.cost_usd)}`"
         )
         lines.append("")
@@ -1208,8 +1258,8 @@ def render_html(record: RunRecord, full: bool = False) -> str:
         f'<span class="badge">outcome: {_esc(record.outcome)}</span>',
         f'<span class="badge">duration: {_esc(format_duration(record.duration_s))}</span>',
         f'<span class="badge">turns: {_esc(record.total_turns)}</span>',
-        f'<span class="badge">tokens: {_esc(record.total_tokens_in)} in / {_esc(record.total_tokens_out)} out</span>',
-        f'<span class="badge">cost: {_esc(format_cost(record.cost_usd))}</span>',
+        f'<span class="badge">tokens: {_esc(_format_run_tokens(record))}</span>',
+        f'<span class="badge">cost: {_esc(_format_run_cost(record))}</span>',
     ]
     if record.total_protocol_errors > 0:
         parts.append(
@@ -1263,7 +1313,7 @@ def render_html(record: RunRecord, full: bool = False) -> str:
         )
         parts.append(f'<span class="badge">turns: {_esc(step.num_turns)}</span>')
         parts.append(
-            f'<span class="badge">tokens: {_esc(step.tokens_in)} in / {_esc(step.tokens_out)} out</span>'
+            f'<span class="badge">tokens: {_esc(_format_token_count(step.tokens_in))} in / {_esc(_format_token_count(step.tokens_out))} out</span>'
         )
         parts.append(f'<span class="badge">cost: {_esc(format_cost(step.cost_usd))}</span>')
         if step.tool_protocol_errors > 0:
@@ -1380,11 +1430,10 @@ def format_runs_table(records: Sequence[RunRecord]) -> str:
     """Format a human-readable table of runs with a TOTAL summary row."""
     headers = ("RUN", "KIND", "TASK", "ENGINES", "OUTCOME", "COST", "DURATION")
     rows: list[tuple[str, str, str, str, str, str, str]] = []
-    total_cost = 0.0
+    total_cost, coverage = _runs_cost(records)
     total_dur = 0.0
 
     for rec in records:
-        total_cost += rec.cost_usd
         total_dur += rec.duration_s
         rows.append(
             (
@@ -1393,7 +1442,7 @@ def format_runs_table(records: Sequence[RunRecord]) -> str:
                 rec.task_label,
                 rec.engines_label,
                 rec.outcome,
-                format_cost(rec.cost_usd),
+                _format_run_cost(rec),
                 format_duration(rec.duration_s),
             )
         )
@@ -1404,7 +1453,7 @@ def format_runs_table(records: Sequence[RunRecord]) -> str:
         "-",
         "-",
         "-",
-        format_cost(total_cost),
+        format_cost(total_cost) + _coverage_suffix(coverage),
         format_duration(total_dur),
     )
 
@@ -1424,9 +1473,21 @@ def format_runs_table(records: Sequence[RunRecord]) -> str:
     return "\n".join(lines)
 
 
+def _runs_cost(records: Sequence[RunRecord]) -> tuple[float | None, dict[str, int]]:
+    costs = [r.cost_usd for r in records if r.cost_usd is not None]
+    coverage = {"known": 0, "eligible": 0}
+    for record in records:
+        counts = record.usage_coverage.get("cost_usd", {
+            "known": int(record.cost_usd is not None), "eligible": 1,
+        })
+        for name in coverage:
+            coverage[name] += counts[name]
+    return (round(sum(costs), 8) if costs else None), coverage
+
+
 def format_runs_json(records: Sequence[RunRecord]) -> str:
     """Serialize ``records`` and aggregate totals as pretty JSON."""
-    total_cost = round(sum(r.cost_usd for r in records), 8)
+    total_cost, coverage = _runs_cost(records)
     total_dur = round(sum(r.duration_s for r in records), 3)
     payload = {
         "runs": [
@@ -1438,6 +1499,7 @@ def format_runs_json(records: Sequence[RunRecord]) -> str:
                 "engines": r.engines_label,
                 "outcome": r.outcome,
                 "cost_usd": r.cost_usd,
+                "usage_coverage": r.usage_coverage,
                 "duration_s": r.duration_s,
             }
             for r in records
@@ -1446,6 +1508,7 @@ def format_runs_json(records: Sequence[RunRecord]) -> str:
             "count": len(records),
             "runs": len(records),
             "cost_usd": total_cost,
+            "usage_coverage": {"cost_usd": coverage},
             "duration_s": total_dur,
         },
     }
@@ -1454,7 +1517,7 @@ def format_runs_json(records: Sequence[RunRecord]) -> str:
 
 def render_site_index_html(records: Sequence[RunRecord]) -> str:
     """Render the static site index HTML linking every run under ``runs_root``."""
-    total_cost = sum(r.cost_usd for r in records)
+    total_cost, coverage = _runs_cost(records)
     total_dur = sum(r.duration_s for r in records)
 
     parts: list[str] = [
@@ -1495,7 +1558,7 @@ def render_site_index_html(records: Sequence[RunRecord]) -> str:
                 f"<td>{_esc(rec.task_label)}</td>",
                 f"<td><code>{_esc(rec.engines_label)}</code></td>",
                 f"<td><code>{_esc(rec.outcome)}</code></td>",
-                f"<td><code>{_esc(format_cost(rec.cost_usd))}</code></td>",
+                f"<td><code>{_esc(_format_run_cost(rec))}</code></td>",
                 f"<td><code>{_esc(format_duration(rec.duration_s))}</code></td>",
                 f'<td><a href="{dir_name}/transcript.md">transcript.md</a></td>',
                 "</tr>",
@@ -1512,7 +1575,7 @@ def render_site_index_html(records: Sequence[RunRecord]) -> str:
             "<th>-</th>",
             "<th>-</th>",
             "<th>-</th>",
-            f"<th><code>{_esc(format_cost(total_cost))}</code></th>",
+            f"<th><code>{_esc(format_cost(total_cost) + _coverage_suffix(coverage))}</code></th>",
             f"<th><code>{_esc(format_duration(total_dur))}</code></th>",
             "<th>-</th>",
             "</tr>",
@@ -1729,10 +1792,10 @@ def _fallback_request_tokens(step: StepRecord) -> tuple[int, str]:
     divided by the turn count as an estimate with ``low`` confidence. Returns ``(0, "none")`` when there is
     no usage data at all.
     """
-    total = int(step.tokens_in) + int(step.cache_read_tokens) + int(step.cache_creation_tokens)
+    total = sum(value for value in (step.tokens_in, step.cache_read_tokens, step.cache_creation_tokens) if value is not None)
     if total <= 0:
         return 0, "none"
-    if step.num_turns == 1:
+    if step.num_turns == 1 and step.tokens_in is not None:
         return total, "medium"
     turns = step.num_turns if step.num_turns > 1 else 1
     return total // turns, "low"
@@ -2320,7 +2383,8 @@ def analyze_run_dir(
         "max_step_tokens_in": max_step_tokens_in,
         "max_request_tokens_in": max_step_tokens_in,
         "context_signal_confidence": context_signal_confidence or "none",
-        "cumulative_tokens_in": sum(int(s.tokens_in) for s in record.steps),
+        "cumulative_tokens_in": record.total_tokens_in,
+        "usage_coverage": record.usage_coverage,
         "context_window": context_window,
         "prompt_over_context": prompt_over_context,
         "tool_protocol_errors": record.total_protocol_errors,

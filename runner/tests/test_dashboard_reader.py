@@ -5,6 +5,10 @@ from pathlib import Path
 from shutil import copytree
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
+
+from runner import heartbeat
+from runner.dash.ui import job_lines
 
 from runner.dash.reader import Reader, Settings
 
@@ -69,6 +73,48 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(detail["state"], "failed")
         self.assertIsNone(detail["cost_usd"])
         self.assertIsNone(detail["process_health"])
+
+    def test_heartbeat_is_independent_of_event_age_and_overridden_by_state(self):
+        run = self.run_record("active", outcome="running")
+        record = {
+            "schema_version": 1, "run_id": "active", "pid": 123, "host_id": "host",
+            "boot_id": "boot", "pid_namespace": "ns", "pid_start_identity": "start",
+            "heartbeat_at": 996, "last_event_at": 600,
+        }
+        write(run / "heartbeat.json", record)
+        with (
+            patch.object(heartbeat, "host_id", return_value="host"),
+            patch.object(heartbeat, "boot_id", return_value="boot"),
+            patch.object(heartbeat, "pid_identity", return_value=("start", "ns")) as probe,
+        ):
+            job = self.reader.snapshot(job_id="active")["jobs"][0]
+            self.assertEqual((job["process_health"], job["activity"], job["last_event_time"]),
+                             ("alive", "quiet", 600))
+            self.assertIn("Process health alive", list(job_lines(job, "Details")))
+            probe.assert_called_once_with(123)
+            for outcome in ("awaiting_approval", "pass"):
+                self.run_record("active", outcome=outcome)
+                job = self.reader.snapshot(job_id="active")["jobs"][0]
+                self.assertIsNone(job["process_health"])
+            probe.assert_called_once_with(123)
+
+    def test_mixed_usage_and_versioned_zero(self):
+        run = self.run_record("mixed", outcome="pass")
+        write(run / "steps" / "01-build-engine.meta.json",
+              {"schema_version": 1, "usage_provenance": "measured", "cost_usd": 0, "tokens_in": 0})
+        write(run / "steps" / "02-review-engine.meta.json",
+              {"schema_version": 1, "usage_provenance": "unknown", "cost_usd": None, "tokens_out": 0})
+        job = self.reader.snapshot(job_id="mixed")["jobs"][0]
+        self.assertEqual((job["cost_usd"], job["tokens_in"], job["tokens_out"]), (0, 0, 0))
+        self.assertEqual(job["cost_usd_coverage"], {"source": "steps", "known": 1, "eligible": 2})
+        write(run / "run_summary.json", {
+            "status": "pass", "schema_version": 1, "usage_provenance": "measured", "cost_usd": 0,
+            "usage_coverage": {"cost_usd": {"known": 1, "eligible": 2}},
+        })
+        job = self.reader.snapshot(job_id="mixed")["jobs"][0]
+        self.assertEqual(job["cost_usd"], 0)
+        self.assertEqual(job["cost_usd_coverage"], {"source": "summary", "known": 1, "eligible": 2})
+        self.assertTrue(any(line.startswith("Cost ") and " + ?" in line for line in job_lines(job, "Details")))
 
     def test_structured_gate_and_active_role(self):
         run = self.run_record("direct", outcome="running", engines=["worker-engine"])

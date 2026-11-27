@@ -1056,6 +1056,7 @@ def dispatch_job(
         )
 
 
+@agent_exec.heartbeat.owns_runs
 def _dispatch_job_with_trusted_cfg(
     *,
     trusted_cfg: TrustedGateConfig,
@@ -1127,7 +1128,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if not engine.is_cloud else 0.0,
+                "cost_usd": None,
                 "error": data_reason,
             }
         if not iso_ok:
@@ -1139,7 +1140,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if not engine.is_cloud else 0.0,
+                "cost_usd": None,
                 "error": iso_msg,
             }
         if not qual_ok and not allow_unqualified:
@@ -1151,7 +1152,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if not engine.is_cloud else 0.0,
+                "cost_usd": None,
                 "error": qual_reason,
             }
         plan = {
@@ -1215,7 +1216,7 @@ def _dispatch_job_with_trusted_cfg(
             "scope": "ok",
             "changed_files": [],
             "final_text_tail": "",
-            "cost_usd": None if not engine.is_cloud else 0.0,
+            "cost_usd": None,
             "error": data_reason,
         }
         _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
@@ -1241,7 +1242,7 @@ def _dispatch_job_with_trusted_cfg(
             "scope": "ok",
             "changed_files": [],
             "final_text_tail": "",
-            "cost_usd": None if not engine.is_cloud else 0.0,
+            "cost_usd": None,
             "error": iso_msg,
         }
         _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
@@ -1271,7 +1272,7 @@ def _dispatch_job_with_trusted_cfg(
             "scope": "ok",
             "changed_files": [],
             "final_text_tail": "",
-            "cost_usd": None if not engine.is_cloud else 0.0,
+            "cost_usd": None,
             "error": qual_reason,
             "qualification": "unqualified",
         }
@@ -1330,7 +1331,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if not engine.is_cloud else 0.0,
+                "cost_usd": None,
                 "error": refusal,
             }
             _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
@@ -1407,7 +1408,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if not engine.is_cloud else 0.0,
+                "cost_usd": None,
             }
             _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
             _emit_json_line(payload)
@@ -1471,13 +1472,21 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": "",
-                "cost_usd": None if not engine.is_cloud else 0.0,
+                "cost_usd": None,
                 "error": str(exc),
             }
             _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
             _emit_json_line(payload)
             return 1, payload
     agent_res = run_agent(req)
+    measured_cost = agent_res.cost_usd if not engine.is_local else None
+    usage = {
+        "schema_version": 1,
+        "usage_provenance": "measured" if measured_cost is not None else "unknown",
+        "cost_usd": round(measured_cost, 6) if measured_cost is not None else None,
+        "tokens_in": agent_res.tokens_in,
+        "tokens_out": agent_res.tokens_out,
+    }
 
     git_ok, git_tamper_reason = check_git_metadata_unchanged(git_snap)
     if not git_ok:
@@ -1495,7 +1504,6 @@ def _dispatch_job_with_trusted_cfg(
             finished=datetime.now(timezone.utc).isoformat(),
         )
         _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
-        cost_val_tamper: float | None = None if not engine.is_cloud else round(float(agent_res.cost_usd or 0.0), 6)
         payload = {
             "run_dir": str(run_dir),
             "status": agent_res.status,
@@ -1506,7 +1514,7 @@ def _dispatch_job_with_trusted_cfg(
             "scope_detail": tamper_msg,
             "changed_files": [],
             "final_text_tail": agent_res.final_text[-800:],
-            "cost_usd": cost_val_tamper,
+            **usage,
             "error": git_tamper_reason,
         }
         _emit_json_line(payload)
@@ -1546,7 +1554,7 @@ def _dispatch_job_with_trusted_cfg(
                 "scope": "ok",
                 "changed_files": [],
                 "final_text_tail": agent_res.final_text[-800:],
-                "cost_usd": None if not engine.is_cloud else round(float(agent_res.cost_usd or 0.0), 6),
+                **usage,
                 "error": model_reason,
                 "qualification": "unqualified",
                 "model_changed": True,
@@ -1774,6 +1782,9 @@ def _dispatch_job_with_trusted_cfg(
                 credentials_path=credentials_path,
             )
             (steps_dir / "02-gate.txt").write_text(redacted_gate + "\n", encoding="utf-8")
+            owner = agent_exec.heartbeat.current(run_dir)
+            if owner is not None:
+                owner.event()
 
     passed = agent_res.status == "ok" and gate_status == "ok" and scope_status == "ok"
 
@@ -1839,7 +1850,6 @@ def _dispatch_job_with_trusted_cfg(
     if not gate_error:
         _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
 
-    cost_val: float | None = None if not engine.is_cloud else round(float(agent_res.cost_usd or 0.0), 6)
     payload: dict[str, Any] = {
         "run_dir": str(run_dir),
         "status": agent_res.status,
@@ -1847,9 +1857,7 @@ def _dispatch_job_with_trusted_cfg(
         "scope": scope_status,
         "changed_files": changed_files,
         "final_text_tail": agent_res.final_text[-800:],
-        "cost_usd": cost_val,
-        "tokens_in": agent_res.tokens_in,
-        "tokens_out": agent_res.tokens_out,
+        **usage,
         "duration_s": agent_res.duration_s,
         "tool_protocol_errors": agent_res.tool_protocol_errors,
         "test_lock": test_lock_status,

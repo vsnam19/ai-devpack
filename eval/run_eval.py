@@ -220,9 +220,9 @@ class TrialResult:
     run_dir: str = ""
     timed_out: bool = False
     engine_class: str = "cloud"
-    tokens_in: int = 0
-    tokens_out: int = 0
-    local_tokens: int = 0
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    local_tokens: int | None = 0
     local_wall_s: float = 0.0
     lint_findings_first_attempt: int | None = None
     lint_findings_final: int | None = None
@@ -262,6 +262,42 @@ class TrialResult:
     ablation_arms: dict[str, Any] = field(default_factory=dict)
     arm: str = "base"
     pipeline_mode: str = "autonomous"
+    usage_coverage: dict[str, dict[str, int]] = field(default_factory=dict)
+
+
+def _trial_usage_coverage(run: TrialResult) -> dict[str, dict[str, int]]:
+    if run.skipped or run.harness_error:
+        return {}
+    fields = ["tokens_in", "tokens_out"]
+    if run.engine_class != "local":
+        fields.append("cost_usd")
+    if run.mode == "runner":
+        fields.append("local_tokens")
+    return {
+        name: run.usage_coverage.get(name, {"known": int(getattr(run, name) is not None), "eligible": 1})
+        for name in fields
+    }
+
+
+def _usage_coverage(runs: Sequence[TrialResult]) -> dict[str, dict[str, int]]:
+    totals: dict[str, dict[str, int]] = {}
+    for run in runs:
+        for name, counts in _trial_usage_coverage(run).items():
+            total = totals.setdefault(name, {"known": 0, "eligible": 0})
+            total["known"] += counts["known"]
+            total["eligible"] += counts["eligible"]
+    return totals
+
+
+def _incomplete_usage(coverage: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    return coverage if any(c["known"] < c["eligible"] for c in coverage.values()) else {}
+
+
+def _usage_note(coverage: dict[str, dict[str, int]]) -> str:
+    return ", ".join(
+        f"{name} {counts['known']}/{counts['eligible']}"
+        for name, counts in coverage.items() if counts["known"] < counts["eligible"]
+    )
 
 
 @dataclass
@@ -1638,8 +1674,8 @@ def _run_trial_body(
             run_dir=_redact(str(trial_run_dir)),
             timed_out=timed_out,
             engine_class=engine.engine_class,
-            tokens_in=int(agent_res.tokens_in) if not is_harness_err else 0,
-            tokens_out=int(agent_res.tokens_out) if not is_harness_err else 0,
+            tokens_in=agent_res.tokens_in if not is_harness_err else None,
+            tokens_out=agent_res.tokens_out if not is_harness_err else None,
             mode="single",
             init_model=agent_res.init_model,
             init_digest=agent_res.init_digest,
@@ -1774,8 +1810,8 @@ def _run_trial_body(
         run_dir=_redact(str(trial_run_dir)),
         timed_out=timed_out,
         engine_class=engine.engine_class,
-        tokens_in=int(agent_res.tokens_in) if not is_harness_err else 0,
-        tokens_out=int(agent_res.tokens_out) if not is_harness_err else 0,
+        tokens_in=agent_res.tokens_in if not is_harness_err else None,
+        tokens_out=agent_res.tokens_out if not is_harness_err else None,
         lint_findings_first_attempt=lint_findings_first,
         lint_findings_final=lint_findings_final,
         lint_clean_final=lint_clean_final,
@@ -2083,7 +2119,11 @@ def run_runner_trial(
 
         trial_cost: float | None = None
         if not is_harness_err and not all_local:
-            trial_cost = float(summary.get("cost_usd", 0.0) or 0.0)
+            trial_cost = summary.get("cost_usd")
+        usage_coverage = summary.get("usage_coverage", {})
+        local_tokens = summary.get("local_tokens", 0)
+        if usage_coverage.get("local_tokens", {}).get("eligible") == 0:
+            local_tokens = 0
         runner_init_model, runner_init_digest = _implementer_init_info(
             trial_run_dir, summary.get("step_logs", []) or []
         )
@@ -2166,8 +2206,8 @@ def run_runner_trial(
             run_dir=_redact(str(trial_run_dir)),
             timed_out=timed_out,
             engine_class="local" if all_local else "cloud",
-            tokens_in=int(summary.get("tokens_in", 0) or 0),
-            tokens_out=int(summary.get("tokens_out", 0) or 0),
+            tokens_in=summary.get("tokens_in"),
+            tokens_out=summary.get("tokens_out"),
             lint_findings_first_attempt=runner_lint_first,
             lint_findings_final=runner_lint_final,
             lint_findings_per_gate=gate_lint_records,
@@ -2176,7 +2216,8 @@ def run_runner_trial(
             no_cpp_change=runner_no_cpp,
             static_findings_first_attempt=runner_static_first,
             static_clean_final=runner_static_clean,
-            local_tokens=int(summary.get("local_tokens", 0) or 0),
+            usage_coverage=usage_coverage,
+            local_tokens=local_tokens,
             local_wall_s=float(summary.get("local_wall_s", 0.0) or 0.0),
             mode="runner",
             rounds_used=int(summary.get("fix_rounds_used", 0) or 0),
@@ -2490,8 +2531,8 @@ def run_orchestrator_trial(
             run_dir=_redact(str(trial_run_dir)),
             timed_out=timed_out,
             engine_class=orch_engine.engine_class,
-            tokens_in=int(agent_res.tokens_in) if not is_harness_err else 0,
-            tokens_out=int(agent_res.tokens_out) if not is_harness_err else 0,
+            tokens_in=agent_res.tokens_in if not is_harness_err else None,
+            tokens_out=agent_res.tokens_out if not is_harness_err else None,
             mode="orchestrator",
             orchestrator_product_edits=int(analysis["orchestrator_product_edits"]),
             dispatch_calls=int(analysis["dispatch_calls"]),
@@ -2719,11 +2760,11 @@ def run_memory_trial(
             path_replacements=path_replacements,
         )
 
-        total_cost = 0.0
+        memory_usage: dict[str, list[int | float | None]] = {
+            "cost_usd": [], "tokens_in": [], "tokens_out": [],
+        }
         total_turns = 0
         total_duration = 0.0
-        total_tok_in = 0
-        total_tok_out = 0
         total_proto_errors = 0
         total_injected_tokens = 0
         all_injected_ids: list[str] = []
@@ -2805,11 +2846,11 @@ def run_memory_trial(
                 last_init_model = agent_res.init_model
                 last_init_digest = agent_res.init_digest
             if not engine.is_local:
-                total_cost += float(agent_res.cost_usd or 0.0)
+                memory_usage["cost_usd"].append(agent_res.cost_usd)
             total_turns += int(agent_res.num_turns or 0)
             total_duration += float(agent_res.duration_s or 0.0)
-            total_tok_in += int(agent_res.tokens_in or 0)
-            total_tok_out += int(agent_res.tokens_out or 0)
+            memory_usage["tokens_in"].append(agent_res.tokens_in)
+            memory_usage["tokens_out"].append(agent_res.tokens_out)
             total_proto_errors += int(agent_res.tool_protocol_errors or 0)
             total_injected_tokens += int(agent_res.memory_tokens or 0)
             for mid in agent_res.memory_ids:
@@ -2982,6 +3023,16 @@ def run_memory_trial(
                 trial_run_dir, fixture_dir, None
             )
 
+        measured_usage = {
+            name: [value for value in values if value is not None]
+            for name, values in memory_usage.items()
+        }
+        usage_coverage = {
+            name: {"known": len(measured_usage[name]), "eligible": len(values)}
+            for name, values in memory_usage.items()
+        }
+        costs = measured_usage["cost_usd"]
+
         return TrialResult(
             task_id=seq.seq_id,
             category=seq.category,
@@ -2990,7 +3041,7 @@ def run_memory_trial(
             passed=passed,
             agent_returncode=last_rc,
             check_returncode=check_rc,
-            cost_usd=None if (any_harness_err or engine.is_local) else round(total_cost, 6),
+            cost_usd=round(sum(costs), 6) if costs and not any_harness_err else None,
             turns=total_turns if not any_harness_err else None,
             duration_s=round(total_duration, 4),
             error=_redact(last_error) or violation_detail,
@@ -3003,8 +3054,11 @@ def run_memory_trial(
             run_dir=_redact(str(trial_run_dir)),
             timed_out=any_timeout,
             engine_class=engine.engine_class,
-            tokens_in=total_tok_in if not any_harness_err else 0,
-            tokens_out=total_tok_out if not any_harness_err else 0,
+            tokens_in=(int(sum(measured_usage["tokens_in"]))
+                       if measured_usage["tokens_in"] and not any_harness_err else None),
+            tokens_out=(int(sum(measured_usage["tokens_out"]))
+                        if measured_usage["tokens_out"] and not any_harness_err else None),
+            usage_coverage=usage_coverage,
             mode="memory",
             init_model=last_init_model,
             init_digest=last_init_digest,
@@ -3075,8 +3129,9 @@ def aggregate_results(
             )
             turns_list = [r.turns for r in valid if r.turns is not None]
             durations = [r.duration_s for r in valid]
-            tokens_in_list = [r.tokens_in for r in valid]
-            tokens_out_list = [r.tokens_out for r in valid]
+            local_tokens = [r.local_tokens for r in valid if r.local_tokens is not None]
+            tokens_in_list = [r.tokens_in for r in valid if r.tokens_in is not None]
+            tokens_out_list = [r.tokens_out for r in valid if r.tokens_out is not None]
 
             no_cpp_change_runs = sum(1 for r in valid if r.no_cpp_change)
             lint_eligible = [r for r in valid if not r.no_cpp_change]
@@ -3205,7 +3260,7 @@ def aggregate_results(
                         if static_clean
                         else None
                     ),
-                    mean_local_tokens=(sum(r.local_tokens for r in valid) / len(valid) if valid else None),
+                    mean_local_tokens=(sum(local_tokens) / len(local_tokens) if local_tokens else None),
                     mean_local_wall_s=(sum(r.local_wall_s for r in valid) / len(valid) if valid else None),
                     mean_rounds_used=(
                         round(sum(rounds_used_list) / len(rounds_used_list), 4)
@@ -3271,6 +3326,7 @@ def aggregate_results(
                 if cat_is_local
                 else [s.mean_cost_usd for s in matching if s.mean_cost_usd is not None]
             )
+            coverage = _incomplete_usage(_usage_coverage([r for ts in matching for r in ts.runs]))
             cat_durations = [s.mean_duration_s for s in matching]
             cat_tokens_in = [s.mean_tokens_in for s in matching if s.mean_tokens_in is not None]
             cat_tokens_out = [s.mean_tokens_out for s in matching if s.mean_tokens_out is not None]
@@ -3343,6 +3399,7 @@ def aggregate_results(
                     ),
                     "mean_local_tokens": _mean([s.mean_local_tokens for s in matching if s.mean_local_tokens is not None]),
                     "mean_local_wall_s": _mean([s.mean_local_wall_s for s in matching if s.mean_local_wall_s is not None]),
+                    **({"usage_coverage": coverage} if coverage else {}),
                     "mean_tokens_in": _mean(cat_tokens_in),
                     "mean_tokens_out": _mean(cat_tokens_out),
                     "mean_duration_s": (
@@ -3393,7 +3450,8 @@ def _fmt_tokens(tok_in: float | int | None, tok_out: float | int | None) -> str:
     """Format input/output token counts or ``n/a``."""
     if tok_in is None and tok_out is None:
         return "n/a"
-    return f"{int(round(tok_in or 0))}/{int(round(tok_out or 0))}"
+    counts = (str(round(value)) if value is not None else "n/a" for value in (tok_in, tok_out))
+    return "/".join(counts)
 
 
 def _compute_failure_cause_rows(
@@ -3474,6 +3532,9 @@ def render_summary_markdown(
             else "n/a"
         )
         tok_str = _fmt_tokens(cat.get("mean_tokens_in"), cat.get("mean_tokens_out"))
+        coverage = _usage_note(cat.get("usage_coverage", {}))
+        if coverage:
+            tok_str += f" ({coverage})"
         under_k = bool(cat.get("any_under_k", False))
         lint_val = (
             cat.get("mean_lint_findings_final")
@@ -3505,6 +3566,9 @@ def render_summary_markdown(
             f"{ts.mean_cost_usd:.4f}" if ts.mean_cost_usd is not None else "n/a"
         )
         tok_str = _fmt_tokens(ts.mean_tokens_in, ts.mean_tokens_out)
+        coverage = _usage_note(_usage_coverage(ts.runs))
+        if coverage:
+            tok_str += f" ({coverage})"
         under_k = ts.valid_runs < ts.k
         lint_val = (
             ts.mean_lint_findings_final
@@ -3613,6 +3677,9 @@ def render_summary_markdown(
         for run in ts.runs:
             run_cost = f"{run.cost_usd:.4f}" if run.cost_usd is not None else "n/a"
             tok_str = _fmt_tokens(run.tokens_in, run.tokens_out)
+            coverage = _usage_note(_trial_usage_coverage(run))
+            if coverage:
+                tok_str += f" ({coverage})"
             pass_str = f"skipped ({run.skip_reason})" if run.skipped else ("yes" if run.passed else "no")
             cause_str = (
                 run.ablation_cause or run.suspected_cause or "-"
@@ -4666,7 +4733,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     serialized_tasks: list[dict[str, Any]] = []
     for ts in task_summaries:
         ts_dict = asdict(ts)
-        for run_item in ts_dict.get("runs", []):
+        coverage = _incomplete_usage(_usage_coverage(ts.runs))
+        if coverage:
+            ts_dict["usage_coverage"] = coverage
+        for run, run_item in zip(ts.runs, ts_dict["runs"]):
+            coverage = _incomplete_usage(_trial_usage_coverage(run))
+            if coverage:
+                run_item["usage_coverage"] = coverage
+            else:
+                run_item.pop("usage_coverage")
             if run_item.get("mode") == "single":
                 run_item.pop("lint_findings_first_attempt", None)
         serialized_tasks.append(ts_dict)

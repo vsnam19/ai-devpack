@@ -37,7 +37,7 @@ from runner.agent_exec import (
     update_run_json,
 )
 from runner.brief_lint import has_errors as brief_has_errors, lint_brief_text
-from runner import checkpoints
+from runner import checkpoints, heartbeat
 from runner.devpack_dispatch import dispatch_job, _render_run_dir_quietly
 from runner.memory import _ensure_memory_decision_checkpoint, find_memory_entry
 from runner.safe_git import run_git
@@ -55,6 +55,9 @@ def write_json(path, payload):
         json.dump(payload, handle, separators=(',', ':'))
         handle.write('\n')
     os.replace(temporary, path)
+    owner = heartbeat.current(path.parent)
+    if owner is not None:
+        owner.event()
 
 
 def relative_path(value):
@@ -419,6 +422,7 @@ class Broker:
                     copy_back(work, self.workdir, relative)
             return code, payload
 
+    @heartbeat.owns_runs
     def execute(self, request, request_id=None):
         """Log and execute one request (or resume an approved checkpoint); never accept worker launch overrides."""
         request_id = request_id or uuid.uuid4().hex

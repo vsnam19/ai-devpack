@@ -80,6 +80,31 @@ def _build_synthetic_run_dir(
 class DevpackLogsTests(unittest.TestCase):
     """Test suite for devpack_logs.py subcommands, rendering, truncation, escaping, and redaction."""
 
+    def test_nullable_usage_in_run_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            steps = run_dir / "steps"
+            steps.mkdir()
+            for index, cost, output in ((1, 0.0, 7), (2, None, None)):
+                event = {
+                    "type": "result", "total_cost_usd": cost,
+                    "usage": {"input_tokens": None, "output_tokens": output},
+                }
+                (steps / f"0{index}-implementer-test.jsonl").write_text(
+                    json.dumps(event) + "\n", encoding="utf-8",
+                )
+            record = devpack_logs.load_run_dir(run_dir, devpack_logs.Redactor())
+            self.assertEqual(0.0, record.cost_usd)
+            self.assertIsNone(record.total_tokens_in)
+            self.assertEqual(7, record.total_tokens_out)
+            self.assertEqual({"known": 0, "eligible": 2}, record.usage_coverage["tokens_in"])
+            self.assertEqual({"known": 1, "eligible": 2}, record.usage_coverage["tokens_out"])
+            summary = json.loads(devpack_logs.format_runs_json([record]))
+            self.assertEqual(0.0, summary["totals"]["cost_usd"])
+            self.assertEqual(
+                {"known": 1, "eligible": 2}, summary["totals"]["usage_coverage"]["cost_usd"],
+            )
+
     def test_render_both_samples_to_markdown_and_html(self) -> None:
         """Render both recorded stream-json samples into transcript.md and index.html."""
         with tempfile.TemporaryDirectory() as tmp:

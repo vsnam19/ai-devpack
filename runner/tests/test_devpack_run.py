@@ -297,7 +297,8 @@ class DevpackRunUnitTests(unittest.TestCase):
                 "st['calls'].append(sys.argv[1:])\n"
                 "resp = st['responses'].pop(0)\n"
                 "sf.write_text(json.dumps(st), encoding='utf-8')\n"
-                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'total_cost_usd': 0.005, 'num_turns': 2, 'duration_ms': 100, 'usage': {'input_tokens': 20, 'output_tokens': 10}, 'result': resp}))\n",
+                "cost = {1: 0, 3: 0.005, 4: 0.01}.get(len(st['calls']))\n"
+                "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'total_cost_usd': cost, 'num_turns': 2, 'duration_ms': 100, 'usage': {'input_tokens': 20, 'output_tokens': 10}, 'result': resp}))\n",
                 encoding="utf-8",
             )
             os.chmod(fake_claude, stat.S_IRWXU)
@@ -360,6 +361,13 @@ class DevpackRunUnitTests(unittest.TestCase):
             self.assertEqual("v2-task-01", run_json["task"])
             self.assertEqual("APPROVED", run_json["outcome"])
             self.assertIsNotNone(run_json["finished"])
+            summary = json.loads((rdir / "run_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["cost_usd"], 0.015)
+            self.assertEqual(summary["usage_coverage"]["cost_usd"], {"known": 3, "eligible": 4})
+            self.assertEqual((summary["tokens_in"], summary["tokens_out"]), (80, 40))
+            record = json.loads((rdir / "heartbeat.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["run_id"], rdir.name)
+            self.assertIsNotNone(record["last_event_at"])
 
             steps_dir = rdir / "steps"
             for expected_step in (
