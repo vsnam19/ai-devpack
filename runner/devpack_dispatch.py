@@ -596,6 +596,9 @@ def _inject_quality_checklist(brief_text: str, pack_root: Path = PACK_ROOT) -> s
     return brief_text.rstrip() + "\n\n" + checklist + "\n"
 
 
+_GATE_RECEIPT_NAME = "02-gate-receipt.json"
+
+
 def _resolve_gate_command(
     explicit_gate_cmd: str,
     engines_cfg: EnginesConfig | None,
@@ -615,7 +618,7 @@ def _resolve_gate_command(
     Raises ``ValueError`` when no gate can be resolved (for example, ``gate_config`` is unset).
     """
     timeout_s = engines_cfg.gate_timeout_s if engines_cfg is not None else 300
-    receipt = run_dir.absolute() / "steps" / "02-gate-receipt.json"
+    receipt = run_dir.absolute() / "steps" / _GATE_RECEIPT_NAME
     if explicit_gate_cmd.strip():
         command, _ = agent_exec.set_gate_receipt(shlex.split(explicit_gate_cmd), workdir, receipt, pack_root=pack_root)
         return command, timeout_s
@@ -1288,6 +1291,9 @@ def _dispatch_job_with_trusted_cfg(
     # Resolve and validate the gate before any agent starts: a missing gate configuration is a
     # clean refusal here, not an exception raised after the agent has already run.
     resolved_gate_cmd: list[str] | None = None
+    gate_run_dir = run_dir.resolve()
+    steps_dir = gate_run_dir / "steps"
+    gate_receipt = steps_dir / _GATE_RECEIPT_NAME
     gate_timeout_s = 300
     if not no_gate:
         gate_scope_names = (
@@ -1300,7 +1306,7 @@ def _dispatch_job_with_trusted_cfg(
                 gate_cmd,
                 engines_cfg,
                 workdir,
-                run_dir,
+                gate_run_dir,
                 pack_root=pack_root,
                 trusted_gate_toml=trusted_cfg.gate_toml_path,
                 all_components=all_components or ws_scope.scan_mode == "all",
@@ -1333,7 +1339,6 @@ def _dispatch_job_with_trusted_cfg(
 
     brief_approval_id = resume_approval_id if resumed_run_dir is not None else ""
     if not brief_approved:
-        steps_dir = run_dir / "steps"
         steps_dir.mkdir(parents=True, exist_ok=True)
         lint_receipt_path = steps_dir / "00-brief-lint.json"
         lint_receipt_path.write_text(
@@ -1667,7 +1672,15 @@ def _dispatch_job_with_trusted_cfg(
     test_lock_status = "skipped"
     gate_logs: list[str] = []
 
-    if agent_res.status == "ok" or engine.external is not None:
+    gate_error = ""
+    try:
+        agent_exec.prepare_gate_receipt(gate_receipt)
+    except (OSError, RuntimeError, ValueError):
+        gate_error = "Cannot safely prepare the gate receipt directory or file."
+        sys.stderr.write(gate_error + "\n")
+        gate_status = "fail"
+
+    if not gate_error and (agent_res.status == "ok" or engine.external is not None):
         if no_gate:
             gate_status = "skipped"
         else:
@@ -1753,8 +1766,6 @@ def _dispatch_job_with_trusted_cfg(
             if scope_out and scope_status != "ok":
                 gate_logs.append(f"[scope_check]\n{scope_out}")
 
-            steps_dir = run_dir / "steps"
-            steps_dir.mkdir(parents=True, exist_ok=True)
             gate_text = "\n\n".join(gate_logs).strip() or f"GATE_{gate_status.upper()}"
             cred_secrets = collect_credential_secrets(credentials_path)
             redacted_gate = redact_sensitive_text(
@@ -1825,7 +1836,8 @@ def _dispatch_job_with_trusted_cfg(
         finished=datetime.now(timezone.utc).isoformat(),
         **run_extra,
     )
-    _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
+    if not gate_error:
+        _render_run_dir_quietly(run_dir, credentials_path=credentials_path)
 
     cost_val: float | None = None if not engine.is_cloud else round(float(agent_res.cost_usd or 0.0), 6)
     payload: dict[str, Any] = {
@@ -1860,8 +1872,8 @@ def _dispatch_job_with_trusted_cfg(
         payload["gate_touched"] = gate_touched
     if any(mem_proposal_summary.values()):
         payload["memory_proposals"] = mem_proposal_summary
-    if agent_res.error:
-        payload["error"] = agent_res.error
+    if gate_error or agent_res.error:
+        payload["error"] = gate_error or agent_res.error
     if scope_out and scope_status != "ok":
         payload["scope_detail"] = scope_out
     if agent_res.profile_sha256:

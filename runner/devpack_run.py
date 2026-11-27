@@ -1290,10 +1290,7 @@ def run_task_workflow(
             gate_cmd, worktree, receipt, pack_root=lint_pack_root,
         )
         try:
-            if receipt_dir.resolve(strict=True) != receipt_dir or not receipt_dir.is_dir():
-                raise ValueError("expected a directory without symlinks")
-            if writes_receipt:
-                receipt.unlink(missing_ok=True)
+            agent_exec.prepare_gate_receipt(receipt, clear=writes_receipt)
         except (OSError, RuntimeError, ValueError):
             escalation_reason = "Cannot safely prepare the gate receipt directory or file."
             enforcement_failed = True

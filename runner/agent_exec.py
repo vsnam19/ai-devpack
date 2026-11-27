@@ -949,6 +949,15 @@ def build_gate_argv(
     return argv
 
 
+def prepare_gate_receipt(receipt: Path, *, clear: bool = True) -> None:
+    """Validate the absolute steps directory and optionally remove the old receipt."""
+    steps_dir = receipt.parent
+    if steps_dir.resolve(strict=True) != steps_dir or not steps_dir.is_dir():
+        raise ValueError("expected a directory without symlinks")
+    if clear:
+        receipt.unlink(missing_ok=True)
+
+
 def set_gate_receipt(
     command: Sequence[str], workdir: Path, receipt: Path, *, pack_root: Path | str | None = None,
 ) -> tuple[list[str], bool]:

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 RUNNER_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = RUNNER_DIR.parent
@@ -158,6 +159,66 @@ class DevpackDispatchTests(unittest.TestCase):
             self.assertTrue((rdir / "steps" / "02-gate.txt").is_file())
             prompt_saved = (rdir / "steps" / "01-worker-haiku.prompt.md").read_text(encoding="utf-8")
             self.assertIn("Code Quality Checklist", prompt_saved)
+
+    def test_dispatch_removes_stale_gate_receipt(self) -> None:
+        for no_gate in (False, True):
+            with self.subTest(no_gate=no_gate):
+                self._check_dispatch_gate_receipt(no_gate=no_gate)
+
+    def test_dispatch_refuses_symlinked_steps(self) -> None:
+        self._check_dispatch_gate_receipt(symlink_steps=True)
+
+    def _check_dispatch_gate_receipt(
+        self, *, no_gate: bool = False, symlink_steps: bool = False,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            wt = base / "wt"
+            _init_git_repo(wt)
+            brief = base / "brief.md"
+            brief.write_text("# Brief\nRun the checks.\n", encoding="utf-8")
+            target = base / "target"
+            target.mkdir()
+            gate_ran = base / "gate-ran"
+            fake_gate = _write_fake_agent(
+                base / "fake_gate.py",
+                f"pathlib.Path({str(gate_ran)!r}).touch()\n"
+                "receipt, = pathlib.Path('runs').glob('*/steps')\n"
+                "if (receipt / '02-gate-receipt.json').exists():\n"
+                "    sys.exit('stale gate receipt')\n",
+            )
+
+            def finish_agent(req: devpack_dispatch.AgentRequest) -> devpack_dispatch.agent_exec.AgentResult:
+                steps = req.run_dir / "steps"
+                if symlink_steps:
+                    steps.rename(req.run_dir / "original-steps")
+                    steps.symlink_to(target, target_is_directory=True)
+                else:
+                    (steps / "02-gate-receipt.json").write_text("{}", encoding="utf-8")
+                return devpack_dispatch.agent_exec.AgentResult()
+
+            args = [
+                "--engine", "haiku", "--brief", str(brief), "--workdir", str(wt),
+                "--runs-root", str(wt / "runs"), "--allow", "runs/**",
+                "--state-dir", str(base / "state"),
+                "--isolation", "local", "--allow-unsandboxed-local",
+            ]
+            args.extend(["--no-gate"] if no_gate else ["--gate-cmd", f"python3 {fake_gate}"])
+            with patch.object(devpack_dispatch, "run_agent", side_effect=finish_agent):
+                rc, stdout, stderr = self._run_dispatch(args)
+
+            data = json.loads(stdout)
+            if symlink_steps:
+                self.assertFalse(gate_ran.exists())
+                self.assertEqual(1, rc)
+                self.assertEqual("fail", data["gate"])
+                self.assertEqual([], list(target.iterdir()))
+            else:
+                receipt = Path(data["run_dir"]) / "steps" / "02-gate-receipt.json"
+                self.assertFalse(receipt.exists())
+                self.assertEqual(not no_gate, gate_ran.exists())
+                self.assertEqual("skipped" if no_gate else "ok", data["gate"])
+                self.assertEqual(1 if no_gate else 0, rc, (data, stderr))
 
     def test_dispatch_shared_comment_aware_lock(self) -> None:
         """Dispatch enforces strict test_lock (rejects assertion and comment edits on protected tests)."""
