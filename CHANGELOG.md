@@ -5,6 +5,8 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-27
+
 ### Changed
 - Allow TelAF in the project leak scanner and rename the SELinux skill to `telaf-selinux`.
 
