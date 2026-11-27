@@ -30,6 +30,7 @@ class MakeReleaseTest(unittest.TestCase):
         self.git("config", "user.name", "Release Test")
         self.git("config", "user.email", "release@example.invalid")
         self.write("VERSION", "1.2.3\n")
+        shutil.copy2(ROOT / "install.sh", self.root / "install.sh")
         self.write("tests/run_all.sh", "printf 'ALL OK\\n'\n")
         self.write("tests/test_no_project_leaks.py", "raise SystemExit(42)\n")
         script = self.root / "tools/make_release.sh"
@@ -85,6 +86,9 @@ class MakeReleaseTest(unittest.TestCase):
         self.assertEqual(f"{digest}  {archive.name}\n",
                          (self.out / "devpack-1.2.3.sha256").read_text())
         with tarfile.open(archive) as packed:
+            installer = packed.getmember("devpack-1.2.3/install.sh")
+            self.assertTrue(installer.isfile())
+            self.assertTrue(installer.mode & 0o111)
             self.assertEqual(b"committed\n", packed.extractfile("devpack-1.2.3/keep.txt").read())
             for path in generated:
                 self.assertNotIn(f"devpack-1.2.3/{path}", packed.getnames())
