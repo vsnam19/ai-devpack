@@ -10,6 +10,9 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 - Offline release installer with optional checksum verification, a self-test, and uninstall.
 - Unified `devpack` command with prerequisite checks, project scaffolding, and access to the existing tools.
 
+### Changed
+- Updated `docs/manual/index.html` and `tests/test_manual.py` with a Quick start section, `install.sh` reference, and validated `runner/devpack_cli.py` sub-commands.
+
 ## [0.4.0] - 2026-11-27
 
 ### Changed
