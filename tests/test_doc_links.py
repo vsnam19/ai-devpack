@@ -11,10 +11,10 @@ import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PREFIXES = ("enforcement", "eval", "runner", "workflow", "policy", "knowledge", "tests", "learning", "orchestrator", "skilltest")
+PREFIXES = ("enforcement", "eval", "runner", "workflow", "policy", "knowledge", "tests", "learning", "orchestrator", "skilltest", "docs", "tools")
 PATH_RE = re.compile(r"(?<![\w./-])((?:%s)/[A-Za-z0-9_./-]*)" % "|".join(PREFIXES))
 SPAN_RE = re.compile(r"`([^`\n]+)`")
-DOC_ROOTS = ("policy", "knowledge", "workflow")
+DOC_ROOTS = ("policy", "knowledge", "workflow", "docs")
 
 
 def doc_files() -> list[pathlib.Path]:
@@ -82,7 +82,13 @@ class DocLinksTest(unittest.TestCase):
                 if any(ch in ref for ch in "*<>{}"):
                     continue
                 checked += 1
-                if not (ROOT / ref).exists():
+                base = ROOT
+                if ref == "docs/spec.md" and (
+                    doc.parent == ROOT or (ROOT / "eval") in doc.parents
+                ):
+                    # The evaluation prompts and fixture descriptions use fixture-relative paths.
+                    base = ROOT / "eval/fixture"
+                if not (base / ref).exists():
                     missing.append(f"{doc.relative_to(ROOT)}: {ref}")
         self.assertGreater(checked, 10, "extractor found suspiciously few references")
         self.assertEqual(missing, [], "dangling references:\n" + "\n".join(missing))
@@ -122,6 +128,29 @@ class DocumentedCommandsTest(unittest.TestCase):
     def test_readme_command_flags(self) -> None:
         """README examples name only supported flags, including subcommands."""
         self.assert_command_flags(python_commands((ROOT / "README.md").read_text()))
+
+    def test_transfer_relative_links_exist(self) -> None:
+        transfer = ROOT / "docs/TRANSFER.md"
+        links = re.findall(r"\]\((\.\./[^)#]+)(?:#[^)]*)?\)", transfer.read_text())
+        self.assertTrue(links)
+        for link in links:
+            self.assertTrue((transfer.parent / link).exists(), link)
+
+    def test_transfer_command_flags(self) -> None:
+        text = (ROOT / "docs/TRANSFER.md").read_text()
+        self.assert_command_flags(python_commands(text))
+        build = re.search(r"`bash (tools/make_release\.sh[^`]*)`", text)
+        self.assertIsNotNone(build)
+        self.assertEqual(["tools/make_release.sh", "VERSION", "OUTDIR"], shlex.split(build.group(1)))
+        command = re.search(r"^bash (tests/run_all\.sh[^\n]*)$", text, re.MULTILINE)
+        self.assertIsNotNone(command)
+        args = shlex.split(command.group(1))
+        self.assertEqual(["tests/run_all.sh"], args)
+        result = subprocess.run(
+            ["bash", *args, "--help"], cwd=ROOT, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Usage: bash tests/run_all.sh", result.stdout)
 
     def test_snake_case_variant_keeps_documentation_checks(self) -> None:
         """The ready variant changes naming while retaining strict checks."""

@@ -5,6 +5,9 @@ All notable changes to ai-devpack are recorded here. Versioning follows
 
 ## [Unreleased]
 
+### Changed
+- Allow TelAF in the project leak scanner and rename the SELinux skill to `telaf-selinux`.
+
 ### Added
 - Verified transfer archives with SHA-256 checksums, offline installation guidance, and expanded project leak detection.
 - Live external engine events in step transcripts and the dashboard, with redaction, bounded reads, and truncation notices.

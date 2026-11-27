@@ -1,9 +1,9 @@
 ---
-name: legato-selinux
-description: Use when reviewing SELinux policies, access manifests, sandbox permissions or AVCs for Legato apps on a project-configured platform.
+name: telaf-selinux
+description: Use when reviewing SELinux policies, access manifests, sandbox permissions or AVCs for TelAF apps on a project-configured platform.
 ---
 
-# Legato SELinux and sandbox workflow
+# TelAF SELinux and sandbox workflow
 
 Produce a reviewable per-process access manifest before writing policy. Treat extraction
 as evidence gathering, never authorization. Read only references needed for the current step.

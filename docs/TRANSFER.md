@@ -1,8 +1,17 @@
 # Install an offline release
 
-Use a company-approved machine with Bash, Python 3.10 or newer, git, tar, and
-`sha256sum`. Docker is optional for the self-test. Provision the approved
+Use a company-approved machine with Bash, Python 3.10 or newer, Git, tar, gzip,
+`sha256sum`, a C++17-capable `g++`, `gcov`, `nm` (binutils), and `cppcheck`.
+CMake, Docker, and ShellCheck are optional for the transfer self-test. Provision the approved
 container runtime and preloaded images if you will run agents in containers.
+
+## Build a release
+
+Use Git 2.31 or newer and install ShellCheck before running
+`bash tools/make_release.sh VERSION OUTDIR`.
+Use a version matching a Git tag and the `VERSION` file at that tag. The
+script accepts tags with or without a leading `v`. Use `0.0.0-test` to
+smoke-test the committed HEAD.
 
 ## Verify and unpack
 
@@ -69,7 +78,7 @@ role to a configured engine and use an independent engine for review.
 ## Platform profile and dashboard
 
 For the SELinux skill, copy the fictional platform profile linked from the
-[skill instructions](../knowledge/skills/legato-selinux/SKILL.md). Fill in the
+[skill instructions](../knowledge/skills/telaf-selinux/SKILL.md). Fill in the
 project's platform conventions and set `[selinux].platform_profile` and
 `platform_root` according to the skill's workspace configuration.
 

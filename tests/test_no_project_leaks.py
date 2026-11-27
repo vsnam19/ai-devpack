@@ -19,7 +19,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Fragments are joined at runtime; the literal forbidden words never appear here.
 _FRAGMENTS = [
     ("/ho", "me/"),
-    ("tel", "af"),
     ("vi", "pc"),
     ("t", "cu"),
     ("sa", "525"),
@@ -87,19 +86,19 @@ def _committable_files(root: Path):
 
 
 def _walk_files(root: Path):
-    """Return the repo-relative paths of every regular file under ``root``, skipping SKIP_DIRS."""
+    """Return the repo-relative paths of every regular file and symlink under ``root``, skipping SKIP_DIRS."""
     found = []
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root)
         if any(part in SKIP_DIRS for part in rel.parts):
             continue
-        if path.is_file():
+        if path.is_symlink() or path.is_file():
             found.append(rel)
     return found
 
 
 def iter_files(root: Path):
-    """Yield the repo-relative paths of regular files that could be committed under ``root``.
+    """Yield the repo-relative paths of regular files and symlinks that could be committed under ``root``.
 
     Uses ``git ls-files -z -co --exclude-standard`` when ``root`` is a git work tree. Otherwise
     prints a notice to stderr and walks the directory, skipping SKIP_DIRS.
@@ -110,20 +109,26 @@ def iter_files(root: Path):
               file=sys.stderr)
         listed = _walk_files(root)
     for rel in sorted(listed):
-        if (root / rel).is_file():
+        path = root / rel
+        if path.is_symlink() or path.is_file():
             yield rel
 
 
 def find_leaks(root: Path):
     """Return a list of ``relative_path:line: match`` strings for forbidden patterns.
 
-    Both file names and file contents are checked. Undecodable bytes are ignored.
+    File names, regular file contents and symlink targets are checked. Undecodable bytes are ignored.
     """
     leaks = []
     for rel in iter_files(root):
         for m in PATTERN.finditer(str(rel)):
             leaks.append(f"{rel}: (file name) {m.group(0)}")
-        text = (root / rel).read_bytes().decode("utf-8", errors="ignore")
+        path = root / rel
+        if path.is_symlink():
+            for m in PATTERN.finditer(os.readlink(path)):
+                leaks.append(f"{rel}: (link target) {m.group(0)}")
+            continue
+        text = path.read_bytes().decode("utf-8", errors="ignore")
         for lineno, line in enumerate(text.splitlines(), start=1):
             m = PATTERN.search(line)
             if m:
@@ -151,6 +156,20 @@ class NoProjectLeaksTest(unittest.TestCase):
         self.assertEqual(1, len(leaks))
         self.assertTrue(leaks[0].startswith("a.md:2:"))
 
+    def test_telaf_is_allowed(self):
+        self.assertIsNone(PATTERN.search("TelAF apps and telaf-selinux"))
+
+    def test_each_remaining_project_term_is_forbidden(self):
+        fragments = (
+            ("vi", "pc"), ("t", "cu"), ("sa", "525"), ("qual", "comm"),
+            ("shoulder", "tap"), ("nam", "vs"), ("tls", "proxy"),
+            ("tls_", "proxy"), ("tls-", "proxy"),
+        )
+        for left, right in fragments:
+            term = (left + right).upper()
+            with self.subTest(term=term):
+                self.assertIsNotNone(PATTERN.search(f" {term} "))
+
     def test_detector_ignores_git_directory(self):
         """Files below ``.git`` are not scanned."""
         import tempfile
@@ -167,4 +186,9 @@ class NoProjectLeaksTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--scan-tree":
+        leaks = find_leaks(Path(sys.argv[2]).resolve())
+        for leak in leaks:
+            print(leak, file=sys.stderr)
+        sys.exit(bool(leaks))
     unittest.main()

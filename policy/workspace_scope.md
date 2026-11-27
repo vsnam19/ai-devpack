@@ -142,12 +142,12 @@ CI must pass `--all-components`. An empty changed-C/C++ set may explicitly use
 Pack self-tests select their own configuration through `DEVPACK_PROJECT_CONFIG=none`
 or `--project-config none`, so a vendored pack never inherits the parent product scope.
 
-## Optional Legato SELinux skill configuration
+## Optional TelAF SELinux skill configuration
 
-The `legato-selinux` skill reads the following optional project section independently
+The `telaf-selinux` skill reads the following optional project section independently
 of component scope resolution. The workspace loader does not interpret these keys.
 Do not hardcode a company tree layout; reconcile selected components and exclusions
-before inventory. See [the skill](../knowledge/skills/legato-selinux/SKILL.md).
+before inventory. See [the skill](../knowledge/skills/telaf-selinux/SKILL.md).
 
 ```toml
 [selinux]
@@ -173,7 +173,7 @@ The extractor does not create modules. It accepts JSON config with the same `sel
 object when TOML support is unavailable, and writes draft YAML using JSON flow syntax.
 
 `platform_profile` selects a project-owned TOML file relative to the workspace root.
-See the [profile contract](../knowledge/skills/legato-selinux/references/platform-profile.md).
+See the [profile contract](../knowledge/skills/telaf-selinux/references/platform-profile.md).
 Naming, interfaces, build conventions, inherited grants and loader checks come only
 from that profile. Missing or invalid fields become unknowns in QUESTIONS.md and
 block dependent steps. Keep proprietary profiles outside the pack in ignored project
@@ -187,7 +187,7 @@ The skill reads `[selinux]` independently of component selection. Optional
 simulation branches to the built-in SIMULATION/TEST/MOCK recognition. Such evidence
 is `candidate_denied` and draft; it never authorizes a production grant or confirms a
 denial. `#else` production evidence remains in ordinary draft resource categories.
-See [Legato SELinux](../knowledge/skills/legato-selinux/SKILL.md) for the full config.
+See [TelAF SELinux](../knowledge/skills/telaf-selinux/SKILL.md) for the full config.
 
 API lookup tries the component `.cdef` directory, then `api_search_paths` in order,
 then `interfaceSearch` entries from definitions matched by optional `sdef_globs`.

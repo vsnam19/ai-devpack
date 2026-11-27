@@ -20,7 +20,7 @@ leak = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(leak)
 
 HOME_PATH = leak.FORBIDDEN[0] + "x"  # a host path prefix followed by a user name
-PROJECT_WORD = leak.FORBIDDEN[3]  # the short project name, lower case
+PROJECT_WORD = "t" + "cu"  # the short project name, lower case
 
 
 def _git(root: Path, *args: str) -> None:
@@ -49,6 +49,18 @@ class CommittableScopeTest(unittest.TestCase):
         self.global_ignore.write_text(".vscode/\n")
         _git(self.root, "init", "-q")
         _git(self.root, "config", "core.excludesFile", str(self.global_ignore))
+
+    def test_tracked_and_untracked_symlinks(self):
+        word = PROJECT_WORD
+        (self.root / f"{word}.link").symlink_to("missing")
+        _git(self.root, "add", f"{word}.link")
+        (self.root / "dir").mkdir()
+        (self.root / "dir" / word).mkdir()
+        (self.root / "directory.link").symlink_to(f"dir/{word}", target_is_directory=True)
+        self.assertCountEqual(
+            [f"{word}.link: (file name) {word}", f"directory.link: (link target) {word}"],
+            leak.find_leaks(self.root),
+        )
 
     def test_ignored_file_with_host_path_is_not_reported(self):
         """A file matched by a global ignore rule is outside the scan, even with a host path."""
@@ -116,6 +128,18 @@ class CommittableScopeTest(unittest.TestCase):
 
 class FallbackWalkTest(unittest.TestCase):
     """Outside a git work tree the leak scan walks the directory and says so."""
+
+    def test_walk_scans_dangling_targets_without_reading_external_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "archive"
+            root.mkdir()
+            _write(parent, "outside.txt", PROJECT_WORD)
+            (root / "external.link").symlink_to("../outside.txt")
+            (root / "dangling.link").symlink_to(f"../{PROJECT_WORD}/missing.txt")
+            self.assertEqual(
+                [f"dangling.link: (link target) {PROJECT_WORD}"], leak.find_leaks(root),
+            )
 
     def test_plain_directory_is_walked_with_notice(self):
         """A non-git directory is scanned and a notice is printed to stderr."""
